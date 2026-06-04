@@ -1,0 +1,9 @@
+[package]
+name = "clw-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clw-types = { workspace = true }

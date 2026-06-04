@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clw-types",
+    "crates/clw-chunk",
+    "crates/clw-client",
+    "crates/clw-manifest",
+    "crates/clw-cache",
+    "crates/clw-snapshot",
+    "crates/clw-hydrate",
+    "crates/clw-run",
+    "crates/clw-cli",
+    "crates/clw-integration-tests",
+    "crates/clw-conformance",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+repository = "https://github.com/humangr-labs/corelink-workspaces"
+
+[workspace.dependencies]
+clw-types = { path = "crates/clw-types" }
+clw-chunk = { path = "crates/clw-chunk" }
+clw-client = { path = "crates/clw-client" }
+clw-manifest = { path = "crates/clw-manifest" }
+clw-cache = { path = "crates/clw-cache" }
+clw-snapshot = { path = "crates/clw-snapshot" }
+clw-hydrate = { path = "crates/clw-hydrate" }
+clw-run = { path = "crates/clw-run" }
+assert_cmd = "2"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+fastcdc = "3"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+hex = "0.4"
+anyhow = "1"
+tempfile = "3"
+proptest = "1"
+wiremock = "0.6"
+filetime = "0.2"
+
+[profile.release]
+lto = "thin"

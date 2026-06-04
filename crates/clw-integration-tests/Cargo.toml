@@ -1,0 +1,13 @@
+[package]
+name = "clw-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clw-types = { workspace = true }
+clw-client = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,5 @@
+/target
+.techlead/
+.DS_Store
+*.local
+.env*

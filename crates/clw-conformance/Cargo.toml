@@ -1,0 +1,17 @@
+[package]
+name = "clw-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clw-types = { workspace = true }
+clw-client = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+# Live conformance against corelink-api.humangr.com — requires CLW_TOKEN. Never on in CI default lane.
+live = []
