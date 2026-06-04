@@ -3,6 +3,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 # One CI run at a time per ref — protects the (owner-chosen) self-hosted Mac.
 concurrency:
@@ -21,3 +22,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: gates (fmt + clippy + test)
         run: bash scripts/gates.sh
+
+  dco:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: fetch base ref
+        run: git fetch origin ${{ github.base_ref || 'main' }} --no-tags
+      - name: DCO trailer check
+        run: bash scripts/dco-check.sh origin/${{ github.base_ref || 'main' }}
