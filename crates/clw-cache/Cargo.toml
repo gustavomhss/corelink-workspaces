@@ -7,3 +7,7 @@ repository.workspace = true
 
 [dependencies]
 clw-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+filetime = { workspace = true }
