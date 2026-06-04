@@ -7,3 +7,10 @@ repository.workspace = true
 
 [dependencies]
 clw-types = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true }
