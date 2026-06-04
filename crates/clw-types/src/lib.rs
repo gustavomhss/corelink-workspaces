@@ -30,6 +30,9 @@ pub const CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// CoreLink CAS single-blob cap (server-enforced; PUTs above this 413).
 pub const CAS_BLOB_CAP_BYTES: usize = 5 * 1024 * 1024;
 
+// Compile-time guarantee: every chunk fits a single CAS blob.
+const _: () = assert!(CHUNK_MAX_BYTES < CAS_BLOB_CAP_BYTES);
+
 /// Domain separator for workspace ref keys in the AC namespace.
 pub const REF_KEY_DOMAIN: &str = "clw/ref/v1/";
 
@@ -336,10 +339,5 @@ mod tests {
         assert_ne!(ref_key("x"), Digest::of_bytes(b"x"));
         assert_ne!(ref_key("a"), ref_key("b"));
         assert_eq!(ref_key("a"), ref_key("a"));
-    }
-
-    #[test]
-    fn chunk_params_fit_under_cas_cap() {
-        assert!(CHUNK_MAX_BYTES < CAS_BLOB_CAP_BYTES);
     }
 }
