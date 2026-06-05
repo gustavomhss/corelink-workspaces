@@ -11,6 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 clw-types = { workspace = true }
+clw-snapshot = { workspace = true }
+clw-hydrate = { workspace = true }
+clw-run = { workspace = true }
+clw-manifest = { workspace = true }
+clw-cache = { workspace = true }
+clw-client = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Pre-added by the lead (wave-0) so W14-e2e never edits this file (conflict defusal).
