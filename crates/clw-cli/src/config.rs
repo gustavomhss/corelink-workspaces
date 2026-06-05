@@ -97,13 +97,11 @@ fn config_file_path() -> Option<PathBuf> {
 /// missing file (failures are silently ignored — flags/env take precedence).
 fn read_config_file() -> HashMap<String, String> {
     let mut map = HashMap::new();
-    let path = match config_file_path() {
-        Some(p) => p,
-        None => return map,
+    let Some(path) = config_file_path() else {
+        return map;
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return map,
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return map;
     };
     parse_config_lines(&content, &mut map);
     map

@@ -4,6 +4,8 @@
 //! Prints `[clw] cache hit` / `[clw] cache miss` to stderr.
 //! Exits with the child's exit code.
 
+use std::io::Write as _;
+
 use clap::Args;
 use clw_client::HttpClient;
 use clw_run::{run_memoized, RunOptions};
@@ -12,17 +14,29 @@ use clw_types::ClwError;
 use crate::config::ResolvedConfig;
 
 #[derive(Debug, Args)]
+#[command(about = "Run a command and memoize its output; replays stdout/stderr on cache hit")]
 pub struct RunArgs {
     /// Input paths (files or directories) that key the memoization.
-    #[arg(long = "input", required = true)]
+    #[arg(
+        long = "input",
+        required = true,
+        help = "Input paths (files or dirs) that form the cache key; repeat for multiple"
+    )]
     pub input: Vec<String>,
 
     /// Environment variable names to include in the cache key.
-    #[arg(long = "env")]
+    #[arg(
+        long = "env",
+        help = "Environment variable names to fold into the cache key; repeat for multiple"
+    )]
     pub env: Vec<String>,
 
     /// The command to run (after `--`).
-    #[arg(last = true, required = true)]
+    #[arg(
+        last = true,
+        required = true,
+        help = "Command and arguments to run (pass after --)"
+    )]
     pub cmd: Vec<String>,
 }
 
@@ -45,7 +59,6 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
     }
 
     // Stream captured output to real stdout/stderr.
-    use std::io::Write as _;
     std::io::stdout().write_all(&outcome.stdout).ok();
     std::io::stderr().write_all(&outcome.stderr).ok();
 

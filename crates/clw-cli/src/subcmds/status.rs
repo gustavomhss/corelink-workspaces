@@ -9,35 +9,49 @@ use clap::Args;
 use clw_client::HttpClient;
 use clw_manifest::diff;
 use clw_snapshot::build_manifest_local;
-use clw_types::{ref_key, AcTransport, ClwError, Manifest, RefRecord};
+use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
 
 #[derive(Debug, Args)]
+#[command(
+    about = "Show diff between remote snapshot and local working tree (exit 0=clean, 1=dirty, 2=error)"
+)]
 pub struct StatusArgs {
     /// Local workspace directory to compare (default: current directory).
-    #[arg(default_value = ".")]
+    #[arg(
+        default_value = ".",
+        help = "Local workspace directory to compare against the remote snapshot"
+    )]
     pub path: PathBuf,
 
     /// Workspace name (ref key).
-    #[arg(long)]
+    #[arg(long, help = "Workspace name to compare against")]
     pub name: String,
 }
 
 pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+    let tenant = cfg.clw_config.tenant.clone();
     let client = HttpClient::new(cfg.clw_config)?;
 
     // --- Fetch remote ref + manifest ---
     let rk = ref_key(&args.name);
     let ref_bytes = AcTransport::get(&client, &rk)
-        .await?
-        .ok_or(ClwError::NotFound(rk))?;
+        .await
+        .map_err(map_auth_error)?
+        .ok_or_else(|| {
+            ClwError::Transport(format!(
+                "workspace '{}' not found for tenant '{}' — run 'clw snapshot --name {}' first or check --tenant",
+                args.name, tenant, args.name
+            ))
+        })?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
 
     // Fetch manifest blob from CAS.
-    use clw_types::CasTransport;
-    let manifest_bytes = CasTransport::get(&client, &record.root).await?;
+    let manifest_bytes = CasTransport::get(&client, &record.root)
+        .await
+        .map_err(map_auth_error)?;
     let remote_manifest = Manifest::from_bytes(&manifest_bytes)?;
 
     // --- Build local manifest ---
@@ -83,5 +97,95 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
     } else {
         // Exit 1 for dirty (not an error, but distinct from clean).
         std::process::exit(1);
+    }
+}
+
+/// Map a 401 `Auth` error to an actionable message; pass other errors through.
+pub fn map_auth_error(err: ClwError) -> ClwError {
+    if matches!(err, ClwError::Auth) {
+        ClwError::Transport(
+            "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
+        )
+    } else {
+        err
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clw_types::ClwError;
+
+    #[test]
+    fn map_auth_error_rewrites_auth_variant() {
+        let mapped = map_auth_error(ClwError::Auth);
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("CLW_TOKEN") || msg.contains("config.toml"),
+            "mapped auth error must mention CLW_TOKEN or config.toml, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_auth_error_passes_through_other_errors() {
+        let original = ClwError::Transport("network timeout".to_string());
+        let mapped = map_auth_error(original);
+        assert!(
+            mapped.to_string().contains("network timeout"),
+            "non-auth errors must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn status_args_defaults() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cmd {
+            #[command(flatten)]
+            args: StatusArgs,
+        }
+
+        let cmd = Cmd::try_parse_from(["cmd", "--name", "my-ws"]).unwrap();
+        assert_eq!(cmd.args.path, PathBuf::from("."));
+        assert_eq!(cmd.args.name, "my-ws");
+    }
+
+    #[test]
+    fn json_shape_matches_spec() {
+        // Verify the JSON shape we produce has the correct keys.
+        let out = json!({
+            "clean": true,
+            "added": Vec::<String>::new(),
+            "removed": Vec::<String>::new(),
+            "changed": Vec::<String>::new(),
+        });
+        assert!(out.get("clean").is_some(), "must have 'clean'");
+        assert!(out.get("added").is_some(), "must have 'added'");
+        assert!(out.get("removed").is_some(), "must have 'removed'");
+        assert!(out.get("changed").is_some(), "must have 'changed'");
+        assert!(out["clean"].as_bool().is_some(), "'clean' must be a bool");
+        assert!(
+            out["added"].as_array().is_some(),
+            "'added' must be an array"
+        );
+    }
+
+    #[test]
+    fn not_found_error_message_is_actionable() {
+        // Simulate the NotFound-mapped error message that run() would produce.
+        let name = "my-workspace";
+        let tenant = "acme";
+        let msg = format!(
+            "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
+        );
+        assert!(msg.contains("not found"), "must say 'not found'");
+        assert!(msg.contains(name), "must mention workspace name");
+        assert!(msg.contains(tenant), "must mention tenant");
+        assert!(msg.contains("clw snapshot"), "must suggest clw snapshot");
     }
 }

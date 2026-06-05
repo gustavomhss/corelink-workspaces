@@ -10,15 +10,20 @@ use clw_types::ClwError;
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
+use crate::subcmds::status::map_auth_error;
 
 #[derive(Debug, Args)]
+#[command(about = "Snapshot a workspace directory and upload it to CoreLink")]
 pub struct SnapshotArgs {
     /// Workspace directory to snapshot (default: current directory).
-    #[arg(default_value = ".")]
+    #[arg(
+        default_value = ".",
+        help = "Workspace directory to snapshot (default: current directory)"
+    )]
     pub path: PathBuf,
 
     /// Workspace name (ref key).
-    #[arg(long)]
+    #[arg(long, help = "Workspace name to store the snapshot under")]
     pub name: String,
 }
 
@@ -27,7 +32,9 @@ pub async fn run(args: SnapshotArgs, cfg: ResolvedConfig, json: bool) -> Result<
     let client = HttpClient::new(cfg.clw_config)?;
     let opts = SnapshotOptions::new(&args.name);
 
-    let report = snapshot(&args.path, &client, &cache, &opts).await?;
+    let report = snapshot(&args.path, &client, &cache, &opts)
+        .await
+        .map_err(map_auth_error)?;
 
     if json {
         let out = json!({

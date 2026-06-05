@@ -8,12 +8,19 @@ use clw_types::ClwError;
 use crate::config::{clw_config_path, ResolvedConfig};
 
 #[derive(Debug, Args)]
+#[command(about = "Write ~/.clw/config.toml from the resolved config values")]
 pub struct InitArgs {
     /// Overwrite an existing config file.
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Overwrite an existing config file (default: error if file exists)"
+    )]
     pub force: bool,
 }
 
+// All subcommand entry points are async to satisfy a uniform dispatch signature.
+#[allow(clippy::unused_async)]
 pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
         ClwError::Transport("cannot determine home directory for config file".to_string())

@@ -1,4 +1,4 @@
-//! clw — CoreLink Workspaces CLI.
+//! clw — `CoreLink` Workspaces CLI.
 //!
 //! Entry point: parses global flags + subcommand, resolves config (flag > env >
 //! config file), builds the transport/cache, and dispatches to the matching
@@ -16,28 +16,53 @@ use config::ResolvedConfig;
 // CLI surface (clap derive)
 // ---------------------------------------------------------------------------
 
-/// CoreLink Workspaces — snapshot, hydrate, and memoize your workspace.
+/// `CoreLink` Workspaces client — snapshot, hydrate, and memoize your workspace.
 #[derive(Debug, Parser)]
 #[command(name = "clw", version, about, long_about = None)]
 pub struct Cli {
     /// Remote API endpoint (no trailing slash).
-    #[arg(long, global = true, env = "CLW_ENDPOINT")]
+    #[arg(
+        long,
+        global = true,
+        env = "CLW_ENDPOINT",
+        help = "Remote API endpoint URL (no trailing slash)"
+    )]
     pub endpoint: Option<String>,
 
-    /// Tenant ID.
-    #[arg(long, global = true, env = "CLW_TENANT")]
+    /// Tenant ID used to namespace all CAS/AC keys.
+    #[arg(
+        long,
+        global = true,
+        env = "CLW_TENANT",
+        help = "Tenant ID (set via --tenant, CLW_TENANT env, or config)"
+    )]
     pub tenant: Option<String>,
 
     /// Personal access token (never printed).
-    #[arg(long, global = true, env = "CLW_TOKEN")]
+    #[arg(
+        long,
+        global = true,
+        env = "CLW_TOKEN",
+        help = "CoreLink personal access token (set via --token, CLW_TOKEN env, or config)"
+    )]
     pub token: Option<String>,
 
     /// Local cache directory.
-    #[arg(long, global = true, env = "CLW_CACHE_DIR")]
+    #[arg(
+        long,
+        global = true,
+        env = "CLW_CACHE_DIR",
+        help = "Local blob cache directory (default: ~/.clw/cache)"
+    )]
     pub cache_dir: Option<String>,
 
     /// Emit machine-readable JSON to stdout.
-    #[arg(long, global = true, default_value_t = false)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Emit machine-readable JSON on stdout; errors still go to stderr"
+    )]
     pub json: bool,
 
     #[command(subcommand)]
@@ -48,13 +73,13 @@ pub struct Cli {
 pub enum Commands {
     /// Write ~/.clw/config.toml from resolved config values.
     Init(subcmds::init::InitArgs),
-    /// Snapshot a workspace directory to CoreLink.
+    /// Snapshot a workspace directory to `CoreLink`.
     Snapshot(subcmds::snapshot::SnapshotArgs),
-    /// Hydrate a workspace snapshot into a directory.
+    /// Hydrate a workspace snapshot into a local directory.
     Hydrate(subcmds::hydrate::HydrateArgs),
-    /// Show diff between remote ref and local working tree.
+    /// Show diff between remote snapshot and local working tree.
     Status(subcmds::status::StatusArgs),
-    /// Run a command, memoizing the result.
+    /// Run a command, memoizing its output to `CoreLink`.
     Run(subcmds::run::RunArgs),
     /// List ref info for a workspace name.
     Ls(subcmds::ls::LsArgs),
@@ -65,8 +90,24 @@ pub enum Commands {
 // ---------------------------------------------------------------------------
 
 fn exit_err(err: &ClwError) -> ! {
-    eprintln!("error: {err}");
+    let msg = actionable_error(err);
+    eprintln!("error: {msg}");
     std::process::exit(2);
+}
+
+/// Produce a user-actionable error message for any `ClwError`.
+///
+/// Falls back to the `Display` impl for errors that are already clear.
+#[must_use]
+pub fn actionable_error(err: &ClwError) -> String {
+    match err {
+        ClwError::Auth => {
+            "authentication failed — check CLW_TOKEN or add token to ~/.clw/config.toml".to_string()
+        }
+        // NotFound at the top-level prints the raw digest — subcommands override
+        // this with workspace-name context before returning to main.
+        _ => err.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,5 +274,49 @@ mod tests {
         assert_eq!(cli.tenant.as_deref(), Some("t1"));
         assert_eq!(cli.token.as_deref(), Some("tok"));
         assert_eq!(cli.cache_dir.as_deref(), Some("/tmp/cache"));
+    }
+
+    // -----------------------------------------------------------------------
+    // actionable_error mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn actionable_error_auth_is_user_friendly() {
+        let err = ClwError::Auth;
+        let msg = actionable_error(&err);
+        assert!(
+            msg.contains("CLW_TOKEN") || msg.contains("config.toml"),
+            "auth error must mention CLW_TOKEN or config.toml, got: {msg}"
+        );
+        assert!(
+            msg.contains("authentication failed"),
+            "auth error must say 'authentication failed', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn actionable_error_transport_falls_back_to_display() {
+        let err = ClwError::Transport("some transport issue".to_string());
+        let msg = actionable_error(&err);
+        // Falls back to Display, which is the transport error string.
+        assert!(
+            msg.contains("some transport issue"),
+            "transport error must include original message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn version_flag_parses() {
+        // `--version` causes clap to print version and exit; verify it is
+        // recognised as a valid flag (no UnknownArgument error).
+        let result = Cli::try_parse_from(["clw", "--version"]);
+        // clap returns Err with kind=DisplayVersion for --version.
+        if let Err(e) = &result {
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayVersion,
+                "expected DisplayVersion, got: {e}"
+            );
+        }
     }
 }
