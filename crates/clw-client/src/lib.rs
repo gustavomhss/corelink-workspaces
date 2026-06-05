@@ -12,9 +12,9 @@ use std::time::Duration;
 // Retry configuration
 // ---------------------------------------------------------------------------
 
-const MAX_ATTEMPTS: u32 = 3;
+const MAX_ATTEMPTS: u32 = 6;
 /// Sleep durations between attempt 1→2 and 2→3.
-const RETRY_SLEEP_MS: [u64; 2] = [200, 800];
+const RETRY_SLEEP_MS: [u64; 5] = [200, 800, 2_000, 5_000, 10_000];
 
 // ---------------------------------------------------------------------------
 // HttpClient
@@ -62,7 +62,7 @@ impl HttpClient {
     }
 
     /// Execute `op` with up to `MAX_ATTEMPTS` attempts, sleeping between them.
-    /// Retries on connect/transport errors and 5xx responses.
+    /// Retries on connect/transport errors, 5xx responses, and 429 rate limits\n    /// (found by dogfood day-1: prod throttled the first real snapshot).
     /// Returns `Ok(T)` on first success; propagates the last error on exhaustion.
     async fn with_retry<F, Fut, T>(&self, op: F) -> Result<T>
     where
@@ -94,7 +94,7 @@ impl HttpClient {
 fn is_retryable(e: &ClwError) -> bool {
     match e {
         ClwError::Transport(_) => true,
-        ClwError::Http { status, .. } => *status >= 500,
+        ClwError::Http { status, .. } => *status >= 500 || *status == 429,
         _ => false,
     }
 }
@@ -843,7 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_three_500s_returns_http_error() {
+    async fn retry_persistent_500s_returns_http_error() {
         let server = MockServer::start().await;
         let (digest, _) = digest_and_bytes();
         let path_str = format!("/v1/cas/test-tenant/{}", digest);
@@ -858,9 +858,13 @@ mod tests {
         let err = CasTransport::get(&client, &digest).await.unwrap_err();
         assert!(matches!(err, ClwError::Http { status: 500, .. }));
 
-        // Verify we actually retried (3 attempts total).
+        // Verify we exhausted the full retry budget (MAX_ATTEMPTS total).
         let received = server.received_requests().await.unwrap();
-        assert_eq!(received.len(), 3, "expected 3 attempts");
+        assert_eq!(
+            received.len(),
+            MAX_ATTEMPTS as usize,
+            "expected MAX_ATTEMPTS attempts"
+        );
     }
 
     #[tokio::test]
@@ -900,5 +904,69 @@ mod tests {
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1, "401 must not be retried");
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use clw_types::{CasTransport, Config, Digest};
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn config_for(server: &MockServer) -> Config {
+        Config {
+            endpoint: server.uri(),
+            tenant: "t1".into(),
+            token: "test-pat".into(),
+            cache_dir: std::env::temp_dir(),
+        }
+    }
+
+    /// Dogfood day-1 regression: prod answered 429 to the first real snapshot
+    /// and the client gave up. 429 MUST back off and retry, then succeed.
+    #[tokio::test]
+    async fn put_retries_through_429_then_succeeds() {
+        let server = MockServer::start().await;
+        let bytes = b"rate-limited-blob".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = HttpClient::new(config_for(&server)).unwrap();
+        CasTransport::put(&client, &digest, bytes)
+            .await
+            .expect("429s must be retried through");
+    }
+
+    /// Exhausted 429s still surface as Http{429} (no infinite loop).
+    #[tokio::test]
+    async fn put_exhausts_429_retries_with_error() {
+        let server = MockServer::start().await;
+        let bytes = b"always-throttled".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let client = HttpClient::new(config_for(&server)).unwrap();
+        let err = CasTransport::put(&client, &digest, bytes)
+            .await
+            .unwrap_err();
+        match err {
+            clw_types::ClwError::Http { status, .. } => assert_eq!(status, 429),
+            other => panic!("expected Http 429, got {other:?}"),
+        }
     }
 }
