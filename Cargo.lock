@@ -220,7 +220,13 @@ dependencies = [
 name = "clw-hydrate"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "clw-cache",
+ "clw-client",
  "clw-types",
+ "futures",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
