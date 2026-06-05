@@ -251,7 +251,15 @@ dependencies = [
 name = "clw-run"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "blake3",
+ "clw-client",
+ "clw-manifest",
  "clw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

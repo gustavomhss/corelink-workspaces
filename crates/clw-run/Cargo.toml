@@ -7,3 +7,14 @@ repository.workspace = true
 
 [dependencies]
 clw-types = { workspace = true }
+clw-manifest = { workspace = true }
+clw-client = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
