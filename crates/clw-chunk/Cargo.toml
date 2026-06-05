@@ -7,3 +7,7 @@ repository.workspace = true
 
 [dependencies]
 clw-types = { workspace = true }
+fastcdc = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
