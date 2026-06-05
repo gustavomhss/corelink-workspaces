@@ -97,11 +97,15 @@ dedupe (8/48 chunks uploaded) · hydrate 100%-from-cache · roundtrip 0 diffs.
 
 ## Related findings (recorded, owners assigned)
 
-- **Edge 429s are Bot Fight Mode, not app quota.** `checkRequestQuota` is a
-  deferred stub (always ok) and storage quota was never near its 10 GB free cap —
-  the burst 429s during parallel chunk PUTs came from the orange-cloud WAF.
-  **Launch decision needed (owner):** WAF exception for authenticated `/v1/*`
-  API traffic, or every sccache/bazel/clw client will be throttled at the edge.
+- **Burst 429s on parallel writes — CORRECTED diagnosis.** An earlier note here
+  guessed "Bot Fight Mode / WAF". **That was wrong.** Header capture + code trace +
+  live capacity check (all 2026-06-05) prove the 429 is **Cloudflare platform
+  backpressure on the single per-tenant Durable Object** under bursty parallel CAS
+  writes — not Bot Fight Mode (no `cf-mitigated`), not app quota (our `retry-after`
+  was 10; the app's only 429 uses `secondsUntilNextMonthStart()` ≈ millions), not
+  container exhaustion (20 instances live). `checkRequestQuota` is a deferred stub.
+  Full analysis + scaling options → **`docs/FINDING-per-tenant-write-ceiling.md`**.
+  **Owner decision** belongs to the CI-acceleration campaign, not a WAF tweak.
 - **`signup-worker` hardcodes `primary_region='enam'`** for every tenant
   (`apps/signup-worker/src/webhooks/clerk.ts:456`; the colo-derived region param
   is discarded — `configureTenant` is a no-op). Latent multi-region correctness
