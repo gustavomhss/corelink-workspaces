@@ -258,7 +258,14 @@ dependencies = [
 name = "clw-snapshot"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "clw-cache",
+ "clw-chunk",
+ "clw-manifest",
  "clw-types",
+ "futures",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

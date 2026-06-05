@@ -7,3 +7,13 @@ repository.workspace = true
 
 [dependencies]
 clw-types = { workspace = true }
+clw-chunk = { workspace = true }
+clw-manifest = { workspace = true }
+clw-cache = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
