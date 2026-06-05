@@ -233,9 +233,16 @@ dependencies = [
 name = "clw-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "clw-cache",
  "clw-client",
+ "clw-hydrate",
+ "clw-run",
+ "clw-snapshot",
  "clw-types",
+ "reqwest",
+ "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

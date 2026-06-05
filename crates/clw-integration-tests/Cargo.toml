@@ -8,6 +8,13 @@ repository.workspace = true
 [dependencies]
 clw-types = { workspace = true }
 clw-client = { workspace = true }
+clw-snapshot = { workspace = true }
+clw-hydrate = { workspace = true }
+clw-run = { workspace = true }
+clw-cache = { workspace = true }
 
 [dev-dependencies]
+wiremock = { workspace = true }
 tokio = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true }
