@@ -25,3 +25,5 @@ serde_json = { workspace = true }
 # Pre-added by the lead (wave-0) so W14-e2e never edits this file (conflict defusal).
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true }
