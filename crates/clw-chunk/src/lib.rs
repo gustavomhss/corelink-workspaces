@@ -5,7 +5,7 @@
 //! cross-snapshot deduplication — never alter without a lead decision record.
 
 use clw_types::{ChunkRef, Digest, CHUNK_AVG_BYTES, CHUNK_MAX_BYTES, CHUNK_MIN_BYTES};
-use fastcdc::v2020::FastCDC;
+use fastcdc::v2020::{FastCDC, StreamCDC};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -17,6 +17,21 @@ pub struct Chunk {
     pub digest: Digest,
     pub offset: u64,
     pub len: u64,
+}
+
+/// A single content-defined chunk produced by [`chunk_stream`], carrying the
+/// chunk's raw bytes so callers can upload them without re-reading the source.
+///
+/// `(digest, offset, len)` is byte-for-byte identical to the corresponding
+/// [`Chunk`] from [`chunk_bytes`] over the same content (see the `equivalence`
+/// proptest), so the streaming path produces identical manifests/digests and
+/// preserves the cross-snapshot dedupe contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamedChunk {
+    pub digest: Digest,
+    pub offset: u64,
+    pub len: u64,
+    pub data: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +80,41 @@ pub fn to_chunk_refs(chunks: &[Chunk]) -> Vec<ChunkRef> {
             size: c.len,
         })
         .collect()
+}
+
+/// Streaming counterpart to [`chunk_bytes`]: split the bytes from `reader` into
+/// content-defined chunks using FastCDC (v2020) with the same frozen parameters
+/// from `clw-types`, holding at most one chunk's bytes in memory at a time.
+///
+/// Built on `fastcdc::v2020::StreamCDC`, which uses the identical content-defined
+/// boundary algorithm as the in-memory `FastCDC` driving [`chunk_bytes`]; the
+/// `equivalence` proptest asserts the two paths agree byte-for-byte on
+/// `(offset, len, digest)` so manifests/digests are unchanged.
+///
+/// Each yielded [`StreamedChunk`] carries the chunk's raw bytes and a
+/// `Digest::of_bytes` over exactly those bytes. I/O errors and decode errors
+/// from the underlying reader are surfaced as `std::io::Error`.
+pub fn chunk_stream<R: std::io::Read>(
+    reader: R,
+) -> impl Iterator<Item = std::io::Result<StreamedChunk>> {
+    StreamCDC::new(
+        reader,
+        CHUNK_MIN_BYTES as u32,
+        CHUNK_AVG_BYTES as u32,
+        CHUNK_MAX_BYTES as u32,
+    )
+    .map(|res| {
+        // fastcdc::v2020::Error is `std::error::Error + Send + Sync`; wrap it in
+        // an io::Error so the iterator item is a plain `std::io::Result`.
+        let chunk = res.map_err(std::io::Error::other)?;
+        let digest = Digest::of_bytes(&chunk.data);
+        Ok(StreamedChunk {
+            digest,
+            offset: chunk.offset,
+            len: chunk.length as u64,
+            data: chunk.data,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +303,47 @@ mod tests {
             let chunks1 = chunk_bytes(&data);
             let chunks2 = chunk_bytes(&data);
             prop_assert_eq!(chunks1, chunks2);
+        }
+    }
+
+    proptest! {
+        // Inputs are large (up to 3 MiB); keep the case count modest.
+        #![proptest_config(ProptestConfig::with_cases(16))]
+        /// LOAD-BEARING dedupe invariant: the streaming chunker
+        /// (`chunk_stream` over a reader, backed by FastCDC's `StreamCDC`) MUST
+        /// agree byte-for-byte with the in-memory `chunk_bytes` (`FastCDC`) on
+        /// every boundary AND digest. If FastCDC and StreamCDC ever disagree on
+        /// chunk boundaries this fails — and the streaming change must NOT ship,
+        /// because divergent boundaries would silently break cross-snapshot
+        /// dedupe.
+        #[test]
+        fn equivalence(data in proptest::collection::vec(any::<u8>(), 0..=3 * 1024 * 1024)) {
+            use std::io::Cursor;
+
+            // In-memory reference: (offset, len, digest) tuples.
+            let in_memory: Vec<(u64, u64, Digest)> = chunk_bytes(&data)
+                .into_iter()
+                .map(|c| (c.offset, c.len, c.digest))
+                .collect();
+
+            // Streaming path over a reader: same tuple shape.
+            let mut streamed: Vec<(u64, u64, Digest)> = Vec::new();
+            for res in chunk_stream(Cursor::new(&data)) {
+                let sc = res.expect("chunk_stream over an in-memory Cursor is infallible");
+                // The streaming chunk's digest is taken over its own bytes; it
+                // must equal a digest over the same byte range of `data`.
+                prop_assert_eq!(
+                    sc.digest,
+                    Digest::of_bytes(&data[sc.offset as usize..(sc.offset + sc.len) as usize])
+                );
+                streamed.push((sc.offset, sc.len, sc.digest));
+            }
+
+            prop_assert_eq!(
+                streamed,
+                in_memory,
+                "chunk_stream must be dedupe-identical to chunk_bytes (boundaries + digests)"
+            );
         }
     }
 }
