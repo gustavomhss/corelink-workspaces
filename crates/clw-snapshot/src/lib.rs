@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clw_cache::LocalCache;
-use clw_chunk::{chunk_bytes, to_chunk_refs};
+use clw_chunk::{chunk_bytes, chunk_stream, to_chunk_refs};
 use clw_manifest::{walk, WalkedEntry};
 use clw_types::{
-    ref_key, AcTransport, CasTransport, Digest, Entry, Manifest, RefRecord, Result,
+    ref_key, AcTransport, CasTransport, ChunkRef, Digest, Entry, Manifest, RefRecord, Result,
     MANIFEST_VERSION,
 };
 use futures::stream::{self, StreamExt};
@@ -57,10 +57,38 @@ pub struct SnapshotReport {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// A chunk together with its raw bytes, used during `snapshot()`.
-struct ChunkData {
-    digest: Digest,
+/// Files at or below this size keep the in-memory fast path (read whole →
+/// `chunk_bytes`); larger files are streamed (`chunk_stream`) so that at most
+/// one chunk's bytes are resident at a time. Streaming and in-memory chunking
+/// are byte-for-byte dedupe-identical (see clw-chunk's `equivalence` proptest),
+/// so the manifest/digest is unaffected by which path a file takes.
+const STREAM_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Upload one chunk: write it into the local cache, then PUT it to the remote
+/// CAS only if it is not already present. Returns `true` iff a remote PUT was
+/// performed (i.e. the chunk was missing), so the caller can advance the
+/// `chunks_uploaded` counter. This preserves the existing dedupe behaviour:
+/// `exists` is consulted and `put` happens only on a miss.
+async fn upload_chunk<C>(
+    client: &C,
+    cache: &LocalCache,
+    digest: &Digest,
     data: Vec<u8>,
+) -> Result<bool>
+where
+    C: CasTransport,
+{
+    // Local cache: temp-file + atomic rename(2); fast enough to call directly.
+    cache.put(digest, &data)?;
+
+    // Remote: check existence, then PUT if missing.
+    let already_there = CasTransport::exists(client, digest).await?;
+    if already_there {
+        Ok(false)
+    } else {
+        CasTransport::put(client, digest, data).await?;
+        Ok(true)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,13 +113,34 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
     for we in walked {
         match we {
             WalkedEntry::File(f) => {
-                let abs = f.abs.clone();
-                let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
-                    .await
-                    .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+                // Same threshold as `snapshot`: small files chunk in memory,
+                // large files stream (bounded to one chunk's bytes at a time).
+                // Both paths are dedupe-identical, so the manifest produced here
+                // matches `snapshot`'s regardless of which path a file takes.
+                let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
+                    let abs = f.abs.clone();
+                    let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                        .await
+                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
 
-                let chunks_raw = chunk_bytes(&data);
-                let chunk_refs = to_chunk_refs(&chunks_raw);
+                    let chunks_raw = chunk_bytes(&data);
+                    to_chunk_refs(&chunks_raw)
+                } else {
+                    let abs = f.abs.clone();
+                    let file = tokio::task::spawn_blocking(move || std::fs::File::open(&abs))
+                        .await
+                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+
+                    let mut refs: Vec<ChunkRef> = Vec::new();
+                    for item in chunk_stream(file) {
+                        let sc = item.map_err(|e| clw_types::ClwError::Transport(e.to_string()))?;
+                        refs.push(ChunkRef {
+                            digest: sc.digest,
+                            size: sc.len,
+                        });
+                    }
+                    refs
+                };
 
                 total_size += f.size;
                 entries.push(Entry::File {
@@ -141,34 +190,85 @@ where
         .await
         .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
 
-    // --- 2. Read files and chunk --------------------------------------------
+    // --- 2. Read/stream files, chunk, and upload as we go -------------------
+    //
+    // Memory is kept bounded: we NEVER buffer the whole workspace's chunk
+    // bytes. Small files take the in-memory fast path (their chunks are
+    // uploaded with bounded concurrency, then their bytes are dropped before
+    // moving on); large files are streamed so at most one chunk's bytes are
+    // resident at a time. Only the small `ChunkRef`s and the counters survive
+    // across files. Streaming and in-memory chunking are dedupe-identical, so
+    // the resulting manifest/digest is independent of which path each file
+    // took.
     let mut entries: Vec<Entry> = Vec::with_capacity(walked.len());
-    let mut all_chunks: Vec<ChunkData> = Vec::new();
     let mut total_size: u64 = 0;
     let mut chunks_total: u64 = 0;
     let mut files_count: u64 = 0;
 
+    // Shared across all files so `chunks_uploaded` aggregates the whole tree.
+    let uploaded_counter = Arc::new(AtomicU64::new(0));
+
     for we in walked {
         match we {
             WalkedEntry::File(f) => {
-                let abs = f.abs.clone();
-                let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
-                    .await
-                    .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+                let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
+                    // ---- small file: in-memory fast path -------------------
+                    let abs = f.abs.clone();
+                    let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                        .await
+                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
 
-                let chunks_raw = chunk_bytes(&data);
-                let chunk_refs = to_chunk_refs(&chunks_raw);
+                    let chunks_raw = chunk_bytes(&data);
+                    let chunk_refs = to_chunk_refs(&chunks_raw);
+                    chunks_total += chunks_raw.len() as u64;
 
-                // Collect raw chunk bytes for the upload step.
-                for c in &chunks_raw {
-                    let slice = &data[c.offset as usize..(c.offset + c.len) as usize];
-                    all_chunks.push(ChunkData {
-                        digest: c.digest,
-                        data: slice.to_vec(),
-                    });
-                }
+                    // Upload THIS file's chunks (bounded concurrency), then let
+                    // `data` / the per-chunk copies drop at the end of the block.
+                    let concurrency = opts.concurrency.max(1);
+                    let results: Vec<Result<()>> = stream::iter(chunks_raw.into_iter().map(|c| {
+                        let counter = Arc::clone(&uploaded_counter);
+                        // Copy out this chunk's bytes (bounded by CHUNK_MAX_BYTES).
+                        let bytes = data[c.offset as usize..(c.offset + c.len) as usize].to_vec();
+                        async move {
+                            if upload_chunk(client, cache, &c.digest, bytes).await? {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(())
+                        }
+                    }))
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+                    for r in results {
+                        r?;
+                    }
 
-                chunks_total += chunks_raw.len() as u64;
+                    chunk_refs
+                } else {
+                    // ---- large file: stream, one chunk's bytes at a time ----
+                    // Open the handle on the blocking pool (mirrors the
+                    // `std::fs::read` pattern); chunking + uploads then proceed
+                    // sequentially so peak memory stays at ~one chunk.
+                    let abs = f.abs.clone();
+                    let file = tokio::task::spawn_blocking(move || std::fs::File::open(&abs))
+                        .await
+                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+
+                    let mut chunk_refs: Vec<ChunkRef> = Vec::new();
+                    for item in chunk_stream(file) {
+                        let sc = item.map_err(|e| clw_types::ClwError::Transport(e.to_string()))?;
+                        chunks_total += 1;
+                        chunk_refs.push(ChunkRef {
+                            digest: sc.digest,
+                            size: sc.len,
+                        });
+                        if upload_chunk(client, cache, &sc.digest, sc.data).await? {
+                            uploaded_counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    chunk_refs
+                };
+
                 total_size += f.size;
                 files_count += 1;
 
@@ -195,41 +295,7 @@ where
         entries,
     };
 
-    // --- 4. Upload chunks to local cache + remote (concurrency-limited) ------
-    // Store chunk bytes in an Arc<Vec<ChunkData>> so async closures can share.
-    let uploaded_counter = Arc::new(AtomicU64::new(0));
-
-    {
-        let concurrency = opts.concurrency;
-        let counter = Arc::clone(&uploaded_counter);
-
-        let results: Vec<Result<()>> = stream::iter(all_chunks.into_iter().map(|cd| {
-            let counter = Arc::clone(&counter);
-            async move {
-                // Put in local cache (sync, atomic rename — fast enough to
-                // call directly; LocalCache::put is a temp-file + rename(2)).
-                // References cannot cross spawn_blocking boundaries without
-                // 'static lifetime, so we call it directly here.
-                cache.put(&cd.digest, &cd.data)?;
-
-                // Remote: check existence, then PUT if missing.
-                let already_there = CasTransport::exists(client, &cd.digest).await?;
-                if !already_there {
-                    CasTransport::put(client, &cd.digest, cd.data).await?;
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(())
-            }
-        }))
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-
-        for r in results {
-            r?;
-        }
-    }
-
+    // --- 4. Chunk uploads already happened inline above ---------------------
     let chunks_uploaded = uploaded_counter.load(Ordering::Relaxed);
 
     // --- 5. Upload manifest -------------------------------------------------
