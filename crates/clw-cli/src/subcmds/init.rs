@@ -63,9 +63,12 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
 
 /// Write `content` to `path`, truncating any existing file and forcing
 /// owner-only (`0600`) permissions on Unix. The file contains the plaintext
-/// PAT, so it must never be group- or world-readable; using `OpenOptions` with
-/// an explicit `mode` resets a previously-loose mode on every write rather than
-/// inheriting the process umask (which is commonly `0644`).
+/// PAT, so it must never be group- or world-readable.
+///
+/// `OpenOptions::mode(0o600)` only applies when the file is **created**; if the
+/// file already exists (e.g. `clw init --force` over a prior `0644` config) the
+/// open does NOT change its mode. We therefore `set_permissions(0o600)`
+/// explicitly after writing so a pre-existing loose mode is always tightened.
 fn write_config_file_0600(path: &Path, content: &str) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -76,6 +79,13 @@ fn write_config_file_0600(path: &Path, content: &str) -> std::io::Result<()> {
     }
     let mut file = opts.open(path)?;
     file.write_all(content.as_bytes())?;
+    // `mode()` above only applies on CREATION; force 0600 on an already-existing
+    // file too (the file holds the plaintext PAT).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
