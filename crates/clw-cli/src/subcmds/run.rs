@@ -3,6 +3,17 @@
 //! Streams captured stdout/stderr to real stdout/stderr after completion.
 //! Prints `[clw] cache hit` / `[clw] cache miss` to stderr.
 //! Exits with the child's exit code.
+//!
+//! ## Hermeticity contract
+//!
+//! The memoization key captures ONLY: the declared `--input` paths (file/dir
+//! content digests), the `--env` variable values, the full command vector, and
+//! the resolved tool identity (the content digest of `command[0]`). Anything
+//! NOT in that set is INVISIBLE to the cache: network access, the clock/`$NOW`,
+//! random sources, and any file the command reads that was not passed via
+//! `--input`. Such undeclared inputs are therefore NOT captured, so a hit may
+//! replay a stale result for a non-deterministic command. Only memoize commands
+//! that are deterministic given their declared inputs.
 
 use std::io::Write as _;
 

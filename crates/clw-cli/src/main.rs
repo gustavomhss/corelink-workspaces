@@ -43,7 +43,7 @@ pub struct Cli {
         long,
         global = true,
         env = "CLW_TOKEN",
-        help = "CoreLink personal access token (set via --token, CLW_TOKEN env, or config)"
+        help = "CoreLink personal access token. WARNING: visible in `ps`/shell history — prefer CLW_TOKEN env or ~/.clw/config.toml"
     )]
     pub token: Option<String>,
 
@@ -64,6 +64,15 @@ pub struct Cli {
         help = "Emit machine-readable JSON on stdout; errors still go to stderr"
     )]
     pub json: bool,
+
+    /// Max concurrent CAS requests for snapshot/hydrate.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 8,
+        help = "Max concurrent CAS requests for snapshot/hydrate (lower it if you hit rate limits)"
+    )]
+    pub concurrency: usize,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -126,18 +135,23 @@ async fn main() {
         }
     };
 
-    let result = dispatch(cli.command, resolved, cli.json).await;
+    let result = dispatch(cli.command, resolved, cli.json, cli.concurrency).await;
     if let Err(e) = result {
         // `run` subcommand propagates child exit code differently (handled in subcmd).
         exit_err(&e);
     }
 }
 
-async fn dispatch(cmd: Commands, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+async fn dispatch(
+    cmd: Commands,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+) -> Result<(), ClwError> {
     match cmd {
         Commands::Init(args) => subcmds::init::run(args, cfg).await,
-        Commands::Snapshot(args) => subcmds::snapshot::run(args, cfg, json).await,
-        Commands::Hydrate(args) => subcmds::hydrate::run(args, cfg, json).await,
+        Commands::Snapshot(args) => subcmds::snapshot::run(args, cfg, json, concurrency).await,
+        Commands::Hydrate(args) => subcmds::hydrate::run(args, cfg, json, concurrency).await,
         Commands::Status(args) => subcmds::status::run(args, cfg, json).await,
         Commands::Run(args) => subcmds::run::run(args, cfg).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
@@ -188,6 +202,20 @@ mod tests {
             }
             other => panic!("expected Snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_concurrency_flag() {
+        let cli =
+            Cli::try_parse_from(["clw", "--concurrency", "4", "snapshot", "--name", "ws"]).unwrap();
+        assert_eq!(cli.concurrency, 4);
+        assert!(matches!(cli.command, Commands::Snapshot(_)));
+    }
+
+    #[test]
+    fn parse_concurrency_defaults_to_8() {
+        let cli = Cli::try_parse_from(["clw", "snapshot", "--name", "ws"]).unwrap();
+        assert_eq!(cli.concurrency, 8);
     }
 
     #[test]
