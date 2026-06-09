@@ -16,7 +16,7 @@ use std::path::Path;
 // Public constants + types (frozen anchor)
 // ---------------------------------------------------------------------------
 
-pub const RUN_KEY_DOMAIN: &str = "clw/run/v1/";
+pub const RUN_KEY_DOMAIN: &str = "clw/run/v2/";
 
 pub struct RunOptions {
     pub inputs: Vec<String>,
@@ -54,6 +54,34 @@ struct KeyPayload {
     inputs: Vec<[String; 2]>,
     command: Vec<String>,
     env: Vec<[String; 2]>,
+    /// Identity of the tool being invoked (`command[0]`), resolved to a content
+    /// digest when the executable can be located + read, else a literal marker.
+    /// Folding this into the key prevents a stale replay after a toolchain
+    /// upgrade (e.g. `cargo` upgraded in place would otherwise be a false hit).
+    tool: String,
+}
+
+/// Resolve `command[0]` to a stable tool-identity string.
+///
+/// If `cmd0` looks like a path (contains `/`), it is used directly; otherwise
+/// `PATH` is searched for the first matching file. When the executable can be
+/// read, the identity is its content digest; if it cannot be located or read,
+/// we fall back to a literal marker so the key is still well-defined.
+fn resolve_tool_id(cmd0: &str) -> String {
+    // If cmd0 is a path, use it directly; else search PATH for the first match.
+    let candidate: Option<std::path::PathBuf> = if cmd0.contains('/') {
+        Some(std::path::PathBuf::from(cmd0))
+    } else {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(cmd0))
+                .find(|p| p.is_file())
+        })
+    };
+    match candidate.and_then(|p| std::fs::read(&p).ok()) {
+        Some(bytes) => format!("digest:{}", Digest::of_bytes(&bytes).to_hex()),
+        None => format!("literal:{cmd0}"),
+    }
 }
 
 /// Compute the run key for the given options and working directory.
@@ -125,11 +153,23 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
         env_pairs.push([key.clone(), value]);
     }
 
+    // --- tool identity ---
+    // Resolve command[0] to a content digest (or literal marker) so an in-place
+    // toolchain upgrade invalidates stale memoized results instead of replaying
+    // them. `run_memoized` guarantees a non-empty command before reaching here,
+    // but guard defensively in case compute_key is ever called directly.
+    let tool = if opts.command.is_empty() {
+        String::new()
+    } else {
+        resolve_tool_id(&opts.command[0])
+    };
+
     // --- canonical JSON ---
     let payload = KeyPayload {
         inputs: input_pairs,
         command: opts.command.clone(),
         env: env_pairs,
+        tool,
     };
     let json_bytes = serde_json::to_vec(&payload)?;
 
@@ -561,6 +601,96 @@ mod tests {
         assert!(
             matches!(err, ClwError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "missing input must return Io(NotFound), got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: tool identity (command[0] content) is folded into the key.
+    // Two different executable scripts (same args) → different keys;
+    // identical tool → same key. Prevents stale replay after a toolchain
+    // upgrade.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_identity_change_yields_different_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("input.txt"), b"data").unwrap();
+
+        // Create two tiny shell scripts with DIFFERENT contents.
+        let tool_a = cwd.join("tool_a.sh");
+        let tool_b = cwd.join("tool_b.sh");
+        std::fs::write(&tool_a, b"#!/bin/sh\necho A\n").unwrap();
+        std::fs::write(&tool_b, b"#!/bin/sh\necho B\n").unwrap();
+        std::fs::set_permissions(&tool_a, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&tool_b, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tool_a_str = tool_a.to_str().unwrap().to_string();
+        let tool_b_str = tool_b.to_str().unwrap().to_string();
+
+        // Same args, different tool[0] (absolute paths).
+        let opts_a = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec![tool_a_str.clone(), "arg".to_string()],
+            env_keys: vec![],
+        };
+        let opts_b = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec![tool_b_str, "arg".to_string()],
+            env_keys: vec![],
+        };
+
+        let key_a = compute_key(cwd, &opts_a).await.unwrap();
+        let key_b = compute_key(cwd, &opts_b).await.unwrap();
+        assert_ne!(
+            key_a, key_b,
+            "different tool[0] content must yield a different key"
+        );
+
+        // Identical tool (and everything else) → same key.
+        let opts_a2 = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec![tool_a_str, "arg".to_string()],
+            env_keys: vec![],
+        };
+        let key_a2 = compute_key(cwd, &opts_a2).await.unwrap();
+        assert_eq!(key_a, key_a2, "identical tool must yield the same key");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: mutating the tool's content in place (same path) changes the key.
+    // This is the toolchain-upgrade scenario M3 guards against.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tool_content_mutation_yields_different_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("input.txt"), b"data").unwrap();
+
+        let tool = cwd.join("tool.sh");
+        std::fs::write(&tool, b"#!/bin/sh\necho v1\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tool_str = tool.to_str().unwrap().to_string();
+
+        let opts = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec![tool_str, "arg".to_string()],
+            env_keys: vec![],
+        };
+        let key_before = compute_key(cwd, &opts).await.unwrap();
+
+        // Upgrade the tool in place (same path, new content).
+        std::fs::write(&tool, b"#!/bin/sh\necho v2\n").unwrap();
+        let key_after = compute_key(cwd, &opts).await.unwrap();
+
+        assert_ne!(
+            key_before, key_after,
+            "in-place tool upgrade must invalidate the key (no stale replay)"
         );
     }
 }

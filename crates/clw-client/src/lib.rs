@@ -48,6 +48,19 @@ impl HttpClient {
     /// - connect timeout: 10 s
     /// - request timeout: 120 s
     pub fn new(config: Config) -> Result<Self> {
+        // Refuse to send the PAT over plaintext http://, except loopback for
+        // dev/tests (the wiremock suite uses http://127.0.0.1:<port>).
+        let ep = config.endpoint.trim();
+        let is_https = ep.starts_with("https://");
+        let is_local_http = ep.starts_with("http://127.0.0.1")
+            || ep.starts_with("http://localhost")
+            || ep.starts_with("http://[::1]");
+        if !is_https && !is_local_http {
+            return Err(ClwError::Transport(format!(
+                "refusing to send PAT over plaintext: endpoint must be https:// (got '{ep}'); http:// is only allowed for loopback"
+            )));
+        }
+
         let inner = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
@@ -72,8 +85,15 @@ impl HttpClient {
         let mut last_err: Option<ClwError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
-                let sleep_ms = RETRY_SLEEP_MS[(attempt - 1) as usize];
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                let base = RETRY_SLEEP_MS[(attempt - 1) as usize];
+                // Cheap jitter in [0, base/2] derived from the clock — avoids a
+                // synchronized thundering herd without pulling in a rand dep.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0);
+                let jitter = if base > 0 { nanos % (base / 2 + 1) } else { 0 };
+                tokio::time::sleep(Duration::from_millis(base + jitter)).await;
             }
             match op().await {
                 Ok(v) => return Ok(v),
@@ -904,6 +924,34 @@ mod tests {
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1, "401 must not be retried");
+    }
+
+    // -------------------------------------------------------------------------
+    // Transport hardening — refuse PAT over plaintext http:// (loopback allowed)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn new_rejects_plaintext_http_endpoint() {
+        let err = HttpClient::new(test_config("http://example.com".into())).unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(_)),
+            "plaintext http:// non-loopback must be refused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_accepts_https_endpoint() {
+        let client = HttpClient::new(test_config("https://corelink-api.humangr.com".into()));
+        assert!(client.is_ok(), "https:// endpoint must be accepted");
+    }
+
+    #[test]
+    fn new_accepts_loopback_http_endpoint() {
+        let client = HttpClient::new(test_config("http://127.0.0.1:8080".into()));
+        assert!(
+            client.is_ok(),
+            "http://127.0.0.1 loopback must be accepted for dev/tests"
+        );
     }
 }
 

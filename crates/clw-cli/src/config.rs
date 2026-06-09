@@ -109,6 +109,14 @@ fn read_config_file() -> HashMap<String, String> {
 
 /// Parse lines of the form `key = "value"` or `key = value` (no quotes).
 /// Blank lines and lines beginning with `#` are ignored.
+///
+/// NOTE: this is a deliberately minimal, dependency-free subset of TOML — it
+/// handles exactly the flat string keys clw writes (`endpoint`, `tenant`,
+/// `token`, `cache_dir`). It is NOT a general TOML parser (no tables, arrays,
+/// multi-line values, or escapes). A quoted value is read up to its closing
+/// quote, so a trailing inline `# comment` after a quoted value is ignored; an
+/// unquoted value is taken verbatim (so `#` is NOT an inline comment there —
+/// only whole-line `#` comments are stripped).
 pub fn parse_config_lines(content: &str, map: &mut HashMap<String, String>) {
     for line in content.lines() {
         let line = line.trim();
@@ -118,9 +126,13 @@ pub fn parse_config_lines(content: &str, map: &mut HashMap<String, String>) {
         if let Some((k, v)) = line.split_once('=') {
             let key = k.trim().to_string();
             let val_raw = v.trim();
-            // Strip optional surrounding double-quotes.
-            let val = if val_raw.starts_with('"') && val_raw.ends_with('"') && val_raw.len() >= 2 {
-                val_raw[1..val_raw.len() - 1].to_string()
+            // A quoted value is read up to its CLOSING quote (ignoring any
+            // trailing inline comment); an unquoted value is taken verbatim.
+            let val = if let Some(rest) = val_raw.strip_prefix('"') {
+                match rest.find('"') {
+                    Some(end) => rest[..end].to_string(),
+                    None => rest.to_string(), // unterminated quote: best-effort
+                }
             } else {
                 val_raw.to_string()
             };
@@ -144,10 +156,13 @@ pub fn expand_tilde(s: &str) -> PathBuf {
 }
 
 /// Return the home directory.
+///
+/// Reads `$HOME` directly (unix-correct) rather than the deprecated
+/// `std::env::home_dir`. An empty `$HOME` is treated as unset.
 pub fn home_dir() -> Option<PathBuf> {
-    // std::env::home_dir is deprecated but functional on macOS/Linux.
-    #[allow(deprecated)]
-    std::env::home_dir()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Return `~/.clw/config.toml` path (for use in subcommands).
@@ -202,6 +217,14 @@ cache_dir = "~/.clw/cache"
         parse_config_lines("# this is a comment\n\nkey = val", &mut map);
         assert_eq!(map.len(), 1);
         assert_eq!(map["key"], "val");
+    }
+
+    #[test]
+    fn parse_quoted_value_ignores_trailing_inline_comment() {
+        // A trailing inline comment after a QUOTED value must not leak into the value.
+        let mut map = HashMap::new();
+        parse_config_lines("token = \"secret\" # inline comment", &mut map);
+        assert_eq!(map["token"], "secret");
     }
 
     // -----------------------------------------------------------------------

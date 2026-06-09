@@ -49,6 +49,13 @@ impl LocalCache {
             let shard = format!("{:02x}", i);
             fs::create_dir_all(root.join("blobs").join(&shard))?;
         }
+        // Workspace content is private: keep the cache root owner-only (0700).
+        // Best-effort — ignore the error on exotic filesystems that reject chmod.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        }
         Ok(Self { root })
     }
 
@@ -216,6 +223,30 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = LocalCache::new(dir.path()).unwrap();
         (dir, cache)
+    }
+
+    // -----------------------------------------------------------------------
+    // cache root is private (0700): workspace content must not be world-readable
+    // -----------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn cache_root_is_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        // Start from a deliberately loose mode so the test proves `new` tightens it
+        // rather than merely inheriting whatever TempDir created.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _cache = LocalCache::new(dir.path()).unwrap();
+
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o700, 0o700, "cache root must be owner-rwx");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "cache root must not be group/world accessible"
+        );
     }
 
     // -----------------------------------------------------------------------

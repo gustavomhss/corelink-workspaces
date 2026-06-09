@@ -24,11 +24,18 @@ pub struct HydrateArgs {
     pub name: String,
 }
 
-pub async fn run(args: HydrateArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+pub async fn run(
+    args: HydrateArgs,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+) -> Result<(), ClwError> {
     let tenant = cfg.clw_config.tenant.clone();
     let cache = LocalCache::new(&cfg.clw_config.cache_dir)?;
     let client = HttpClient::new(cfg.clw_config)?;
-    let opts = HydrateOptions::new(&args.name);
+    let mut opts = HydrateOptions::new(&args.name);
+    // Clamp to at least 1 so `--concurrency 0` can't stall the stream.
+    opts.concurrency = concurrency.max(1);
 
     let report = hydrate(&args.dest, &client, &cache, &opts)
         .await

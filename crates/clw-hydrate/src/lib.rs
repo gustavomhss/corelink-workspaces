@@ -14,7 +14,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tokio::task::spawn_blocking;
 
 use clw_cache::LocalCache;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Entry, Manifest, RefRecord, Result};
@@ -127,10 +126,15 @@ where
     for entry in &manifest.entries {
         match entry {
             Entry::Dir { path } => {
+                // Defense-in-depth: reject unsafe paths even if from_bytes was bypassed.
+                clw_types::validate_rel_path(path)?;
                 let abs = dest.join(path);
                 std::fs::create_dir_all(&abs)?;
             }
             Entry::Symlink { path, target } => {
+                // Defense-in-depth: validate both the link path and its target.
+                clw_types::validate_rel_path(path)?;
+                clw_types::validate_symlink_target(target)?;
                 let abs = dest.join(path);
                 if let Some(parent) = abs.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -218,57 +222,42 @@ async fn materialize_file<C>(
 where
     C: CasTransport,
 {
+    // Defense-in-depth: reject any unsafe path even if from_bytes was bypassed.
+    clw_types::validate_rel_path(rel_path)?;
     let abs = dest.join(rel_path);
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Assemble file content from chunks, tracking cache vs network bytes.
-    let mut file_bytes: Vec<u8> = Vec::new();
+    let parent = abs
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dest.to_path_buf());
+    std::fs::create_dir_all(&parent)?;
+    let tmp_path = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tid = std::thread::current().id();
+        parent.join(format!(".clw-tmp-{tid:?}-{nanos}"))
+    };
     let mut bytes_from_cache: u64 = 0;
     let mut bytes_downloaded: u64 = 0;
-
-    for chunk in chunks {
-        let (data, from_cache) = fetch_chunk(chunk.digest, client, cache).await?;
-        if from_cache {
-            bytes_from_cache += chunk.size;
-        } else {
-            bytes_downloaded += chunk.size;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        for chunk in chunks {
+            let (data, from_cache) = fetch_chunk(chunk.digest, client, cache).await?;
+            if from_cache {
+                bytes_from_cache += chunk.size;
+            } else {
+                bytes_downloaded += chunk.size;
+            }
+            f.write_all(&data)?;
         }
-        file_bytes.extend_from_slice(&data);
+        f.flush()?;
     }
-
-    // Write atomically: tmp file in the same dir, then rename.
-    let parent = abs.parent().unwrap_or(dest).to_path_buf();
-    let abs_path = abs.clone();
-    let mode_copy = mode;
-    let file_bytes = Arc::new(file_bytes);
-    let fba = Arc::clone(&file_bytes);
-
-    spawn_blocking(move || -> Result<()> {
-        // Create temp file in the same directory.
-        let tmp_path = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let tid = std::thread::current().id();
-            parent.join(format!(".clw-tmp-{tid:?}-{nanos}"))
-        };
-
-        std::fs::write(&tmp_path, fba.as_ref())?;
-        std::fs::rename(&tmp_path, &abs_path)?;
-
-        // Set permissions.
-        let perms = std::fs::Permissions::from_mode(mode_copy);
-        std::fs::set_permissions(&abs_path, perms)?;
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| ClwError::Transport(format!("spawn_blocking join: {e}")))??;
-
+    std::fs::rename(&tmp_path, &abs)?;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(&abs, perms)?;
     Ok((bytes_from_cache, bytes_downloaded))
 }
 
@@ -282,34 +271,14 @@ async fn fetch_chunk<C>(digest: Digest, client: &C, cache: &LocalCache) -> Resul
 where
     C: CasTransport,
 {
-    // Try local cache first (blocking I/O).
-    let cache_ptr = cache as *const LocalCache as usize;
-    let cached = spawn_blocking(move || {
-        // SAFETY: `cache` is borrowed for the lifetime of `hydrate`, which
-        // awaits every future before returning. The raw pointer is valid.
-        let cache_ref = unsafe { &*(cache_ptr as *const LocalCache) };
-        cache_ref.get(&digest)
-    })
-    .await
-    .map_err(|e| ClwError::Transport(format!("spawn_blocking join: {e}")))??;
-
-    if let Some(data) = cached {
+    // Direct sync cache access (LocalCache is just a PathBuf; calling it directly
+    // here avoids the 'static requirement of spawn_blocking — same approach as
+    // clw-snapshot). NO unsafe, NO raw pointers.
+    if let Some(data) = cache.get(&digest)? {
         return Ok((data, true));
     }
-
-    // Cache miss — fetch from remote.
     let data = CasTransport::get(client, &digest).await?;
-
-    // Populate cache (blocking I/O).
-    let data_clone = data.clone();
-    let cache_ptr2 = cache as *const LocalCache as usize;
-    spawn_blocking(move || {
-        let cache_ref = unsafe { &*(cache_ptr2 as *const LocalCache) };
-        cache_ref.put(&digest, &data_clone)
-    })
-    .await
-    .map_err(|e| ClwError::Transport(format!("spawn_blocking join: {e}")))??;
-
+    cache.put(&digest, &data)?;
     Ok((data, false))
 }
 
