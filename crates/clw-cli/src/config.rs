@@ -329,6 +329,7 @@ cache_dir = "~/.clw/cache"
 
     #[test]
     fn expand_tilde_with_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(home) = home_dir() {
             let result = expand_tilde("~/.clw/cache");
             assert_eq!(result, home.join(".clw/cache"));
@@ -351,9 +352,15 @@ cache_dir = "~/.clw/cache"
     // home_dir: Windows fallback to %USERPROFILE% when $HOME is absent
     // -----------------------------------------------------------------------
 
+    /// Serializes tests that mutate or read the process-global `HOME`/
+    /// `USERPROFILE` env — cargo runs tests as parallel threads in one process,
+    /// so a mutation in one test would otherwise race a read in another.
+    /// Poison-tolerant so one panicking test does not cascade-fail the rest.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard that snapshots `HOME`/`USERPROFILE`, lets the test mutate
-    /// them, and restores the originals on drop. This crate does not serialize
-    /// env tests, so restore-on-drop keeps the mutation scoped to this test.
+    /// them, and restores the originals on drop (hold [`ENV_LOCK`] for the
+    /// whole test so the mutation window is never observed concurrently).
     struct HomeEnvGuard {
         home: Option<std::ffi::OsString>,
         userprofile: Option<std::ffi::OsString>,
@@ -383,6 +390,7 @@ cache_dir = "~/.clw/cache"
 
     #[test]
     fn home_dir_falls_back_to_userprofile_when_home_absent() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = HomeEnvGuard::new();
 
         // $HOME unset, %USERPROFILE% set → USERPROFILE is used (Windows path).
