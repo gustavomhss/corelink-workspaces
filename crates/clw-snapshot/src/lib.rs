@@ -458,6 +458,25 @@ mod tests {
             self.ac.lock().await.insert(*key, value);
             Ok(())
         }
+
+        async fn delete(&self, key: &Digest) -> Result<()> {
+            self.ac.lock().await.remove(key);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_delete_removes_key_and_is_idempotent() {
+        let client = FakeTransport::default();
+        let key = Digest::of_bytes(b"some-ref-key");
+        AcTransport::put(&client, &key, b"value".to_vec())
+            .await
+            .unwrap();
+        assert!(AcTransport::get(&client, &key).await.unwrap().is_some());
+        AcTransport::delete(&client, &key).await.unwrap();
+        assert!(AcTransport::get(&client, &key).await.unwrap().is_none());
+        // Idempotent: deleting an absent key is still Ok.
+        AcTransport::delete(&client, &key).await.unwrap();
     }
 
     // -----------------------------------------------------------------------

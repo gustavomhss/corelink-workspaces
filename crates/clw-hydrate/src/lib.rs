@@ -578,6 +578,25 @@ mod tests {
             self.ac.lock().unwrap().insert(*key, value);
             Ok(())
         }
+
+        async fn delete(&self, key: &Digest) -> Result<()> {
+            self.ac.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_delete_removes_key_and_is_idempotent() {
+        let store = FakeStore::new();
+        let key = Digest::of_bytes(b"some-ref-key");
+        AcTransport::put(&store, &key, b"value".to_vec())
+            .await
+            .unwrap();
+        assert!(AcTransport::get(&store, &key).await.unwrap().is_some());
+        AcTransport::delete(&store, &key).await.unwrap();
+        assert!(AcTransport::get(&store, &key).await.unwrap().is_none());
+        // Idempotent: deleting an absent key is still Ok.
+        AcTransport::delete(&store, &key).await.unwrap();
     }
 
     // -----------------------------------------------------------------------

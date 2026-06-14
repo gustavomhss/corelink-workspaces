@@ -138,6 +138,8 @@ pub enum Commands {
     Run(subcmds::run::RunArgs),
     /// List ref info for a workspace name.
     Ls(subcmds::ls::LsArgs),
+    /// Delete a workspace ref by name.
+    Rm(subcmds::rm::RmArgs),
     /// Print a support-ready, redacted diagnostics bundle.
     Doctor(subcmds::doctor::DoctorArgs),
     /// Manage the locally-stored CoreLink identity (login/logout/whoami).
@@ -340,6 +342,7 @@ async fn dispatch(
         // `--json` form by design (the wrapped command owns stdout).
         Commands::Run(args) => subcmds::run::run(args, cfg).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
+        Commands::Rm(args) => subcmds::rm::run(args, cfg, json).await,
         Commands::Doctor(args) => subcmds::doctor::run(args, cfg, json).await,
         Commands::Auth(args) => subcmds::auth::run(args, cfg, json).await,
         Commands::Uninstall(args) => {
@@ -471,6 +474,27 @@ mod tests {
         match &cli.command {
             Commands::Ls(a) => assert_eq!(a.name, "some-ws"),
             other => panic!("expected Ls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rm() {
+        let cli = Cli::try_parse_from(["clw", "rm", "--name", "some-ws"]).unwrap();
+        match &cli.command {
+            Commands::Rm(a) => {
+                assert_eq!(a.name, "some-ws");
+                assert!(!a.yes);
+            }
+            other => panic!("expected Rm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rm_yes() {
+        let cli = Cli::try_parse_from(["clw", "rm", "--name", "ws", "--yes"]).unwrap();
+        match &cli.command {
+            Commands::Rm(a) => assert!(a.yes),
+            other => panic!("expected Rm, got {other:?}"),
         }
     }
 

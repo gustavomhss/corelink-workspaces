@@ -694,6 +694,50 @@ impl AcTransport for HttpClient {
         })
         .await
     }
+
+    async fn delete(&self, key: &Digest) -> Result<()> {
+        let url = self.config.ac_url(key);
+        let auth = self.auth_header();
+        let client = &self.inner;
+
+        self.with_retry(|retry_slot| {
+            let url = url.clone();
+            let auth = auth.clone();
+            async move {
+                let resp = client
+                    .delete(&url)
+                    .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
+                    .send()
+                    .await
+                    .map_err(|e| ClwError::Transport(e.to_string()))?;
+
+                match resp.status().as_u16() {
+                    // Idempotent: an absent key (404) is a successful delete.
+                    200 | 202 | 204 | 404 => Ok(()),
+                    401 => Err(ClwError::Auth),
+                    // Optimistic-pending case: the server has no DELETE handler yet
+                    // (this branch is HELD until corelink-server ships D-1).
+                    405 | 501 => Err(ClwError::Transport(format!(
+                        "ref deletion requires a corelink-server capability not yet deployed \
+                         (DELETE /v1/ac); tracked — see docs/REQUESTS-to-other-TLs.md D-1 ({url})"
+                    ))),
+                    429 => {
+                        record_retry_after(&retry_slot, &resp);
+                        Err(ClwError::Http {
+                            status: 429,
+                            context: format!("DELETE {url}"),
+                        })
+                    }
+                    s => Err(ClwError::Http {
+                        status: s,
+                        context: format!("DELETE {url}"),
+                    }),
+                }
+            }
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1280,122 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ClwError::Auth));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC delete — status mappings (optimistic; server DELETE pending)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ac_delete_204_returns_ok() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        AcTransport::delete(&client, &key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ac_delete_404_is_idempotent_ok() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        // Deleting an absent key returns Ok(()) — idempotent.
+        AcTransport::delete(&client, &key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ac_delete_401_returns_auth_error() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::delete(&client, &key).await.unwrap_err();
+        assert!(matches!(err, ClwError::Auth));
+    }
+
+    #[tokio::test]
+    async fn ac_delete_405_surfaces_not_deployed_error() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        // The optimistic-pending case: corelink-server has no DELETE handler yet.
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::delete(&client, &key).await.unwrap_err();
+        match err {
+            ClwError::Transport(msg) => assert!(
+                msg.contains("not yet deployed"),
+                "405 must surface the not-deployed message, got: {msg}"
+            ),
+            other => panic!("expected Transport not-deployed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_delete_501_surfaces_not_deployed_error() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::delete(&client, &key).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed")),
+            "501 must surface the not-deployed message"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac_delete_other_status_returns_http_error() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::delete(&client, &key).await.unwrap_err();
+        assert!(matches!(err, ClwError::Http { status: 403, .. }));
     }
 
     // -------------------------------------------------------------------------

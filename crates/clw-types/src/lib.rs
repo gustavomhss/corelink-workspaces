@@ -346,6 +346,9 @@ pub trait CasTransport: Send + Sync {
 pub trait AcTransport: Send + Sync {
     async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>>;
     async fn put(&self, key: &Digest, value: Vec<u8>) -> Result<()>;
+    /// Delete a ref by its key. Idempotent: deleting an absent key returns Ok(()).
+    /// (corelink-server DELETE /v1/ac/{tenant}/{key}; pending — see docs/REQUESTS-to-other-TLs.md D-1.)
+    async fn delete(&self, key: &Digest) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
