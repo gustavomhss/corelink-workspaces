@@ -1,0 +1,159 @@
+# cargo-deny configuration — supply-chain policy for proprietary distribution.
+#
+# WP M4 (supply-chain metadata). Authored against cargo-deny 0.19.8 (config
+# schema v2). Tuned for a CLOSED-SOURCE, commercially-distributed binary: every
+# third-party crate that ships inside `clw` must carry a permissive license
+# whose obligations we can satisfy by attribution, every advisory is a hard
+# failure, and every dependency must come from crates.io.
+#
+# Run:  cargo deny --all-features check
+#
+# ---------------------------------------------------------------------------
+# LICENSE POSTURE (read before editing the allow-list):
+#
+#   The workspace itself declares `license = "UNLICENSED"` in
+#   [workspace.package] of the root Cargo.toml. "UNLICENSED" is the cargo/SPDX
+#   convention for "no public license granted" (i.e. proprietary), but it is
+#   NOT a valid SPDX *expression*, so cargo-deny cannot evaluate it and would
+#   emit an "unlicensed" error for all 11 first-party clw-* crates. We do NOT
+#   change that license field in this WP (the EULA/LicenseRef swap is M2.4's
+#   decision). Instead we clarify the first-party crates below to the closest
+#   valid SPDX token ("Unlicense") purely so cargo-deny does not choke — this
+#   is a parser accommodation, NOT a grant of the Unlicense to anyone.
+#
+#   TEMPORARY: when M2.4 replaces "UNLICENSED" with a real EULA /
+#   LicenseRef-Proprietary, DELETE every [[licenses.clarify]] block below.
+# ---------------------------------------------------------------------------
+
+[graph]
+# Evaluate every feature so the scan also covers the `live` feature path of
+# clw-conformance and any other feature-gated dependency edge. Default targets
+# (= all targets) is correct for the cross-platform release matrix (M2.2).
+all-features = true
+
+[advisories]
+# RustSec advisory database posture. v2 schema defaults already DENY any crate
+# with an open vulnerability advisory, so no severity-threshold key is needed
+# (those keys are deprecated in v2). We additionally refuse yanked crates.
+version = 2
+yanked = "deny"
+# No silent waivers. Any RUSTSEC exception MUST be a dated, justified,
+# owner-approved entry here (RUSTSEC id + reason + date) — never a blanket
+# ignore. Keep this list empty until such an entry is consciously added.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Permissive SPDX atoms ACTUALLY present in the current Cargo.lock, enumerated
+# from the dependency graph (not aspirational). All are attribution-only or
+# more permissive — every one is compatible with proprietary redistribution.
+#
+# NOTE on CDLA-Permissive-2.0: this is webpki-roots' license (the bundled
+# Mozilla root-CA set pulled in via rustls). CDLA-Permissive-2.0 is a
+# permissive, attribution-style data license with NO copyleft / share-alike
+# obligation — safe to ship inside a closed-source binary. It is allowed
+# explicitly and deliberately, not by accident.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# --- TEMPORARY first-party clarifications (delete when M2.4 lands) ----------
+# Each block maps a first-party clw-* crate (which inherits the non-SPDX
+# "UNLICENSED" token) to a parseable SPDX expression so cargo-deny's license
+# check passes. This grants nothing — the binding terms remain proprietary
+# (see LICENSE POSTURE header). Removing any one block makes that crate fail
+# the license check, which is the intended trip-wire if a new first-party
+# crate is added without being clarified here too.
+[[licenses.clarify]]
+crate = "clw-types"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-chunk"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-client"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-manifest"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-cache"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-snapshot"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-hydrate"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-run"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-cli"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-conformance"
+expression = "Unlicense"
+license-files = []
+
+[[licenses.clarify]]
+crate = "clw-integration-tests"
+expression = "Unlicense"
+license-files = []
+# ---------------------------------------------------------------------------
+
+[bans]
+# A single duplicate (windows-sys, 2 versions) exists today; warn rather than
+# block so a transitive bump does not break CI on an unrelated PR.
+multiple-versions = "warn"
+# wildcards = "warn" — the internal path deps are wildcard ("*") version reqs.
+# As of this WP every workspace crate is `publish = false`, so cargo-deny's
+# `allow-wildcard-paths` would exempt them and this could be flipped to "deny"
+# + allow-wildcard-paths = true. That tightening is deliberately deferred to a
+# separate decision (it is not part of the M4 metadata scope); kept at "warn"
+# so the supply-chain gate stays green and non-flaky in the meantime.
+wildcards = "warn"
+# Empty by design — future home for any pinned-version bans (deny) or
+# version-skip allowances (skip / skip-tree) once such a need is identified.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Dependencies must originate from crates.io and nowhere else: no unknown
+# registries, no git sources. This is the closed-supply-chain guarantee.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -35,6 +35,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
+# tokio feature union is intentionally workspace-wide. M4 evaluated scoping the
+# broad features per-crate (only clw-run uses `process`/`fs`; `sync`/`time`/
+# `macros`/`rt-multi-thread` are used across most crates via tokio::test/main,
+# Semaphore/Mutex/mpsc, etc.). Because cargo unifies features additively across
+# the workspace, per-crate narrowing yields no real isolation while risking a
+# broken build, so the union is kept here as the single source of truth.
+# `process` is the only feature confined to one crate (clw-run) — revisit if
+# that crate is ever split out.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 fastcdc = "3"
