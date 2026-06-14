@@ -96,6 +96,30 @@ pub struct Cli {
     )]
     pub concurrency: usize,
 
+    /// Increase diagnostic verbosity on stderr (repeatable: -v=info, -vv=debug).
+    ///
+    /// Drives a `tracing` diagnostic layer that writes to STDERR only, so stdout
+    /// (including `--json`) stays clean. `RUST_LOG`, when set, overrides this.
+    #[arg(
+        short = 'v',
+        long,
+        global = true,
+        action = clap::ArgAction::Count,
+        help = "Increase diagnostic logging on stderr (-v=info, -vv=debug); RUST_LOG overrides"
+    )]
+    pub verbose: u8,
+
+    /// Suppress diagnostics below ERROR on stderr. Conflicts with `-v`.
+    #[arg(
+        short = 'q',
+        long,
+        global = true,
+        default_value_t = false,
+        conflicts_with = "verbose",
+        help = "Quiet: only ERROR-level diagnostics on stderr; RUST_LOG overrides"
+    )]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -147,6 +171,70 @@ pub fn color_enabled(no_color_flag: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic tracing layer (M5.1)
+// ---------------------------------------------------------------------------
+
+/// Initialize the diagnostic `tracing` subscriber, writing to STDERR only.
+///
+/// This is a SEPARATE channel from user-facing command output (which stays on
+/// stdout, including `--json`). It exists for support/debugging via `-v`/`-q`
+/// and `RUST_LOG`.
+///
+/// Level policy: if `RUST_LOG` is set it wins (full `env-filter` syntax);
+/// otherwise the level derives from verbosity — default WARN, `-v`=INFO,
+/// `-vv`(or more)=DEBUG, `-q`=ERROR. ANSI color follows the same policy as the
+/// rest of the CLI: disabled by `--no-color`, `NO_COLOR`, or a non-TTY stderr.
+///
+/// Safe to call exactly once at startup; uses `try_init` so a double-init (e.g.
+/// a test harness that already installed a subscriber) is a silent no-op rather
+/// than a panic.
+fn init_tracing(verbose: u8, quiet: bool, no_color_flag: bool) {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    // RUST_LOG (if present) overrides the -v/-q knobs entirely.
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => {
+            let level = if quiet {
+                "error"
+            } else {
+                match verbose {
+                    0 => "warn",
+                    1 => "info",
+                    _ => "debug",
+                }
+            };
+            EnvFilter::new(level)
+        }
+    };
+
+    // Color on stderr follows --no-color / NO_COLOR / non-TTY stderr.
+    let ansi = stderr_color_enabled(no_color_flag);
+
+    // try_init: a no-op if a global subscriber is already installed.
+    let _ = fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .with_ansi(ansi)
+        .try_init();
+}
+
+/// Whether ANSI color may be emitted on STDERR (the diagnostic channel).
+///
+/// Mirrors [`color_enabled`] but gates on stderr being a TTY, since the
+/// diagnostic layer writes there rather than to stdout.
+fn stderr_color_enabled(no_color_flag: bool) -> bool {
+    use std::io::IsTerminal as _;
+    if no_color_flag {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stderr().is_terminal()
+}
+
+// ---------------------------------------------------------------------------
 // Error exit helper
 // ---------------------------------------------------------------------------
 
@@ -178,6 +266,10 @@ pub fn actionable_error(err: &ClwError) -> String {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Bring up the diagnostic tracing layer (stderr only) before anything that
+    // might emit an event. Honors -v/-q and RUST_LOG; never touches stdout.
+    init_tracing(cli.verbose, cli.quiet, cli.no_color);
 
     // Resolve config from flags, env, and file.
     let resolved = match ResolvedConfig::resolve(&cli) {
@@ -516,6 +608,43 @@ mod tests {
             msg.contains("some transport issue"),
             "transport error must include original message, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.1 — diagnostic verbosity flags (-v/-q)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verbose_counts_repeats() {
+        let cli = Cli::try_parse_from(["clw", "-vv", "doctor"]).unwrap();
+        assert_eq!(cli.verbose, 2);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn verbose_defaults_to_zero() {
+        let cli = Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        assert_eq!(cli.verbose, 0);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn quiet_flag_parses() {
+        let cli = Cli::try_parse_from(["clw", "-q", "doctor"]).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn verbose_and_quiet_conflict() {
+        // -q conflicts with -v: clap must reject combining them.
+        let err = Cli::try_parse_from(["clw", "-v", "-q", "doctor"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn stderr_color_disabled_by_flag() {
+        // --no-color always disables ANSI on the diagnostic (stderr) channel.
+        assert!(!stderr_color_enabled(true));
     }
 
     #[test]

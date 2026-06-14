@@ -347,6 +347,15 @@ where
     // --- 4. Chunk uploads already happened inline above ---------------------
     let chunks_uploaded = uploaded_counter.load(Ordering::Relaxed);
 
+    // Diagnostic channel (M5.1): dedupe effectiveness at a glance, on stderr.
+    tracing::info!(
+        files = files_count,
+        chunks_total,
+        chunks_uploaded,
+        chunks_deduped = chunks_total.saturating_sub(chunks_uploaded),
+        "snapshot chunk upload complete"
+    );
+
     // --- 5. Upload manifest -------------------------------------------------
     let manifest_bytes = manifest.canonical_bytes()?;
     let manifest_digest = Digest::of_bytes(&manifest_bytes);

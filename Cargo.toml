@@ -55,6 +55,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 fastcdc = "3"
 clap = { version = "4", features = ["derive"] }
+# Diagnostic tracing (M5.1). `tracing` is the lib-side instrumentation facade
+# (debug!/warn! events on the DIAGNOSTIC channel — distinct from user-facing
+# stdout). `tracing-subscriber` is the CLI-side fmt sink to stderr; default
+# features are off and only fmt/ansi/env-filter are pulled in to keep the dep
+# surface (and license set) minimal. All licenses are MIT (already allow-listed).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 ignore = "0.4"
 hex = "0.4"
 anyhow = "1"

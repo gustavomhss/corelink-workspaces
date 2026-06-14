@@ -99,12 +99,14 @@ impl LocalCache {
             Some(v) if v == CACHE_FORMAT_VERSION => Ok(()),
             // Mismatch (parseable-but-different or unparseable sentinel): invalidate.
             Some(v) => {
-                eprintln!(
-                    "clw-cache: cache format mismatch at {} (on-disk={}, expected={}); \
-                     invalidating cached content to avoid stale reads",
-                    self.root.display(),
-                    v,
-                    CACHE_FORMAT_VERSION,
+                // Diagnostic channel (M5.1): the wipe is never silent, but it now
+                // rides the structured tracing channel (stderr) instead of a raw
+                // eprintln so it composes with -v/RUST_LOG verbosity control.
+                tracing::warn!(
+                    root = %self.root.display(),
+                    on_disk = v,
+                    expected = CACHE_FORMAT_VERSION,
+                    "cache format mismatch; invalidating cached content to avoid stale reads"
                 );
                 self.clear_content()?;
                 self.write_version()

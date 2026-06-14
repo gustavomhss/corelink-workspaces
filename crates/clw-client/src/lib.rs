@@ -285,6 +285,9 @@ impl HttpClient {
                     let jitter = if base > 0 { nanos % (base / 2 + 1) } else { 0 };
                     base + jitter
                 };
+                // Diagnostic channel (M5.1): one event per backoff so support can
+                // see attempt count + sleep without it touching user-facing stdout.
+                tracing::debug!(attempt, sleep_ms, "retry backoff before next attempt");
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
             // Hold one governor permit for the lifetime of this attempt.
@@ -307,6 +310,14 @@ impl HttpClient {
                             if raw != NONE {
                                 last_retry_after_secs = raw.max(1);
                             }
+                            // Diagnostic channel (M5.1): a 429 throttle is worth a
+                            // WARN — include the attempt and any server Retry-After.
+                            let retry_after_secs = (raw != NONE).then_some(raw);
+                            tracing::warn!(
+                                attempt,
+                                ?retry_after_secs,
+                                "rate-limited (429); backing off"
+                            );
                         }
                         last_err = Some(e);
                     } else {

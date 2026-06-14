@@ -213,6 +213,8 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
                 CasTransport::get(client, &record.stderr).await,
             ) {
                 (Ok(stdout), Ok(stderr)) => {
+                    // Diagnostic channel (M5.1): cache hit + key on stderr.
+                    tracing::debug!(key = %key.to_hex(), hit = true, "run cache hit");
                     return Ok(RunOutcome {
                         key,
                         hit: true,
@@ -230,6 +232,8 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     }
 
     // --- MISS: execute the command ---
+    // Diagnostic channel (M5.1): cache miss + key on stderr.
+    tracing::debug!(key = %key.to_hex(), hit = false, "run cache miss; executing");
     let child = tokio::process::Command::new(&opts.command[0])
         .args(&opts.command[1..])
         .current_dir(cwd)

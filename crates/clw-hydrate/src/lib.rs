@@ -405,6 +405,13 @@ where
     // so we skip set_permissions entirely. `mode` is consumed only on unix.
     #[cfg(windows)]
     let _ = mode;
+    // Diagnostic channel (M5.1): per-file cache-hit vs download split on stderr.
+    tracing::debug!(
+        path = rel_path,
+        bytes_from_cache,
+        bytes_downloaded,
+        "materialized file"
+    );
     Ok((bytes_from_cache, bytes_downloaded))
 }
 
