@@ -178,8 +178,19 @@ impl Manifest {
     }
 }
 
+/// True if `comp` begins with a Windows drive-letter spec (`C:`, `d:`...). Such a
+/// component is drive-relative/absolute on Windows and would escape `dest` via
+/// `Path::join`, so it is rejected on EVERY platform (a manifest must hydrate
+/// identically everywhere). `:` is also forbidden in Windows filenames, so this
+/// rule keeps manifests portable.
+fn starts_with_drive_letter(comp: &str) -> bool {
+    let b = comp.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 /// Validate that a manifest entry path is a safe RELATIVE path (the documented
-/// invariant). Rejects absolute paths and any '.'/'..'/empty component.
+/// invariant). Rejects absolute paths, backslashes, Windows drive-letters, and
+/// any '.'/'..'/empty component — on every platform, for portable hydration.
 pub fn validate_rel_path(p: &str) -> Result<()> {
     if p.is_empty() {
         return Err(ClwError::InvalidManifest("empty path".into()));
@@ -200,11 +211,18 @@ pub fn validate_rel_path(p: &str) -> Result<()> {
                 "unsafe path component in: {p}"
             )));
         }
+        if starts_with_drive_letter(comp) {
+            return Err(ClwError::InvalidManifest(format!(
+                "Windows drive-letter component not allowed: {p}"
+            )));
+        }
     }
     Ok(())
 }
 
-/// Validate a symlink target stays within the workspace (relative, no '..').
+/// Validate a symlink target stays within the workspace: relative, no '..', no
+/// backslash, no Windows drive-letter (rejected on every platform so a tampered
+/// manifest cannot escape `dest` on a Windows host).
 pub fn validate_symlink_target(t: &str) -> Result<()> {
     if t.is_empty() {
         return Err(ClwError::InvalidManifest("empty symlink target".into()));
@@ -214,10 +232,20 @@ pub fn validate_symlink_target(t: &str) -> Result<()> {
             "absolute symlink target not allowed: {t}"
         )));
     }
+    if t.contains('\\') {
+        return Err(ClwError::InvalidManifest(format!(
+            "backslash not allowed in symlink target: {t}"
+        )));
+    }
     for comp in t.split('/') {
         if comp == ".." {
             return Err(ClwError::InvalidManifest(format!(
                 "symlink target escapes workspace: {t}"
+            )));
+        }
+        if starts_with_drive_letter(comp) {
+            return Err(ClwError::InvalidManifest(format!(
+                "Windows drive-letter symlink target not allowed: {t}"
             )));
         }
     }
@@ -477,6 +505,12 @@ mod tests {
         assert!(validate_rel_path("a/./b").is_err());
         assert!(validate_rel_path("a//b").is_err());
         assert!(validate_rel_path("a\\b").is_err());
+        // Windows drive-letter escapes (rejected on every platform).
+        assert!(validate_rel_path("C:foo").is_err());
+        assert!(validate_rel_path("C:/evil").is_err());
+        assert!(validate_rel_path("dir/D:bar").is_err());
+        // A colon mid-component is NOT a drive-letter and stays allowed.
+        assert!(validate_rel_path("foo:bar").is_ok());
     }
 
     #[test]
@@ -486,5 +520,9 @@ mod tests {
         assert!(validate_symlink_target("").is_err());
         assert!(validate_symlink_target("/etc/passwd").is_err());
         assert!(validate_symlink_target("../../x").is_err());
+        // Windows-syntax escapes (rejected on every platform).
+        assert!(validate_symlink_target("..\\..\\x").is_err());
+        assert!(validate_symlink_target("C:\\evil").is_err());
+        assert!(validate_symlink_target("C:/evil").is_err());
     }
 }
