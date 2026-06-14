@@ -252,7 +252,6 @@ mod tests {
     use super::*;
     use clw_types::{ChunkRef, Digest, Entry, Manifest, MANIFEST_VERSION};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn make_manifest(entries: Vec<Entry>) -> Manifest {
@@ -411,6 +410,7 @@ mod tests {
         assert_eq!(rels, vec!["a.txt", "m.txt", "z.txt"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn walk_symlink_captured() {
         let tmp = TempDir::new().unwrap();
@@ -454,8 +454,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn walk_mode_captured() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
