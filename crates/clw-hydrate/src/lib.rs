@@ -9,6 +9,7 @@
 pub use clw_types as types;
 
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -201,7 +202,19 @@ where
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // On unix, create the symlink. On Windows, symlink creation while
+            // hydrating is a DOCUMENTED v1 limitation (tracked): rather than
+            // silently skipping the entry — which would leave the workspace
+            // incomplete and the dangling-reference invariant ambiguous — we
+            // fail loudly with a clear, actionable error. Windows symlink
+            // creation also requires elevated privileges / Developer Mode, so a
+            // proper port is deferred to a future milestone.
+            #[cfg(unix)]
             std::os::unix::fs::symlink(target, &abs)?;
+            #[cfg(windows)]
+            return Err(ClwError::InvalidManifest(format!(
+                "symlinks are not supported when hydrating on Windows: {path}"
+            )));
         }
     }
 
@@ -268,8 +281,15 @@ where
     // SECURITY (M1.7): mask to permission bits only. An untrusted manifest must
     // not be able to create setuid/setgid/sticky files — strip everything above
     // the low 9 permission bits (0o777).
-    let perms = std::fs::Permissions::from_mode(mode & 0o777);
-    std::fs::set_permissions(&abs, perms)?;
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(mode & 0o777);
+        std::fs::set_permissions(&abs, perms)?;
+    }
+    // On Windows there is no unix mode concept: applying mode bits is a no-op,
+    // so we skip set_permissions entirely. `mode` is consumed only on unix.
+    #[cfg(windows)]
+    let _ = mode;
     Ok((bytes_from_cache, bytes_downloaded))
 }
 

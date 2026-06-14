@@ -43,6 +43,7 @@ impl WalkedEntry {
 // ---------------------------------------------------------------------------
 
 pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let walker = WalkBuilder::new(root)
@@ -136,7 +137,13 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
             candidate_dirs.push((rel, abs));
         } else if file_type.is_file() {
             let meta = std::fs::metadata(&abs)?;
+            // On unix, read the real permission bits. On Windows there is no
+            // unix mode concept, so we record a constant default of 0o644 for
+            // every regular file (symlink DETECTION below stays cross-platform).
+            #[cfg(unix)]
             let mode = meta.permissions().mode() & 0o7777;
+            #[cfg(windows)]
+            let mode = 0o644;
             let size = meta.len();
             entries.push(WalkedEntry::File(WalkedFile {
                 abs,
