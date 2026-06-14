@@ -69,6 +69,12 @@ tempfile = "3"
 proptest = "1"
 wiremock = "0.6"
 filetime = "0.2"
+# Microbenchmark harness for hot paths (dev-only; never a runtime dep). Default
+# features are off to drop the optional HTML/plotting backend (plotters etc.)
+# and keep the dev-dep + license surface minimal; `cargo-criterion` is the
+# external runner if richer reports are ever wanted. All pulled-in licenses are
+# permissive and already allow-listed in deny.toml/about.toml.
+criterion = { version = "0.5", default-features = false }
 
 [profile.release]
 lto = "thin"
