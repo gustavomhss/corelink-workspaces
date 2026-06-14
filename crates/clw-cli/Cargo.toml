@@ -19,6 +19,10 @@ clw-manifest = { workspace = true }
 clw-cache = { workspace = true }
 clw-client = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+# Shell-completion generator for `clw completions <shell>`. MIT/Apache-2.0
+# (both already in deny.toml [licenses].allow / about.toml accepted) and pinned
+# to clap's 4.x line so the generated completions track the derived CLI surface.
+clap_complete = "4"
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

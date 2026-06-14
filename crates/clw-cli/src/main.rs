@@ -142,6 +142,10 @@ pub enum Commands {
     Doctor(subcmds::doctor::DoctorArgs),
     /// Manage the locally-stored CoreLink identity (login/logout/whoami).
     Auth(subcmds::auth::AuthArgs),
+    /// Remove clw's on-disk footprint (config + PAT, cache, telemetry record).
+    Uninstall(subcmds::uninstall::UninstallArgs),
+    /// Generate a shell-completion script (bash|zsh|fish|powershell|elvish).
+    Completions(subcmds::completions::CompletionsArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -271,10 +275,34 @@ async fn main() {
     // might emit an event. Honors -v/-q and RUST_LOG; never touches stdout.
     init_tracing(cli.verbose, cli.quiet, cli.no_color);
 
-    // Resolve config from flags, env, and file.
+    // `completions` is a pure, offline, client-only command: it reflects the
+    // derived clap surface and needs NO endpoint/tenant/token. Handle it before
+    // config resolution so a fresh user (no config, no token) can still generate
+    // completions. It bypasses the telemetry gate for the same reason.
+    if let Commands::Completions(args) = cli.command {
+        if let Err(e) = subcmds::completions::run(args).await {
+            exit_err(&e);
+        }
+        return;
+    }
+
+    // Resolve config from flags, env, and file. `uninstall` must work even when
+    // no token/tenant has ever been set (it is the cleanup path), so it resolves
+    // ONLY the cache dir leniently rather than failing on a missing token.
     let resolved = match ResolvedConfig::resolve(&cli) {
         Ok(c) => c,
         Err(e) => {
+            if matches!(cli.command, Commands::Uninstall(_)) {
+                let cache_dir = ResolvedConfig::resolve_cache_dir_lenient(&cli);
+                let json = cli.json;
+                let Commands::Uninstall(args) = cli.command else {
+                    unreachable!("guarded by matches! above")
+                };
+                if let Err(e) = subcmds::uninstall::run(args, cache_dir, json).await {
+                    exit_err(&e);
+                }
+                return;
+            }
             exit_err(&e);
         }
     };
@@ -314,6 +342,12 @@ async fn dispatch(
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
         Commands::Doctor(args) => subcmds::doctor::run(args, cfg, json).await,
         Commands::Auth(args) => subcmds::auth::run(args, cfg, json).await,
+        Commands::Uninstall(args) => {
+            subcmds::uninstall::run(args, cfg.clw_config.cache_dir, json).await
+        }
+        // `completions` is handled before config resolution in `main` (it needs
+        // no config); it never reaches `dispatch`.
+        Commands::Completions(_) => Ok(()),
     }
 }
 
@@ -517,6 +551,58 @@ mod tests {
             Commands::Auth(a) => assert!(matches!(a.command, AuthCommand::Rotate)),
             other => panic!("expected Auth, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // clw uninstall + clw completions parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_uninstall_defaults() {
+        let cli = Cli::try_parse_from(["clw", "uninstall"]).unwrap();
+        match cli.command {
+            Commands::Uninstall(a) => {
+                assert!(!a.yes);
+                assert!(!a.dry_run);
+            }
+            other => panic!("expected Uninstall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_uninstall_yes_and_dry_run() {
+        let cli = Cli::try_parse_from(["clw", "uninstall", "--yes", "--dry-run"]).unwrap();
+        match cli.command {
+            Commands::Uninstall(a) => {
+                assert!(a.yes);
+                assert!(a.dry_run);
+            }
+            other => panic!("expected Uninstall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_uninstall_with_json() {
+        let cli = Cli::try_parse_from(["clw", "--json", "uninstall", "--yes"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Commands::Uninstall(_)));
+    }
+
+    #[test]
+    fn parse_completions_each_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let cli = Cli::try_parse_from(["clw", "completions", shell]).unwrap();
+            assert!(
+                matches!(cli.command, Commands::Completions(_)),
+                "completions {shell} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_completions_rejects_unknown_shell() {
+        let err = Cli::try_parse_from(["clw", "completions", "tcsh"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     // -----------------------------------------------------------------------

@@ -820,3 +820,205 @@ fn ls_unconfigured_fails_cleanly() {
         "unconfigured ls must give an actionable 'missing tenant' error, got:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: uninstall — consent, dry-run, redaction, real removal
+//
+// These exercise the REAL binary against an isolated HOME + cache dir, so no
+// real ~/.clw is ever touched. They cover the security-critical contract:
+//   - --dry-run lists paths and removes NOTHING (and never prints the token),
+//   - no --yes in a non-interactive context ERRORS without deleting,
+//   - --yes actually scrubs ~/.clw + the resolved cache dir,
+//   - the running binary is never auto-deleted (path + command are printed).
+// ---------------------------------------------------------------------------
+
+/// Seed an isolated `HOME/.clw/config.toml` holding the secret PAT, plus a
+/// populated cache dir, and return (home, cache) temp dirs.
+fn seed_clw_footprint() -> (TempDir, TempDir) {
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+
+    let clw_dir = home.path().join(".clw");
+    std::fs::create_dir_all(&clw_dir).unwrap();
+    std::fs::write(
+        clw_dir.join("config.toml"),
+        format!("# clw configuration\ntenant = \"{TEST_TENANT}\"\ntoken = \"{SECRET_TOKEN}\"\n"),
+    )
+    .unwrap();
+    // A stand-in for cached customer file content.
+    std::fs::write(cache.path().join("blob.bin"), b"customer file content").unwrap();
+
+    (home, cache)
+}
+
+#[test]
+fn uninstall_dry_run_lists_paths_removes_nothing_and_no_token() {
+    let (home, cache) = seed_clw_footprint();
+    let clw_dir = home.path().join(".clw");
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["--json", "uninstall", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "dry-run must exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Removed NOTHING: both the config dir and the cache dir still exist.
+    assert!(clw_dir.exists(), "dry-run must NOT remove ~/.clw");
+    assert!(
+        cache.path().exists(),
+        "dry-run must NOT remove the cache dir"
+    );
+
+    // Never leaks the token, on either stream.
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "uninstall must NEVER print the token"
+    );
+
+    // JSON reports dry_run + the resolved paths, removed=false for each target.
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["dry_run"], true);
+    let targets = parsed["targets"].as_array().unwrap();
+    assert!(!targets.is_empty(), "must list at least one target path");
+    for t in targets {
+        assert_eq!(t["removed"], false, "dry-run removes nothing");
+    }
+    // The running binary is reported but NEVER auto-deleted.
+    assert_eq!(parsed["binary"]["removed"], false);
+}
+
+#[test]
+fn uninstall_without_yes_noninteractive_errors_and_deletes_nothing() {
+    let (home, cache) = seed_clw_footprint();
+    let clw_dir = home.path().join(".clw");
+
+    // No TTY in the test harness (stdin is not a terminal) and no --yes: the
+    // binary must REFUSE and delete nothing, in both plain and --json mode.
+    for json in [false, true] {
+        let mut cmd = Command::cargo_bin("clw").unwrap();
+        cmd.env("HOME", home.path())
+            .env_remove("CLW_TENANT")
+            .env_remove("CLW_TOKEN")
+            .env("CLW_CACHE_DIR", cache.path().to_str().unwrap());
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.arg("uninstall");
+        let out = cmd.output().unwrap();
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "uninstall without --yes (non-interactive) must exit 2 (json={json})"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--yes"),
+            "error must instruct to pass --yes, got:\n{stderr}"
+        );
+        // Nothing deleted.
+        assert!(clw_dir.exists(), "refused uninstall must NOT remove ~/.clw");
+        assert!(
+            cache.path().exists(),
+            "refused uninstall must NOT remove cache"
+        );
+        // Never leaks the token.
+        assert!(
+            !stderr.contains(SECRET_TOKEN),
+            "must not leak token on error"
+        );
+    }
+}
+
+#[test]
+fn uninstall_yes_scrubs_config_and_cache_keeps_binary() {
+    let (home, cache) = seed_clw_footprint();
+    let clw_dir = home.path().join(".clw");
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["--json", "uninstall", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "uninstall --yes must exit 0");
+
+    // Actually scrubbed: both sensitive trees are gone.
+    assert!(!clw_dir.exists(), "uninstall --yes must remove ~/.clw");
+    assert!(
+        !cache.path().exists(),
+        "uninstall --yes must remove the resolved cache dir"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "uninstall must NEVER print the token"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["dry_run"], false);
+    // The binary was reported with a remove command but NOT auto-deleted.
+    assert_eq!(parsed["binary"]["removed"], false);
+    assert!(parsed["binary"]["remove_command"]
+        .as_str()
+        .unwrap()
+        .starts_with("rm "));
+    // The actual clw test binary still exists on disk (we never self-deleted).
+    let exe = parsed["binary"]["path"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(exe).exists(),
+        "the running binary must NOT be deleted by uninstall"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: completions — each shell yields non-empty output mentioning `clw`,
+// and works with NO config/token (a fresh, unconfigured user).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn completions_each_shell_nonempty_and_offline() {
+    let home = TempDir::new().unwrap();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let out = Command::cargo_bin("clw")
+            .unwrap()
+            // Fresh, unconfigured user: no identity at all.
+            .env("HOME", home.path())
+            .env_remove("CLW_ENDPOINT")
+            .env_remove("CLW_TENANT")
+            .env_remove("CLW_TOKEN")
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "completions {shell} must exit 0 even when unconfigured"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.trim().is_empty(),
+            "completions {shell} must produce a non-empty script"
+        );
+        assert!(
+            stdout.contains("clw"),
+            "completions {shell} script must reference the clw binary"
+        );
+    }
+}

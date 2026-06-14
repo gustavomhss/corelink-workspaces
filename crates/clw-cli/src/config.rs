@@ -81,6 +81,23 @@ impl ResolvedConfig {
             },
         })
     }
+
+    /// Resolve ONLY the cache directory, tolerating a missing tenant/token.
+    ///
+    /// `clw uninstall` is the cleanup path and must work even when no identity
+    /// was ever configured (so [`resolve`] would error on the missing token).
+    /// This applies the same flag > env > file > default precedence as [`resolve`]
+    /// for `cache_dir` alone, and never touches the token.
+    #[must_use]
+    pub fn resolve_cache_dir_lenient(cli: &Cli) -> PathBuf {
+        let file_cfg = read_config_file();
+        let cache_dir_str = cli
+            .cache_dir
+            .clone()
+            .or_else(|| file_cfg.get("cache_dir").cloned())
+            .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
+        expand_tilde(&cache_dir_str)
+    }
 }
 
 // ---------------------------------------------------------------------------
