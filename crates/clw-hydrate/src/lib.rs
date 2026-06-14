@@ -20,6 +20,52 @@ use clw_cache::LocalCache;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Entry, Manifest, RefRecord, Result};
 
 // ---------------------------------------------------------------------------
+// Resource-safety / abuse bounds (M1.6)
+//
+// A REMOTE manifest is untrusted input: it may be malicious or pathological.
+// Before doing *any* filesystem work we bound what a single hydrate is allowed
+// to attempt, so a hostile manifest cannot drive us into OOM, an enumeration
+// bomb, a petabyte disk-fill request, or an unbounded symlink chain. These caps
+// are intentionally generous (far above any plausible real workspace) but
+// finite, and they live in *this* crate as policy — they do NOT touch the
+// frozen clw-types contract.
+// ---------------------------------------------------------------------------
+
+/// Maximum number of manifest entries a single hydrate will accept.
+///
+/// Rationale (anti-OOM / anti-enumeration-bomb): every entry is iterated, and
+/// `File` entries are cloned into an in-memory `Vec` before materialisation, so
+/// the entry count bounds our peak allocation and the number of filesystem
+/// operations. One million entries is larger than any real workspace we expect
+/// (the Linux kernel tree is ~80k files) yet small enough that the per-entry
+/// bookkeeping stays well within memory. A manifest above this cap is rejected
+/// up-front, before we allocate the file-entry vector or touch the disk.
+const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
+
+/// Maximum total declared bytes (`Manifest::total_size`) a single hydrate will
+/// accept.
+///
+/// Rationale (anti disk-fill): `total_size` is attacker-controlled. Without a
+/// ceiling a manifest could *declare* a petabyte and we would happily start
+/// writing toward filling the disk. 1 TiB is far above any realistic single
+/// workspace snapshot yet bounds the damage a malicious manifest can request.
+/// We reject before materialisation; this is a declared-size sanity bound, not
+/// a substitute for the OS running out of space mid-write (that still surfaces
+/// as a normal `ClwError::Io`).
+const MAX_HYDRATE_TOTAL_BYTES: u64 = 1 << 40; // 1 TiB
+
+/// Maximum number of symlink entries a single hydrate will create.
+///
+/// Rationale (anti symlink cycle/chain blow-up): symlinks are materialised in
+/// their own pass and a manifest could declare an enormous number of links
+/// (including chains that resolve through one another). validate_symlink_target
+/// already forbids absolute paths, `..`, and drive letters, so a link cannot
+/// escape `dest`; this cap additionally bounds the *count* so a pathological
+/// manifest cannot create an effectively unbounded chain/fan-out of links. The
+/// cap is per-hydrate and checked while creating links.
+const MAX_SYMLINK_ENTRIES: usize = 100_000;
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -111,6 +157,29 @@ where
     let manifest = Manifest::from_bytes(&manifest_bytes)?;
 
     // ------------------------------------------------------------------
+    // 2c. Resource-safety / abuse bounds (M1.6).
+    //
+    // The manifest is untrusted REMOTE input. Enforce the abuse caps BEFORE we
+    // allocate the file-entry vector or touch the filesystem, so a malicious or
+    // pathological manifest is rejected with a clear, actionable error instead
+    // of driving us into OOM or a disk-fill.
+    // ------------------------------------------------------------------
+    let entry_count = manifest.entries.len();
+    if entry_count > MAX_MANIFEST_ENTRIES {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest has {entry_count} entries, exceeding the hydrate cap of \
+             {MAX_MANIFEST_ENTRIES} (anti-OOM/enumeration-bomb guard); refusing to hydrate"
+        )));
+    }
+    if manifest.total_size > MAX_HYDRATE_TOTAL_BYTES {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest declares total_size {} bytes, exceeding the hydrate cap of \
+             {MAX_HYDRATE_TOTAL_BYTES} bytes (anti disk-fill guard); refusing to hydrate",
+            manifest.total_size
+        )));
+    }
+
+    // ------------------------------------------------------------------
     // 3. Ensure dest exists.
     // ------------------------------------------------------------------
     std::fs::create_dir_all(dest)?;
@@ -193,8 +262,21 @@ where
     // 3c. Symlinks — created LAST, after every regular file is materialised
     //     (see the SECURITY note on pass 3a). No network I/O needed.
     // ------------------------------------------------------------------
+    let mut symlink_count: usize = 0;
     for entry in &manifest.entries {
         if let Entry::Symlink { path, target } = entry {
+            // Resource-safety (M1.6): bound the number of symlinks a single
+            // hydrate will create. validate_symlink_target already prevents a
+            // link from escaping `dest` (no absolute, no `..`, no drive letter),
+            // so this is a pure anti-cycle/anti-chain count guard against a
+            // manifest that declares a pathological number of links.
+            symlink_count += 1;
+            if symlink_count > MAX_SYMLINK_ENTRIES {
+                return Err(ClwError::InvalidManifest(format!(
+                    "manifest declares more than {MAX_SYMLINK_ENTRIES} symlinks \
+                     (anti symlink-cycle/chain guard); refusing to hydrate"
+                )));
+            }
             // Defense-in-depth: validate both the link path and its target.
             clw_types::validate_rel_path(path)?;
             clw_types::validate_symlink_target(target)?;
@@ -937,6 +1019,83 @@ mod tests {
             std::fs::read(&link).unwrap(),
             data,
             "symlink resolves to the already-materialised file"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8 (M1.6): a manifest with more entries than MAX_MANIFEST_ENTRIES is
+    // rejected up-front with InvalidManifest, before any filesystem work.
+    // We build the entry list directly (bypassing canonical_bytes round-trip)
+    // so the test stays cheap — the guard runs on the parsed in-memory manifest.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oversized_entry_count_rejected() {
+        // Construct a manifest just over the cap using empty Dir entries (cheap
+        // to allocate, no chunk data needed). Names are zero-padded so their
+        // lexical order matches numeric order — the manifest's "entries sorted
+        // by path, no duplicates" invariant (checked by canonical_bytes) holds.
+        let mut entries = Vec::with_capacity(MAX_MANIFEST_ENTRIES + 1);
+        for i in 0..=MAX_MANIFEST_ENTRIES {
+            entries.push(Entry::Dir {
+                path: format!("d{i:08}"),
+            });
+        }
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries,
+        };
+
+        // setup_store canonicalises the manifest, but that is still far cheaper
+        // than touching the filesystem 1M times, and the guard fires before any
+        // directory is created.
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("entries")),
+            "expected InvalidManifest about entry count, got: {err}"
+        );
+        // No materialisation should have happened.
+        assert!(
+            !dest.join("d0").exists(),
+            "guard must fire before any directory is created"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9 (M1.6): a manifest whose declared total_size exceeds
+    // MAX_HYDRATE_TOTAL_BYTES is rejected up-front with InvalidManifest.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oversized_total_bytes_rejected() {
+        // One tiny entry, but a malicious declared total of (cap + 1) bytes.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: MAX_HYDRATE_TOTAL_BYTES + 1,
+            entries: vec![Entry::Dir {
+                path: "only-dir".into(),
+            }],
+        };
+
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("total_size")),
+            "expected InvalidManifest about total_size, got: {err}"
+        );
+        assert!(
+            !dest.join("only-dir").exists(),
+            "guard must fire before any directory is created"
         );
     }
 }
