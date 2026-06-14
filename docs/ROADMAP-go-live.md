@@ -14,8 +14,11 @@
 |---|---|---|
 | 2026-06-09 | **Audit (#26)** + **M1.1 StreamCDC (#27)** | `fix/clw-audit-2026-06-09` and `fix/clw-deferrals-2026-06-09` merged to `main` (`87f9842`). M1.1 (snapshot streaming, dedupe-identical) is **DONE**. |
 | 2026-06-14 | **M0.5 audit-defect fixes** (`1422fa6`) | Closed 3 defects *inside* the merged audit: https loopback prefix-bypass (CRIT), `clw run` tool-cwd (HIGH), config value escaping (HIGH) + Windows test gating. Full local gate green (145 tests). |
+| 2026-06-14 | **7-lane parallel wave** (`70ba1cb`) | Worktree-isolated, conflict-free fleet: **M2.0** toolchain de-hack · **M4** (publish=false ×11 + `deny.toml`, cargo-deny green) · **M1.5** run-key unset≠empty (domain v3) · **M1.7** hydrate hardening (verify fetched digests, mask mode bits, symlink-after-files) · **SECURITY.md + THREAT-MODEL** · **release.yml scaffold + DISTRIBUTION** · **handoff specs D-7/D-8/D-9**. Full gate green (149 tests). |
 
-> **Status:** M0 complete (audit + its M0.5 defect fixes live), M1.1 complete. **Next: the M1 spine resumes at M1.2** (drop the exists-HEAD) → M1.3 → M1.4, plus the M2 Windows port and the corelink-server track.
+> **Status:** M0 done; M1.1, M1.5, M1.7, M2.0 done; M4 metadata + SECURITY + release-scaffold + D-7/8/9 handoffs done. **Next:** M1.3 (rate-limit Option A) · M2 Windows port (long pole) · M4.2 EULA swap + M4.1 wire cargo-deny/audit into CI · the corelink-server track (D-3/D-4/D-6/D-7/D-8/D-9).
+
+> **DECISION — M1.2 PULLED (2026-06-14):** "drop the exists-HEAD, always PUT" is **rejected**. The snapshot already does `exists`(HEAD, no body) then `put` only on a miss. Always-PUT would trade cheap HEADs for full PUT-with-body on *existing* chunks — re-uploading bytes on every re-snapshot (killing the zero-upload dedupe property) and **increasing** write pressure on the rate-limited per-tenant DO (the opposite of the 429 goal). The 429 relief comes from **M1.3** (Retry-After + AIMD), not from M1.2. Net: keep the exists-HEAD; M1.2 is closed as won't-do.
 
 ## What v2 changed (the fleet's high-signal corrections)
 
