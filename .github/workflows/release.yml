@@ -1,0 +1,396 @@
+# Release pipeline — clw signed, cross-platform distribution (WP M3 release scaffold).
+#
+# STATUS: SCAFFOLD. This workflow is a correct, well-structured skeleton that a
+# human fills in once the owner decisions in docs/DISTRIBUTION.md are made and the
+# deployment secrets are provisioned. It is NOT runnable end-to-end yet: every
+# step that needs an owner-gated secret or an owner-gated infra decision is marked
+# with a `TODO(OWNER):` comment and, where possible, guarded so the job no-ops
+# cleanly instead of failing when the secret/credential is absent.
+#
+# Pipeline shape (four serial stages, dependent jobs):
+#   preflight  -> build (5-target matrix, sign folded in) -> publish (checksum + upload)
+#
+# Constraints (from docs/go-live/WP-BRIEFS.md M2.3 / M2.5):
+#   * Proprietary: the download surface is NOT a public GitHub Release.
+#   * Signed: macOS Developer ID + notarize; Windows cloud/HSM Authenticode;
+#     Linux minisign (sigstore as documented alternative).
+#   * Cross-platform, 5 locked targets:
+#       aarch64-apple-darwin, x86_64-apple-darwin            (macOS)
+#       x86_64-pc-windows-msvc                                (Windows)
+#       x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu  (Linux)
+#     aarch64-linux is BUILD-ONLY here: it is cross-compiled (cargo-zigbuild) and
+#     cannot be executed/tested on the x86_64 hosted runner.
+#   * No self-hosted Mac in the release path (M2 de-self-hosting mandate) — all
+#     legs run on GitHub-hosted runners.
+
+name: release
+
+# Tag-triggered only. The brief specifies `tags: ['v*']` for this scaffold, so we
+# trigger broadly here and let the preflight GUARD job reject non-semver and
+# version-mismatched tags. That keeps the trigger simple while still failing fast.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Never run two releases for the same tag concurrently.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned toolchain — must match rust-toolchain.toml. Installed via STANDARD
+  # rustup on each leg; do NOT reproduce the founder-Mac PATH hack (M2.1).
+  RUST_TOOLCHAIN: "1.91.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 1 — PREFLIGHT / GUARD
+  # Validates the tag and runs the hard pre-tag gates. Runs on a hosted runner.
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: preflight (guard + gates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install pinned rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component rustfmt clippy
+          rustup default "${RUST_TOOLCHAIN}"
+
+      # Tag must be a semver shape (vX.Y.Z, optionally -rc.N / -rcN). Reject loose
+      # `v*` tags that slipped past the broad trigger.
+      - name: validate tag is semver
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?$'; then
+            echo "::error::tag '$TAG' is not a semver release tag (expected vX.Y.Z or vX.Y.Z-rc.N)"
+            exit 1
+          fi
+          # Strip the leading 'v' for downstream artifact naming.
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # The git tag must equal the workspace Cargo version — prevents shipping a
+      # binary whose --version disagrees with the release tag.
+      - name: assert tag matches workspace Cargo version
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          TAG_VER="${{ steps.version.outputs.version }}"
+          # Compare on the release core (ignore any -rc suffix for the match).
+          if [ "${TAG_VER%%-*}" != "$CARGO_VER" ]; then
+            echo "::error::tag version '$TAG_VER' != Cargo workspace version '$CARGO_VER'"
+            exit 1
+          fi
+
+      # Hard pre-tag gate: the full local gate (fmt + clippy -D warnings + test).
+      # An unbuildable / un-lintable tag must never produce a release.
+      - name: full gate (scripts/gates.sh)
+        run: bash scripts/gates.sh
+
+      # -----------------------------------------------------------------------
+      # EXTENSION POINT — M3.1 supply-chain gate (cargo-deny + cargo-audit).
+      # Wire the HOOK only; do not implement the checks here (that is WP M3.1).
+      # When M3.1 lands, this becomes the env-guarded invocation of gates.sh
+      # (CLW_SUPPLY_CHAIN=1) or a standalone `cargo deny check` + `cargo audit`.
+      # TODO(M3.1): enable the supply-chain pre-tag gate here.
+      # -----------------------------------------------------------------------
+      # - name: supply-chain gate (cargo-deny + cargo-audit)
+      #   env:
+      #     CLW_SUPPLY_CHAIN: "1"
+      #   run: bash scripts/gates.sh
+
+      # -----------------------------------------------------------------------
+      # EXTENSION POINT — M3.4 live-conformance pre-tag gate.
+      # The conformance suite runs against prod CAS/AC as a final pre-tag guard.
+      # Wire the HOOK only; the suite itself is owned by WP M3.4.
+      # TODO(M3.4): run the live conformance suite here (opt-in / feature-gated)
+      #   before any binary is built and signed.
+      # -----------------------------------------------------------------------
+      # - name: live conformance gate (M3.4)
+      #   env:
+      #     CLW_CONFORMANCE_TOKEN: ${{ secrets.CLW_CONFORMANCE_TOKEN }}
+      #   run: cargo test -p clw-conformance --features live -- --include-ignored
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 + 3 — BUILD MATRIX (+ SIGN folded into each leg)
+  # Signing is folded into the matching-OS build leg so unsigned binaries are
+  # never shuttled between runners (that shuttle is itself a supply-chain risk).
+  # Each leg: build -> sign (OS-specific) -> upload a per-leg signed artifact.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build+sign (${{ matrix.target }})
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- macOS (Apple Silicon, native on the arm runner) ---------------
+          - target: aarch64-apple-darwin
+            os: macos-14
+            platform: macos
+            ext: ""
+            cross: false
+          # --- macOS (Intel, cross-compiled on the arm runner) ---------------
+          - target: x86_64-apple-darwin
+            os: macos-14
+            platform: macos
+            ext: ""
+            cross: false
+          # --- Windows (x86_64, native) --------------------------------------
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            ext: ".exe"
+            cross: false
+          # --- Linux (x86_64, native) ----------------------------------------
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux
+            ext: ""
+            cross: false
+          # --- Linux (aarch64, BUILD-ONLY: cross-compiled via cargo-zigbuild,
+          #     CANNOT be run/tested on the x86_64 hosted runner) -------------
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            platform: linux
+            ext: ""
+            cross: true
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      # Final per-target asset basename. Keep this in lockstep with the M2.5
+      # installer (scripts/install.sh) and docs/INSTALL.md asset-naming.
+      ASSET: clw-${{ needs.preflight.outputs.version }}-${{ matrix.target }}${{ matrix.ext }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned rust toolchain + target
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+          rustup target add "${{ matrix.target }}"
+
+      # cargo-zigbuild handles the aarch64-linux cross-compile cleanly (the M2.2
+      # decision; `cross` is the alternative). Installed only on the cross leg.
+      - name: install cargo-zigbuild (cross legs only)
+        if: matrix.cross
+        shell: bash
+        run: |
+          # TODO(M2.2): pin cargo-zigbuild + zig versions to match the M2.2 matrix
+          # decision so the cross toolchain is reproducible.
+          pip install ziglang
+          cargo install --locked cargo-zigbuild
+
+      - name: build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo zigbuild --release -p clw-cli --target "${{ matrix.target }}"
+          else
+            cargo build --release -p clw-cli --target "${{ matrix.target }}"
+          fi
+          # Stage the binary under its final per-target asset name.
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/clw${{ matrix.ext }}" "dist/${ASSET}"
+
+      # =======================================================================
+      # SIGN — macOS: Developer ID codesign + notarize.
+      # A bare Mach-O CLI CANNOT be `xcrun stapler staple`d (only bundles / .pkg
+      # / .dmg can). We notarize a ZIP (or a .pkg — see DISTRIBUTION.md decision
+      # (c)); the consumer-side check is then a Gatekeeper assessment of the
+      # notarized artifact, not a staple check.
+      # =======================================================================
+      - name: sign + notarize (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          # TODO(OWNER): provision these secrets (see docs/DISTRIBUTION.md).
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}          # "Developer ID Application: ..."
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}  # App Store Connect API .p8
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::macOS signing secrets absent — SKIPPING sign+notarize (dry-run)."
+            exit 0
+          fi
+          # --- TODO(OWNER): implement, once secrets exist -------------------
+          #  1. Create a temporary keychain; import the Developer ID .p12.
+          #  2. codesign --force --options runtime --timestamp \
+          #       --sign "$MACOS_SIGN_IDENTITY" "dist/${ASSET}"
+          #  3. zip the signed binary: ditto -c -k --keepParent "dist/${ASSET}" "dist/${ASSET}.zip"
+          #  4. xcrun notarytool submit "dist/${ASSET}.zip" --wait \
+          #       --key <p8> --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID"
+          #  5. Verify: codesign --verify --strict "dist/${ASSET}" ; spctl -a -t install (on the zip/pkg)
+          #  6. Tear down the temporary keychain — leave NO key material on the runner.
+          #  (If DISTRIBUTION.md decision (c) chooses .pkg: build+sign+notarize+staple the .pkg here.)
+          echo "::error::macOS sign+notarize not yet implemented — fill TODO(OWNER) steps."
+          exit 1
+
+      # =======================================================================
+      # SIGN — Windows: Authenticode via CLOUD / HSM signing.
+      # Post-2023 CA/Browser-Forum rules forbid exportable code-signing keys, so
+      # there is NO .pfx to drop in a secret. Use Azure Trusted Signing (default)
+      # or DigiCert KeyLocker — see DISTRIBUTION.md decision (b).
+      # =======================================================================
+      - name: sign (Windows, Authenticode via Azure Trusted Signing)
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          # TODO(OWNER): provision Azure Trusted Signing credentials (OIDC preferred).
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_CODE_SIGNING_ACCOUNT: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AZURE_TENANT_ID:-}" ]; then
+            echo "::warning::Windows signing credentials absent — SKIPPING Authenticode sign (dry-run)."
+            exit 0
+          fi
+          # --- TODO(OWNER): implement, once an Azure Trusted Signing account exists ---
+          #  Prefer the azure/trusted-signing-action@v0 marketplace action over a raw
+          #  signtool dlib invocation. Equivalent signtool call once the dlib is set up:
+          #    signtool sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com \
+          #      /td SHA256 /dlib <Azure.CodeSigning.Dlib.dll> /dmdf <metadata.json> "dist/${ASSET}"
+          #  Verify: signtool verify /pa /v "dist/${ASSET}"
+          echo "::error::Windows Authenticode signing not yet implemented — fill TODO(OWNER) steps."
+          exit 1
+
+      # =======================================================================
+      # SIGN — Linux: minisign detached signature (default). sigstore/cosign is a
+      # documented alternative (see DISTRIBUTION.md decision (d)). Produces
+      # `<asset>.minisig`. The public key is committed + published for consumers.
+      # =======================================================================
+      - name: sign (Linux, minisign detached)
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          # TODO(OWNER): provision the minisign secret key + passphrase.
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}  # base64 of the minisign.key
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::minisign secret absent — SKIPPING Linux signature (dry-run)."
+            exit 0
+          fi
+          # --- TODO(OWNER): implement, once the minisign keypair exists -------
+          #  sudo apt-get install -y minisign
+          #  printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
+          #  echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "dist/${ASSET}"
+          #    # -> produces dist/${ASSET}.minisig
+          #  rm -f minisign.key   # leave NO key material on the runner
+          echo "::error::Linux minisign signing not yet implemented — fill TODO(OWNER) steps."
+          exit 1
+
+      # Upload the (eventually) signed binary + its signature/zip for the publish job.
+      - name: upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clw-${{ matrix.target }}
+          # `*` so the per-OS signature/zip files ride along once signing is wired.
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4 — CHECKSUM + PUBLISH
+  # Collect every signed artifact, produce one signed SHA256SUMS, then publish to
+  # the AUTHENTICATED proprietary download surface (NOT a public GitHub Release).
+  # ---------------------------------------------------------------------------
+  publish:
+    name: checksum + publish
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download all signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: collect into a flat release dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Flatten per-target artifact dirs into one release/ dir.
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release/
+
+      # SHA-256 over every published binary + signature file, then SIGN the
+      # checksum file itself (minisign) — the cross-platform signed-checksum
+      # guarantee the roadmap demands.
+      - name: signed SHA-256 checksums
+        shell: bash
+        env:
+          # TODO(OWNER): same minisign secret as the Linux leg (see DISTRIBUTION.md (d)).
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -- * > SHA256SUMS
+          echo "---- SHA256SUMS ----"
+          cat SHA256SUMS
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::minisign secret absent — SHA256SUMS left UNSIGNED (dry-run)."
+            exit 0
+          fi
+          # --- TODO(OWNER): sign SHA256SUMS -> SHA256SUMS.minisig --------------
+          #  printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
+          #  echo "$MINISIGN_PASSWORD" | minisign -S -s ../minisign.key -m SHA256SUMS
+          #  rm -f ../minisign.key
+          echo "::warning::SHA256SUMS signing not yet implemented — fill TODO(OWNER) steps."
+
+      # Publish to the authenticated proprietary surface. Default per the brief:
+      # Cloudflare R2 behind a versioned prefix. The EXACT surface is an OWNER
+      # DECISION — see docs/DISTRIBUTION.md decision (a). The step is guarded so
+      # the whole pipeline is dry-runnable without credentials.
+      - name: publish to authenticated download surface
+        shell: bash
+        env:
+          # TODO(OWNER): pick the surface (DISTRIBUTION.md (a)) and provision creds.
+          # Default = Cloudflare R2 (S3-compatible) behind CoreLink auth.
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ACCESS_KEY_ID:-}" ]; then
+            echo "::warning::download-surface credentials absent — SKIPPING publish (dry-run)."
+            echo "would publish release/ -> ${R2_BUCKET:-<bucket>}/releases/clw/${VERSION}/"
+            ls -la release/
+            exit 0
+          fi
+          # --- TODO(OWNER): implement upload to the chosen surface ------------
+          #  Default (R2, S3-compatible):
+          #    aws s3 cp release/ "s3://${R2_BUCKET}/releases/clw/${VERSION}/" \
+          #      --recursive --endpoint-url "${R2_ENDPOINT}"
+          #  Also publish: the committed minisign public key, and (when M2.4 lands)
+          #  EULA.md / NOTICE / THIRD-PARTY-LICENSES.md alongside the binaries.
+          echo "::error::publish not yet implemented — fill TODO(OWNER) steps."
+          exit 1
