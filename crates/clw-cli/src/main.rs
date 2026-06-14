@@ -92,6 +92,8 @@ pub enum Commands {
     Run(subcmds::run::RunArgs),
     /// List ref info for a workspace name.
     Ls(subcmds::ls::LsArgs),
+    /// Print a support-ready, redacted diagnostics bundle.
+    Doctor(subcmds::doctor::DoctorArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +157,7 @@ async fn dispatch(
         Commands::Status(args) => subcmds::status::run(args, cfg, json).await,
         Commands::Run(args) => subcmds::run::run(args, cfg).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
+        Commands::Doctor(args) => subcmds::doctor::run(args, cfg).await,
     }
 }
 
@@ -279,6 +282,12 @@ mod tests {
             Commands::Ls(a) => assert_eq!(a.name, "some-ws"),
             other => panic!("expected Ls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_doctor() {
+        let cli = Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Commands::Doctor(_)));
     }
 
     #[test]
