@@ -3,9 +3,11 @@
 #
 # WP M4.2 (license posture + EULA). `cargo about generate` walks the dependency
 # graph, collects the license text of every shipped third-party crate, and
-# renders it into an attribution document (referenced from NOTICE):
+# renders it into an attribution document (referenced from NOTICE). The output
+# filename is THIRD-PARTY-LICENSES.md, matching what release.yml publishes
+# alongside the binaries. The committed `about.hbs` template emits Markdown:
 #
-#     cargo about generate about.hbs > THIRD-PARTY-NOTICES.html
+#     cargo about generate about.hbs > THIRD-PARTY-LICENSES.md
 #
 # ---------------------------------------------------------------------------
 # SINGLE SOURCE OF TRUTH:
@@ -19,19 +21,27 @@
 #   this note pointing at deny.toml.
 #
 #   The first-party clw-* crates are publish=false and proprietary
-#   ("UNLICENSED"); they are excluded from the third-party bundle via the
-#   workspace settings below — only third-party dependencies are attributed.
+#   (LicenseRef-Proprietary); they are excluded from the third-party bundle via
+#   the workspace settings below — only third-party dependencies are attributed.
 # ---------------------------------------------------------------------------
 
 # Attribute the dependencies of the whole workspace, not just one crate.
 workspace = true
 
-# Do not attribute the first-party clw-* crates themselves; they are the
-# proprietary product, not a third-party component to be license-listed.
+# `no-clearly-defined`: when true, refuse to fall back to the clearlydefined.io
+# service for crates whose license cannot be harvested locally. Left false so
+# license text can still be resolved that way; flip to true for fully offline,
+# hermetic generation.
 no-clearly-defined = false
+
+# Do not attribute the first-party clw-* crates themselves; they are the
+# proprietary product (publish=false), not a third-party component to be
+# license-listed.
 private = { ignore = true }
 
-# Accepted licenses (kept consistent with deny.toml [licenses].allow).
+# Accepted licenses (kept consistent with deny.toml [licenses].allow — the
+# third-party permissive set; the first-party LicenseRef-Proprietary atom lives
+# only in deny.toml and is excluded here via `private.ignore`).
 accepted = [
     "MIT",
     "MIT-0",

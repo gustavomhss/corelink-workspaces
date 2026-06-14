@@ -5,10 +5,10 @@ This software and its source code are PROPRIETARY and CONFIDENTIAL to HumanGR
 Labs / CoreLink. They are licensed, not sold. Use of the distributed binary is
 governed solely by the End User License Agreement in the accompanying EULA.md
 file. No license to copy, redistribute, reverse-engineer, or create derivative
-works is granted except as expressly stated in that EULA. The token
-"UNLICENSED" in the package metadata denotes "no public license granted"
-(i.e. proprietary) — it is NOT an offer of the SPDX "Unlicense" public-domain
-dedication.
+works is granted except as expressly stated in that EULA. The package metadata
+declares the SPDX expression "LicenseRef-Proprietary", which denotes "no public
+license granted" (i.e. proprietary) — it is NOT an offer of the SPDX "Unlicense"
+public-domain dedication.
 
 ---------------------------------------------------------------------------
 THIRD-PARTY COMPONENTS
@@ -23,7 +23,7 @@ third-party attribution bundle.
 That attribution bundle is GENERATED, not hand-maintained. It is produced with
 cargo-about from the workspace's about.toml configuration:
 
-    cargo about generate about.hbs > THIRD-PARTY-NOTICES.html
+    cargo about generate about.hbs > THIRD-PARTY-LICENSES.md
 
 The accepted-license allow-list in about.toml is kept consistent with the
 [licenses] allow-list in deny.toml (single source of truth: see the note in

@@ -17,14 +17,15 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# proprietary — binding terms in EULA.md (M4.2). The SPDX-correct way to mark a
-# closed-source crate is `license-file = "EULA.md"`, but cargo CANNOT inherit
-# `license-file` across the workspace via `.workspace = true` (only `license`
-# inherits). Switching only the root to license-file while crates inherit
-# `license` would half-break the graph, so the literal "UNLICENSED" token is
-# kept (cargo accepts it) as the inheritable marker; the real, binding posture
-# is EULA.md + `publish = false` on every crate. See deny.toml LICENSE POSTURE.
-license = "UNLICENSED"
+# proprietary — binding terms in EULA.md (M4.2). `LicenseRef-Proprietary` is a
+# VALID SPDX expression (the `LicenseRef-` form for non-listed licenses), so
+# cargo-deny can evaluate it — unlike the old "UNLICENSED" token, which cargo
+# accepts but is NOT a valid SPDX expression (exit-gate #5 failure). It inherits
+# cleanly across the workspace via `.workspace = true` (`license-file` does NOT
+# inherit, only `license`, which is why the inheritable `license` field is used).
+# The real, binding posture is EULA.md + `publish = false` on every crate; this
+# field is just the SPDX-valid proprietary marker. See deny.toml LICENSE POSTURE.
+license = "LicenseRef-Proprietary"
 repository = "https://github.com/humangr-labs/corelink-workspaces"
 
 [workspace.dependencies]
