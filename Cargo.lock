@@ -306,6 +306,7 @@ name = "clw-cache"
 version = "0.1.0"
 dependencies = [
  "clw-types",
+ "criterion",
  "filetime",
  "tempfile",
  "tracing",
@@ -403,6 +404,7 @@ name = "clw-manifest"
 version = "0.1.0"
 dependencies = [
  "clw-types",
+ "criterion",
  "ignore",
  "tempfile",
 ]
