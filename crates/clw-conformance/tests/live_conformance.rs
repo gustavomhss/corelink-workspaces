@@ -27,6 +27,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Read runtime env for credentials. Returns `None` (and prints skip notice)
 /// when `CLW_TOKEN` or `CLW_TENANT` is absent.
 fn try_client() -> Option<(HttpClient, String)> {
+    let cfg = try_config()?;
+    let tenant = cfg.tenant.clone();
+    let client = HttpClient::new(cfg).expect("failed to build HttpClient");
+    Some((client, tenant))
+}
+
+/// Read runtime env into a `Config`. Returns `None` (and prints skip notice)
+/// when `CLW_TOKEN` or `CLW_TENANT` is absent. Used by tests that need the raw
+/// endpoint / token in addition to (or instead of) a built `HttpClient`.
+fn try_config() -> Option<Config> {
     let token = std::env::var("CLW_TOKEN").ok();
     let tenant = std::env::var("CLW_TENANT").ok();
 
@@ -34,14 +44,12 @@ fn try_client() -> Option<(HttpClient, String)> {
         (Some(t), Some(tn)) => {
             let endpoint = std::env::var("CLW_ENDPOINT")
                 .unwrap_or_else(|_| "https://corelink-api.humangr.com".to_string());
-            let cfg = Config {
+            Some(Config {
                 endpoint,
-                tenant: tn.clone(),
+                tenant: tn,
                 token: t,
                 cache_dir: PathBuf::from("/tmp/clw-conformance-cache"),
-            };
-            let client = HttpClient::new(cfg).expect("failed to build HttpClient");
-            Some((client, tn))
+            })
         }
         _ => {
             eprintln!("SKIPPED: set CLW_TOKEN + CLW_TENANT to run live conformance");
@@ -200,4 +208,77 @@ async fn auth_rejected() {
         matches!(err, ClwError::Auth),
         "expected ClwError::Auth (401), got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ref_delete_roundtrip
+// ---------------------------------------------------------------------------
+
+/// PUT a ref → confirm present → DELETE it → confirm gone (`get` → `None`).
+///
+/// # Optimistic / pending-capability skip
+///
+/// The server `DELETE /v1/ac/{tenant}/{key}` endpoint is still pending, so the
+/// `AcTransport` contract does not yet carry a `delete` method. This test issues
+/// the DELETE directly against the same URL the client would use. When the
+/// server has not deployed the capability it answers `405 Method Not Allowed`
+/// or `501 Not Implemented`; in that case (or when no PAT is configured) the
+/// test logs a skip notice and returns early — it must **never** fail for a
+/// not-yet-deployed endpoint. Once the endpoint ships this test asserts the full
+/// round-trip and an `AcTransport::delete` impl can replace the raw request.
+#[tokio::test]
+async fn ref_delete_roundtrip() {
+    let Some(config) = try_config() else {
+        return;
+    };
+    let client = HttpClient::new(config.clone()).expect("failed to build HttpClient");
+
+    let suffix = run_suffix();
+    let key_input = format!("clw/ref/v1/conformance-delete-{suffix}");
+    let key = Digest::of_bytes(key_input.as_bytes());
+    let value = format!("ref-delete-value-{suffix}").into_bytes();
+
+    // PUT the ref.
+    AcTransport::put(&client, &key, value.clone())
+        .await
+        .expect("ac put should succeed");
+
+    // Confirm it exists.
+    let present = AcTransport::get(&client, &key)
+        .await
+        .expect("ac get should succeed");
+    assert_eq!(
+        present,
+        Some(value),
+        "ref must be present after put, before delete"
+    );
+
+    // DELETE via the same URL the client uses. `AcTransport::delete` is not yet
+    // in the contract because the server endpoint is pending, so we issue the
+    // raw request here and decide skip-vs-assert on the status code.
+    let url = config.ac_url(&key);
+    let resp = reqwest::Client::new()
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", config.token))
+        .send()
+        .await
+        .expect("delete request should reach the server");
+
+    let status = resp.status().as_u16();
+    if status == 405 || status == 501 {
+        eprintln!(
+            "SKIPPED: DELETE /v1/ac not yet deployed (HTTP {status}); ref-delete round-trip pending"
+        );
+        return;
+    }
+    assert!(
+        matches!(status, 200 | 202 | 204),
+        "expected a success status from DELETE, got HTTP {status}"
+    );
+
+    // Confirm the ref is gone.
+    let after = AcTransport::get(&client, &key)
+        .await
+        .expect("ac get after delete should succeed");
+    assert_eq!(after, None, "ref must be absent after delete (get → None)");
 }

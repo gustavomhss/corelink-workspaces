@@ -321,6 +321,7 @@ version = "0.1.0"
 dependencies = [
  "clw-client",
  "clw-types",
+ "reqwest",
  "tokio",
 ]
 
