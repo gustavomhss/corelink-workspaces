@@ -14,9 +14,9 @@
 //! Telemetry NEVER activates unless the user *explicitly opts in*. The decision is
 //! resolved by [`Decision::resolve`] in this strict precedence:
 //!
-//! 1. **Kill-switches win, always.** `DO_NOT_TRACK=1` (the cross-vendor standard,
-//!    <https://consoledonottrack.com>) or `CLW_TELEMETRY=0` force telemetry OFF and
-//!    cannot be overridden by anything else.
+//! 1. **Kill-switches win, always.** `DO_NOT_TRACK` set to any non-empty, non-`"0"`
+//!    value (the cross-vendor standard, <https://consoledonottrack.com>) or
+//!    `CLW_TELEMETRY=0` force telemetry OFF and cannot be overridden by anything else.
 //! 2. **Explicit env opt-in.** `CLW_TELEMETRY=1` turns it ON.
 //! 3. **Recorded consent.** `telemetry = "on"|"off"` in `~/.clw/config.toml`.
 //! 4. **Default.** OFF.
@@ -32,11 +32,13 @@
 //! *type-impossible* to pass a PAT, a filesystem path, or file contents through this
 //! API. See [`Event`] for the per-field justification.
 //!
-//! # Pluggable backend (TODO)
+//! # Pluggable backend (deferred — decision record)
 //!
-//! When a real sink lands it should implement a `Sink` trait and be selected behind a
-//! cargo feature; [`emit`] is the single seam where the no-op is replaced. Until then
-//! every recorded event is dropped after the enabled-gate, by design.
+//! Deferred: the sink is intentionally a no-op until a backend is chosen — tracked in
+//! docs/ROADMAP-go-live.md M5.3. When a real sink lands it should implement a `Sink`
+//! trait and be selected behind a cargo feature; [`emit`] is the single seam where the
+//! no-op is replaced. Until then every recorded event is dropped after the
+//! enabled-gate, by design.
 
 use std::sync::OnceLock;
 
@@ -69,7 +71,8 @@ impl Decision {
     /// - `config_value` returns the recorded `telemetry = ...` config value, if any.
     ///
     /// Precedence (first match wins):
-    /// 1. `DO_NOT_TRACK=1` or `CLW_TELEMETRY=0` → **Off** (kill-switch, unoverridable).
+    /// 1. `DO_NOT_TRACK` (any non-empty, non-`"0"` value) or `CLW_TELEMETRY=0`
+    ///    → **Off** (kill-switch, unoverridable).
     /// 2. `CLW_TELEMETRY=1` → **On** (explicit env opt-in).
     /// 3. recorded config `telemetry = "on"|"off"` → that choice.
     /// 4. otherwise → **Off** (off by default).
@@ -78,9 +81,13 @@ impl Decision {
         E: Fn(&str) -> Option<String>,
         C: FnOnce() -> Option<String>,
     {
-        // (1) Kill-switches always win. DO_NOT_TRACK=1 is the cross-vendor standard.
-        if env("DO_NOT_TRACK").as_deref() == Some("1") {
-            return Decision::Off;
+        // (1) Kill-switches always win. DO_NOT_TRACK is the cross-vendor standard;
+        // per the broader convention we treat ANY non-empty, non-"0" value as
+        // opt-out (e.g. "1", "true", "yes") — only unset or "0" is "not set".
+        if let Some(v) = env("DO_NOT_TRACK") {
+            if !v.is_empty() && v != "0" {
+                return Decision::Off;
+            }
         }
         match env("CLW_TELEMETRY").as_deref() {
             // (1) explicit kill-switch.
@@ -254,9 +261,10 @@ pub fn record(event: Event) {
 
 /// The single pluggable-backend seam.
 ///
-/// TODO(M5.x — telemetry backend): replace this no-op with a real `Sink`
-/// (e.g. selected behind a `telemetry-backend` cargo feature) that serializes the
-/// event and ships it over the network. Until that lands every event is dropped
+/// Deferred: the sink is intentionally a no-op until a backend is chosen — tracked
+/// in docs/ROADMAP-go-live.md M5.3. When it lands, this no-op is replaced by a real
+/// `Sink` (e.g. selected behind a `telemetry-backend` cargo feature) that serializes
+/// the event and ships it over the network. Until that lands every event is dropped
 /// here AFTER the enabled-gate, so behavior is identical to telemetry being off.
 fn emit(_event: Event) {
     // No-op sink. Intentionally empty: no network backend is built in this WP.
@@ -388,10 +396,30 @@ mod tests {
     }
 
     #[test]
-    fn do_not_track_only_triggers_on_value_one() {
-        // A stray DO_NOT_TRACK that is not "1" does not flip anything; default OFF.
-        let d = Decision::resolve(env_of(&[("DO_NOT_TRACK", "0")]), || None);
-        assert_eq!(d, Decision::Off);
+    fn do_not_track_zero_or_empty_is_not_opt_out() {
+        // Per the convention, only unset or "0" (or empty) means "not set" — those
+        // do NOT force opt-out by themselves (default is already OFF here anyway).
+        for v in ["0", ""] {
+            let d = Decision::resolve(env_of(&[("DO_NOT_TRACK", v)]), || Some("on".to_string()));
+            assert_eq!(
+                d,
+                Decision::On,
+                "DO_NOT_TRACK={v:?} must NOT act as a kill-switch"
+            );
+        }
+    }
+
+    #[test]
+    fn do_not_track_any_truthy_value_forces_off() {
+        // Broader convention: ANY non-empty, non-"0" value opts out, even over a
+        // recorded `on` and an explicit CLW_TELEMETRY=1.
+        for v in ["1", "true", "yes", "anything"] {
+            let d = Decision::resolve(
+                env_of(&[("DO_NOT_TRACK", v), ("CLW_TELEMETRY", "1")]),
+                || Some("on".to_string()),
+            );
+            assert_eq!(d, Decision::Off, "DO_NOT_TRACK={v:?} must force OFF");
+        }
     }
 
     // -----------------------------------------------------------------------

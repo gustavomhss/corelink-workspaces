@@ -5,7 +5,8 @@ use clw_types::ClwError;
 use serde_json::json;
 
 use crate::config::{
-    clw_config_path, ensure_config_parent_0700, toml_escape, write_config_file_0600, ResolvedConfig,
+    clw_config_path, ensure_config_parent_0700, merge_config_pairs, render_config,
+    write_config_file_0600, ResolvedConfig,
 };
 
 #[derive(Debug, Args)]
@@ -38,18 +39,18 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), 
     // plaintext PAT. Tighten perms even if ~/.clw pre-existed with a looser mode.
     ensure_config_parent_0700(&path)?;
 
-    let content = format!(
-        "# clw configuration\n\
-         endpoint = \"{endpoint}\"\n\
-         tenant = \"{tenant}\"\n\
-         token = \"{token}\"\n\
-         cache_dir = \"{cache_dir}\"\n",
-        endpoint = toml_escape(&cfg.clw_config.endpoint),
-        tenant = toml_escape(&cfg.clw_config.tenant),
-        // NEVER print the token to stdout/stderr — write it to the config file only.
-        token = toml_escape(&cfg.clw_config.token),
-        cache_dir = toml_escape(&cfg.clw_config.cache_dir.display().to_string()),
-    );
+    // Preserve any unrelated keys already in the file (e.g. recorded `telemetry`
+    // consent) — only the four identity keys are overwritten. The token is NEVER
+    // echoed; it is written to the 0600 file only.
+    let c = &cfg.clw_config;
+    let updates = vec![
+        ("endpoint".to_string(), c.endpoint.clone()),
+        ("tenant".to_string(), c.tenant.clone()),
+        ("token".to_string(), c.token.clone()),
+        ("cache_dir".to_string(), c.cache_dir.display().to_string()),
+    ];
+    let pairs = merge_config_pairs(&path, &updates);
+    let content = render_config(&pairs);
 
     // config.toml holds the plaintext token: force owner-only (0600) perms.
     write_config_file_0600(&path, &content)?;
@@ -74,7 +75,47 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{harden_dir_0700, write_config_file_0600};
+    use crate::config::{
+        harden_dir_0700, merge_config_pairs, read_config_pairs, render_config,
+        write_config_file_0600,
+    };
+
+    // -----------------------------------------------------------------------
+    // init must PRESERVE unrelated keys (e.g. telemetry consent) when rewriting.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn init_rewrite_preserves_unrelated_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Pre-existing file with a telemetry consent key plus a stale token.
+        write_config_file_0600(
+            &path,
+            "# clw configuration\ntelemetry = \"on\"\ntoken = \"old-tok\"\n",
+        )
+        .unwrap();
+
+        // Simulate the init rewrite: overwrite the four identity keys, merge.
+        let updates = vec![
+            ("endpoint".to_string(), "https://example.com".to_string()),
+            ("tenant".to_string(), "acme".to_string()),
+            ("token".to_string(), "new-tok".to_string()),
+            ("cache_dir".to_string(), "/tmp/clw-cache".to_string()),
+        ];
+        let pairs = merge_config_pairs(&path, &updates);
+        write_config_file_0600(&path, &render_config(&pairs)).unwrap();
+
+        let mut after = read_config_pairs(&path);
+        after.sort();
+        let map: std::collections::HashMap<_, _> = after.into_iter().collect();
+        assert_eq!(
+            map.get("telemetry").map(String::as_str),
+            Some("on"),
+            "telemetry consent key must survive an init rewrite"
+        );
+        assert_eq!(map.get("token").map(String::as_str), Some("new-tok"));
+        assert_eq!(map.get("tenant").map(String::as_str), Some("acme"));
+    }
 
     // -----------------------------------------------------------------------
     // config.toml must be written 0600 (it holds the plaintext PAT).

@@ -15,8 +15,8 @@ use clw_types::ClwError;
 use serde_json::json;
 
 use crate::config::{
-    clw_config_path, ensure_config_parent_0700, read_config_pairs, render_config,
-    write_config_file_0600, ResolvedConfig,
+    clw_config_path, ensure_config_parent_0700, merge_config_pairs, read_config_pairs,
+    render_config, write_config_file_0600, ResolvedConfig,
 };
 
 /// Presence sentinels — token values are never shown verbatim.
@@ -88,10 +88,28 @@ pub async fn run(args: AuthArgs, cfg: ResolvedConfig, json: bool) -> Result<(), 
     }
 }
 
+/// Build the `clw auth login` summary as a machine-readable JSON object.
+///
+/// PURE over its inputs (this is the real value `login` prints in `--json` mode,
+/// so redaction tests assert on THIS rather than a re-built literal). The token is
+/// reported as `<set>`/`<unset>` presence only — its value never appears.
+fn build_login_summary_json(cfg: &ResolvedConfig, wrote: &std::path::Path) -> serde_json::Value {
+    let c = &cfg.clw_config;
+    json!({
+        "logged_in": true,
+        "wrote": wrote.display().to_string(),
+        "endpoint": c.endpoint,
+        "tenant": c.tenant,
+        // NEVER the value — presence only.
+        "token": redact_present(&c.token),
+    })
+}
+
 /// `clw auth login` — persist the resolved identity to ~/.clw/config.toml.
 ///
 /// Reuses the shared 0600 writer/`toml_escape` helpers (no duplication). NEVER
-/// prints the token — only the path and `<set>`/`<unset>` presence.
+/// prints the token — only the path and `<set>`/`<unset>` presence. Unrelated keys
+/// already in the file (e.g. recorded `telemetry` consent) are PRESERVED.
 fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
         ClwError::Transport("cannot determine home directory for config file".to_string())
@@ -100,26 +118,21 @@ fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
     ensure_config_parent_0700(&path)?;
 
     let c = &cfg.clw_config;
-    // Render via the shared writer so the format round-trips through the parser.
-    let pairs = vec![
+    // Merge over existing keys so an unrelated key (e.g. `telemetry`) survives;
+    // only the four identity keys are overwritten. NEVER echoed — the token is
+    // written to the 0600 file only.
+    let updates = vec![
         ("endpoint".to_string(), c.endpoint.clone()),
         ("tenant".to_string(), c.tenant.clone()),
-        // NEVER echoed — written to the 0600 file only.
         ("token".to_string(), c.token.clone()),
         ("cache_dir".to_string(), c.cache_dir.display().to_string()),
     ];
+    let pairs = merge_config_pairs(&path, &updates);
     let content = render_config(&pairs);
     write_config_file_0600(&path, &content)?;
 
     if json {
-        let out = json!({
-            "logged_in": true,
-            "wrote": path.display().to_string(),
-            "endpoint": c.endpoint,
-            "tenant": c.tenant,
-            "token": redact_present(&c.token),
-        });
-        println!("{out}");
+        println!("{}", build_login_summary_json(cfg, &path));
     } else {
         eprintln!("logged in — wrote identity to {}", path.display());
         eprintln!("  endpoint: {}", c.endpoint);
@@ -146,9 +159,18 @@ fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
     }
 
     if args.all {
-        // Clear the entire file (destructive) — confirm unless --yes.
-        if !args.yes && !json && !confirm_clear(&path)? {
-            eprintln!("aborted — config file left unchanged");
+        // Clear the entire file (destructive) — consent is required regardless of
+        // output format. `--json` only affects the OUTPUT shape, never consent: a
+        // destructive clear needs `--yes` or an interactive y/N confirm.
+        if !args.yes && !confirm_clear(&path)? {
+            if json {
+                println!(
+                    "{}",
+                    json!({ "removed": [], "note": "aborted — confirmation declined" })
+                );
+            } else {
+                eprintln!("aborted — config file left unchanged");
+            }
             return Ok(());
         }
         let existing = read_config_pairs(&path);
@@ -204,17 +226,26 @@ fn confirm_clear(path: &std::path::Path) -> Result<bool, ClwError> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
+/// Build the `clw auth whoami` summary as a machine-readable JSON object.
+///
+/// PURE over its inputs (this is the real value `whoami` prints in `--json` mode,
+/// so redaction tests assert on THIS rather than a re-built literal). The token is
+/// reported as `<set>`/`<unset>` presence only — its value never appears.
+fn build_whoami_json(cfg: &ResolvedConfig) -> serde_json::Value {
+    let c = &cfg.clw_config;
+    json!({
+        "endpoint": c.endpoint,
+        "tenant": c.tenant,
+        // NEVER the value — presence only.
+        "token": redact_present(&c.token),
+    })
+}
+
 /// `clw auth whoami` — print the resolved identity (redacted, offline).
 fn whoami(cfg: &ResolvedConfig, json: bool) {
     let c = &cfg.clw_config;
     if json {
-        let out = json!({
-            "endpoint": c.endpoint,
-            "tenant": c.tenant,
-            // NEVER the value — presence only.
-            "token": redact_present(&c.token),
-        });
-        println!("{out}");
+        println!("{}", build_whoami_json(cfg));
     } else {
         println!("endpoint: {}", c.endpoint);
         println!("tenant:   {}", c.tenant);
@@ -267,47 +298,81 @@ mod tests {
         assert_eq!(redact_present("x"), "<set>");
     }
 
-    // whoami output must never leak the token value (text form).
+    // whoami output must never leak the token value — asserted on the REAL pure
+    // function `build_whoami_json` that the command actually prints.
     #[test]
-    fn whoami_text_never_leaks_token() {
+    fn whoami_json_never_leaks_token() {
         let secret = "super-secret-pat-abc123XYZ";
         let cfg = cfg_with(secret);
-        // Build the same JSON whoami emits and assert no leak.
-        let c = &cfg.clw_config;
-        let out = json!({
-            "endpoint": c.endpoint,
-            "tenant": c.tenant,
-            "token": redact_present(&c.token),
-        });
+        let out = build_whoami_json(&cfg);
         let s = out.to_string();
         assert!(
             !s.contains(secret),
             "whoami JSON must NEVER contain the token value, got: {s}"
         );
-        assert!(
-            s.contains("<set>"),
-            "token presence must be <set>, got: {s}"
-        );
+        // The token field must be exactly the presence sentinel, nothing else.
+        assert_eq!(out["token"], "<set>", "set token must redact to <set>");
+
+        // And an unset token must redact to <unset>.
+        let empty = cfg_with("");
+        assert_eq!(build_whoami_json(&empty)["token"], "<unset>");
     }
 
-    // login render must put the token in the file body (for persistence) but the
-    // value must NOT appear in any of the redacted summary fields.
+    // login summary must never leak the token — asserted on the REAL pure function
+    // `build_login_summary_json` that the command actually prints.
     #[test]
     fn login_json_summary_redacts_token() {
         let secret = "pat-do-not-leak-987";
         let cfg = cfg_with(secret);
-        let c = &cfg.clw_config;
-        let summary = json!({
-            "logged_in": true,
-            "endpoint": c.endpoint,
-            "tenant": c.tenant,
-            "token": redact_present(&c.token),
-        });
-        let s = summary.to_string();
+        let out = build_login_summary_json(&cfg, std::path::Path::new("/tmp/config.toml"));
+        let s = out.to_string();
         assert!(
             !s.contains(secret),
             "login JSON summary must NEVER contain the token, got: {s}"
         );
+        assert_eq!(out["token"], "<set>", "set token must redact to <set>");
+        assert_eq!(out["logged_in"], true);
+
+        let empty = cfg_with("");
+        assert_eq!(
+            build_login_summary_json(&empty, std::path::Path::new("/tmp/config.toml"))["token"],
+            "<unset>"
+        );
+    }
+
+    // login must PRESERVE an unrelated key (e.g. telemetry consent) on rewrite.
+    #[test]
+    fn login_rewrite_preserves_unrelated_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Pre-existing file holding telemetry consent + a stale token.
+        write_config_file_0600(
+            &path,
+            "# clw configuration\ntelemetry = \"on\"\ntoken = \"old-tok\"\n",
+        )
+        .unwrap();
+
+        // Simulate the login rewrite (overwrite identity keys, merge the rest).
+        let cfg = cfg_with("new-tok");
+        let c = &cfg.clw_config;
+        let updates = vec![
+            ("endpoint".to_string(), c.endpoint.clone()),
+            ("tenant".to_string(), c.tenant.clone()),
+            ("token".to_string(), c.token.clone()),
+            ("cache_dir".to_string(), c.cache_dir.display().to_string()),
+        ];
+        let pairs = merge_config_pairs(&path, &updates);
+        write_config_file_0600(&path, &render_config(&pairs)).unwrap();
+
+        let map: std::collections::HashMap<_, _> = read_config_pairs(&path).into_iter().collect();
+        assert_eq!(
+            map.get("telemetry").map(String::as_str),
+            Some("on"),
+            "telemetry consent key must survive an auth login rewrite"
+        );
+        assert_eq!(map.get("token").map(String::as_str), Some("new-tok"));
+        assert_eq!(map.get("tenant").map(String::as_str), Some("acme-tenant"));
     }
 
     #[cfg(unix)]

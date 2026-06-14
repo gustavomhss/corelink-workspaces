@@ -269,6 +269,27 @@ pub(crate) fn read_config_pairs(path: &std::path::Path) -> Vec<(String, String)>
     pairs
 }
 
+/// Merge `updates` into the existing pairs read from `path`, overwriting only the
+/// keys being set and PRESERVING every other key already in the file.
+///
+/// This is the shared preserve-then-overwrite primitive used by `clw init` and
+/// `clw auth login` (and mirrors [`telemetry::persist_decision`]) so that writing
+/// the four identity keys never wipes an unrelated key such as the recorded
+/// `telemetry` consent. Returns the merged pairs in a stable (sorted) order ready
+/// for [`render_config`].
+pub(crate) fn merge_config_pairs(
+    path: &std::path::Path,
+    updates: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut pairs = read_config_pairs(path);
+    for (k, v) in updates {
+        pairs.retain(|(existing, _)| existing != k);
+        pairs.push((k.clone(), v.clone()));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
 /// Serialize `(key, value)` pairs back into the minimal `key = "value"` config
 /// format that [`parse_config_lines`] reads.
 pub(crate) fn render_config(pairs: &[(String, String)]) -> String {

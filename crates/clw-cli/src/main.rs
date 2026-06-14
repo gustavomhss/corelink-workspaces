@@ -6,10 +6,12 @@
 
 mod config;
 mod subcmds;
-// M5.3: the telemetry module ships the policy + consent gate; only
-// `init_from_env_and_config` is wired today. The `record`/`Event` API and the
-// consent helpers are deliberately not yet called from subcommands (the call
-// sites land with the pluggable backend), so allow the as-yet-unused scaffolding.
+// Justification: the telemetry module ships the off-by-default policy + consent +
+// redaction gate (M5.3). Only `init_from_env_and_config` is wired today; the
+// `record`/`Event` consent/redaction API is scaffolding that the per-subcommand
+// call sites adopt when the pluggable backend lands (tracked in
+// docs/ROADMAP-go-live.md M5.3). It is intentionally unused now so the interface
+// is reviewed and frozen ahead of the backend — hence the scoped dead_code allow.
 #[allow(dead_code)]
 mod telemetry;
 
