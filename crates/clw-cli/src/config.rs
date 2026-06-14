@@ -178,10 +178,12 @@ pub fn expand_tilde(s: &str) -> PathBuf {
 
 /// Return the home directory.
 ///
-/// Reads `$HOME` directly (unix-correct) rather than the deprecated
-/// `std::env::home_dir`. An empty `$HOME` is treated as unset.
+/// Reads `$HOME` first (unix-correct), falling back to `%USERPROFILE%` so the
+/// resolver works on Windows, rather than the deprecated `std::env::home_dir`.
+/// An empty value is treated as unset.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
 }
@@ -343,5 +345,53 @@ cache_dir = "~/.clw/cache"
     fn expand_tilde_relative_path_unchanged() {
         let result = expand_tilde("relative/path");
         assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    // -----------------------------------------------------------------------
+    // home_dir: Windows fallback to %USERPROFILE% when $HOME is absent
+    // -----------------------------------------------------------------------
+
+    /// RAII guard that snapshots `HOME`/`USERPROFILE`, lets the test mutate
+    /// them, and restores the originals on drop. This crate does not serialize
+    /// env tests, so restore-on-drop keeps the mutation scoped to this test.
+    struct HomeEnvGuard {
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn new() -> Self {
+            Self {
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+            }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[test]
+    fn home_dir_falls_back_to_userprofile_when_home_absent() {
+        let _guard = HomeEnvGuard::new();
+
+        // $HOME unset, %USERPROFILE% set → USERPROFILE is used (Windows path).
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "/fallback/userprofile");
+        assert_eq!(home_dir(), Some(PathBuf::from("/fallback/userprofile")));
+
+        // $HOME present → it wins over %USERPROFILE% (unix-correct precedence).
+        std::env::set_var("HOME", "/primary/home");
+        assert_eq!(home_dir(), Some(PathBuf::from("/primary/home")));
     }
 }

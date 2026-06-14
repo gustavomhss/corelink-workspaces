@@ -331,6 +331,7 @@ mod tests {
     // Test: miss executes, stores; identical second call is a hit (no re-exec)
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses /bin/sh + unix shell command (Windows port: M2)
     #[tokio::test]
     async fn miss_executes_and_stores_then_hit_replays() {
         let tmp = TempDir::new().unwrap();
@@ -385,6 +386,7 @@ mod tests {
     // Test: changing input content → different key → miss
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses /bin/sh (Windows port: M2)
     #[tokio::test]
     async fn changed_input_yields_different_key() {
         let tmp = TempDir::new().unwrap();
@@ -535,6 +537,7 @@ mod tests {
     // Test: non-zero exit → outcome returned, nothing stored, second call still miss
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses /bin/sh (Windows port: M2)
     #[tokio::test]
     async fn nonzero_exit_not_cached() {
         let tmp = TempDir::new().unwrap();
