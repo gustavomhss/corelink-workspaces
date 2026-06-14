@@ -6,8 +6,8 @@
 pub use clw_types as types;
 
 use clw_types::{AcTransport, CasTransport, ClwError, Config, Digest, Result, CAS_BLOB_CAP_BYTES};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -29,6 +29,18 @@ const AIMD_INCREASE_AFTER_SUCCESSES: u32 = 8;
 // AIMD adaptive-concurrency governor
 // ---------------------------------------------------------------------------
 
+/// Mutable governor state, mutated only under [`Governor::state`]'s lock so that
+/// `target`/`debt`/`successes` move together and concurrent 429s/successes can't
+/// lose updates via read-modify-write races.
+struct GovernorState {
+    /// Current target permit count (the live window size).
+    target: usize,
+    /// Permits still owed back (to be reclaimed via `forget` on release).
+    debt: usize,
+    /// Consecutive successes since the last increase/decrease.
+    successes: usize,
+}
+
 /// Additive-Increase / Multiplicative-Decrease concurrency governor.
 ///
 /// Wraps a [`Semaphore`] whose live permit budget tracks `target` permits.
@@ -41,17 +53,18 @@ const AIMD_INCREASE_AFTER_SUCCESSES: u32 = 8;
 /// their permit (drop it *without* returning it) instead of releasing it. This
 /// is race-free under concurrent in-flight requests, where eagerly forgetting
 /// the available pool would be undone as held permits drop and re-return.
+///
+/// All of `target`/`debt`/`successes` live behind a single [`std::sync::Mutex`]
+/// so each adjustment is a consistent read-modify-write. The semaphore ops are
+/// non-async and tiny, so holding the lock across them (never across an
+/// `.await`) is fine.
 struct Governor {
     /// Live permit pool. Capacity floats between 1 and `ceiling`.
     sem: Arc<Semaphore>,
-    /// Current target permit count (the live window size).
-    target: AtomicUsize,
     /// Hard upper bound on `target` (additive increase never exceeds this).
     ceiling: usize,
-    /// Permits still owed back (to be reclaimed via `forget` on release).
-    debt: AtomicUsize,
-    /// Consecutive successes since the last increase/decrease.
-    successes: AtomicUsize,
+    /// All mutable counters, moved together under the lock.
+    state: Mutex<GovernorState>,
 }
 
 impl Governor {
@@ -59,10 +72,12 @@ impl Governor {
         let ceiling = ceiling.max(1);
         Self {
             sem: Arc::new(Semaphore::new(ceiling)),
-            target: AtomicUsize::new(ceiling),
             ceiling,
-            debt: AtomicUsize::new(0),
-            successes: AtomicUsize::new(0),
+            state: Mutex::new(GovernorState {
+                target: ceiling,
+                debt: 0,
+                successes: 0,
+            }),
         }
     }
 
@@ -83,14 +98,14 @@ impl Governor {
     /// Multiplicative decrease: halve the target (floor 1) on a 429.
     ///
     /// Forgets whatever is immediately available, and books the remainder as
-    /// debt so in-flight permits are reclaimed as they finish.
+    /// debt so in-flight permits are reclaimed as they finish. Done entirely
+    /// under the lock so the available-permit read and the `target`/`debt`
+    /// writes form a single consistent transaction.
     fn on_throttle(&self) {
-        self.successes.store(0, Ordering::Relaxed);
-        let old = self.target.load(Ordering::Relaxed);
-        let new = (old / 2).max(1);
-        if new < old {
-            self.target.store(new, Ordering::Relaxed);
-            let mut to_reclaim = old - new;
+        let mut state = self.state.lock().expect("governor lock poisoned");
+        let new = (state.target / 2).max(1);
+        if new < state.target {
+            let mut to_reclaim = state.target - new;
             // Forget what's sitting idle right now; queue the rest as debt.
             let avail = self.sem.available_permits().min(to_reclaim);
             if avail > 0 {
@@ -98,29 +113,30 @@ impl Governor {
                 to_reclaim -= avail;
             }
             if to_reclaim > 0 {
-                self.debt.fetch_add(to_reclaim, Ordering::Relaxed);
+                state.debt += to_reclaim;
             }
+            state.target = new;
+            state.successes = 0;
         }
     }
 
     /// Record a success; after a run of [`AIMD_INCREASE_AFTER_SUCCESSES`],
-    /// additively increase the target by one toward the ceiling.
+    /// additively increase the target by one toward the ceiling — never beyond.
     fn on_success(&self) {
-        let n = self.successes.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= AIMD_INCREASE_AFTER_SUCCESSES as usize {
-            self.successes.store(0, Ordering::Relaxed);
-            let old = self.target.load(Ordering::Relaxed);
-            if old < self.ceiling {
-                self.target.store(old + 1, Ordering::Relaxed);
-                self.sem.add_permits(1);
-            }
+        let mut state = self.state.lock().expect("governor lock poisoned");
+        state.successes += 1;
+        if state.successes >= AIMD_INCREASE_AFTER_SUCCESSES as usize && state.target < self.ceiling
+        {
+            state.target += 1;
+            self.sem.add_permits(1);
+            state.successes = 0;
         }
     }
 
     /// Current target window size — for tests/observability.
     #[cfg(test)]
     fn target(&self) -> usize {
-        self.target.load(Ordering::Relaxed)
+        self.state.lock().expect("governor lock poisoned").target
     }
 }
 
@@ -137,14 +153,11 @@ impl Drop for GovernorPermit {
             return;
         };
         // Pay down shrink-debt first: forget this permit instead of returning it.
-        let owed = self.gov.debt.load(Ordering::Relaxed);
-        if owed > 0
-            && self
-                .gov
-                .debt
-                .compare_exchange(owed, owed - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
+        // The decision and the decrement happen together under the lock.
+        let mut state = self.gov.state.lock().expect("governor lock poisoned");
+        if state.debt > 0 {
+            state.debt -= 1;
+            drop(state);
             permit.forget();
         }
         // Otherwise the permit drops normally, returning to the pool.
@@ -165,16 +178,6 @@ pub struct HttpClient {
     config: Config,
     /// AIMD adaptive-concurrency governor shared across all in-flight requests.
     governor: Arc<Governor>,
-    /// Last `Retry-After` (in ms) observed on a 429, stashed out-of-band because
-    /// [`ClwError`] is frozen and carries no retry hint. `with_retry` consults
-    /// and clears it to pick the next sleep. `0` means "none pending".
-    last_retry_after_ms: Arc<AtomicU64>,
-    /// Last *raw* `Retry-After` value (in seconds, un-clamped) observed on a 429.
-    /// Unlike `last_retry_after_ms` this is not consumed by the backoff loop; it
-    /// is read once on retry exhaustion to distinguish a transient backpressure
-    /// 429 (small value) from an app/plan quota ceiling (huge value) when
-    /// composing the [`ClwError::Http`] context. `0` means "none observed".
-    last_retry_after_secs: Arc<AtomicU64>,
 }
 
 // Manual Debug impl: redact the token.
@@ -222,8 +225,6 @@ impl HttpClient {
             inner,
             config,
             governor: Arc::new(Governor::new(max)),
-            last_retry_after_ms: Arc::new(AtomicU64::new(0)),
-            last_retry_after_secs: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -242,23 +243,38 @@ impl HttpClient {
     /// for the *next* sleep.
     ///
     /// Returns `Ok(T)` on first success; propagates the last error on exhaustion.
+    ///
+    /// The `op` closure receives a fresh per-call `Retry-After` slot (in raw
+    /// delta-seconds, sentinel [`u64::MAX`] = none). On a 429 the op writes the
+    /// parsed value into *its own* call's slot before returning the error; this
+    /// loop reads and resets the slot to pick the next sleep and to classify the
+    /// exhaustion message. The slot is local to this call, so concurrent requests
+    /// can never steal each other's hint.
     async fn with_retry<F, Fut, T>(&self, op: F) -> Result<T>
     where
-        F: Fn() -> Fut,
+        F: Fn(Arc<AtomicU64>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        const NONE: u64 = u64::MAX;
         let mut last_err: Option<ClwError> = None;
-        // Reset the raw retry-after observation for this call so a stale value
-        // from a previous request can't taint the exhaustion message.
-        self.last_retry_after_secs.store(0, Ordering::Relaxed);
+        // Per-request Retry-After hint (raw delta-seconds; NONE sentinel = absent).
+        // Created fresh for this call so no two requests share a slot.
+        let slot = Arc::new(AtomicU64::new(NONE));
+        // Raw seconds observed on the most recent 429 of this call, retained for
+        // the quota-vs-backpressure exhaustion message (M5.6).
+        let mut last_retry_after_secs: u64 = 0;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 let base = RETRY_SLEEP_MS[(attempt - 1) as usize];
-                // Honor a server-supplied Retry-After (ms) if one was stashed by
-                // the previous 429; otherwise fall back to the jittered ladder.
-                let retry_after = self.last_retry_after_ms.swap(0, Ordering::Relaxed);
-                let sleep_ms = if retry_after > 0 {
-                    retry_after
+                // Honor a server-supplied Retry-After if the previous 429 wrote one
+                // into our slot; otherwise fall back to the jittered ladder. Reading
+                // resets the slot to the NONE sentinel.
+                let raw = slot.swap(NONE, Ordering::Relaxed);
+                let sleep_ms = if raw != NONE {
+                    // Cap at the longest ladder rung so a hostile header can't park
+                    // us for an unbounded time; floor at 1ms so a literal 0 still
+                    // delays. (Matches the previous clamp semantics.)
+                    raw.saturating_mul(1_000).clamp(1, RETRY_SLEEP_MS[4])
                 } else {
                     // Cheap jitter in [0, base/2] derived from the clock — avoids a
                     // synchronized thundering herd without pulling in a rand dep.
@@ -273,7 +289,7 @@ impl HttpClient {
             }
             // Hold one governor permit for the lifetime of this attempt.
             let _permit = self.governor.acquire().await;
-            match op().await {
+            match op(Arc::clone(&slot)).await {
                 Ok(v) => {
                     self.governor.on_success();
                     return Ok(v);
@@ -284,6 +300,13 @@ impl HttpClient {
                         // transport) leave it alone.
                         if matches!(&e, ClwError::Http { status: 429, .. }) {
                             self.governor.on_throttle();
+                            // Snapshot the raw seconds the op just wrote (if any)
+                            // for the exhaustion message; the swap above will reset
+                            // the slot before the next sleep.
+                            let raw = slot.load(Ordering::Relaxed);
+                            if raw != NONE {
+                                last_retry_after_secs = raw.max(1);
+                            }
                         }
                         last_err = Some(e);
                     } else {
@@ -297,8 +320,7 @@ impl HttpClient {
         // ceiling, using the last raw Retry-After observed (M5.6).
         let last_err = last_err.unwrap();
         if let ClwError::Http { status: 429, .. } = &last_err {
-            let raw = self.last_retry_after_secs.load(Ordering::Relaxed);
-            let retry_after = (raw > 0).then_some(raw);
+            let retry_after = (last_retry_after_secs > 0).then_some(last_retry_after_secs);
             return Err(ClwError::Http {
                 status: 429,
                 context: exhausted_429_context(retry_after, MAX_ATTEMPTS),
@@ -343,25 +365,22 @@ fn exhausted_429_context(retry_after_secs: Option<u64>, attempts: u32) -> String
 }
 
 /// Read a `Retry-After` header (delta-seconds form) off a 429 response and stash
-/// it as milliseconds into `slot` for [`HttpClient::with_retry`] to consume. Must
-/// be called *before* the response is mapped to a [`ClwError`] (which drops
-/// headers). Threaded out-of-band because [`ClwError`] is frozen.
-fn record_retry_after(slot: &AtomicU64, raw_secs_slot: &AtomicU64, resp: &reqwest::Response) {
+/// the raw delta-seconds into this request's per-call `slot` for
+/// [`HttpClient::with_retry`] to consume. Must be called *before* the response is
+/// mapped to a [`ClwError`] (which drops headers). Threaded out-of-band because
+/// [`ClwError`] is frozen. The slot is per-request, so concurrent requests never
+/// cross-talk; the loop converts the raw seconds to a clamped sleep and uses the
+/// raw value to classify the exhaustion message.
+fn record_retry_after(slot: &AtomicU64, resp: &reqwest::Response) {
     if let Some(secs) = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
     {
-        // Preserve the raw (un-clamped) seconds for the quota-vs-backpressure
-        // distinction surfaced on retry exhaustion. Floor at 1 so a literal
-        // `retry-after: 0` still registers as "present".
-        raw_secs_slot.store(secs.max(1), Ordering::Relaxed);
-        // Cap at the longest ladder rung so a hostile header can't park us for an
-        // unbounded time, and floor visible values at 1ms so the "present" signal
-        // survives the swap-on-0 sentinel.
-        let ms = secs.saturating_mul(1_000).clamp(1, RETRY_SLEEP_MS[4]);
-        slot.store(ms, Ordering::Relaxed);
+        // Floor at 1 so a literal `retry-after: 0` still registers as "present"
+        // (the absent sentinel is u64::MAX, set by `with_retry`).
+        slot.store(secs.max(1), Ordering::Relaxed);
     }
 }
 
@@ -407,14 +426,10 @@ impl CasTransport for HttpClient {
         let url = self.config.cas_url(digest);
         let auth = self.auth_header();
         let client = &self.inner;
-        let retry_slot = Arc::clone(&self.last_retry_after_ms);
-        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
-        self.with_retry(|| {
+        self.with_retry(|retry_slot| {
             let url = url.clone();
             let auth = auth.clone();
-            let retry_slot = Arc::clone(&retry_slot);
-            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 // Try HEAD first.
                 let resp = client
@@ -432,7 +447,7 @@ impl CasTransport for HttpClient {
                     // 405 Method Not Allowed or 501 Not Implemented → fall back to GET.
                     405 | 501 => {}
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         return Err(ClwError::Http {
                             status: 429,
                             context: format!("HEAD {url}"),
@@ -460,7 +475,7 @@ impl CasTransport for HttpClient {
                     404 => Ok(false),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url} (exists-fallback)"),
@@ -481,14 +496,10 @@ impl CasTransport for HttpClient {
         let auth = self.auth_header();
         let client = &self.inner;
         let digest = *digest;
-        let retry_slot = Arc::clone(&self.last_retry_after_ms);
-        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
-        self.with_retry(|| {
+        self.with_retry(|retry_slot| {
             let url = url.clone();
             let auth = auth.clone();
-            let retry_slot = Arc::clone(&retry_slot);
-            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .get(&url)
@@ -516,7 +527,7 @@ impl CasTransport for HttpClient {
                     404 => Err(ClwError::NotFound(digest)),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url}"),
@@ -544,15 +555,11 @@ impl CasTransport for HttpClient {
         let url = self.config.cas_url(digest);
         let auth = self.auth_header();
         let client = &self.inner;
-        let retry_slot = Arc::clone(&self.last_retry_after_ms);
-        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
-        self.with_retry(|| {
+        self.with_retry(|retry_slot| {
             let url = url.clone();
             let auth = auth.clone();
             let bytes = bytes.clone();
-            let retry_slot = Arc::clone(&retry_slot);
-            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .put(&url)
@@ -571,7 +578,7 @@ impl CasTransport for HttpClient {
                         cap: CAS_BLOB_CAP_BYTES as u64,
                     }),
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("PUT {url}"),
@@ -598,14 +605,10 @@ impl AcTransport for HttpClient {
         let url = self.config.ac_url(key);
         let auth = self.auth_header();
         let client = &self.inner;
-        let retry_slot = Arc::clone(&self.last_retry_after_ms);
-        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
-        self.with_retry(|| {
+        self.with_retry(|retry_slot| {
             let url = url.clone();
             let auth = auth.clone();
-            let retry_slot = Arc::clone(&retry_slot);
-            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .get(&url)
@@ -626,7 +629,7 @@ impl AcTransport for HttpClient {
                     404 => Ok(None),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url}"),
@@ -646,15 +649,11 @@ impl AcTransport for HttpClient {
         let url = self.config.ac_url(key);
         let auth = self.auth_header();
         let client = &self.inner;
-        let retry_slot = Arc::clone(&self.last_retry_after_ms);
-        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
-        self.with_retry(|| {
+        self.with_retry(|retry_slot| {
             let url = url.clone();
             let auth = auth.clone();
             let value = value.clone();
-            let retry_slot = Arc::clone(&retry_slot);
-            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .put(&url)
@@ -669,7 +668,7 @@ impl AcTransport for HttpClient {
                     200 | 201 | 204 => Ok(()),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
+                        record_retry_after(&retry_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("PUT {url}"),
@@ -1615,5 +1614,85 @@ mod rate_limit_tests {
             }
             other => panic!("expected Http 429, got {other:?}"),
         }
+    }
+
+    /// Adversarial-review regression: hammer the governor from many tasks at
+    /// once — concurrent `on_throttle` / `on_success` / `acquire` — and assert
+    /// the invariants hold under contention. The pre-fix lock-free counters lost
+    /// decrements (over-forgetting could drive live permits to 0 → CAS/AC
+    /// deadlock) and `on_success` could exceed the ceiling. With the single
+    /// `Mutex<GovernorState>` each adjustment is atomic, so:
+    ///   * no deadlock (every spawned acquire completes),
+    ///   * `target` stays within `[1, ceiling]`,
+    ///   * live permits never exceed the ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn governor_concurrent_throttle_success_acquire_is_consistent() {
+        use tokio::task::JoinSet;
+
+        const CEILING: usize = 8;
+        let gov = std::sync::Arc::new(super::Governor::new(CEILING));
+
+        let mut set: JoinSet<()> = JoinSet::new();
+        // Throttlers: repeatedly shrink the window.
+        for _ in 0..16 {
+            let g = std::sync::Arc::clone(&gov);
+            set.spawn(async move {
+                for _ in 0..200 {
+                    g.on_throttle();
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Successes: repeatedly grow the window back toward the ceiling.
+        for _ in 0..16 {
+            let g = std::sync::Arc::clone(&gov);
+            set.spawn(async move {
+                for _ in 0..200 {
+                    g.on_success();
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Acquirers: hold a permit briefly, then release (exercising debt repay).
+        for _ in 0..32 {
+            let g = std::sync::Arc::clone(&gov);
+            set.spawn(async move {
+                for _ in 0..50 {
+                    // A bounded acquire: if the window is momentarily at 0 live
+                    // permits this would hang forever, surfacing a deadlock as a
+                    // test timeout. Invariant under test: that never happens.
+                    let permit = g.acquire().await;
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                    // After every release the live pool must still be bounded.
+                    assert!(
+                        g.sem.available_permits() <= CEILING,
+                        "live permits exceeded ceiling: {} > {CEILING}",
+                        g.sem.available_permits()
+                    );
+                }
+            });
+        }
+
+        // Join with a generous timeout: a deadlock (permits driven to 0) would
+        // hang the JoinSet and trip this.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(res) = set.join_next().await {
+                res.expect("governor task panicked");
+            }
+        })
+        .await;
+        assert!(joined.is_ok(), "governor tasks deadlocked / timed out");
+
+        // Final invariants: target within bounds, live pool within bounds.
+        let target = gov.target();
+        assert!(
+            (1..=CEILING).contains(&target),
+            "target out of [1, {CEILING}] range: {target}"
+        );
+        assert!(
+            gov.sem.available_permits() <= CEILING,
+            "final live permits exceeded ceiling"
+        );
     }
 }
