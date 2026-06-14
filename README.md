@@ -34,16 +34,15 @@ Backed by the live CoreLink API at `https://corelink-api.humangr.com` (`/v1/cas`
 git clone https://github.com/humangr-labs/corelink-workspaces
 cd corelink-workspaces
 
-# The rustup proxy is broken on the founder Mac — put the toolchain on PATH directly:
-PATH="$HOME/.rustup/toolchains/1.91.1-x86_64-apple-darwin/bin:$PATH" \
-  cargo build --release
+cargo build --release
 
 # The binary lands at:
 ./target/release/clw --version
 ```
 
-Toolchain pinned to `1.91.1` in `rust-toolchain.toml`. The PATH workaround above
-mirrors the comment in that file and the CI `gates.sh`.
+Toolchain pinned to `1.91.1` in `rust-toolchain.toml`, which also declares the
+`rustfmt` and `clippy` components — rustup installs the pinned toolchain and its
+components automatically on first build.
 
 ---
 

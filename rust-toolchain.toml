@@ -1,4 +1,3 @@
-# NOTE: the rustup proxy is broken on the founder Mac — invoke the toolchain
-# directly: PATH="$HOME/.rustup/toolchains/1.91.1-x86_64-apple-darwin/bin:$PATH"
 [toolchain]
 channel = "1.91.1"
+components = ["rustfmt", "clippy"]

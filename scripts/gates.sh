@@ -11,7 +11,6 @@
 # compiles everything that crate depends on; main is ALWAYS full-lane, so nothing
 # can merge-then-rot unnoticed.
 set -euo pipefail
-export PATH="$HOME/.rustup/toolchains/1.91.1-x86_64-apple-darwin/bin:$PATH"  # rustup proxy is broken on the runner Mac
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 # Persistent target dir on CI (outside the runner's _work checkout, immune to clean):
