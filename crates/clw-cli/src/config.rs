@@ -109,6 +109,14 @@ fn read_config_file() -> HashMap<String, String> {
 
 /// Parse lines of the form `key = "value"` or `key = value` (no quotes).
 /// Blank lines and lines beginning with `#` are ignored.
+///
+/// NOTE: this is a deliberately minimal, dependency-free subset of TOML — it
+/// handles exactly the flat string keys clw writes (`endpoint`, `tenant`,
+/// `token`, `cache_dir`). It is NOT a general TOML parser (no tables, arrays,
+/// multi-line values; only `\"` and `\\` escapes within quoted values). A quoted
+/// value is read up to its closing quote, so a trailing inline `# comment` after a quoted value is ignored; an
+/// unquoted value is taken verbatim (so `#` is NOT an inline comment there —
+/// only whole-line `#` comments are stripped).
 pub fn parse_config_lines(content: &str, map: &mut HashMap<String, String>) {
     for line in content.lines() {
         let line = line.trim();
@@ -118,9 +126,27 @@ pub fn parse_config_lines(content: &str, map: &mut HashMap<String, String>) {
         if let Some((k, v)) = line.split_once('=') {
             let key = k.trim().to_string();
             let val_raw = v.trim();
-            // Strip optional surrounding double-quotes.
-            let val = if val_raw.starts_with('"') && val_raw.ends_with('"') && val_raw.len() >= 2 {
-                val_raw[1..val_raw.len() - 1].to_string()
+            // A quoted value is read up to its CLOSING quote (ignoring any
+            // trailing inline comment); an unquoted value is taken verbatim.
+            let val = if let Some(rest) = val_raw.strip_prefix('"') {
+                // Quoted value: read up to the closing quote, honoring `\"` and
+                // `\\` escapes (the matched inverse of `toml_escape` on write, so
+                // a token containing a quote round-trips instead of truncating).
+                // A trailing inline `# comment` after the closing quote is ignored.
+                let mut out = String::new();
+                let mut chars = rest.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                out.push(next);
+                            }
+                        }
+                        '"' => break,
+                        _ => out.push(c),
+                    }
+                }
+                out
             } else {
                 val_raw.to_string()
             };
@@ -133,6 +159,13 @@ pub fn parse_config_lines(content: &str, map: &mut HashMap<String, String>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Escape a string value for the minimal config writer: backslash and double
+/// quote, so it round-trips through [`parse_config_lines`]. Writer and parser are
+/// a matched pair (this is intentionally NOT a general TOML serializer).
+pub(crate) fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Expand a leading `~` to the home directory.
 pub fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
@@ -144,10 +177,13 @@ pub fn expand_tilde(s: &str) -> PathBuf {
 }
 
 /// Return the home directory.
+///
+/// Reads `$HOME` directly (unix-correct) rather than the deprecated
+/// `std::env::home_dir`. An empty `$HOME` is treated as unset.
 pub fn home_dir() -> Option<PathBuf> {
-    // std::env::home_dir is deprecated but functional on macOS/Linux.
-    #[allow(deprecated)]
-    std::env::home_dir()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Return `~/.clw/config.toml` path (for use in subcommands).
@@ -202,6 +238,35 @@ cache_dir = "~/.clw/cache"
         parse_config_lines("# this is a comment\n\nkey = val", &mut map);
         assert_eq!(map.len(), 1);
         assert_eq!(map["key"], "val");
+    }
+
+    #[test]
+    fn parse_quoted_value_ignores_trailing_inline_comment() {
+        // A trailing inline comment after a QUOTED value must not leak into the value.
+        let mut map = HashMap::new();
+        parse_config_lines("token = \"secret\" # inline comment", &mut map);
+        assert_eq!(map["token"], "secret");
+    }
+
+    #[test]
+    fn escaped_value_round_trips_through_writer_and_parser() {
+        // Regression (M0.5): a value containing a quote/backslash must round-trip
+        // through toml_escape -> parse_config_lines instead of truncating the PAT.
+        for raw in [
+            "pat_with\"quote",
+            "back\\slash",
+            "both\"and\\here",
+            "trailing\\",
+            "normal_pat_abc123",
+        ] {
+            let line = format!("token = \"{}\"", toml_escape(raw));
+            let mut map = HashMap::new();
+            parse_config_lines(&line, &mut map);
+            assert_eq!(
+                map["token"], raw,
+                "value must round-trip exactly for {raw:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

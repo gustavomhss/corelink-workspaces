@@ -166,8 +166,62 @@ impl Manifest {
                 m.version
             )));
         }
+        // Enforce the documented path invariant on EVERY entry before the
+        // manifest is trusted by hydrate (defense against traversal payloads).
+        for entry in &m.entries {
+            validate_rel_path(entry.path())?;
+            if let Entry::Symlink { target, .. } = entry {
+                validate_symlink_target(target)?;
+            }
+        }
         Ok(m)
     }
+}
+
+/// Validate that a manifest entry path is a safe RELATIVE path (the documented
+/// invariant). Rejects absolute paths and any '.'/'..'/empty component.
+pub fn validate_rel_path(p: &str) -> Result<()> {
+    if p.is_empty() {
+        return Err(ClwError::InvalidManifest("empty path".into()));
+    }
+    if p.starts_with('/') {
+        return Err(ClwError::InvalidManifest(format!(
+            "absolute path not allowed: {p}"
+        )));
+    }
+    if p.contains('\\') {
+        return Err(ClwError::InvalidManifest(format!(
+            "backslash not allowed: {p}"
+        )));
+    }
+    for comp in p.split('/') {
+        if comp.is_empty() || comp == "." || comp == ".." {
+            return Err(ClwError::InvalidManifest(format!(
+                "unsafe path component in: {p}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a symlink target stays within the workspace (relative, no '..').
+pub fn validate_symlink_target(t: &str) -> Result<()> {
+    if t.is_empty() {
+        return Err(ClwError::InvalidManifest("empty symlink target".into()));
+    }
+    if t.starts_with('/') {
+        return Err(ClwError::InvalidManifest(format!(
+            "absolute symlink target not allowed: {t}"
+        )));
+    }
+    for comp in t.split('/') {
+        if comp == ".." {
+            return Err(ClwError::InvalidManifest(format!(
+                "symlink target escapes workspace: {t}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -339,5 +393,98 @@ mod tests {
         assert_ne!(ref_key("x"), Digest::of_bytes(b"x"));
         assert_ne!(ref_key("a"), ref_key("b"));
         assert_eq!(ref_key("a"), ref_key("a"));
+    }
+
+    #[test]
+    fn from_bytes_rejects_parent_traversal_path() {
+        // Hand-written JSON: a file entry whose path escapes via "..".
+        let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"file","path":"../escape.txt","mode":420,"size":0,"chunks":[]}]}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(_)),
+            "expected InvalidManifest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_absolute_path() {
+        let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"file","path":"/etc/passwd","mode":420,"size":0,"chunks":[]}]}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(_)),
+            "expected InvalidManifest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_absolute_symlink_target() {
+        let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"symlink","path":"link","target":"/etc/passwd"}]}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(_)),
+            "expected InvalidManifest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_traversal_symlink_target() {
+        let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"symlink","path":"link","target":"../../x"}]}"#;
+        let err = Manifest::from_bytes(bytes).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(_)),
+            "expected InvalidManifest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_accepts_normal_manifest() {
+        // A clean manifest (sorted by path) must round-trip through from_bytes.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![
+                Entry::File {
+                    path: "a.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+                Entry::File {
+                    path: "dir/b.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+                Entry::Symlink {
+                    path: "link.txt".into(),
+                    target: "a.txt".into(),
+                },
+            ],
+        };
+        let bytes = manifest.canonical_bytes().unwrap();
+        let parsed = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn validate_rel_path_rejects_unsafe_and_accepts_clean() {
+        assert!(validate_rel_path("a.txt").is_ok());
+        assert!(validate_rel_path("dir/b.txt").is_ok());
+        assert!(validate_rel_path("").is_err());
+        assert!(validate_rel_path("/abs").is_err());
+        assert!(validate_rel_path("../up").is_err());
+        assert!(validate_rel_path("a/../b").is_err());
+        assert!(validate_rel_path("a/./b").is_err());
+        assert!(validate_rel_path("a//b").is_err());
+        assert!(validate_rel_path("a\\b").is_err());
+    }
+
+    #[test]
+    fn validate_symlink_target_rejects_escape_and_accepts_clean() {
+        assert!(validate_symlink_target("a.txt").is_ok());
+        assert!(validate_symlink_target("dir/a.txt").is_ok());
+        assert!(validate_symlink_target("").is_err());
+        assert!(validate_symlink_target("/etc/passwd").is_err());
+        assert!(validate_symlink_target("../../x").is_err());
     }
 }

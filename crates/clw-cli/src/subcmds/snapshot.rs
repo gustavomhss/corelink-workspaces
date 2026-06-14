@@ -27,10 +27,17 @@ pub struct SnapshotArgs {
     pub name: String,
 }
 
-pub async fn run(args: SnapshotArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+pub async fn run(
+    args: SnapshotArgs,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+) -> Result<(), ClwError> {
     let cache = LocalCache::new(&cfg.clw_config.cache_dir)?;
     let client = HttpClient::new(cfg.clw_config)?;
-    let opts = SnapshotOptions::new(&args.name);
+    let mut opts = SnapshotOptions::new(&args.name);
+    // Clamp to at least 1 so `--concurrency 0` can't stall the stream.
+    opts.concurrency = concurrency.max(1);
 
     let report = snapshot(&args.path, &client, &cache, &opts)
         .await

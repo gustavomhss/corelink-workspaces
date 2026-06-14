@@ -176,3 +176,12 @@ before a release or when verifying a new CoreLink deployment.
 | `error: missing token: ...` | `CLW_TOKEN` not set and not in config | Set `CLW_TOKEN=<pat>` or run `clw init` |
 | `clw hydrate` fails with a non-empty destination directory | Destination directory exists and is not empty | Choose a new (non-existent) path, or remove the existing directory first |
 | `[clw] cache miss` on every run despite no source changes | An `--env` variable is fluctuating (e.g., `TMPDIR`, timestamps) | Audit `--env` flags and remove any variables that change between runs |
+
+
+## Rate limits (free tier, as of 2026-06-05)
+
+- **Storage:** 10 GB (enforced; exceeding → 429 + `Retry-After`).
+- **Requests:** 1M/month on paper; enforcement currently deferred server-side.
+- **Burst throttling:** parallel chunk uploads can be throttled at the CDN edge
+  (HTTP 429). `clw` retries automatically with backoff (200ms → 10s ladder);
+  long snapshots of many small files may simply take longer under throttle.

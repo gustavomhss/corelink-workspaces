@@ -63,3 +63,53 @@ source ~/.clw/dogfood.env
 curl -sS -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $CLW_TOKEN" \
   "$CLW_ENDPOINT/v1/ac/$CLW_TENANT/$(printf 'a%.0s' {1..64})"   # expect 500 (bug) / 404 (fixed)
 ```
+
+---
+
+# ✅ RESOLVED (2026-06-05) — confirmed root cause & fix trail
+
+**Three stacked failures**, each masking the next:
+
+1. **Original D-day R2 S3 token had no AC-bucket scope** (CAS-only era) → rotated.
+2. **Replacement token was created read-only** (dashboard default) → owner
+   upgraded to Admin Read & Write. (Note: container instances only read env at
+   start — a credential change requires instance recycle to take effect.)
+3. **THE root cause:** the Worker DO forwards container env as
+   `R2_AC_BUCKET: this.env.R2_AC_BUCKET ?? ""` (`worker/src/durable_object.ts:476`)
+   with a documented "absent/empty → default" contract — but the Rust side used
+   `std::env::var(..).unwrap_or_else(..)`, which only defaults when the var is
+   ABSENT; `Ok("")` passes through → S3 client with an EMPTY bucket name →
+   `failed to construct request` → `AcHandlerError::Internal` → 500 on every
+   `/v1/ac/*` op since the 2026-05-30 prod deploy. Reproduced locally
+   byte-for-byte; CAS only survived because the DO does NOT forward
+   `R2_CAS_BUCKET` at all (absent → Rust default works).
+
+**Prod hotfix applied (2026-06-05):** `R2_AC_BUCKET=corelink-ac-iad` +
+`R2_AC_REGION=iad` added as plain vars on the `corelink-prod` worker via
+settings-PATCH (inherit pattern; 19/19 secrets preserved; rehearsed on
+`corelink-prod-sam` first) + container rollout. **Code root fix:** corelink-server
+PR `fix/container-empty-env-vars` (`storage::env_or` honors empty-as-default in
+ac.rs + cas.rs; wrangler.toml codifies the prod vars; cf-deploy-prod.yml
+wrangler@4).
+
+**Verified end-to-end after fix:** live conformance 4/4 · snapshot with prod
+dedupe (8/48 chunks uploaded) · hydrate 100%-from-cache · roundtrip 0 diffs.
+
+## Related findings (recorded, owners assigned)
+
+- **Burst 429s on parallel writes — CORRECTED diagnosis.** An earlier note here
+  guessed "Bot Fight Mode / WAF". **That was wrong.** Header capture + code trace +
+  live capacity check (all 2026-06-05) prove the 429 is **Cloudflare platform
+  backpressure on the single per-tenant Durable Object** under bursty parallel CAS
+  writes — not Bot Fight Mode (no `cf-mitigated`), not app quota (our `retry-after`
+  was 10; the app's only 429 uses `secondsUntilNextMonthStart()` ≈ millions), not
+  container exhaustion (20 instances live). `checkRequestQuota` is a deferred stub.
+  Full analysis + scaling options → **`docs/FINDING-per-tenant-write-ceiling.md`**.
+  **Owner decision** belongs to the CI-acceleration campaign, not a WAF tweak.
+- **`signup-worker` hardcodes `primary_region='enam'`** for every tenant
+  (`apps/signup-worker/src/webhooks/clerk.ts:456`; the colo-derived region param
+  is discarded — `configureTenant` is a no-op). Latent multi-region correctness
+  bug; NOT touched here (active GAP-5 lane) — route to the signup-worker session.
+- `SIGNUP_TOKEN_KEY` had no `.env.local` backup (write-only secret) → rotated
+  2026-06-05 + backed up; any previously-minted pilot links are invalidated
+  (re-mint with `scripts/admin/mint-pilot-token.sh`).
