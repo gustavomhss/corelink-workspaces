@@ -202,19 +202,21 @@ where
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // On unix, create the symlink. On Windows, symlink creation while
-            // hydrating is a DOCUMENTED v1 limitation (tracked): rather than
-            // silently skipping the entry — which would leave the workspace
-            // incomplete and the dangling-reference invariant ambiguous — we
-            // fail loudly with a clear, actionable error. Windows symlink
-            // creation also requires elevated privileges / Developer Mode, so a
-            // proper port is deferred to a future milestone.
+            // On unix, create a real symlink.
             #[cfg(unix)]
             std::os::unix::fs::symlink(target, &abs)?;
+            // On Windows there are no *unprivileged* symlinks (creating one
+            // requires elevated privileges / Developer Mode), so clw copies the
+            // target's bytes into the link path instead of linking. This means a
+            // snapshot→hydrate round-trip on Windows yields COPIES, not links —
+            // a documented, non-silent divergence from the unix behavior, not a
+            // skipped entry. Correctness is preserved: the target was already
+            // validated by validate_symlink_target (relative, no `..`, no
+            // drive-letter/backslash), and because symlinks are materialised in
+            // pass 3c AFTER all files (M1.7 ordering), any file target already
+            // exists under `dest`.
             #[cfg(windows)]
-            return Err(ClwError::InvalidManifest(format!(
-                "symlinks are not supported when hydrating on Windows: {path}"
-            )));
+            materialize_symlink_as_copy(dest, path, target, &abs)?;
         }
     }
 
@@ -291,6 +293,64 @@ where
     #[cfg(windows)]
     let _ = mode;
     Ok((bytes_from_cache, bytes_downloaded))
+}
+
+// ---------------------------------------------------------------------------
+// Internal (Windows only): materialise a symlink entry as a byte/subtree copy.
+//
+// Windows has no unprivileged symlinks, so clw copies the target instead of
+// linking. The `target` is relative to the LINK's parent directory and was
+// already validated (relative, no `..`, no drive-letter/backslash) by
+// validate_symlink_target. We resolve it within `dest`, then:
+//   - regular FILE target  -> copy its bytes (std::fs::copy),
+//   - DIRECTORY target      -> recursively copy the subtree,
+//   - missing target        -> a dangling symlink can't be copied: clear error.
+// File targets are guaranteed to exist because symlinks run in pass 3c, after
+// every regular file has been materialised (M1.7 files-before-symlinks order).
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn materialize_symlink_as_copy(dest: &Path, path: &str, target: &str, link: &Path) -> Result<()> {
+    // The link's parent within `dest`; the target is resolved relative to it.
+    let link_parent = link.parent().unwrap_or(dest);
+    // `target` uses '/' separators (backslashes were rejected by validation);
+    // join component-by-component so it resolves correctly on Windows.
+    let mut resolved = link_parent.to_path_buf();
+    for comp in target.split('/') {
+        resolved.push(comp);
+    }
+
+    let meta = std::fs::symlink_metadata(&resolved).map_err(|_| {
+        ClwError::InvalidManifest(format!(
+            "symlink target does not exist under dest, cannot copy on Windows: \
+             link {path} -> {target}"
+        ))
+    })?;
+
+    if meta.file_type().is_dir() {
+        copy_dir_recursive(&resolved, link)?;
+    } else {
+        // Regular file (or anything that is not a directory): copy its bytes.
+        std::fs::copy(&resolved, link)?;
+    }
+    Ok(())
+}
+
+// Recursively copy the directory subtree at `src` to `dst` (Windows only).
+#[cfg(windows)]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
