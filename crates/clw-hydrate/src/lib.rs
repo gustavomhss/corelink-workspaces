@@ -54,10 +54,16 @@ const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// as a normal `ClwError::Io`).
 const MAX_HYDRATE_TOTAL_BYTES: u64 = 1 << 40; // 1 TiB
 
-/// Enforce the M1.6 abuse caps on an untrusted manifest's declared size. Pure
-/// (takes counts, not the `Manifest`) so it is testable at the boundary without
-/// building a million-entry manifest. Run before any allocation or FS work.
-fn enforce_resource_bounds(entry_count: usize, total_size: u64) -> Result<()> {
+/// Enforce the M1.6 abuse caps on an untrusted manifest's declared size and
+/// symlink count. Pure (takes counts, not the `Manifest`) so it is testable at
+/// the boundary without building a million-entry manifest. Run before any
+/// allocation or FS work so a pathological manifest never produces a partial
+/// destination.
+fn enforce_resource_bounds(
+    entry_count: usize,
+    total_size: u64,
+    symlink_count: usize,
+) -> Result<()> {
     if entry_count > MAX_MANIFEST_ENTRIES {
         return Err(ClwError::InvalidManifest(format!(
             "manifest has {entry_count} entries, exceeding the hydrate cap of \
@@ -70,18 +76,26 @@ fn enforce_resource_bounds(entry_count: usize, total_size: u64) -> Result<()> {
              {MAX_HYDRATE_TOTAL_BYTES} bytes (anti disk-fill guard); refusing to hydrate"
         )));
     }
+    if symlink_count > MAX_SYMLINK_ENTRIES {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest declares {symlink_count} symlinks, exceeding the hydrate cap of \
+             {MAX_SYMLINK_ENTRIES} (anti fan-out/count guard); refusing to hydrate"
+        )));
+    }
     Ok(())
 }
 
 /// Maximum number of symlink entries a single hydrate will create.
 ///
-/// Rationale (anti symlink cycle/chain blow-up): symlinks are materialised in
-/// their own pass and a manifest could declare an enormous number of links
-/// (including chains that resolve through one another). validate_symlink_target
-/// already forbids absolute paths, `..`, and drive letters, so a link cannot
-/// escape `dest`; this cap additionally bounds the *count* so a pathological
-/// manifest cannot create an effectively unbounded chain/fan-out of links. The
-/// cap is per-hydrate and checked while creating links.
+/// Rationale (anti fan-out / count blow-up): a manifest could declare an
+/// enormous number of links. validate_symlink_target already forbids absolute
+/// paths, `..`, and drive letters, so a link cannot escape `dest`; this cap
+/// additionally bounds the *count* of links a single hydrate will create. It is
+/// purely a fan-out/count bound, NOT a cycle guard — hydrate never resolves
+/// symlink chains (it only creates the links verbatim), so there is no chain to
+/// guard against here. The count is computed up-front in `enforce_resource_bounds`
+/// and rejected before any filesystem work, so a pathological manifest never
+/// produces a partial destination.
 const MAX_SYMLINK_ENTRIES: usize = 100_000;
 
 // ---------------------------------------------------------------------------
@@ -173,6 +187,17 @@ where
     // 2b. Fetch manifest blob from CAS; parse.
     // ------------------------------------------------------------------
     let manifest_bytes = CasTransport::get(client, &record.root).await?;
+    // SECURITY (M1.7): re-verify the whole manifest blob against record.root
+    // BEFORE parsing — symmetric to the per-chunk integrity check in
+    // fetch_chunk. A hostile or buggy CasTransport must not be able to
+    // substitute a different manifest than the one the RefRecord pins.
+    let actual = Digest::of_bytes(&manifest_bytes);
+    if actual != record.root {
+        return Err(ClwError::Integrity {
+            expected: record.root,
+            actual,
+        });
+    }
     let manifest = Manifest::from_bytes(&manifest_bytes)?;
 
     // ------------------------------------------------------------------
@@ -183,7 +208,12 @@ where
     // pathological manifest is rejected with a clear, actionable error instead
     // of driving us into OOM or a disk-fill.
     // ------------------------------------------------------------------
-    enforce_resource_bounds(manifest.entries.len(), manifest.total_size)?;
+    let symlink_count = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e, Entry::Symlink { .. }))
+        .count();
+    enforce_resource_bounds(manifest.entries.len(), manifest.total_size, symlink_count)?;
 
     // ------------------------------------------------------------------
     // 3. Ensure dest exists.
@@ -268,21 +298,10 @@ where
     // 3c. Symlinks — created LAST, after every regular file is materialised
     //     (see the SECURITY note on pass 3a). No network I/O needed.
     // ------------------------------------------------------------------
-    let mut symlink_count: usize = 0;
+    // The symlink-count cap (MAX_SYMLINK_ENTRIES) was already enforced up-front
+    // in enforce_resource_bounds, before any filesystem work — see pass 2c.
     for entry in &manifest.entries {
         if let Entry::Symlink { path, target } = entry {
-            // Resource-safety (M1.6): bound the number of symlinks a single
-            // hydrate will create. validate_symlink_target already prevents a
-            // link from escaping `dest` (no absolute, no `..`, no drive letter),
-            // so this is a pure anti-cycle/anti-chain count guard against a
-            // manifest that declares a pathological number of links.
-            symlink_count += 1;
-            if symlink_count > MAX_SYMLINK_ENTRIES {
-                return Err(ClwError::InvalidManifest(format!(
-                    "manifest declares more than {MAX_SYMLINK_ENTRIES} symlinks \
-                     (anti symlink-cycle/chain guard); refusing to hydrate"
-                )));
-            }
             // Defense-in-depth: validate both the link path and its target.
             clw_types::validate_rel_path(path)?;
             clw_types::validate_symlink_target(target)?;
@@ -343,13 +362,19 @@ where
         .unwrap_or_else(|| dest.to_path_buf());
     std::fs::create_dir_all(&parent)?;
     let tmp_path = {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Process-wide monotonic counter guarantees uniqueness even when two
+        // tasks on the same thread hit the same subsec_nanos value (the thread-id
+        // + nanos pair alone can collide under concurrency).
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let tid = std::thread::current().id();
-        parent.join(format!(".clw-tmp-{tid:?}-{nanos}"))
+        parent.join(format!(".clw-tmp-{tid:?}-{nanos}-{seq}"))
     };
     let mut bytes_from_cache: u64 = 0;
     let mut bytes_downloaded: u64 = 0;
@@ -606,6 +631,9 @@ mod tests {
     // Test 1: full hydrate (2 files + 1 multi-chunk file + symlink + empty dir)
     // -----------------------------------------------------------------------
 
+    // Asserts unix permission bits via PermissionsExt::mode(); gate to unix so
+    // the test build compiles on Windows (production code is already cfg-gated).
+    #[cfg(unix)]
     #[tokio::test]
     async fn full_hydrate_two_files_multichunk_symlink_empty_dir() {
         let data_a = b"hello world".as_ref();
@@ -883,6 +911,65 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 4b (M1.7): a fetched MANIFEST blob whose bytes don't hash to
+    // record.root must surface ClwError::Integrity — never be parsed or used.
+    // Mirrors the per-chunk integrity check at the whole-manifest level.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn substituted_manifest_returns_integrity_error() {
+        // Build a legitimate manifest and seed the store so record.root points
+        // at its digest.
+        let data = b"file-bytes";
+        let (d, bytes) = make_chunk(data);
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![Entry::File {
+                path: "f.txt".into(),
+                mode: 0o644,
+                size: data.len() as u64,
+                chunks: vec![ChunkRef {
+                    digest: d,
+                    size: data.len() as u64,
+                }],
+            }],
+        };
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+
+        // Recover record.root, then overwrite the CAS blob at that key with a
+        // DIFFERENT (still well-formed) manifest — a hostile transport
+        // substituting the whole manifest. Its bytes no longer hash to root.
+        let root = {
+            let mb = manifest.canonical_bytes().unwrap();
+            Digest::of_bytes(&mb)
+        };
+        let other = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![Entry::Dir {
+                path: "evil".into(),
+            }],
+        };
+        store.cas_put_raw(root, other.canonical_bytes().unwrap());
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Integrity { expected, .. } if expected == root),
+            "expected Integrity for manifest root {root}, got: {err}"
+        );
+        // The substituted manifest must not have driven any filesystem work.
+        assert!(
+            !dest.join("evil").exists(),
+            "substituted manifest must not produce any output"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 5 (M1.7): a fetched chunk whose bytes don't hash to the expected
     // digest must surface ClwError::Integrity — never be written or cached.
     // -----------------------------------------------------------------------
@@ -936,6 +1023,9 @@ mod tests {
     // stripped — only the low 9 permission bits survive.
     // -----------------------------------------------------------------------
 
+    // Asserts unix permission bits via PermissionsExt::mode(); gate to unix so
+    // the test build compiles on Windows (production code is already cfg-gated).
+    #[cfg(unix)]
     #[tokio::test]
     async fn manifest_mode_setuid_bit_is_stripped() {
         let data = b"executable-ish";
@@ -1040,11 +1130,26 @@ mod tests {
         // The cap is a pure guard — exercise it at the boundary directly instead
         // of building a million-entry manifest (which made this test ~minute-long
         // via canonical_bytes serialization). The guard runs before any FS work.
-        assert!(enforce_resource_bounds(MAX_MANIFEST_ENTRIES, 0).is_ok());
-        let err = enforce_resource_bounds(MAX_MANIFEST_ENTRIES + 1, 0).unwrap_err();
+        assert!(enforce_resource_bounds(MAX_MANIFEST_ENTRIES, 0, 0).is_ok());
+        let err = enforce_resource_bounds(MAX_MANIFEST_ENTRIES + 1, 0, 0).unwrap_err();
         assert!(
             matches!(err, ClwError::InvalidManifest(ref m) if m.contains("entries")),
             "expected InvalidManifest about entry count, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8b (M1.6): the symlink-count cap is enforced up-front in
+    // enforce_resource_bounds, before any filesystem work.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oversized_symlink_count_rejected() {
+        assert!(enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES).is_ok());
+        let err = enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES + 1).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("symlink")),
+            "expected InvalidManifest about symlinks, got: {err}"
         );
     }
 
