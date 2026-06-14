@@ -1,0 +1,30 @@
+CoreLink Workspaces (clw)
+Copyright (c) 2026 HumanGR Labs / CoreLink. All rights reserved.
+
+This software and its source code are PROPRIETARY and CONFIDENTIAL to HumanGR
+Labs / CoreLink. They are licensed, not sold. Use of the distributed binary is
+governed solely by the End User License Agreement in the accompanying EULA.md
+file. No license to copy, redistribute, reverse-engineer, or create derivative
+works is granted except as expressly stated in that EULA. The token
+"UNLICENSED" in the package metadata denotes "no public license granted"
+(i.e. proprietary) — it is NOT an offer of the SPDX "Unlicense" public-domain
+dedication.
+
+---------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+---------------------------------------------------------------------------
+
+CoreLink Workspaces statically links third-party open-source components, each
+distributed under its own permissive license (Apache-2.0, MIT, the BSD family,
+ISC, Unicode-3.0, CDLA-Permissive-2.0, Zlib, and equivalents). Those licenses
+and their copyright/attribution notices are reproduced in the per-release
+third-party attribution bundle.
+
+That attribution bundle is GENERATED, not hand-maintained. It is produced with
+cargo-about from the workspace's about.toml configuration:
+
+    cargo about generate about.hbs > THIRD-PARTY-NOTICES.html
+
+The accepted-license allow-list in about.toml is kept consistent with the
+[licenses] allow-list in deny.toml (single source of truth: see the note in
+deny.toml). Regenerate the bundle whenever the dependency graph changes.

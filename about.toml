@@ -1,0 +1,49 @@
+# cargo-about configuration — third-party attribution bundle for the
+# proprietary CoreLink Workspaces (clw) binary distribution.
+#
+# WP M4.2 (license posture + EULA). `cargo about generate` walks the dependency
+# graph, collects the license text of every shipped third-party crate, and
+# renders it into an attribution document (referenced from NOTICE):
+#
+#     cargo about generate about.hbs > THIRD-PARTY-NOTICES.html
+#
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH:
+#   The `accepted` allow-list below MUST stay consistent with the [licenses]
+#   `allow` list in deny.toml. deny.toml is the supply-chain GATE (it FAILS CI
+#   if a crate carries a license outside the set); about.toml is the
+#   ATTRIBUTION generator over that same set. The permissive set is, by family:
+#   Apache-2.0 / MIT / BSD / ISC / Unicode / CDLA-Permissive-2.0 / Zlib (plus
+#   the additional attribution-only / public-domain atoms actually present in
+#   Cargo.lock). When you change one file's list, change the other and keep
+#   this note pointing at deny.toml.
+#
+#   The first-party clw-* crates are publish=false and proprietary
+#   ("UNLICENSED"); they are excluded from the third-party bundle via the
+#   workspace settings below — only third-party dependencies are attributed.
+# ---------------------------------------------------------------------------
+
+# Attribute the dependencies of the whole workspace, not just one crate.
+workspace = true
+
+# Do not attribute the first-party clw-* crates themselves; they are the
+# proprietary product, not a third-party component to be license-listed.
+no-clearly-defined = false
+private = { ignore = true }
+
+# Accepted licenses (kept consistent with deny.toml [licenses].allow).
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
