@@ -1,0 +1,7 @@
+# Standard cargo-fuzz ignores (this dir is its own root; the repo .gitignore's
+# /target is root-anchored and does NOT cover fuzz/target).
+/target
+/corpus
+/artifacts
+/coverage
+Cargo.lock

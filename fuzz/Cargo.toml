@@ -1,0 +1,75 @@
+# cargo-fuzz harnesses for the UNTRUSTED-input parsers of clw-types.
+#
+# This is a SEPARATE, OUT-OF-WORKSPACE package on purpose:
+#   * cargo-fuzz requires the NIGHTLY toolchain (-Z build-std, the libFuzzer
+#     sanitizer wiring), but the workspace is pinned to stable 1.91.1 via
+#     rust-toolchain.toml. Keeping fuzz/ out of the workspace means the main
+#     `bash scripts/gates.sh` (stable) never sees libfuzzer-sys / cargo-fuzz and
+#     stays green, while these targets are run on demand under nightly.
+#   * The root Cargo.toml `members` list is explicit and does NOT include fuzz/,
+#     so this package is invisible to the workspace build/test/clippy lanes.
+#
+# Run (needs `rustup toolchain install nightly` + `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz run fuzz_manifest_from_bytes
+[package]
+name = "clw-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Make this its OWN root, fully detached from the parent workspace at the repo
+# root. Without this, cargo auto-attaches fuzz/ to that workspace (it is nested
+# under it on disk) and then errors because fuzz/ is not in `members`. An empty
+# `[workspace]` table here — exactly what `cargo fuzz init` emits — keeps fuzz/
+# out of the main build/gates lane WITHOUT editing the root Cargo.toml.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# The crate under test, by path. No workspace inheritance — this package is
+# deliberately standalone.
+clw-types = { path = "../crates/clw-types" }
+
+# Fuzz targets must not be unwound into the harness with the default panic=unwind
+# bench/test plumbing; declare each explicitly with test/doc/bench off.
+[[bin]]
+name = "fuzz_manifest_from_bytes"
+path = "fuzz_targets/fuzz_manifest_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_validate_rel_path"
+path = "fuzz_targets/fuzz_validate_rel_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_validate_symlink_target"
+path = "fuzz_targets/fuzz_validate_symlink_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_digest_from_hex"
+path = "fuzz_targets/fuzz_digest_from_hex.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz builds these under a release-ish profile with debug assertions and
+# overflow checks ON, so arithmetic UB in the parse path is caught as a panic.
+[profile.release]
+debug = 1
+
+[profile.release.package.clw-types]
+debug-assertions = true
+overflow-checks = true
