@@ -6,7 +6,7 @@ use std::path::Path;
 use clap::Args;
 use clw_types::ClwError;
 
-use crate::config::{clw_config_path, ResolvedConfig};
+use crate::config::{clw_config_path, toml_escape, ResolvedConfig};
 
 #[derive(Debug, Args)]
 #[command(about = "Write ~/.clw/config.toml from the resolved config values")]
@@ -47,11 +47,11 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
          tenant = \"{tenant}\"\n\
          token = \"{token}\"\n\
          cache_dir = \"{cache_dir}\"\n",
-        endpoint = cfg.clw_config.endpoint,
-        tenant = cfg.clw_config.tenant,
+        endpoint = toml_escape(&cfg.clw_config.endpoint),
+        tenant = toml_escape(&cfg.clw_config.tenant),
         // NEVER print the token to stdout/stderr — write it to the config file only.
-        token = cfg.clw_config.token,
-        cache_dir = cfg.clw_config.cache_dir.display(),
+        token = toml_escape(&cfg.clw_config.token),
+        cache_dir = toml_escape(&cfg.clw_config.cache_dir.display().to_string()),
     );
 
     // config.toml holds the plaintext token: force owner-only (0600) perms.

@@ -67,10 +67,13 @@ struct KeyPayload {
 /// `PATH` is searched for the first matching file. When the executable can be
 /// read, the identity is its content digest; if it cannot be located or read,
 /// we fall back to a literal marker so the key is still well-defined.
-fn resolve_tool_id(cmd0: &str) -> String {
-    // If cmd0 is a path, use it directly; else search PATH for the first match.
+fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
+    // If cmd0 is a path, resolve it against the RUN cwd — a relative tool path
+    // must resolve where the command actually runs, not against the orchestrator
+    // process cwd (else the digest is unstable / wrong). `Path::join` returns
+    // cmd0 unchanged when it is already absolute. Otherwise search PATH.
     let candidate: Option<std::path::PathBuf> = if cmd0.contains('/') {
-        Some(std::path::PathBuf::from(cmd0))
+        Some(cwd.join(cmd0))
     } else {
         std::env::var_os("PATH").and_then(|paths| {
             std::env::split_paths(&paths)
@@ -161,7 +164,7 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     let tool = if opts.command.is_empty() {
         String::new()
     } else {
-        resolve_tool_id(&opts.command[0])
+        resolve_tool_id(cwd, &opts.command[0])
     };
 
     // --- canonical JSON ---
@@ -611,6 +614,7 @@ mod tests {
     // upgrade.
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // shell-script tooling + mode bits are unix-only (Windows port: M2)
     #[tokio::test]
     async fn tool_identity_change_yields_different_key() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -664,6 +668,7 @@ mod tests {
     // This is the toolchain-upgrade scenario M3 guards against.
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // shell-script tooling + mode bits are unix-only (Windows port: M2)
     #[tokio::test]
     async fn tool_content_mutation_yields_different_key() {
         use std::os::unix::fs::PermissionsExt as _;

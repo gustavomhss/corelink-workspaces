@@ -52,9 +52,7 @@ impl HttpClient {
         // dev/tests (the wiremock suite uses http://127.0.0.1:<port>).
         let ep = config.endpoint.trim();
         let is_https = ep.starts_with("https://");
-        let is_local_http = ep.starts_with("http://127.0.0.1")
-            || ep.starts_with("http://localhost")
-            || ep.starts_with("http://[::1]");
+        let is_local_http = is_loopback_http(ep);
         if !is_https && !is_local_http {
             return Err(ClwError::Transport(format!(
                 "refusing to send PAT over plaintext: endpoint must be https:// (got '{ep}'); http:// is only allowed for loopback"
@@ -108,6 +106,29 @@ impl HttpClient {
         }
         Err(last_err.unwrap())
     }
+}
+
+/// Returns `true` iff `ep` is a plaintext `http://` URL whose host is *exactly* a
+/// loopback (`127.0.0.1`, `localhost`, or `[::1]`), with an optional `:port` and
+/// path. This is an exact-host check, **not** a prefix check: a prefix match would
+/// accept attacker-controlled hosts like `http://127.0.0.1.evil.com` or
+/// `http://localhostx` and leak the PAT in cleartext to them.
+fn is_loopback_http(ep: &str) -> bool {
+    let Some(rest) = ep.trim().strip_prefix("http://") else {
+        return false;
+    };
+    // Authority = everything before the first '/' (drop any path).
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // IPv6 literal: `[::1]` optionally followed by `:port`.
+    if let Some(after) = authority.strip_prefix('[') {
+        return match after.split_once(']') {
+            Some((host, port)) => host == "::1" && (port.is_empty() || port.starts_with(':')),
+            None => false,
+        };
+    }
+    // `host[:port]` — strip an optional trailing `:port`.
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    host == "127.0.0.1" || host == "localhost"
 }
 
 /// Returns `true` if the error warrants a retry.
@@ -952,6 +973,37 @@ mod tests {
             client.is_ok(),
             "http://127.0.0.1 loopback must be accepted for dev/tests"
         );
+    }
+
+    #[test]
+    fn new_rejects_loopback_prefix_impersonation() {
+        // Regression (M0.5): the loopback allow-list must be an EXACT-host check,
+        // not a prefix match. Attacker-controlled hosts that merely START WITH a
+        // loopback string must be refused, or the PAT leaks in cleartext to them.
+        for ep in [
+            "http://127.0.0.1.evil.com",
+            "http://localhostx",
+            "http://localhost.attacker.net",
+            "http://127.0.0.1@evil.com/",
+            "http://[::1].evil.com",
+        ] {
+            let err = HttpClient::new(test_config(ep.into())).unwrap_err();
+            assert!(
+                matches!(err, ClwError::Transport(_)),
+                "loopback-prefix impersonation {ep:?} must be refused, got {err:?}"
+            );
+        }
+        // And the genuine loopback hosts (with/without port/path) stay accepted.
+        for ep in [
+            "http://localhost",
+            "http://127.0.0.1/v1",
+            "http://[::1]:9000",
+        ] {
+            assert!(
+                HttpClient::new(test_config(ep.into())).is_ok(),
+                "genuine loopback {ep:?} must be accepted"
+            );
+        }
     }
 }
 
