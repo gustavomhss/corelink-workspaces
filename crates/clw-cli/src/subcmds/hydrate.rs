@@ -32,10 +32,14 @@ pub async fn run(
 ) -> Result<(), ClwError> {
     let tenant = cfg.clw_config.tenant.clone();
     let cache = LocalCache::new(&cfg.clw_config.cache_dir)?;
-    let client = HttpClient::new(cfg.clw_config)?;
+    // Clamp to at least 1 so `--concurrency 0` can't stall the stream or starve
+    // the client's AIMD governor.
+    let concurrency = concurrency.max(1);
+    // Govern the GET fan-out at the client too, so the AIMD limiter sees the
+    // same ceiling the stream uses (M1.3).
+    let client = HttpClient::with_concurrency(cfg.clw_config, concurrency)?;
     let mut opts = HydrateOptions::new(&args.name);
-    // Clamp to at least 1 so `--concurrency 0` can't stall the stream.
-    opts.concurrency = concurrency.max(1);
+    opts.concurrency = concurrency;
 
     let report = hydrate(&args.dest, &client, &cache, &opts)
         .await
