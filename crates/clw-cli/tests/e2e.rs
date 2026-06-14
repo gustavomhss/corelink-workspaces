@@ -563,3 +563,260 @@ async fn auth_failure() {
         "stderr must mention auth failure, got: {stderr_str}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Binary-level smoke tests for the offline subcommands: doctor / init / auth /
+// ls. These never touch the network — they exercise config resolution,
+// filesystem effects, and the redaction invariant against the REAL binary.
+//
+// Each test that needs a config home points $HOME at its own `TempDir`, so the
+// per-process subprocess env is isolated and the tests stay parallel-safe
+// without any shared-state locking.
+// ---------------------------------------------------------------------------
+
+/// A token value that must NEVER appear verbatim in any redacted output.
+const SECRET_TOKEN: &str = "super-secret-pat-DO-NOT-LEAK-9f8e7d6c";
+
+// ---------------------------------------------------------------------------
+// Test 6: doctor_runs_and_redacts_token
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_runs_and_redacts_token() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", SECRET_TOKEN)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "doctor must exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Reports version and OS.
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "doctor must print the clw version, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(std::env::consts::OS),
+        "doctor must print the OS, got:\n{stdout}"
+    );
+
+    // Redaction invariant: the token value must never appear on either stream.
+    assert!(
+        !stdout.contains(SECRET_TOKEN),
+        "token value must NEVER appear on stdout, got:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(SECRET_TOKEN),
+        "token value must NEVER appear on stderr, got:\n{stderr}"
+    );
+    // Presence is reported as the sentinel instead of the value.
+    assert!(
+        stdout.contains("<set>"),
+        "token presence must be shown as <set>, got:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: doctor_json_redacts_token
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_json_redacts_token() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", SECRET_TOKEN)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "doctor --json must exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Valid JSON.
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor --json stdout must be valid JSON");
+
+    // Token field is redacted to the presence sentinel, never the value.
+    assert_eq!(
+        parsed["token"], "<set>",
+        "doctor --json token field must be redacted to <set>, got: {parsed}"
+    );
+    assert!(
+        !stdout.contains(SECRET_TOKEN),
+        "token value must NEVER appear in doctor --json stdout, got:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(SECRET_TOKEN),
+        "token value must NEVER appear on stderr, got:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: init_writes_0600_config_and_rejects_reinit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_writes_0600_config_and_rejects_reinit() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let run_init = |args: &[&str]| {
+        Command::cargo_bin("clw")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("CLW_ENDPOINT", "https://example.com")
+            .env("CLW_TENANT", TEST_TENANT)
+            .env("CLW_TOKEN", SECRET_TOKEN)
+            .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+            .args(["init"].iter().chain(args.iter()))
+            .output()
+            .unwrap()
+    };
+
+    // First init writes the config file.
+    let out1 = run_init(&[]);
+    assert_eq!(out1.status.code(), Some(0), "first init must exit 0");
+
+    let config_path = home.path().join(".clw").join("config.toml");
+    assert!(
+        config_path.exists(),
+        "init must write {}",
+        config_path.display()
+    );
+
+    // The file holds the plaintext PAT, so it must be owner-only (0600).
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "config.toml must be written 0600");
+
+    // The token is never echoed on stderr/stdout, only persisted to the file.
+    let out1_stdout = String::from_utf8_lossy(&out1.stdout);
+    let out1_stderr = String::from_utf8_lossy(&out1.stderr);
+    assert!(
+        !out1_stdout.contains(SECRET_TOKEN) && !out1_stderr.contains(SECRET_TOKEN),
+        "init must NEVER echo the token value"
+    );
+
+    // Re-init WITHOUT --force must fail cleanly (no panic) with an actionable error.
+    let out2 = run_init(&[]);
+    assert!(
+        !out2.status.success(),
+        "re-init without --force must fail, got: {:?}",
+        out2.status.code()
+    );
+    let out2_stderr = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        out2_stderr.contains("already exists") && out2_stderr.contains("--force"),
+        "re-init error must mention the existing file and --force, got:\n{out2_stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: auth_whoami_prints_tenant_not_token
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auth_whoami_prints_tenant_not_token() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", SECRET_TOKEN)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["auth", "whoami"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "auth whoami must exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The tenant IS printed (it is an identifier, not a secret).
+    assert!(
+        stdout.contains(TEST_TENANT),
+        "whoami must print the tenant '{TEST_TENANT}', got:\n{stdout}"
+    );
+    // The token value is NEVER printed — presence sentinel only.
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "whoami must NEVER print the token value"
+    );
+    assert!(
+        stdout.contains("<set>"),
+        "whoami must show token presence as <set>, got:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: ls_unconfigured_fails_cleanly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ls_unconfigured_fails_cleanly() {
+    // No tenant/token anywhere (empty HOME, no CLW_* identity env) — config
+    // resolution must fail with an actionable error BEFORE any network call,
+    // and the binary must never panic.
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        // Strip any inherited identity so the binary is genuinely unconfigured.
+        .env_remove("CLW_ENDPOINT")
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["ls", "--name", "missing-ws"])
+        .output()
+        .unwrap();
+
+    // Clean failure: exit 2 (config error), not a panic / abort signal.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unconfigured ls must exit 2 (config error), got: {:?}",
+        out.status.code()
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Must not have panicked.
+    assert!(
+        !stderr.contains("panicked"),
+        "ls must not panic when unconfigured, got:\n{stderr}"
+    );
+    // Actionable: tells the user what to set.
+    assert!(
+        stderr.contains("tenant")
+            && (stderr.contains("CLW_TENANT")
+                || stderr.contains("--tenant")
+                || stderr.contains("config.toml")),
+        "unconfigured ls must give an actionable 'missing tenant' error, got:\n{stderr}"
+    );
+}
