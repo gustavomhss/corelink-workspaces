@@ -6,6 +6,12 @@
 
 mod config;
 mod subcmds;
+// M5.3: the telemetry module ships the policy + consent gate; only
+// `init_from_env_and_config` is wired today. The `record`/`Event` API and the
+// consent helpers are deliberately not yet called from subcommands (the call
+// sites land with the pluggable backend), so allow the as-yet-unused scaffolding.
+#[allow(dead_code)]
+mod telemetry;
 
 use clap::Parser;
 use clw_types::ClwError;
@@ -182,6 +188,12 @@ async fn main() {
     // Resolve the color policy once (flag > NO_COLOR env > non-TTY). clw emits
     // no ANSI today, so this currently only documents/guarantees the contract.
     let _color = color_enabled(cli.no_color);
+
+    // Resolve the telemetry gate once (M5.3). Off by default; honors
+    // DO_NOT_TRACK / CLW_TELEMETRY kill-switches and recorded consent. This is
+    // no-op-safe: it never errors, prompts, or blocks, so it is safe in CI and
+    // scripts. The sink is a documented no-op until a backend is plugged in.
+    telemetry::init_from_env_and_config();
 
     let result = dispatch(cli.command, resolved, cli.json, cli.concurrency).await;
     if let Err(e) = result {
