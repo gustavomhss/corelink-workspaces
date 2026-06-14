@@ -54,6 +54,25 @@ const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// as a normal `ClwError::Io`).
 const MAX_HYDRATE_TOTAL_BYTES: u64 = 1 << 40; // 1 TiB
 
+/// Enforce the M1.6 abuse caps on an untrusted manifest's declared size. Pure
+/// (takes counts, not the `Manifest`) so it is testable at the boundary without
+/// building a million-entry manifest. Run before any allocation or FS work.
+fn enforce_resource_bounds(entry_count: usize, total_size: u64) -> Result<()> {
+    if entry_count > MAX_MANIFEST_ENTRIES {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest has {entry_count} entries, exceeding the hydrate cap of \
+             {MAX_MANIFEST_ENTRIES} (anti-OOM/enumeration-bomb guard); refusing to hydrate"
+        )));
+    }
+    if total_size > MAX_HYDRATE_TOTAL_BYTES {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest declares total_size {total_size} bytes, exceeding the hydrate cap of \
+             {MAX_HYDRATE_TOTAL_BYTES} bytes (anti disk-fill guard); refusing to hydrate"
+        )));
+    }
+    Ok(())
+}
+
 /// Maximum number of symlink entries a single hydrate will create.
 ///
 /// Rationale (anti symlink cycle/chain blow-up): symlinks are materialised in
@@ -164,20 +183,7 @@ where
     // pathological manifest is rejected with a clear, actionable error instead
     // of driving us into OOM or a disk-fill.
     // ------------------------------------------------------------------
-    let entry_count = manifest.entries.len();
-    if entry_count > MAX_MANIFEST_ENTRIES {
-        return Err(ClwError::InvalidManifest(format!(
-            "manifest has {entry_count} entries, exceeding the hydrate cap of \
-             {MAX_MANIFEST_ENTRIES} (anti-OOM/enumeration-bomb guard); refusing to hydrate"
-        )));
-    }
-    if manifest.total_size > MAX_HYDRATE_TOTAL_BYTES {
-        return Err(ClwError::InvalidManifest(format!(
-            "manifest declares total_size {} bytes, exceeding the hydrate cap of \
-             {MAX_HYDRATE_TOTAL_BYTES} bytes (anti disk-fill guard); refusing to hydrate",
-            manifest.total_size
-        )));
-    }
+    enforce_resource_bounds(manifest.entries.len(), manifest.total_size)?;
 
     // ------------------------------------------------------------------
     // 3. Ensure dest exists.
@@ -1029,41 +1035,16 @@ mod tests {
     // so the test stays cheap — the guard runs on the parsed in-memory manifest.
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn oversized_entry_count_rejected() {
-        // Construct a manifest just over the cap using empty Dir entries (cheap
-        // to allocate, no chunk data needed). Names are zero-padded so their
-        // lexical order matches numeric order — the manifest's "entries sorted
-        // by path, no duplicates" invariant (checked by canonical_bytes) holds.
-        let mut entries = Vec::with_capacity(MAX_MANIFEST_ENTRIES + 1);
-        for i in 0..=MAX_MANIFEST_ENTRIES {
-            entries.push(Entry::Dir {
-                path: format!("d{i:08}"),
-            });
-        }
-        let manifest = Manifest {
-            version: MANIFEST_VERSION,
-            total_size: 0,
-            entries,
-        };
-
-        // setup_store canonicalises the manifest, but that is still far cheaper
-        // than touching the filesystem 1M times, and the guard fires before any
-        // directory is created.
-        let (store, _cache_dir, cache) = setup_store(&manifest, &[]);
-        let dest_dir = TempDir::new().unwrap();
-        let dest = dest_dir.path().join("out");
-
-        let opts = HydrateOptions::new("test-ws");
-        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+    #[test]
+    fn oversized_entry_count_rejected() {
+        // The cap is a pure guard — exercise it at the boundary directly instead
+        // of building a million-entry manifest (which made this test ~minute-long
+        // via canonical_bytes serialization). The guard runs before any FS work.
+        assert!(enforce_resource_bounds(MAX_MANIFEST_ENTRIES, 0).is_ok());
+        let err = enforce_resource_bounds(MAX_MANIFEST_ENTRIES + 1, 0).unwrap_err();
         assert!(
             matches!(err, ClwError::InvalidManifest(ref m) if m.contains("entries")),
             "expected InvalidManifest about entry count, got: {err}"
-        );
-        // No materialisation should have happened.
-        assert!(
-            !dest.join("d0").exists(),
-            "guard must fire before any directory is created"
         );
     }
 
