@@ -8,6 +8,15 @@
 > explicit, scoped, owner-scheduled cross-repo dependency. `clw` is a **pure client** of
 > `corelink-server` and never edits it; server work is coordinated via the dependency ledger.
 
+## Progress log
+
+| Date | Landed | Notes |
+|---|---|---|
+| 2026-06-09 | **Audit (#26)** + **M1.1 StreamCDC (#27)** | `fix/clw-audit-2026-06-09` and `fix/clw-deferrals-2026-06-09` merged to `main` (`87f9842`). M1.1 (snapshot streaming, dedupe-identical) is **DONE**. |
+| 2026-06-14 | **M0.5 audit-defect fixes** (`1422fa6`) | Closed 3 defects *inside* the merged audit: https loopback prefix-bypass (CRIT), `clw run` tool-cwd (HIGH), config value escaping (HIGH) + Windows test gating. Full local gate green (145 tests). |
+
+> **Status:** M0 complete (audit + its M0.5 defect fixes live), M1.1 complete. **Next: the M1 spine resumes at M1.2** (drop the exists-HEAD) → M1.3 → M1.4, plus the M2 Windows port and the corelink-server track.
+
 ## What v2 changed (the fleet's high-signal corrections)
 
 1. **Windows does not even compile.** `clw-hydrate` and `clw-manifest` use unconditional `std::os::unix`
@@ -80,7 +89,8 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 
 ## Milestones
 
-### M0 — Baseline integrity: merge the audit **and fix its defects**  *(clw, blocking)*
+### ✅ M0 — Baseline integrity: merge the audit **and fix its defects**  *(clw, blocking) — DONE 2026-06-14*
+> Audit merged via #26 (2026-06-09); M0.5 defect fixes landed `1422fa6` (2026-06-14), full gate green.
 - **M0.1** Cold-review `fix/clw-audit-2026-06-09` diff-by-diff (TechLead verify L0–L3); confirm clean merge onto `main`.
 - **M0.2** **M0.5 defect fixes** folded in (https exact-host, tool-in-key cwd + Windows, portable home, resolve_tool_id RAM).
 - **M0.3** Full local gate (`scripts/gates.sh`) — fmt + clippy `-D warnings` + whole-workspace test (the check the audit deferred to CI).
@@ -91,7 +101,7 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 ### M1 — Correctness & deferral **spine** (SERIAL) + new correctness WPs  *(clw)*
 > The fleet proved M1.1→M1.2→M1.3 cannot be fanned out (shared `clw-client` `with_retry`/`put`, shared
 > `clw-snapshot snapshot()`, shared frozen `clw-types`). Run as a serial chain. M1.4 is a **conditional tail** gated on D-1.
-- **M1.1 — StreamCDC snapshot streaming** (audit M4 snapshot-half). Boundary-identical to FastCDC. **Non-vacuous equivalence proptest** (must force a `>4 MiB` body, assert ≥1 max-length cut + ≥1 multi-chunk case) **+ a frozen golden-root vector** so drift is caught even if both chunker paths drift together. `clw-types` edit is a **doc-only** decision-record comment — keep it in a **separate commit/PR** from M1.2's signature change. *Scope = remove the duplicate whole-file buffer; O(1)-per-file memory is a larger refactor — owner to confirm (loose end).*
+- ✅ **M1.1 — StreamCDC snapshot streaming** — **DONE (#27, 2026-06-09):** `fix(clw-snapshot): stream large files (M4) — bounded memory, dedupe-identical`. *(Original spec retained below for the record.)* Boundary-identical to FastCDC. **Non-vacuous equivalence proptest** (must force a `>4 MiB` body, assert ≥1 max-length cut + ≥1 multi-chunk case) **+ a frozen golden-root vector** so drift is caught even if both chunker paths drift together. `clw-types` edit is a **doc-only** decision-record comment — keep it in a **separate commit/PR** from M1.2's signature change. *Scope = remove the duplicate whole-file buffer; O(1)-per-file memory is a larger refactor — owner to confirm (loose end).*
 - **M1.2 — Drop the exists-HEAD (audit L4).** `CasTransport::put → PutOutcome{Created,Existed}` so the HEAD-before-PUT is removed (2 req→1). **Frozen-trait change** rippling to exactly **4 impls** (real `clw-client` + fakes in snapshot/hydrate/run). **Premise correction:** server returns 201 for both → outcome only distinguishable in fakes; `chunks_uploaded` becomes best-effort. **DoD blocker:** a wiremock test asserting **zero HEAD requests** (the in-memory fakes can't observe the dropped HEAD). Faithful accounting needs a server change → **D-11**.
 - **M1.3 — Full Option A rate-limit client.** Honor `Retry-After` + **AIMD** adaptive concurrency on 429 (today: blind retry). Reconcile with the audit's `--concurrency` flag + jitter (overlap — define once). Wire `--concurrency` into **hydrate** too (GETs get 429'd). Note: AIMD is per-invocation (CLI). **Must land after M1.2** (same `put` status-arm).
 - **M1.4 — `clw rm` (conditional, gated on D-1).** `AcTransport::delete` (frozen-trait add, ripples same 4 fakes — **serialize with M1.2**) + server `DELETE /v1/ac`. **`ls --all` and `prune` are carved OUT** — they need ref-enumeration (**D-7**) and CAS-DELETE/LIST (**D-8**); see M6 erasure track. `rm` alone orphans CAS blobs (documented until prune exists).
