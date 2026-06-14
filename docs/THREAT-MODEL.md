@@ -38,7 +38,7 @@ and (b) the local environment in which it stores its credential and cache.
 
 | Threat | Vector | Mitigation | Ref |
 |---|---|---|---|
-| **Malicious / tampered manifest → path traversal** | A manifest entry path or symlink target that is absolute or contains `..`/`.` causes `hydrate` to write **outside** the destination (zip-slip / symlink-slip) | `validate_rel_path` + `validate_symlink_target` reject such entries at `Manifest::from_bytes`; `hydrate` re-validates (defense-in-depth) | audit H1 |
+| **Malicious / tampered manifest → path traversal** | A manifest entry path or symlink target that is absolute or contains `..`/`.` (POSIX) or a Windows backslash / drive-letter / UNC form causes `hydrate` to write **outside** the destination (zip-slip / symlink-slip) | `validate_rel_path` + `validate_symlink_target` reject such entries at `Manifest::from_bytes`; `hydrate` re-validates (defense-in-depth). **Windows-aware: backslash / drive-letter / UNC are rejected on every platform** (M2.2), so this is no longer unix-only | audit H1 / M2.2 |
 | **PAT leakage — at rest** | World-readable config on a multi-user machine | `config.toml` `0600`; `~/.clw` + cache root `0700` | audit H2 |
 | **PAT leakage — in transit** | PAT sent over cleartext `http://`, incl. a loopback allow-list bypass (`http://127.0.0.1.evil.com`) | `https://`-only client; loopback exception uses an **exact-host** check, not a prefix match (regression-tested) | audit M2 / M0.5 CRIT |
 | **PAT leakage — in output / argv** | Token printed in logs/diagnostics; `--token` visible in the process list | Token **redaction** in all `clw` output; `--token` help **warns** of process-list visibility (config/env preferred) | audit LOWs |
@@ -58,17 +58,19 @@ These are **known and tracked**, not silently accepted. See
   with anti-OOM / anti-disk-fill / symlink-cycle guards). Hydrate-side hardening
   (re-verify fetched-chunk digests, mask setuid/setgid/sticky/world-writable
   mode bits, materialize files before symlinks) is **M1.7**.
-- **Windows path validation.** `validate_rel_path` / `validate_symlink_target`
-  currently reason about POSIX paths; Windows backslash / drive-letter / UNC
-  forms are **not yet rejected** (traversal could be possible on Windows). The
-  Windows-correct path & symlink semantics are tracked under the cross-platform
-  port, **roadmap M2** (specifically M2.2). `clw` is unix-only until that lands.
-- **Right-to-erasure (GDPR Art. 17) gap.** `clw rm` deletes only the AC ref
-  pointer; it **cannot enumerate or garbage-collect the CAS blobs**, so a tenant
-  cannot today fully delete their uploaded data. Closing this needs client
-  `prune`/CAS-GC **plus** server capabilities: ref-enumeration LIST
-  (**dependency D-7**) and CAS DELETE/LIST (**dependency D-8**), tracked under
-  the erasure milestone **M6/M6.4**.
+- **Resource-safety / abuse bounds (hostile manifest).** Now mitigated by
+  **roadmap M1.6** — `hydrate` enforces manifest entry-count / byte / symlink
+  bounds (anti-OOM, anti disk-fill, symlink-cycle guard). See the entry-count
+  guard in `clw-hydrate`.
+- **Right-to-erasure (GDPR Art. 17) gap.** `clw` has **no erasure command today**
+  — there is no `clw rm`. A future `clw rm` (deleting the AC ref pointer) is
+  tracked as **roadmap M1.4**, gated on server **dependency D-1** (`DELETE /v1/ac`).
+  Even once `clw rm` lands it would delete only the AC ref pointer and **cannot
+  enumerate or garbage-collect the CAS blobs**, so fully deleting a tenant's
+  uploaded data additionally needs client `prune`/CAS-GC **plus** server
+  capabilities: ref-enumeration LIST (**dependency D-7**) and CAS DELETE/LIST
+  (**dependency D-8**), tracked under the erasure milestone **M6/M6.4**. Until
+  these land, the residency promise is non-compliant.
 - **Operational secret backup.** The server-side `SIGNUP_TOKEN_KEY` backup rule
   is tracked as dependency **D-2** (server-owned, coordinated via the ledger).
 

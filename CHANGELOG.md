@@ -1,5 +1,74 @@
 # Changelog
 
+## [Unreleased] — go-live hardening waves (2026-06-14)
+
+> Everything below shipped on `main` after the phase-1 baseline: the M0.5 audit-defect
+> fixes, the M2 Windows port, and the M1/M4/M5/M6 hardening waves. The phase-1 section
+> that follows is retained for the record.
+
+### Added
+- **`clw auth`** — manage the locally-stored CoreLink identity, fully offline (no network call):
+  `login` (persist resolved endpoint/tenant/token to `~/.clw/config.toml`, forced `0600`),
+  `logout` (drop the `token` key; `--all` clears the whole file, with a confirm unless `--yes`),
+  `whoami` (print the resolved identity, token shown as `<set>`/`<unset>` only).
+  `rotate` is a stub — not yet supported pending a server token-rotation endpoint
+  (use `auth login` with a new `--token` to replace the stored token). (M6.6)
+- **`clw doctor`** — support-ready, **redacted** diagnostics bundle (version, os/arch, config
+  path/existence/mode, endpoint, tenant + token presence, cache dir); the token is never
+  printed; `--json` supported; points at `SECURITY.md` for disclosure; always exits 0. (M5.5)
+- **`--no-color` / `NO_COLOR`** — accessibility flag; color is also auto-disabled when the
+  `NO_COLOR` env var is set or stdout is not a TTY (single `color_enabled` policy seam). (M5.7)
+- **`--json` coverage** audited across commands as a documented contract; `clw run` is the
+  one **documented exception** (the wrapped command owns stdout, so it has no `--json` form). (M5.7)
+- **Telemetry consent scaffolding** — off by default, with kill-switches (`DO_NOT_TRACK=1` and
+  `CLW_TELEMETRY=0` always win; `CLW_TELEMETRY=1` opts in; `telemetry = "on"|"off"` in config).
+  **No network backend** — events route to a documented no-op sink; the `Event` type is a
+  fixed enum (no String/PathBuf/token field) so PII is redaction-proof by construction; never
+  prompts in CI/non-TTY. (M5.3)
+- **Windows support** — the entire workspace now compiles and runs on Windows x86_64
+  (`USERPROFILE` home resolution, `#[cfg]`-gated unix-only constructs). (M2.1)
+- **Client resource-safety bounds** in `hydrate` — manifest entry-count / byte / symlink
+  guards (anti-OOM, anti disk-fill, symlink-cycle guard) against a hostile manifest. (M1.6)
+- **`SECURITY.md` + threat model** (`docs/THREAT-MODEL.md`) — disclosure policy and the
+  client threat model summarized from the audit. (M4.4)
+- **Legal/attribution bundle** — `EULA.md`, `NOTICE`, `about.toml` (cargo-about), and a
+  finalized `deny.toml` license posture; M6 legal drafts (privacy/ToS/export-control/DPA/DR). (M4.2/M6)
+
+### Changed
+- **Windows hydrate copies symlinks instead of linking them.** Windows has no unprivileged
+  symlinks, so a hydrated symlink entry becomes a **copy** of its target (file → bytes,
+  directory → recursive subtree). This is a documented, non-silent copies-not-links
+  divergence; it closes the prior "symlink-on-Windows" v1 limitation. (M2.2)
+- **Windows-aware path validation.** `validate_rel_path` / `validate_symlink_target` now reject
+  Windows backslash, drive-letter, and UNC forms on **every** platform (not unix-only). (M2.2)
+- **Adaptive rate-limit client.** On HTTP 429 the client now honors `Retry-After` and applies
+  **AIMD** adaptive concurrency (per-invocation) instead of blind retry; `--concurrency` is
+  wired into hydrate as well as snapshot. (M1.3)
+- **User-Agent header** `clw/<ver> (<os>; <arch>)` sent on every CoreLink request. (M5.2)
+- **Quota-aware 429 UX** — distinguish "rate-limited (retrying)" from "plan/quota limit
+  reached (actionable)" in the surfaced message. (M5.6)
+- **Cache-format versioning** — `~/.clw/cache` is stamped with a format version; on mismatch
+  the cache is safely invalidated rather than silently replaying stale content. (M5.4)
+- **Run-key hermeticity** — `clw run` now distinguishes an **unset** env var from an **empty**
+  one in the cache key (key domain `v2`→`v3`); secret-looking files are warned on at snapshot. (M1.5 / M6.5)
+- **Toolchain de-hack** — removed the founder-Mac rustup hack; `rust-toolchain.toml` declares
+  `components = ["rustfmt", "clippy"]` so a clean machine builds correctly. (M2.0)
+
+### Security
+- **No erasure command exists yet.** `clw` has no `clw rm`; a future `clw rm` (AC-ref delete)
+  is tracked as **M1.4**, gated on server dependency **D-1**. CAS blob GC / right-to-erasure
+  is **M6.4** (gated on D-7/D-8). Documented as a tracked residual, not silently accepted.
+- Threat model updated to reflect the shipped Windows path validation and the erasure gap
+  (see `docs/THREAT-MODEL.md`).
+
+### CI
+- **`cargo-deny`** (advisories + licenses + bans + sources) + `cargo-audit` wired into the
+  gate and the release lane. (M4.1)
+- **Cross-platform CI matrix** — Linux blocking, Windows informational (to flip to required
+  once green); release pipeline scaffold + distribution decisions; **`publish = false`** on all
+  crates (proprietary-leak guard). (M2.4 / M3 / M4)
+- Per-release **CycloneDX SBOM** + live-conformance pre-tag gate scaffolding. (M4.3 / M4.5)
+
 ## [Unreleased] — phase-1 complete (2026-06-05)
 
 ### Security & hardening (audit 2026-06-09)

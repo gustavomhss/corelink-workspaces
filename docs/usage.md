@@ -165,11 +165,153 @@ before a release or when verifying a new CoreLink deployment.
 
 ---
 
+## `clw auth` — managing the stored identity
+
+`clw auth` manages the locally-stored CoreLink identity in `~/.clw/config.toml`.
+It is **fully offline** — no subcommand makes a network call. The personal access
+token is never printed; its presence is reported as `<set>` / `<unset>`.
+
+```sh
+# Persist the resolved endpoint/tenant/token to ~/.clw/config.toml (forced 0600):
+clw auth login
+# logged in — wrote identity to /Users/you/.clw/config.toml
+#   endpoint: https://corelink-api.humangr.com
+#   tenant:   my-tenant
+#   token:    <set>
+
+# Print the resolved identity (redacted, offline):
+clw auth whoami
+# endpoint: https://corelink-api.humangr.com
+# tenant:   my-tenant
+# token:    <set>
+
+# Remove just the token line (keeps endpoint/tenant/cache_dir):
+clw auth logout
+
+# Clear the entire config file (confirm prompt unless --yes):
+clw auth logout --all
+clw auth logout --all --yes
+```
+
+`clw auth login` resolves the identity through the usual precedence (CLI flag >
+env > config > default), so `clw --tenant t --token pat_… auth login` persists
+those values. `whoami` works with `--json` for scripting.
+
+**Rotation is not yet supported.** `clw auth rotate` is a stub pending a server
+token-rotation endpoint:
+
+```sh
+clw auth rotate
+# clw auth rotate: not yet supported — tracked (server dependency).
+# Use `clw auth login` with a new --token to replace the stored token.
+```
+
+To rotate today, run `clw auth login` with a fresh `--token`.
+
+---
+
+## `clw doctor` — redacted diagnostics for support
+
+`clw doctor` prints a support-ready diagnostics bundle: clw version, os/arch, the
+config file path / existence / mode, the resolved endpoint, tenant + token
+**presence** (never the token value), and the cache dir. It always exits 0 and is
+safe to paste into a bug report. Use `--json` for a machine-readable form.
+
+```sh
+clw doctor
+# clw doctor — diagnostics (redacted)
+# ===================================
+# clw version:    0.1.0
+# os/arch:        macos/aarch64
+# config file:    /Users/you/.clw/config.toml
+# config exists:  true
+# config mode:    0o600
+# endpoint:       https://corelink-api.humangr.com
+# tenant:         <set>
+# tenant value:   my-tenant
+# token:          <set>
+# cache dir:      /Users/you/.clw/cache
+# cache exists:   true
+```
+
+For security issues, follow the disclosure process in `SECURITY.md` rather than
+pasting diagnostics into a public issue.
+
+---
+
+## Accessibility — color and `--json`
+
+- **`--no-color`** disables ANSI color in human-readable output. Color is also
+  auto-disabled when the `NO_COLOR` env var is set (https://no-color.org) or when
+  stdout is not a TTY (a pipe, a file, or a `--json` consumer).
+- **`--json`** emits machine-readable JSON on stdout for every command **except
+  `clw run`**. `run` has no `--json` form by design: the wrapped command owns
+  stdout, so clw must not interleave its own JSON there. Errors always go to
+  stderr regardless of `--json`.
+
+```sh
+clw --no-color status --name myapp-dev
+clw --json ls --name myapp-dev
+```
+
+---
+
+## Telemetry — off by default, with kill-switches
+
+Telemetry is **off by default** and currently has **no network backend** — events
+route to a documented no-op sink. It activates only on explicit opt-in. Resolution
+precedence (first match wins):
+
+1. **Kill-switches, always.** `DO_NOT_TRACK=1` or `CLW_TELEMETRY=0` force it OFF
+   and cannot be overridden.
+2. `CLW_TELEMETRY=1` opts in.
+3. `telemetry = "on"|"off"` recorded in `~/.clw/config.toml`.
+4. Otherwise OFF.
+
+clw **never prompts** for consent in CI / non-interactive / non-TTY contexts. The
+event type is a fixed enum carrying only a coarse subcommand/outcome/duration — by
+construction it cannot carry a PAT, a path, a workspace name, or file contents.
+
+```sh
+# Force telemetry off regardless of config (cross-vendor standard):
+export DO_NOT_TRACK=1
+# or
+export CLW_TELEMETRY=0
+```
+
+---
+
+## `--concurrency` — throttling CAS requests
+
+`--concurrency` (default `8`) caps the number of concurrent CAS requests for
+`snapshot` and `hydrate`. Lower it if you are hitting rate limits; the client also
+honors `Retry-After` and adapts concurrency downward (AIMD) on HTTP 429 on its own.
+
+```sh
+clw --concurrency 4 snapshot --name myapp-dev
+clw --concurrency 4 hydrate ~/workspace/myapp --name myapp-dev
+```
+
+---
+
+## Windows — hydrated symlinks become copies
+
+Windows has no unprivileged symlinks, so when `clw hydrate` materializes a symlink
+entry on Windows it **copies the target** instead of creating a link: a file
+target is copied byte-for-byte, a directory target is copied as a recursive
+subtree. Content round-trips bit-for-bit, but the link relationship does not
+survive a Windows hydrate. This is a documented, non-silent divergence.
+
+Path validation (rejecting backslash, drive-letter, and UNC traversal forms) is
+enforced on **every** platform, not just Windows.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `error: authentication failed (401) — check CLW_TOKEN / config PAT` | Missing or invalid token | Verify `CLW_TOKEN` is set and the PAT is correct in your CoreLink dashboard |
+| `error: authentication failed — check CLW_TOKEN or ~/.clw/config.toml` | Missing or invalid token | Verify `CLW_TOKEN` is set and the PAT is correct in your CoreLink dashboard (or run `clw auth whoami` to see the resolved identity) |
 | `error: not found in CAS: <digest>` on `clw hydrate` | Wrong workspace name or wrong tenant | Check `--name` matches what was passed to `clw snapshot`; verify `CLW_TENANT` is the same tenant that created the snapshot |
 | `error: transport error: config file already exists at ...; use --force to overwrite` | `clw init` run on a machine that already has a config | Run `clw init --force` to overwrite, or edit `~/.clw/config.toml` manually |
 | `error: missing tenant: ...` | `CLW_TENANT` not set and not in config | Set `CLW_TENANT=<your-tenant>` or run `clw init` |

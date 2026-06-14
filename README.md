@@ -6,9 +6,9 @@
 content-addressed store (CAS + AC), hydrates it anywhere in seconds, and memoizes
 deterministic commands so they never re-run when the inputs have not changed.
 
-> **Phase 1 / pre-1.0.** The commands documented here (`init`, `snapshot`, `hydrate`,
-> `status`, `run`, `ls`) are implemented and tested. No stability guarantee exists
-> until 1.0.
+> **Pre-1.0.** The commands documented here (`init`, `snapshot`, `hydrate`,
+> `status`, `run`, `ls`, `doctor`, `auth`) are implemented and tested. No stability
+> guarantee exists until 1.0.
 
 ---
 
@@ -22,6 +22,8 @@ deterministic commands so they never re-run when the inputs have not changed.
 | `clw status`   | Compares the local directory against the remote ref; exits 0 (clean) or 1 (dirty) |
 | `clw run`      | Runs a command, memoizing stdout/stderr/exit-code in the AC |
 | `clw ls`       | Shows ref metadata (root digest, file count, byte count) for a workspace |
+| `clw doctor`   | Prints a support-ready, **redacted** diagnostics bundle (token never shown) |
+| `clw auth`     | Manages the locally-stored identity offline: `login` / `logout` / `whoami` (`rotate` is a server-dependent stub) |
 
 Backed by the live CoreLink API at `https://corelink-api.humangr.com` (`/v1/cas`,
 `/v1/ac`). Pure client — zero server changes required.
@@ -30,19 +32,41 @@ Backed by the live CoreLink API at `https://corelink-api.humangr.com` (`/v1/cas`
 
 ## Install
 
-```sh
-git clone https://github.com/humangr-labs/corelink-workspaces
-cd corelink-workspaces
+`clw` is **proprietary** (commercial EULA — see [License](#license)). There is no
+public source repo or crates.io package, and pre-built binaries ship via an
+**authenticated download** surface, not a public release.
 
+> **Authenticated download:** _(placeholder — the signed cross-platform binaries
+> and the install-token bootstrap are coming with the release pipeline; see
+> `docs/ROADMAP-go-live.md` M3.)_
+
+### Building from source (internal / development only)
+
+If you have authenticated access to the source tree, build it directly:
+
+```sh
 cargo build --release
 
 # The binary lands at:
 ./target/release/clw --version
 ```
 
-Toolchain pinned to `1.91.1` in `rust-toolchain.toml`, which also declares the
-`rustfmt` and `clippy` components — rustup installs the pinned toolchain and its
-components automatically on first build.
+Toolchain pinned in `rust-toolchain.toml`, which also declares the `rustfmt` and
+`clippy` components — rustup installs the pinned toolchain and its components
+automatically on first build.
+
+### Platform support
+
+Signed targets are macOS (arm64 + x86_64), Windows x86_64, and Linux x86_64
+(+ aarch64). The whole workspace compiles and runs on Windows.
+
+> **Windows caveat — hydrated symlinks become copies.** Windows has no
+> unprivileged symlinks, so a symlink entry in a snapshot is materialized on
+> Windows as a **copy** of its target (a file is copied byte-for-byte; a
+> directory is copied as a subtree). This is a documented, non-silent
+> copies-not-links divergence; content round-trips, but the link relationship
+> does not survive a Windows hydrate. Path validation (rejecting backslash /
+> drive-letter / UNC traversal) is enforced on every platform.
 
 ---
 
@@ -132,8 +156,22 @@ missing after all layers.
 | `--token`       | `CLW_TOKEN`          | `token`         | *(required)*                         |
 | `--cache-dir`   | `CLW_CACHE_DIR`      | `cache_dir`     | `~/.clw/cache`                       |
 | `--json`        | —                    | —               | `false`                              |
+| `--no-color`    | `NO_COLOR` (presence)| —               | `false` (also auto-off on non-TTY)   |
+| `--concurrency` | —                    | —               | `8`                                  |
 
-`~/.clw/config.toml` format (written by `clw init`):
+Global flags are accepted before any subcommand. `--json` emits machine-readable
+JSON on stdout for every command **except `clw run`**, which has no `--json` form
+by design (the wrapped command owns stdout). `--no-color` disables ANSI color;
+color is also auto-disabled when `NO_COLOR` is set or stdout is not a TTY.
+`--concurrency` caps concurrent CAS requests for `snapshot`/`hydrate` (lower it if
+you hit rate limits).
+
+**Telemetry** is **off by default** and has no network backend today. It only
+activates on explicit opt-in (`CLW_TELEMETRY=1`, or `telemetry = "on"` in the
+config). The kill-switches `DO_NOT_TRACK=1` and `CLW_TELEMETRY=0` always win and
+cannot be overridden. clw never prompts for consent in CI / non-interactive runs.
+
+`~/.clw/config.toml` format (written by `clw init` or `clw auth login`):
 
 ```toml
 # clw configuration
@@ -201,4 +239,11 @@ See `scripts/gates.sh` for the exact escalation rules. The short version: touch
 
 ## License
 
-UNLICENSED — all rights reserved.
+`clw` is **proprietary software** distributed under a commercial end-user license
+agreement. It is not open source; there is no public repository or crates.io
+package, and all crates are marked `publish = false`.
+
+- [EULA.md](EULA.md) — the end-user license agreement governing use of `clw`.
+- [NOTICE](NOTICE) — third-party attributions for bundled dependencies (generated
+  via `cargo-about` from `about.toml`; the license allow-list lives in `deny.toml`).
+- [SECURITY.md](SECURITY.md) — security policy and responsible-disclosure process.
