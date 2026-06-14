@@ -317,6 +317,20 @@ mod tests {
             self.cas.lock().unwrap().insert(digest.to_hex(), bytes);
             Ok(())
         }
+
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().unwrap().remove(&digest.to_hex());
+            Ok(())
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            self.cas
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| Digest::from_hex(k))
+                .collect()
+        }
     }
 
     #[async_trait::async_trait]
@@ -334,6 +348,30 @@ mod tests {
             self.ac.lock().unwrap().remove(&key.to_hex());
             Ok(())
         }
+
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            self.ac
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| Digest::from_hex(k))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_list_refs_and_blobs_return_map_keys() {
+        let store = FakeStore::default();
+        let r = Digest::of_bytes(b"r");
+        let b = Digest::of_bytes(b"b");
+        AcTransport::put(&store, &r, b"v".to_vec()).await.unwrap();
+        CasTransport::put(&store, &b, b"data".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(AcTransport::list_refs(&store).await.unwrap(), vec![r]);
+        assert_eq!(CasTransport::list_blobs(&store).await.unwrap(), vec![b]);
+        CasTransport::delete(&store, &b).await.unwrap();
+        assert!(CasTransport::list_blobs(&store).await.unwrap().is_empty());
     }
 
     #[tokio::test]

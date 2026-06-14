@@ -6,6 +6,7 @@
 pub use clw_types as types;
 
 use clw_types::{AcTransport, CasTransport, ClwError, Config, Digest, Result, CAS_BLOB_CAP_BYTES};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -339,6 +340,86 @@ impl HttpClient {
         }
         Err(last_err)
     }
+
+    /// GET a paginated digest-listing endpoint at `base_url` and flatten every
+    /// page into a single `Vec<Digest>`.
+    ///
+    /// Tolerates both ratified-pending wire shapes (bare hex array OR
+    /// `{keys,cursor?}`; see [`ListPage`]) and follows a non-empty `cursor`
+    /// internally via `?cursor=<opaque>` until the server stops returning one.
+    /// Each page GET rides the SAME [`with_retry`](Self::with_retry) /
+    /// [`Governor`] / `User-Agent` path as every other request. The OPTIMISTIC
+    /// not-yet-deployed signal (405|501) is surfaced as
+    /// `ClwError::Transport(not_deployed_msg)`, so the AC (D-7) and CAS (D-8)
+    /// messages stay distinct per caller.
+    async fn list_digests(&self, base_url: &str, not_deployed_msg: &str) -> Result<Vec<Digest>> {
+        let auth = self.auth_header();
+        let client = &self.inner;
+        let mut out: Vec<Digest> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            // Append the opaque cursor as a query param when continuing.
+            let url = match &cursor {
+                Some(c) => format!("{base_url}?cursor={c}"),
+                None => base_url.to_string(),
+            };
+
+            let page: ListPage = self
+                .with_retry(|retry_slot| {
+                    let url = url.clone();
+                    let auth = auth.clone();
+                    let not_deployed_msg = not_deployed_msg.to_string();
+                    async move {
+                        let resp = client
+                            .get(&url)
+                            .header("Authorization", &auth)
+                            .header(reqwest::header::USER_AGENT, user_agent())
+                            .send()
+                            .await
+                            .map_err(|e| ClwError::Transport(e.to_string()))?;
+
+                        match resp.status().as_u16() {
+                            200 => {
+                                let bytes = resp
+                                    .bytes()
+                                    .await
+                                    .map_err(|e| ClwError::Transport(e.to_string()))?;
+                                serde_json::from_slice::<ListPage>(&bytes).map_err(|e| {
+                                    ClwError::Transport(format!(
+                                        "malformed list page from {url}: {e}"
+                                    ))
+                                })
+                            }
+                            401 => Err(ClwError::Auth),
+                            // OPTIMISTIC-pending: the listing endpoint isn't deployed yet.
+                            405 | 501 => Err(ClwError::Transport(not_deployed_msg)),
+                            429 => {
+                                record_retry_after(&retry_slot, &resp);
+                                Err(ClwError::Http {
+                                    status: 429,
+                                    context: format!("GET {url}"),
+                                })
+                            }
+                            s => Err(ClwError::Http {
+                                status: s,
+                                context: format!("GET {url}"),
+                            }),
+                        }
+                    }
+                })
+                .await?;
+
+            let (keys, next) = page.into_parts();
+            out.extend(keys);
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 /// The `User-Agent` value sent on every outgoing request, e.g.
@@ -424,6 +505,43 @@ fn is_retryable(e: &ClwError) -> bool {
         ClwError::Transport(_) => true,
         ClwError::Http { status, .. } => *status >= 500 || *status == 429,
         _ => false,
+    }
+}
+
+/// One page of a digest-listing endpoint (AC `list_refs` / CAS `list_blobs`).
+///
+/// The server contract (docs/REQUESTS-to-other-TLs.md D-7/D-8) is not yet
+/// ratified to one exact shape, so the client tolerates BOTH wire forms:
+///
+/// * a bare JSON array of hex digests: `["aa..","bb.."]`
+/// * an object: `{"keys":["aa.."],"cursor":"<opaque>"}` (cursor optional)
+///
+/// `Digest`'s own `Deserialize` validates each hex string. A present, non-empty
+/// `cursor` means more pages follow; the caller re-requests with `?cursor=...`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ListPage {
+    /// Bare hex array, no pagination envelope.
+    Bare(Vec<Digest>),
+    /// `{keys:[...], cursor?}` envelope.
+    Paged {
+        keys: Vec<Digest>,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+}
+
+impl ListPage {
+    /// Split a page into `(keys, next_cursor)`. A bare array never paginates.
+    fn into_parts(self) -> (Vec<Digest>, Option<String>) {
+        match self {
+            ListPage::Bare(keys) => (keys, None),
+            ListPage::Paged { keys, cursor } => {
+                // Treat an empty-string cursor as "no more pages".
+                let next = cursor.filter(|c| !c.is_empty());
+                (keys, next)
+            }
+        }
     }
 }
 
@@ -604,6 +722,70 @@ impl CasTransport for HttpClient {
         })
         .await
     }
+
+    /// DELETE a blob by its hash (`DELETE /v1/cas/{tenant}/{hash}`). Idempotent:
+    /// 200|202|204|404 all return Ok(()). OPTIMISTIC: 405|501 surface a clear
+    /// "CAS delete not yet deployed (D-8)" error until corelink-server ships the
+    /// handler — see docs/REQUESTS-to-other-TLs.md D-8.
+    async fn delete(&self, digest: &Digest) -> Result<()> {
+        let url = self.config.cas_url(digest);
+        let auth = self.auth_header();
+        let client = &self.inner;
+
+        self.with_retry(|retry_slot| {
+            let url = url.clone();
+            let auth = auth.clone();
+            async move {
+                let resp = client
+                    .delete(&url)
+                    .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
+                    .send()
+                    .await
+                    .map_err(|e| ClwError::Transport(e.to_string()))?;
+
+                match resp.status().as_u16() {
+                    // Idempotent: an absent blob (404) is a successful delete.
+                    200 | 202 | 204 | 404 => Ok(()),
+                    401 => Err(ClwError::Auth),
+                    405 | 501 => Err(ClwError::Transport(format!(
+                        "CAS delete not yet deployed (D-8) — corelink-server has no DELETE \
+                         /v1/cas handler yet; see docs/REQUESTS-to-other-TLs.md D-8 ({url})"
+                    ))),
+                    429 => {
+                        record_retry_after(&retry_slot, &resp);
+                        Err(ClwError::Http {
+                            status: 429,
+                            context: format!("DELETE {url}"),
+                        })
+                    }
+                    s => Err(ClwError::Http {
+                        status: s,
+                        context: format!("DELETE {url}"),
+                    }),
+                }
+            }
+        })
+        .await
+    }
+
+    /// List the tenant's CAS blob hashes (`GET /v1/cas/{tenant}`), paginating
+    /// internally into a flat `Vec`. Tolerates a bare hex array OR
+    /// `{keys,cursor?}`. OPTIMISTIC: 405|501 surface a clear "CAS listing not yet
+    /// deployed (D-8)" error — see docs/REQUESTS-to-other-TLs.md D-8.
+    async fn list_blobs(&self) -> Result<Vec<Digest>> {
+        let base_url = format!(
+            "{}/v1/cas/{}",
+            self.config.endpoint.trim_end_matches('/'),
+            self.config.tenant
+        );
+        self.list_digests(
+            &base_url,
+            "CAS listing not yet deployed (D-8) — corelink-server has no GET /v1/cas \
+             listing endpoint yet; see docs/REQUESTS-to-other-TLs.md D-8",
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +920,26 @@ impl AcTransport for HttpClient {
         })
         .await
     }
+
+    /// List the tenant's ref keys (`GET /v1/ac/{tenant}`), paginating internally
+    /// into a flat `Vec`. Needed because `ref_key = BLAKE3(domain‖name)` is
+    /// one-way and the client keeps no name→key index. Tolerates a bare hex
+    /// array OR `{keys,cursor?}`. OPTIMISTIC: 405|501 surface a clear "ref
+    /// listing not yet deployed (D-7)" error — see docs/REQUESTS-to-other-TLs.md
+    /// D-7.
+    async fn list_refs(&self) -> Result<Vec<Digest>> {
+        let base_url = format!(
+            "{}/v1/ac/{}",
+            self.config.endpoint.trim_end_matches('/'),
+            self.config.tenant
+        );
+        self.list_digests(
+            &base_url,
+            "ref listing not yet deployed (D-7) — corelink-server has no GET /v1/ac \
+             listing endpoint yet; see docs/REQUESTS-to-other-TLs.md D-7",
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -748,7 +950,7 @@ impl AcTransport for HttpClient {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_config(endpoint: String) -> Config {
@@ -1396,6 +1598,277 @@ mod tests {
         let client = make_client(server.uri());
         let err = AcTransport::delete(&client, &key).await.unwrap_err();
         assert!(matches!(err, ClwError::Http { status: 403, .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC list_refs — array / cursor pagination / not-deployed (D-7)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ac_list_refs_bare_array() {
+        let server = MockServer::start().await;
+        let d1 = Digest::of_bytes(b"ref-one");
+        let d2 = Digest::of_bytes(b"ref-two");
+        let body = format!(r#"["{d1}","{d2}"]"#);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/ac/test-tenant"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let refs = AcTransport::list_refs(&client).await.unwrap();
+        assert_eq!(refs, vec![d1, d2]);
+    }
+
+    #[tokio::test]
+    async fn ac_list_refs_cursor_pagination_flattens_all_pages() {
+        let server = MockServer::start().await;
+        let d1 = Digest::of_bytes(b"page1-a");
+        let d2 = Digest::of_bytes(b"page2-a");
+
+        // Page 1: a cursor envelope pointing at the next page.
+        Mock::given(method("GET"))
+            .and(path("/v1/ac/test-tenant"))
+            .and(query_param("cursor", "next-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"keys":["{d2}"],"cursor":""}}"#)),
+            )
+            .mount(&server)
+            .await;
+        // The first (cursor-less) request: keys + a non-empty cursor.
+        Mock::given(method("GET"))
+            .and(path("/v1/ac/test-tenant"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"keys":["{d1}"],"cursor":"next-1"}}"#)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let refs = AcTransport::list_refs(&client).await.unwrap();
+        // Both pages flattened, in page order. (Empty cursor on page 2 stops.)
+        assert_eq!(refs, vec![d1, d2]);
+    }
+
+    #[tokio::test]
+    async fn ac_list_refs_405_surfaces_not_deployed_d7() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ac/test-tenant"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::list_refs(&client).await.unwrap_err();
+        match err {
+            ClwError::Transport(msg) => {
+                assert!(msg.contains("not yet deployed"), "got: {msg}");
+                assert!(msg.contains("D-7"), "must cite D-7, got: {msg}");
+            }
+            other => panic!("expected Transport not-deployed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ac_list_refs_501_surfaces_not_deployed_d7() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ac/test-tenant"))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::list_refs(&client).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-7"))
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // CAS delete — idempotent (D-8); 204/404 → Ok, 405|501 → not-deployed
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cas_delete_204_returns_ok() {
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        CasTransport::delete(&client, &digest).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cas_delete_404_is_idempotent_ok() {
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        // Deleting an absent blob returns Ok(()) — idempotent.
+        CasTransport::delete(&client, &digest).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cas_delete_401_returns_auth_error() {
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::delete(&client, &digest).await.unwrap_err();
+        assert!(matches!(err, ClwError::Auth));
+    }
+
+    #[tokio::test]
+    async fn cas_delete_405_surfaces_not_deployed_d8() {
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::delete(&client, &digest).await.unwrap_err();
+        match err {
+            ClwError::Transport(msg) => {
+                assert!(msg.contains("not yet deployed"), "got: {msg}");
+                assert!(msg.contains("D-8"), "must cite D-8, got: {msg}");
+            }
+            other => panic!("expected Transport not-deployed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cas_delete_501_surfaces_not_deployed_d8() {
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("DELETE"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::delete(&client, &digest).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // CAS list_blobs — array / cursor pagination / not-deployed (D-8)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cas_list_blobs_bare_array() {
+        let server = MockServer::start().await;
+        let d1 = Digest::of_bytes(b"blob-one");
+        let d2 = Digest::of_bytes(b"blob-two");
+        let body = format!(r#"["{d1}","{d2}"]"#);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let blobs = CasTransport::list_blobs(&client).await.unwrap();
+        assert_eq!(blobs, vec![d1, d2]);
+    }
+
+    #[tokio::test]
+    async fn cas_list_blobs_cursor_pagination_flattens_all_pages() {
+        let server = MockServer::start().await;
+        let d1 = Digest::of_bytes(b"cblob-1");
+        let d2 = Digest::of_bytes(b"cblob-2");
+
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .and(query_param("cursor", "c2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"keys":["{d2}"]}}"#)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"keys":["{d1}"],"cursor":"c2"}}"#)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let blobs = CasTransport::list_blobs(&client).await.unwrap();
+        assert_eq!(blobs, vec![d1, d2]);
+    }
+
+    #[tokio::test]
+    async fn cas_list_blobs_405_surfaces_not_deployed_d8() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::list_blobs(&client).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_list_blobs_501_surfaces_not_deployed_d8() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(ResponseTemplate::new(501))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::list_blobs(&client).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+        );
     }
 
     // -------------------------------------------------------------------------

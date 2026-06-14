@@ -339,6 +339,18 @@ pub trait CasTransport: Send + Sync {
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>>;
     /// `bytes.len()` MUST be ≤ `CAS_BLOB_CAP_BYTES` (else `ClwError::TooLarge`).
     async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()>;
+    /// Delete a blob by its hash. Idempotent: deleting an absent blob returns
+    /// Ok(()). Unblocks `clw prune` (CAS mark-and-sweep GC) and the GDPR Art.17
+    /// erasure path. (corelink-server DELETE /v1/cas/{tenant}/{hash}; OPTIMISTIC —
+    /// pending, see docs/REQUESTS-to-other-TLs.md D-8. 405|501 surfaces a clear
+    /// "not yet deployed" error until it ships.)
+    async fn delete(&self, digest: &Digest) -> Result<()>;
+    /// List the tenant's CAS blob hashes (the live blob set for prune's
+    /// mark-and-sweep). Implementations paginate internally and return a flat
+    /// `Vec`. (corelink-server GET /v1/cas/{tenant}; OPTIMISTIC — pending, see
+    /// docs/REQUESTS-to-other-TLs.md D-8. 405|501 surfaces a clear "not yet
+    /// deployed" error until it ships.)
+    async fn list_blobs(&self) -> Result<Vec<Digest>>;
 }
 
 /// Mutable key→value transport (CoreLink `/v1/ac`). Values are opaque bytes.
@@ -349,6 +361,14 @@ pub trait AcTransport: Send + Sync {
     /// Delete a ref by its key. Idempotent: deleting an absent key returns Ok(()).
     /// (corelink-server DELETE /v1/ac/{tenant}/{key}; pending — see docs/REQUESTS-to-other-TLs.md D-1.)
     async fn delete(&self, key: &Digest) -> Result<()>;
+    /// List the tenant's ref keys. `ref_key = BLAKE3(domain‖name)` is one-way and
+    /// the client keeps no name→key index, so enumeration must come from the
+    /// server. Implementations paginate internally and return a flat `Vec`.
+    /// Unblocks `clw ls --all` + the live-root-set for prune + GDPR erasure.
+    /// (corelink-server GET /v1/ac/{tenant}; OPTIMISTIC — pending, see
+    /// docs/REQUESTS-to-other-TLs.md D-7. 405|501 surfaces a clear "not yet
+    /// deployed" error until it ships.)
+    async fn list_refs(&self) -> Result<Vec<Digest>>;
 }
 
 // ---------------------------------------------------------------------------

@@ -446,6 +446,15 @@ mod tests {
             self.cas.lock().await.insert(*digest, bytes);
             Ok(())
         }
+
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().await.remove(digest);
+            Ok(())
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().await.keys().copied().collect())
+        }
     }
 
     #[async_trait::async_trait]
@@ -463,6 +472,26 @@ mod tests {
             self.ac.lock().await.remove(key);
             Ok(())
         }
+
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            Ok(self.ac.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_list_refs_and_blobs_return_map_keys() {
+        let client = FakeTransport::default();
+        let r = Digest::of_bytes(b"r");
+        let b = Digest::of_bytes(b"b");
+        AcTransport::put(&client, &r, b"v".to_vec()).await.unwrap();
+        CasTransport::put(&client, &b, b"data".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(AcTransport::list_refs(&client).await.unwrap(), vec![r]);
+        assert_eq!(CasTransport::list_blobs(&client).await.unwrap(), vec![b]);
+        // CAS delete removes the blob.
+        CasTransport::delete(&client, &b).await.unwrap();
+        assert!(CasTransport::list_blobs(&client).await.unwrap().is_empty());
     }
 
     #[tokio::test]

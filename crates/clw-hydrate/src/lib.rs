@@ -566,6 +566,15 @@ mod tests {
             self.cas.lock().unwrap().insert(*digest, bytes);
             Ok(())
         }
+
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().unwrap().remove(digest);
+            Ok(())
+        }
+
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().unwrap().keys().copied().collect())
+        }
     }
 
     #[async_trait::async_trait]
@@ -583,6 +592,23 @@ mod tests {
             self.ac.lock().unwrap().remove(key);
             Ok(())
         }
+
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            Ok(self.ac.lock().unwrap().keys().copied().collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_list_refs_and_blobs_return_map_keys() {
+        let store = FakeStore::new();
+        let r = Digest::of_bytes(b"r");
+        let b = Digest::of_bytes(b"b");
+        store.ac_put_raw(r, b"v".to_vec());
+        store.cas_put_raw(b, b"data".to_vec());
+        assert_eq!(AcTransport::list_refs(&store).await.unwrap(), vec![r]);
+        assert_eq!(CasTransport::list_blobs(&store).await.unwrap(), vec![b]);
+        CasTransport::delete(&store, &b).await.unwrap();
+        assert!(CasTransport::list_blobs(&store).await.unwrap().is_empty());
     }
 
     #[tokio::test]
