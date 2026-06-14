@@ -18,12 +18,28 @@
 //! [`LocalCache::get`] re-hashes every blob it reads.  If the hash does not match the
 //! requested [`Digest`] (disk corruption, partial write, etc.) the corrupt file is
 //! removed and `Ok(None)` is returned so the caller can fetch the blob from the remote.
+//!
+//! # Format versioning
+//! The cache root carries a version sentinel file ([`VERSION_FILE`]) holding the
+//! integer [`CACHE_FORMAT_VERSION`].  On [`LocalCache::new`] the sentinel is checked:
+//! absent is treated as a fresh/legacy v1 store (the sentinel is written, content is
+//! **not** wiped); a matching version is a no-op; a mismatching version (older *or*
+//! newer) triggers a safe invalidation — all blob content is cleared and the sentinel
+//! is rewritten — so a future format change can never silently replay stale reads.
 
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use clw_types::{ClwError, Digest, Result};
+
+/// On-disk cache format version.  Bump this whenever the blob layout, sharding, or
+/// stored representation changes incompatibly; mismatching stores are invalidated on
+/// open rather than read stale.
+pub const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Name of the version sentinel file stored at the cache root.
+const VERSION_FILE: &str = ".clw-cache-version";
 
 // ---------------------------------------------------------------------------
 // LocalCache
@@ -56,7 +72,76 @@ impl LocalCache {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         }
-        Ok(Self { root })
+
+        let cache = Self { root };
+        cache.check_format_version()?;
+        Ok(cache)
+    }
+
+    /// Reconcile the on-disk format version with [`CACHE_FORMAT_VERSION`].
+    ///
+    /// * sentinel absent  ⇒ fresh or legacy v1 store; write the current version and
+    ///   leave existing content untouched.
+    /// * sentinel matches ⇒ no-op.
+    /// * sentinel differs (older *or* newer, or unparseable) ⇒ safely invalidate:
+    ///   clear all blob content, then rewrite the sentinel.  A one-line notice is
+    ///   logged to stderr so the wipe is never silent.
+    fn check_format_version(&self) -> Result<()> {
+        let version_path = self.root.join(VERSION_FILE);
+        let on_disk: Option<u32> = match fs::read_to_string(&version_path) {
+            Ok(s) => s.trim().parse::<u32>().ok().or(Some(u32::MAX)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(ClwError::Io(e)),
+        };
+
+        match on_disk {
+            // Matching version: nothing to do.
+            Some(v) if v == CACHE_FORMAT_VERSION => Ok(()),
+            // Mismatch (parseable-but-different or unparseable sentinel): invalidate.
+            Some(v) => {
+                eprintln!(
+                    "clw-cache: cache format mismatch at {} (on-disk={}, expected={}); \
+                     invalidating cached content to avoid stale reads",
+                    self.root.display(),
+                    v,
+                    CACHE_FORMAT_VERSION,
+                );
+                self.clear_content()?;
+                self.write_version()
+            }
+            // Absent sentinel: fresh or legacy v1 store — stamp it, keep content.
+            None => self.write_version(),
+        }
+    }
+
+    /// Write the current [`CACHE_FORMAT_VERSION`] to the sentinel file.
+    fn write_version(&self) -> Result<()> {
+        fs::write(
+            self.root.join(VERSION_FILE),
+            CACHE_FORMAT_VERSION.to_string(),
+        )
+        .map_err(ClwError::Io)
+    }
+
+    /// Remove every cached blob, leaving the shard directories in place.
+    fn clear_content(&self) -> Result<()> {
+        let blobs_root = self.root.join("blobs");
+        for i in 0u16..=255 {
+            let shard = format!("{:02x}", i);
+            let shard_path = blobs_root.join(&shard);
+            let rd = match fs::read_dir(&shard_path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(ClwError::Io(e)),
+            };
+            for entry in rd {
+                let entry = entry?;
+                if entry.metadata()?.is_file() {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -355,6 +440,92 @@ mod tests {
 
         // Suppress unused variable warning.
         let _ = base;
+    }
+
+    // -----------------------------------------------------------------------
+    // format version: fresh cache stamps the sentinel
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fresh_cache_writes_version_sentinel() {
+        let (dir, _cache) = make_cache();
+        let sentinel = dir.path().join(VERSION_FILE);
+        assert!(
+            sentinel.exists(),
+            "fresh cache must write the version sentinel"
+        );
+        let contents = fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(contents.trim(), CACHE_FORMAT_VERSION.to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // format version: absent sentinel (legacy store) keeps existing content
+    // -----------------------------------------------------------------------
+    #[test]
+    fn absent_sentinel_is_treated_as_legacy_and_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        // First open stamps the sentinel and stores a blob.
+        let cache = LocalCache::new(dir.path()).unwrap();
+        let data = b"legacy content";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        // Simulate a legacy store: remove the sentinel but keep content.
+        fs::remove_file(dir.path().join(VERSION_FILE)).unwrap();
+
+        // Reopen: sentinel is rewritten, content is NOT wiped.
+        let cache = LocalCache::new(dir.path()).unwrap();
+        assert!(dir.path().join(VERSION_FILE).exists());
+        assert!(cache.has(&d), "legacy content must survive the stamp");
+    }
+
+    // -----------------------------------------------------------------------
+    // format version: matching sentinel is a no-op (content untouched)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn matching_version_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+        let data = b"keep me";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        // Reopen with an unchanged sentinel: content must remain.
+        let cache = LocalCache::new(dir.path()).unwrap();
+        assert!(cache.has(&d), "matching version must not touch content");
+    }
+
+    // -----------------------------------------------------------------------
+    // format version: mismatching sentinel invalidates content + rewrites stamp
+    // -----------------------------------------------------------------------
+    #[test]
+    fn mismatching_version_invalidates_cache() {
+        let dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+        let data = b"stale across formats";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+        assert!(cache.has(&d));
+
+        // Write a different (older/newer) version into the sentinel.
+        fs::write(
+            dir.path().join(VERSION_FILE),
+            (CACHE_FORMAT_VERSION + 7).to_string(),
+        )
+        .unwrap();
+
+        // Reopen: content must be cleared and the sentinel rewritten to current.
+        let cache = LocalCache::new(dir.path()).unwrap();
+        assert!(!cache.has(&d), "mismatched format must invalidate content");
+        let contents = fs::read_to_string(dir.path().join(VERSION_FILE)).unwrap();
+        assert_eq!(
+            contents.trim(),
+            CACHE_FORMAT_VERSION.to_string(),
+            "sentinel must be rewritten to the current version"
+        );
+
+        // The store is still usable after invalidation.
+        cache.put(&d, data).unwrap();
+        assert!(cache.has(&d));
     }
 
     // -----------------------------------------------------------------------
