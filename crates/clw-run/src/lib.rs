@@ -16,7 +16,7 @@ use std::path::Path;
 // Public constants + types (frozen anchor)
 // ---------------------------------------------------------------------------
 
-pub const RUN_KEY_DOMAIN: &str = "clw/run/v2/";
+pub const RUN_KEY_DOMAIN: &str = "clw/run/v3/";
 
 pub struct RunOptions {
     pub inputs: Vec<String>,
@@ -148,11 +148,17 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     input_pairs.sort_by(|a, b| a[0].cmp(&b[0]));
 
     // --- env ---
+    // Presence-distinguishing encoding: an UNSET var ("unset") and a var SET to
+    // "" ("set:") now produce DIFFERENT bytes. Previously both collapsed to ""
+    // and yielded identical key bytes, breaking hermeticity (unset ≠ empty).
     let mut env_pairs: Vec<[String; 2]> = Vec::new();
     let mut env_keys = opts.env_keys.clone();
     env_keys.sort();
     for key in &env_keys {
-        let value = std::env::var(key).unwrap_or_default();
+        let value = match std::env::var(key) {
+            Ok(v) => format!("set:{v}"),
+            Err(_) => "unset".to_string(),
+        };
         env_pairs.push([key.clone(), value]);
     }
 
@@ -479,6 +485,50 @@ mod tests {
             "unlisted env var change must not change key"
         );
         assert!(o2.hit, "unlisted env var change must yield hit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: env presence — an UNSET var vs a var SET TO "" must yield DIFFERENT
+    // keys (M1.5: unset ≠ empty); unchanged presence yields the same key.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn env_unset_differs_from_empty() {
+        // Unique var name to avoid races with other env-mutating tests
+        // (this crate's env tests are not serialized; uniqueness is the guard).
+        const VAR: &str = "CLW_TEST_PRESENCE_9f3a_M15";
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("p.txt"), b"data").unwrap();
+
+        let opts = RunOptions {
+            inputs: vec!["p.txt".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![VAR.to_string()],
+        };
+
+        // Ensure a known starting state.
+        std::env::remove_var(VAR);
+        let key_unset = compute_key(cwd, &opts).await.unwrap();
+        // Same UNSET state again → same key.
+        let key_unset2 = compute_key(cwd, &opts).await.unwrap();
+
+        // Now SET the var to the empty string.
+        std::env::set_var(VAR, "");
+        let key_empty = compute_key(cwd, &opts).await.unwrap();
+
+        // Clean up the env var.
+        std::env::remove_var(VAR);
+
+        assert_eq!(
+            key_unset, key_unset2,
+            "unchanged (unset) presence must yield the same key"
+        );
+        assert_ne!(
+            key_unset, key_empty,
+            "UNSET var and a var SET TO \"\" must yield DIFFERENT keys (unset ≠ empty)"
+        );
     }
 
     // -----------------------------------------------------------------------
