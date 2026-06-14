@@ -1,0 +1,50 @@
+name: cross-platform
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One cross-platform run at a time per ref — avoid GitHub-hosted runner pile-ups.
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # GitHub-hosted matrix — the real Windows/Linux compile proof on push.
+  # (This is GitHub-hosted, so rustup works normally — no founder-Mac hack.)
+  build:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Linux is blocking (must pass); Windows is informational while the port stabilizes.
+    continue-on-error: ${{ matrix.continue-on-error }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            continue-on-error: false
+          # first Windows lane — informational until the port is verified green, then remove continue-on-error to make it required
+          - os: windows-latest
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust 1.91.1 (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.1
+          components: rustfmt, clippy
+
+      - name: cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
