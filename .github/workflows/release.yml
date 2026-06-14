@@ -111,15 +111,68 @@ jobs:
 
       # -----------------------------------------------------------------------
       # EXTENSION POINT — M3.4 live-conformance pre-tag gate.
-      # The conformance suite runs against prod CAS/AC as a final pre-tag guard.
-      # Wire the HOOK only; the suite itself is owned by WP M3.4.
-      # TODO(M3.4): run the live conformance suite here (opt-in / feature-gated)
-      #   before any binary is built and signed.
+      # SUPERSEDED by the standalone `conformance` job below (WP M4.5): the live
+      # conformance suite now runs as its own job and is a REQUIRED `needs:`
+      # predecessor of `build` and `publish`, so a tag cannot ship if conformance
+      # is red. See the `conformance` job for the gate itself.
       # -----------------------------------------------------------------------
-      # - name: live conformance gate (M3.4)
-      #   env:
-      #     CLW_CONFORMANCE_TOKEN: ${{ secrets.CLW_CONFORMANCE_TOKEN }}
-      #   run: cargo test -p clw-conformance --features live -- --include-ignored
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1b — LIVE CONFORMANCE PRE-TAG GATE (WP M4.5)
+  # The conformance suite runs against the live CAS/AC service as the FINAL
+  # pre-tag guard, BEFORE any binary is built, signed, or published. It is a
+  # standalone job (not folded into preflight) precisely so `build` and
+  # `publish` can name it in `needs:` — making it a REQUIRED, blocking
+  # predecessor: a tag whose conformance is red cannot reach the signing/publish
+  # stages at all.
+  #
+  # SKIP-NOT-FAIL semantics (intentional):
+  #   `clw-conformance --features live` is written to be env-skip-safe — without
+  #   a service PAT it skips its live cases and the job goes GREEN. That keeps
+  #   the scaffold dry-runnable on forks / before secrets exist. The skip is a
+  #   DELIBERATE no-op, NOT a true gate: until the PAT secret below is
+  #   provisioned, a red service would NOT block a tag (the suite simply skips).
+  #   Once `CLW_CI_TOKEN` is provisioned, the suite exercises the live cases and
+  #   this becomes a genuine ship-blocking gate.
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: live conformance gate (pre-tag)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # CI service identity for the live conformance suite. The suite reads these
+      # and SKIPS its live cases (green) when the PAT is absent — see the
+      # SKIP-NOT-FAIL note above.
+      # TODO(OWNER): provision the conformance service PAT secret (CLW_CI_TOKEN),
+      #   plus the CI tenant + endpoint, so this becomes a true ship-blocking gate
+      #   instead of an env-skipped no-op.
+      CLW_CI_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+      CLW_CI_TENANT: ${{ secrets.CLW_CI_TENANT }}
+      CLW_CI_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+
+      - name: announce gate mode (true gate vs. env-skip)
+        run: |
+          set -euo pipefail
+          if [ -z "${CLW_CI_TOKEN:-}" ]; then
+            echo "::warning::CLW_CI_TOKEN absent — live conformance cases will SKIP (green)."
+            echo "::warning::This is an intentional env-skip, NOT a gate. Provision the PAT secret to make it ship-blocking."
+          else
+            echo "CLW_CI_TOKEN present — running live conformance as a ship-blocking pre-tag gate."
+          fi
+
+      # The suite is env-skip-safe: with no PAT the live cases skip and this is
+      # GREEN; with the PAT provisioned a red service FAILS this job and (via the
+      # `needs:` edges) blocks build/sign/publish.
+      - name: live conformance suite (clw-conformance --features live)
+        run: cargo test -p clw-conformance --features live
 
   # ---------------------------------------------------------------------------
   # STAGE 2 + 3 — BUILD MATRIX (+ SIGN folded into each leg)
@@ -129,7 +182,9 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: build+sign (${{ matrix.target }})
-    needs: preflight
+    # `conformance` is a REQUIRED predecessor (WP M4.5): no binary is built or
+    # signed until the live conformance gate is green.
+    needs: [preflight, conformance]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -312,13 +367,75 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # STAGE 3b — SBOM (WP M4.3)
+  # Generate a CycloneDX SBOM for the whole workspace and ship it as a release
+  # artifact alongside the binaries. The SBOM is uploaded as a build artifact
+  # here and re-collected by `publish` into the release/ dir so it is checksummed
+  # and pushed to the download surface with the binaries.
+  #
+  # Gated on `conformance` (no SBOM for a tag that failed the live gate) but NOT
+  # on `build`: the SBOM is derived from the dependency graph (Cargo.lock), not
+  # from the compiled binaries, so it can run in parallel with the matrix.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: sbom (CycloneDX)
+    needs: [preflight, conformance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      SBOM: clw-${{ needs.preflight.outputs.version }}.cdx.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned rust toolchain
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+
+      # cargo-cyclonedx emits a CycloneDX SBOM straight from the Cargo metadata /
+      # Cargo.lock — no network egress and no signing secret, so this needs NO
+      # owner-gated credential and runs fully in the scaffold.
+      - name: install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: generate CycloneDX SBOM (workspace, JSON)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # `--all` covers every workspace member; JSON is the CycloneDX format the
+          # publish surface consumes. cargo-cyclonedx writes per-manifest files; we
+          # also request an aggregated workspace SBOM under a stable name.
+          cargo cyclonedx --all --format json --override-filename "clw-${VERSION}"
+          # Collect whatever cargo-cyclonedx produced (root + per-member) into dist/
+          # under the versioned release name. The aggregated/root file is the
+          # canonical release SBOM; per-member files ride along for completeness.
+          find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \; || true
+          # Ensure a canonical, predictably-named SBOM exists for the release.
+          if [ -f "clw-${VERSION}.cdx.json" ]; then
+            cp "clw-${VERSION}.cdx.json" "dist/${SBOM}"
+          fi
+          echo "---- SBOM files ----"
+          ls -la dist/
+
+      - name: upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clw-sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # STAGE 4 — CHECKSUM + PUBLISH
   # Collect every signed artifact, produce one signed SHA256SUMS, then publish to
   # the AUTHENTICATED proprietary download surface (NOT a public GitHub Release).
   # ---------------------------------------------------------------------------
   publish:
     name: checksum + publish
-    needs: [preflight, build]
+    # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
+    # predecessor of publish/sign — a red conformance tag never ships.
+    needs: [preflight, conformance, build, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -326,7 +443,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: download all signed artifacts
+      # Downloads EVERY uploaded artifact (per-target binaries AND the M4.3
+      # `clw-sbom` CycloneDX SBOM) — no `name:` filter, so the SBOM rides along.
+      - name: download all signed artifacts + SBOM
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -336,7 +455,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          # Flatten per-target artifact dirs into one release/ dir.
+          # Flatten per-target artifact dirs (binaries, signatures, SBOM) into one
+          # release/ dir so the SBOM is checksummed + published with the binaries.
           find artifacts -type f -exec cp {} release/ \;
           ls -la release/
 
