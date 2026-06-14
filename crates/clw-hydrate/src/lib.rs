@@ -120,28 +120,20 @@ where
     let files_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // ------------------------------------------------------------------
-    // 3a. Directories and symlinks are cheap — handle them first,
-    //     sequentially (no network I/O needed).
+    // 3a. Directories are cheap — handle them first, sequentially.
+    //
+    // SECURITY (M1.7): symlinks are materialised in a *separate, later* pass
+    // (3c, after all regular files exist). A symlink created before its sibling
+    // files could redirect a later file write outside the intended location
+    // (e.g. a link `out/sub` → `/etc` followed by a file `out/sub/passwd`).
+    // Creating every regular file first removes that window.
     // ------------------------------------------------------------------
     for entry in &manifest.entries {
-        match entry {
-            Entry::Dir { path } => {
-                // Defense-in-depth: reject unsafe paths even if from_bytes was bypassed.
-                clw_types::validate_rel_path(path)?;
-                let abs = dest.join(path);
-                std::fs::create_dir_all(&abs)?;
-            }
-            Entry::Symlink { path, target } => {
-                // Defense-in-depth: validate both the link path and its target.
-                clw_types::validate_rel_path(path)?;
-                clw_types::validate_symlink_target(target)?;
-                let abs = dest.join(path);
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::os::unix::fs::symlink(target, &abs)?;
-            }
-            Entry::File { .. } => {} // handled below
+        if let Entry::Dir { path } = entry {
+            // Defense-in-depth: reject unsafe paths even if from_bytes was bypassed.
+            clw_types::validate_rel_path(path)?;
+            let abs = dest.join(path);
+            std::fs::create_dir_all(&abs)?;
         }
     }
 
@@ -194,6 +186,23 @@ where
     let mut buffered = stream.buffer_unordered(opts.concurrency);
     while let Some(result) = buffered.next().await {
         result?;
+    }
+
+    // ------------------------------------------------------------------
+    // 3c. Symlinks — created LAST, after every regular file is materialised
+    //     (see the SECURITY note on pass 3a). No network I/O needed.
+    // ------------------------------------------------------------------
+    for entry in &manifest.entries {
+        if let Entry::Symlink { path, target } = entry {
+            // Defense-in-depth: validate both the link path and its target.
+            clw_types::validate_rel_path(path)?;
+            clw_types::validate_symlink_target(target)?;
+            let abs = dest.join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(target, &abs)?;
+        }
     }
 
     Ok(HydrateReport {
@@ -256,7 +265,10 @@ where
         f.flush()?;
     }
     std::fs::rename(&tmp_path, &abs)?;
-    let perms = std::fs::Permissions::from_mode(mode);
+    // SECURITY (M1.7): mask to permission bits only. An untrusted manifest must
+    // not be able to create setuid/setgid/sticky files — strip everything above
+    // the low 9 permission bits (0o777).
+    let perms = std::fs::Permissions::from_mode(mode & 0o777);
     std::fs::set_permissions(&abs, perms)?;
     Ok((bytes_from_cache, bytes_downloaded))
 }
@@ -275,9 +287,21 @@ where
     // here avoids the 'static requirement of spawn_blocking — same approach as
     // clw-snapshot). NO unsafe, NO raw pointers.
     if let Some(data) = cache.get(&digest)? {
+        // Local-cache path is trusted (we only ever cache verified bytes).
         return Ok((data, true));
     }
     let data = CasTransport::get(client, &digest).await?;
+    // SECURITY (M1.7): re-verify the fetched bytes against the expected digest
+    // before caching/writing. The CasTransport contract requires this, but an
+    // untrusted or buggy transport could return mismatched bytes; hydrate must
+    // not write or cache content that does not hash to what the manifest pins.
+    let actual = Digest::of_bytes(&data);
+    if actual != digest {
+        return Err(ClwError::Integrity {
+            expected: digest,
+            actual,
+        });
+    }
     cache.put(&digest, &data)?;
     Ok((data, false))
 }
@@ -687,6 +711,152 @@ mod tests {
         assert!(
             matches!(err, ClwError::Json(_) | ClwError::InvalidManifest(_)),
             "expected Json or InvalidManifest, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5 (M1.7): a fetched chunk whose bytes don't hash to the expected
+    // digest must surface ClwError::Integrity — never be written or cached.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn corrupt_fetched_chunk_returns_integrity_error() {
+        let honest = b"the real chunk bytes";
+        let (digest, _real_bytes) = make_chunk(honest);
+
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: honest.len() as u64,
+            entries: vec![Entry::File {
+                path: "f.bin".into(),
+                mode: 0o644,
+                size: honest.len() as u64,
+                chunks: vec![ChunkRef {
+                    digest,
+                    size: honest.len() as u64,
+                }],
+            }],
+        };
+
+        // Seed the store but deliberately store CORRUPT bytes under the digest.
+        // (The fake transport does not self-verify, mimicking a hostile/buggy
+        // CAS endpoint; hydrate must catch the mismatch itself.)
+        let corrupt = b"TAMPERED payload of a different length!!".to_vec();
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(digest, honest.to_vec())]);
+        store.cas_put_raw(digest, corrupt);
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Integrity { expected, .. } if expected == digest),
+            "expected Integrity for {digest}, got: {err}"
+        );
+
+        // The corrupt bytes must NOT have been written or cached.
+        assert!(
+            !dest.join("f.bin").exists(),
+            "corrupt file must not be written"
+        );
+        assert!(!cache.has(&digest), "corrupt chunk must not be cached");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6 (M1.7): setuid/setgid/sticky bits in a manifest mode must be
+    // stripped — only the low 9 permission bits survive.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn manifest_mode_setuid_bit_is_stripped() {
+        let data = b"executable-ish";
+        let (d, bytes) = make_chunk(data);
+
+        // 0o4755 = setuid + rwxr-xr-x. After masking we expect 0o755 only.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![Entry::File {
+                path: "suid.bin".into(),
+                mode: 0o4755,
+                size: data.len() as u64,
+                chunks: vec![ChunkRef {
+                    digest: d,
+                    size: data.len() as u64,
+                }],
+            }],
+        };
+
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        hydrate(&dest, &store, &cache, &opts).await.unwrap();
+
+        let meta = std::fs::metadata(dest.join("suid.bin")).unwrap();
+        let mode = meta.permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "permission bits preserved");
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky bits stripped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7 (M1.7): regular files are materialised BEFORE symlinks are
+    // created. We place the symlink first in the manifest's entry order; a
+    // symlink that pre-empted a sibling directory would corrupt where the
+    // file lands. Files-first guarantees the real directory wins.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn regular_files_materialized_before_symlinks() {
+        let data = b"inner-file-data";
+        let (d, bytes) = make_chunk(data);
+
+        // Entry order (NOT sorted): symlink FIRST, then the file under `sub/`.
+        // `mylink` -> `sub/inner.txt`. If the link were created before the file
+        // exists it would dangle; files-first means the target already exists.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![
+                Entry::Symlink {
+                    path: "mylink".into(),
+                    target: "sub/inner.txt".into(),
+                },
+                Entry::File {
+                    path: "sub/inner.txt".into(),
+                    mode: 0o644,
+                    size: data.len() as u64,
+                    chunks: vec![ChunkRef {
+                        digest: d,
+                        size: data.len() as u64,
+                    }],
+                },
+            ],
+        };
+
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        hydrate(&dest, &store, &cache, &opts).await.unwrap();
+
+        // The real file exists with correct content.
+        assert_eq!(std::fs::read(dest.join("sub/inner.txt")).unwrap(), data);
+
+        // The symlink exists and, because the file was materialised first,
+        // resolves through to the real content (no dangling link).
+        let link = dest.join("mylink");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap().to_str().unwrap(),
+            "sub/inner.txt"
+        );
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            data,
+            "symlink resolves to the already-materialised file"
         );
     }
 }
