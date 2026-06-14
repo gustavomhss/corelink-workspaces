@@ -374,6 +374,7 @@ dependencies = [
  "async-trait",
  "clw-cache",
  "clw-client",
+ "clw-snapshot",
  "clw-types",
  "futures",
  "tempfile",

@@ -18,3 +18,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# Needed only by the `snapshot_hydrate_roundtrip` example, which drives a full
+# snapshot -> hydrate round-trip. clw-hydrate does not depend on clw-snapshot at
+# runtime; this dev-dep exists solely so the example can exercise both halves.
+clw-snapshot = { workspace = true }
