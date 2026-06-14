@@ -50,6 +50,13 @@ if [ "$SCOPE" = "full" ]; then
   echo "FULL lane: whole workspace"
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace
+  # Supply-chain gates are a whole-workspace concern — full lane only.
+  cargo deny check
+  if command -v cargo-audit >/dev/null 2>&1; then
+    cargo audit
+  else
+    echo "cargo-audit not installed — CI provisions it; skipping locally"
+  fi
 else
   echo "SCOPED lane: crates [${SCOPE}]"
   pkgs=""
