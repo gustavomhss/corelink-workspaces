@@ -169,6 +169,12 @@ pub struct HttpClient {
     /// [`ClwError`] is frozen and carries no retry hint. `with_retry` consults
     /// and clears it to pick the next sleep. `0` means "none pending".
     last_retry_after_ms: Arc<AtomicU64>,
+    /// Last *raw* `Retry-After` value (in seconds, un-clamped) observed on a 429.
+    /// Unlike `last_retry_after_ms` this is not consumed by the backoff loop; it
+    /// is read once on retry exhaustion to distinguish a transient backpressure
+    /// 429 (small value) from an app/plan quota ceiling (huge value) when
+    /// composing the [`ClwError::Http`] context. `0` means "none observed".
+    last_retry_after_secs: Arc<AtomicU64>,
 }
 
 // Manual Debug impl: redact the token.
@@ -217,6 +223,7 @@ impl HttpClient {
             config,
             governor: Arc::new(Governor::new(max)),
             last_retry_after_ms: Arc::new(AtomicU64::new(0)),
+            last_retry_after_secs: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -241,6 +248,9 @@ impl HttpClient {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let mut last_err: Option<ClwError> = None;
+        // Reset the raw retry-after observation for this call so a stale value
+        // from a previous request can't taint the exhaustion message.
+        self.last_retry_after_secs.store(0, Ordering::Relaxed);
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 let base = RETRY_SLEEP_MS[(attempt - 1) as usize];
@@ -282,7 +292,53 @@ impl HttpClient {
                 }
             }
         }
-        Err(last_err.unwrap())
+        // On exhaustion, rewrite a final 429's context so the message
+        // distinguishes a transient backpressure throttle from a plan/quota
+        // ceiling, using the last raw Retry-After observed (M5.6).
+        let last_err = last_err.unwrap();
+        if let ClwError::Http { status: 429, .. } = &last_err {
+            let raw = self.last_retry_after_secs.load(Ordering::Relaxed);
+            let retry_after = (raw > 0).then_some(raw);
+            return Err(ClwError::Http {
+                status: 429,
+                context: exhausted_429_context(retry_after, MAX_ATTEMPTS),
+            });
+        }
+        Err(last_err)
+    }
+}
+
+/// The `User-Agent` value sent on every outgoing request, e.g.
+/// `clw/0.1.0 (macos; x86_64)`. Built once at first use and cached.
+fn user_agent() -> &'static str {
+    use std::sync::OnceLock;
+    static UA: OnceLock<String> = OnceLock::new();
+    UA.get_or_init(|| {
+        format!(
+            "clw/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+}
+
+/// App-quota 429s carry a `Retry-After` measured in the seconds until the next
+/// monthly window opens (huge); backpressure 429s carry a short delay. Above
+/// this threshold we read the 429 as a plan/quota ceiling rather than transient
+/// throttling, and surface an actionable message on exhaustion.
+const QUOTA_RETRY_AFTER_SECS: u64 = 3_600;
+
+/// Build the `context` string for a 429 that exhausted its retry budget. The
+/// final `Retry-After` (delta-seconds) disambiguates the two real cases:
+/// a small value is transient DO-backpressure ("rate-limited after N retries");
+/// a large one is an app/plan quota ceiling that retrying cannot clear.
+fn exhausted_429_context(retry_after_secs: Option<u64>, attempts: u32) -> String {
+    match retry_after_secs {
+        Some(secs) if secs > QUOTA_RETRY_AFTER_SECS => {
+            format!("plan/quota limit reached — retry-after {secs}s; check your plan/quota")
+        }
+        _ => format!("rate-limited after {attempts} retries"),
     }
 }
 
@@ -290,13 +346,17 @@ impl HttpClient {
 /// it as milliseconds into `slot` for [`HttpClient::with_retry`] to consume. Must
 /// be called *before* the response is mapped to a [`ClwError`] (which drops
 /// headers). Threaded out-of-band because [`ClwError`] is frozen.
-fn record_retry_after(slot: &AtomicU64, resp: &reqwest::Response) {
+fn record_retry_after(slot: &AtomicU64, raw_secs_slot: &AtomicU64, resp: &reqwest::Response) {
     if let Some(secs) = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
     {
+        // Preserve the raw (un-clamped) seconds for the quota-vs-backpressure
+        // distinction surfaced on retry exhaustion. Floor at 1 so a literal
+        // `retry-after: 0` still registers as "present".
+        raw_secs_slot.store(secs.max(1), Ordering::Relaxed);
         // Cap at the longest ladder rung so a hostile header can't park us for an
         // unbounded time, and floor visible values at 1ms so the "present" signal
         // survives the swap-on-0 sentinel.
@@ -348,16 +408,19 @@ impl CasTransport for HttpClient {
         let auth = self.auth_header();
         let client = &self.inner;
         let retry_slot = Arc::clone(&self.last_retry_after_ms);
+        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
         self.with_retry(|| {
             let url = url.clone();
             let auth = auth.clone();
             let retry_slot = Arc::clone(&retry_slot);
+            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 // Try HEAD first.
                 let resp = client
                     .head(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .send()
                     .await
                     .map_err(|e| ClwError::Transport(e.to_string()))?;
@@ -369,7 +432,7 @@ impl CasTransport for HttpClient {
                     // 405 Method Not Allowed or 501 Not Implemented → fall back to GET.
                     405 | 501 => {}
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         return Err(ClwError::Http {
                             status: 429,
                             context: format!("HEAD {url}"),
@@ -387,6 +450,7 @@ impl CasTransport for HttpClient {
                 let resp = client
                     .get(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .send()
                     .await
                     .map_err(|e| ClwError::Transport(e.to_string()))?;
@@ -396,7 +460,7 @@ impl CasTransport for HttpClient {
                     404 => Ok(false),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url} (exists-fallback)"),
@@ -418,15 +482,18 @@ impl CasTransport for HttpClient {
         let client = &self.inner;
         let digest = *digest;
         let retry_slot = Arc::clone(&self.last_retry_after_ms);
+        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
         self.with_retry(|| {
             let url = url.clone();
             let auth = auth.clone();
             let retry_slot = Arc::clone(&retry_slot);
+            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .get(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .send()
                     .await
                     .map_err(|e| ClwError::Transport(e.to_string()))?;
@@ -449,7 +516,7 @@ impl CasTransport for HttpClient {
                     404 => Err(ClwError::NotFound(digest)),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url}"),
@@ -478,16 +545,19 @@ impl CasTransport for HttpClient {
         let auth = self.auth_header();
         let client = &self.inner;
         let retry_slot = Arc::clone(&self.last_retry_after_ms);
+        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
         self.with_retry(|| {
             let url = url.clone();
             let auth = auth.clone();
             let bytes = bytes.clone();
             let retry_slot = Arc::clone(&retry_slot);
+            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .put(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .body(bytes)
                     .send()
                     .await
@@ -501,7 +571,7 @@ impl CasTransport for HttpClient {
                         cap: CAS_BLOB_CAP_BYTES as u64,
                     }),
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("PUT {url}"),
@@ -529,15 +599,18 @@ impl AcTransport for HttpClient {
         let auth = self.auth_header();
         let client = &self.inner;
         let retry_slot = Arc::clone(&self.last_retry_after_ms);
+        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
         self.with_retry(|| {
             let url = url.clone();
             let auth = auth.clone();
             let retry_slot = Arc::clone(&retry_slot);
+            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .get(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .send()
                     .await
                     .map_err(|e| ClwError::Transport(e.to_string()))?;
@@ -553,7 +626,7 @@ impl AcTransport for HttpClient {
                     404 => Ok(None),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("GET {url}"),
@@ -574,16 +647,19 @@ impl AcTransport for HttpClient {
         let auth = self.auth_header();
         let client = &self.inner;
         let retry_slot = Arc::clone(&self.last_retry_after_ms);
+        let retry_secs_slot = Arc::clone(&self.last_retry_after_secs);
 
         self.with_retry(|| {
             let url = url.clone();
             let auth = auth.clone();
             let value = value.clone();
             let retry_slot = Arc::clone(&retry_slot);
+            let retry_secs_slot = Arc::clone(&retry_secs_slot);
             async move {
                 let resp = client
                     .put(&url)
                     .header("Authorization", &auth)
+                    .header(reqwest::header::USER_AGENT, user_agent())
                     .body(value)
                     .send()
                     .await
@@ -593,7 +669,7 @@ impl AcTransport for HttpClient {
                     200 | 201 | 204 => Ok(()),
                     401 => Err(ClwError::Auth),
                     429 => {
-                        record_retry_after(&retry_slot, &resp);
+                        record_retry_after(&retry_slot, &retry_secs_slot, &resp);
                         Err(ClwError::Http {
                             status: 429,
                             context: format!("PUT {url}"),
@@ -960,6 +1036,55 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path(&path_str))
             .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        AcTransport::put(&client, &key, b"value".to_vec())
+            .await
+            .unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // User-Agent header is sent on outgoing requests (M5.2)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn user_agent_header_sent_on_cas_get() {
+        let server = MockServer::start().await;
+        let (digest, bytes) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        // Match only requests whose User-Agent is exactly our built value. If the
+        // header is missing or wrong, the mock won't match and the call errors.
+        Mock::given(method("GET"))
+            .and(path(&path_str))
+            .and(header("User-Agent", super::user_agent()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let result = CasTransport::get(&client, &digest).await.unwrap();
+        assert_eq!(result, bytes);
+
+        // And the value carries the clw/<version> (<os>; <arch>) shape.
+        let ua = super::user_agent();
+        assert!(ua.starts_with("clw/"), "unexpected User-Agent: {ua}");
+        assert!(ua.contains(std::env::consts::OS), "UA missing os: {ua}");
+        assert!(ua.contains(std::env::consts::ARCH), "UA missing arch: {ua}");
+    }
+
+    #[tokio::test]
+    async fn user_agent_header_sent_on_ac_put() {
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+
+        Mock::given(method("PUT"))
+            .and(path(&path_str))
+            .and(header("User-Agent", super::user_agent()))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
@@ -1410,6 +1535,84 @@ mod rate_limit_tests {
             .unwrap_err();
         match err {
             clw_types::ClwError::Http { status, .. } => assert_eq!(status, 429),
+            other => panic!("expected Http 429, got {other:?}"),
+        }
+    }
+
+    /// M5.6: a 429 whose final `Retry-After` is *huge* (≈ seconds-until-next
+    /// month — an app/plan quota ceiling) must surface an actionable
+    /// plan/quota message on exhaustion, not the generic rate-limited wording.
+    /// Early attempts carry a small Retry-After to keep the backoff fast; the
+    /// last attempt carries the huge value that drives the message.
+    #[tokio::test]
+    async fn exhausted_429_huge_retry_after_surfaces_quota_message() {
+        let server = MockServer::start().await;
+        let bytes = b"quota-ceiling".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        // All but the final attempt: 429 + small Retry-After (fast backoff).
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(5)
+            .mount(&server)
+            .await;
+        // Final attempt: 429 + a huge Retry-After (~28 days), the quota signal.
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2419200"))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(config_for(&server)).unwrap();
+        let err = CasTransport::put(&client, &digest, bytes)
+            .await
+            .unwrap_err();
+        match err {
+            clw_types::ClwError::Http { status, context } => {
+                assert_eq!(status, 429);
+                assert!(
+                    context.contains("plan/quota"),
+                    "expected plan/quota wording, got: {context}"
+                );
+                assert!(
+                    context.contains("2419200"),
+                    "quota message should include the retry-after seconds, got: {context}"
+                );
+            }
+            other => panic!("expected Http 429, got {other:?}"),
+        }
+    }
+
+    /// M5.6: a 429 whose final `Retry-After` is *small* (DO backpressure) must
+    /// surface the generic rate-limited wording, not the quota message.
+    #[tokio::test]
+    async fn exhausted_429_small_retry_after_surfaces_rate_limited_message() {
+        let server = MockServer::start().await;
+        let bytes = b"transient-backpressure".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        // Every attempt: 429 + a small Retry-After (transient backpressure).
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(config_for(&server)).unwrap();
+        let err = CasTransport::put(&client, &digest, bytes)
+            .await
+            .unwrap_err();
+        match err {
+            clw_types::ClwError::Http { status, context } => {
+                assert_eq!(status, 429);
+                assert!(
+                    context.contains("rate-limited"),
+                    "expected rate-limited wording, got: {context}"
+                );
+                assert!(
+                    !context.contains("plan/quota"),
+                    "small retry-after must NOT trigger quota wording, got: {context}"
+                );
+            }
             other => panic!("expected Http 429, got {other:?}"),
         }
     }
