@@ -51,6 +51,11 @@ pub struct SnapshotReport {
     pub chunks_total: u64,
     /// Chunks that were actually PUT to the remote (not already present).
     pub chunks_uploaded: u64,
+    /// Relative paths of entries whose name looks like a secret (SSH keys,
+    /// `.env`, certificates, keystores, …). These were still uploaded; the
+    /// field is purely advisory so the CLI can warn the user. Empty when no
+    /// entry matched.
+    pub secret_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +94,40 @@ where
         CasTransport::put(client, digest, data).await?;
         Ok(true)
     }
+}
+
+/// Return `true` if `rel` (a manifest-relative path) has a basename or
+/// extension that matches a common secret-file pattern. This is a heuristic
+/// for an advisory warning only — it never affects which files are uploaded.
+///
+/// Matched: SSH private keys (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`),
+/// `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `.env` / `.env.*`,
+/// and a basename of exactly `credentials`.
+fn looks_like_secret(rel: &str) -> bool {
+    // Manifest paths are always '/'-separated; take the trailing component.
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+
+    // Exact-basename matches (SSH keys + `credentials`).
+    const EXACT: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials"];
+    if EXACT.contains(&base) {
+        return true;
+    }
+
+    // `.env` and `.env.*` (e.g. `.env.local`, `.env.production`).
+    if base == ".env" || base.starts_with(".env.") {
+        return true;
+    }
+
+    // Extension matches (case-insensitive on the extension only).
+    const EXT: &[&str] = &["pem", "key", "p12", "pfx", "keystore"];
+    if let Some((_, ext)) = base.rsplit_once('.') {
+        let ext_lower = ext.to_ascii_lowercase();
+        if EXT.contains(&ext_lower.as_str()) {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +334,16 @@ where
         entries,
     };
 
+    // Advisory scan: collect any entries whose name looks like a secret. This
+    // never drops files — everything was already uploaded above; we only warn.
+    let secret_warnings: Vec<String> = manifest
+        .entries
+        .iter()
+        .map(|e| e.path())
+        .filter(|p| looks_like_secret(p))
+        .map(|p| p.to_string())
+        .collect();
+
     // --- 4. Chunk uploads already happened inline above ---------------------
     let chunks_uploaded = uploaded_counter.load(Ordering::Relaxed);
 
@@ -342,6 +391,7 @@ where
         bytes_total: total_size,
         chunks_total,
         chunks_uploaded,
+        secret_warnings,
     })
 }
 
@@ -597,6 +647,102 @@ mod tests {
         assert_eq!(
             digest_local, report.root,
             "build_manifest_local and snapshot() must produce the same manifest digest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: looks_like_secret pattern matching (unit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn looks_like_secret_matches_expected() {
+        // Positives — basenames, extensions, and nested paths.
+        for p in [
+            "id_rsa",
+            "id_dsa",
+            "id_ecdsa",
+            "id_ed25519",
+            ".ssh/id_rsa",
+            ".env",
+            ".env.local",
+            ".env.production",
+            "server.pem",
+            "tls/server.key",
+            "bundle.p12",
+            "cert.PFX",
+            "store.keystore",
+            "aws/credentials",
+            "credentials",
+        ] {
+            assert!(looks_like_secret(p), "{p} should be flagged as a secret");
+        }
+
+        // Negatives — ordinary files that must not trip the heuristic.
+        for p in [
+            "README.md",
+            "src/main.rs",
+            "environment.txt",
+            "keys.json",
+            "credentials.md",
+            "id_rsa_backup.txt",
+            "notes.env.bak",
+        ] {
+            assert!(!looks_like_secret(p), "{p} should NOT be flagged");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: a tree with .env + id_rsa yields those in secret_warnings
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_collects_secret_warnings() {
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("README.md"), b"hello").unwrap();
+        fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        fs::write(root.join("id_rsa"), b"-----BEGIN KEY-----").unwrap();
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-secrets");
+
+        let report = snapshot(root, &client, &cache, &opts).await.unwrap();
+
+        let mut warnings = report.secret_warnings.clone();
+        warnings.sort();
+        assert_eq!(
+            warnings,
+            vec![".env".to_string(), "id_rsa".to_string()],
+            "expected .env and id_rsa flagged, got {:?}",
+            report.secret_warnings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: a clean tree yields no secret_warnings
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_clean_tree_no_warnings() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        build_tree(root); // small.txt, big.bin, link.txt, empty_dir
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-clean");
+
+        let report = snapshot(root, &client, &cache, &opts).await.unwrap();
+
+        assert!(
+            report.secret_warnings.is_empty(),
+            "clean tree should have no secret warnings, got {:?}",
+            report.secret_warnings
         );
     }
 }

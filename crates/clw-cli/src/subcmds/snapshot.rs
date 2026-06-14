@@ -43,6 +43,20 @@ pub async fn run(
         .await
         .map_err(map_auth_error)?;
 
+    // Non-destructive warning: secret-looking files were uploaded, not dropped.
+    // Printed to stderr so it never pollutes the `--json` stdout payload, and
+    // it does not change the exit code.
+    if !report.secret_warnings.is_empty() {
+        eprintln!(
+            "WARNING: {} secret-looking file(s) were uploaded in this snapshot:",
+            report.secret_warnings.len()
+        );
+        for path in &report.secret_warnings {
+            eprintln!("  - {path}");
+        }
+        eprintln!("Add them to a .clwignore file to exclude them from future snapshots.");
+    }
+
     if json {
         let out = json!({
             "root": report.root.to_hex(),
