@@ -239,6 +239,79 @@ pasting diagnostics into a public issue.
 
 ---
 
+## `clw rm` — deleting a workspace ref (server-pending)
+
+`clw rm --name <ws>` deletes a workspace ref (AC erasure). The client is shipped,
+but it depends on a server `DELETE /v1/ac` endpoint that is **not yet deployed**.
+Until that endpoint ships, `clw rm` is **optimistic**: it prints a clear "not yet
+deployed" message and does **not** touch live data.
+
+```sh
+clw rm --name myapp-dev
+# clw rm: ref deletion is not yet deployed — tracked (server dependency).
+```
+
+`clw rm` only removes the **ref** (the named pointer in the AC); it does not GC the
+underlying CAS blobs. CAS blob garbage-collection / right-to-erasure is a separate,
+also-unshipped track. When the server endpoint lands, this page will be updated
+with the live success/confirmation behavior.
+
+---
+
+## `clw uninstall` — removing the local footprint
+
+`clw uninstall` removes the local `clw` footprint: the `~/.clw` directory (the
+config file, **including the stored PAT**) and the local cache. It prompts for
+confirmation by default.
+
+```sh
+# Prompt before removing anything:
+clw uninstall
+
+# Skip the confirmation prompt (for scripts / non-interactive runs):
+clw uninstall --yes
+
+# Preview exactly what would be removed — deletes nothing:
+clw uninstall --dry-run
+```
+
+The cache is removed along with the config: if you set a custom cache location
+(`--cache-dir` / `CLW_CACHE_DIR`), that directory is the one removed.
+
+`clw uninstall` **cannot delete its own running executable.** It prints the binary
+path so you can remove it manually, e.g.:
+
+```sh
+rm ./target/release/clw
+```
+
+---
+
+## `clw completions` — shell completions
+
+`clw completions <shell>` prints a completion script to stdout for one of `bash`,
+`zsh`, `fish`, `powershell`, or `elvish`. Redirect or source it per your shell's
+convention.
+
+```sh
+# bash — source into the current shell (add to ~/.bashrc to persist):
+source <(clw completions bash)
+
+# zsh — write to a directory on your $fpath, then restart the shell:
+clw completions zsh > ~/.zfunc/_clw
+
+# fish:
+clw completions fish > ~/.config/fish/completions/clw.fish
+
+# powershell — append to your profile:
+clw completions powershell >> $PROFILE
+
+# elvish:
+clw completions elvish > ~/.config/elvish/lib/clw-completions.elv
+```
+
+---
+
 ## Accessibility — color and `--json`
 
 - **`--no-color`** disables ANSI color in human-readable output. Color is also

@@ -7,8 +7,9 @@ content-addressed store (CAS + AC), hydrates it anywhere in seconds, and memoize
 deterministic commands so they never re-run when the inputs have not changed.
 
 > **Pre-1.0.** The commands documented here (`init`, `snapshot`, `hydrate`,
-> `status`, `run`, `ls`, `doctor`, `auth`) are implemented and tested. No stability
-> guarantee exists until 1.0.
+> `status`, `run`, `ls`, `doctor`, `auth`, `rm`, `uninstall`, `completions`) are
+> implemented and tested. `clw rm` is **server-pending** (see the table note). No
+> stability guarantee exists until 1.0.
 
 ---
 
@@ -24,6 +25,9 @@ deterministic commands so they never re-run when the inputs have not changed.
 | `clw ls`       | Shows ref metadata (root digest, file count, byte count) for a workspace |
 | `clw doctor`   | Prints a support-ready, **redacted** diagnostics bundle (token never shown) |
 | `clw auth`     | Manages the locally-stored identity offline: `login` / `logout` / `whoami` (`rotate` is a server-dependent stub) |
+| `clw rm`       | Deletes a workspace ref (`--name`). **Server-pending:** prints "not yet deployed" until CoreLink ships `DELETE /v1/ac` |
+| `clw uninstall`| Removes the local footprint (`~/.clw` config + PAT + cache); confirm / `--yes` / `--dry-run`; prints the binary path to remove |
+| `clw completions` | Prints a shell-completion script for `bash` / `zsh` / `fish` / `powershell` / `elvish` |
 
 Backed by the live CoreLink API at `https://corelink-api.humangr.com` (`/v1/cas`,
 `/v1/ac`). Pure client — zero server changes required.
@@ -196,6 +200,39 @@ All flags are global and can appear before any subcommand.
    CAS and the AC key is set; non-zero exits are never cached.
 4. The exit code of the original command (or the replayed exit code on a hit) is
    propagated as the process exit code.
+
+---
+
+## Shell completions
+
+`clw completions <shell>` prints a completion script to stdout for `bash`, `zsh`,
+`fish`, `powershell`, or `elvish`. Install it per your shell's convention:
+
+```sh
+# bash (current shell)
+source <(clw completions bash)
+# zsh — drop into a directory on your $fpath
+clw completions zsh > ~/.zfunc/_clw
+# fish
+clw completions fish > ~/.config/fish/completions/clw.fish
+```
+
+---
+
+## Uninstall
+
+`clw uninstall` removes the local `clw` footprint: the `~/.clw` directory (config
+file **including the stored PAT**) and the local cache. It prompts for
+confirmation by default.
+
+```sh
+clw uninstall            # prompts before removing anything
+clw uninstall --yes      # skip the confirmation prompt
+clw uninstall --dry-run  # show exactly what would be removed; deletes nothing
+```
+
+`clw uninstall` **cannot delete its own executable**, so it prints the binary path
+for you to remove manually (e.g. `rm ./target/release/clw`).
 
 ---
 

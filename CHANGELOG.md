@@ -7,6 +7,16 @@
 > that follows is retained for the record.
 
 ### Added
+- **`clw rm --name <ws>`** — delete a workspace ref (AC erasure). **Optimistic / pending:** the
+  client sends the request, but it depends on a server `DELETE /v1/ac` endpoint that is not yet
+  deployed. Until the server ships that endpoint, the command prints a clear **"not yet deployed"**
+  message and is a no-op against live data. (M1.4, server dependency D-1)
+- **`clw uninstall`** — remove the local `clw` footprint: the `~/.clw` config (including the stored
+  PAT) and the local cache. Prompts for confirmation by default; `--yes` skips the prompt and
+  `--dry-run` previews exactly what would be removed without deleting anything. It cannot delete its
+  own executable, so it **prints the binary path** for you to remove manually.
+- **`clw completions <bash|zsh|fish|powershell|elvish>`** — print a shell-completion script for the
+  named shell to stdout, to source or install per your shell's convention.
 - **`clw auth`** — manage the locally-stored CoreLink identity, fully offline (no network call):
   `login` (persist resolved endpoint/tenant/token to `~/.clw/config.toml`, forced `0600`),
   `logout` (drop the `token` key; `--all` clears the whole file, with a confirm unless `--yes`),
@@ -55,9 +65,11 @@
   `components = ["rustfmt", "clippy"]` so a clean machine builds correctly. (M2.0)
 
 ### Security
-- **No erasure command exists yet.** `clw` has no `clw rm`; a future `clw rm` (AC-ref delete)
-  is tracked as **M1.4**, gated on server dependency **D-1**. CAS blob GC / right-to-erasure
-  is **M6.4** (gated on D-7/D-8). Documented as a tracked residual, not silently accepted.
+- **Ref erasure is client-shipped but server-pending.** `clw rm --name <ws>` (AC-ref delete,
+  **M1.4**) now exists on the client, but its server dependency **D-1** (`DELETE /v1/ac`) is not yet
+  deployed — until it is, `clw rm` prints a "not yet deployed" message and is a no-op against live
+  data. CAS blob GC / right-to-erasure is **M6.4** (gated on D-7/D-8) and remains unshipped.
+  Documented as a tracked residual, not silently accepted.
 - Threat model updated to reflect the shipped Windows path validation and the erasure gap
   (see `docs/THREAT-MODEL.md`).
 
