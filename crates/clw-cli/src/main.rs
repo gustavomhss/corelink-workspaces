@@ -65,6 +65,20 @@ pub struct Cli {
     )]
     pub json: bool,
 
+    /// Disable ANSI color in human-readable output (accessibility).
+    ///
+    /// Color is ALSO disabled automatically when the `NO_COLOR` env var is set
+    /// (https://no-color.org) or when stdout is not a TTY. clw currently emits
+    /// plain text with no ANSI escapes, so this is a forward-looking guarantee:
+    /// no command may emit color unless [`color_enabled`] returns true.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        help = "Disable ANSI color output (also honored via NO_COLOR env and non-TTY stdout)"
+    )]
+    pub no_color: bool,
+
     /// Max concurrent CAS requests for snapshot/hydrate.
     #[arg(
         long,
@@ -94,6 +108,34 @@ pub enum Commands {
     Ls(subcmds::ls::LsArgs),
     /// Print a support-ready, redacted diagnostics bundle.
     Doctor(subcmds::doctor::DoctorArgs),
+    /// Manage the locally-stored CoreLink identity (login/logout/whoami).
+    Auth(subcmds::auth::AuthArgs),
+}
+
+// ---------------------------------------------------------------------------
+// Color policy (M5.7 accessibility)
+// ---------------------------------------------------------------------------
+
+/// Whether ANSI color may be emitted on stdout.
+///
+/// Color is enabled ONLY when ALL of the following hold:
+/// 1. `--no-color` was not passed,
+/// 2. the `NO_COLOR` env var is unset (https://no-color.org), and
+/// 3. stdout is a TTY (not a pipe/file/`--json` consumer).
+///
+/// clw currently emits no ANSI escapes anywhere; this is the single gate every
+/// future colorized output must consult, so the `--no-color`/`NO_COLOR`/non-TTY
+/// contract holds by construction.
+#[must_use]
+pub fn color_enabled(no_color_flag: bool) -> bool {
+    use std::io::IsTerminal as _;
+    if no_color_flag {
+        return false;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +179,10 @@ async fn main() {
         }
     };
 
+    // Resolve the color policy once (flag > NO_COLOR env > non-TTY). clw emits
+    // no ANSI today, so this currently only documents/guarantees the contract.
+    let _color = color_enabled(cli.no_color);
+
     let result = dispatch(cli.command, resolved, cli.json, cli.concurrency).await;
     if let Err(e) = result {
         // `run` subcommand propagates child exit code differently (handled in subcmd).
@@ -151,13 +197,17 @@ async fn dispatch(
     concurrency: usize,
 ) -> Result<(), ClwError> {
     match cmd {
-        Commands::Init(args) => subcmds::init::run(args, cfg).await,
+        Commands::Init(args) => subcmds::init::run(args, cfg, json).await,
         Commands::Snapshot(args) => subcmds::snapshot::run(args, cfg, json, concurrency).await,
         Commands::Hydrate(args) => subcmds::hydrate::run(args, cfg, json, concurrency).await,
         Commands::Status(args) => subcmds::status::run(args, cfg, json).await,
+        // `run` streams the child's stdout/stderr verbatim and propagates its
+        // exit code, so there is no clw-level payload to render — it has no
+        // `--json` form by design (the wrapped command owns stdout).
         Commands::Run(args) => subcmds::run::run(args, cfg).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
-        Commands::Doctor(args) => subcmds::doctor::run(args, cfg).await,
+        Commands::Doctor(args) => subcmds::doctor::run(args, cfg, json).await,
+        Commands::Auth(args) => subcmds::auth::run(args, cfg, json).await,
     }
 }
 
@@ -288,6 +338,118 @@ mod tests {
     fn parse_doctor() {
         let cli = Cli::try_parse_from(["clw", "doctor"]).unwrap();
         assert!(matches!(cli.command, Commands::Doctor(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // M6.6 — `clw auth` parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_auth_login() {
+        use subcmds::auth::AuthCommand;
+        let cli = Cli::try_parse_from(["clw", "auth", "login"]).unwrap();
+        match cli.command {
+            Commands::Auth(a) => assert!(matches!(a.command, AuthCommand::Login)),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_logout_default() {
+        use subcmds::auth::AuthCommand;
+        let cli = Cli::try_parse_from(["clw", "auth", "logout"]).unwrap();
+        match cli.command {
+            Commands::Auth(a) => match a.command {
+                AuthCommand::Logout(l) => {
+                    assert!(!l.all);
+                    assert!(!l.yes);
+                }
+                other => panic!("expected Logout, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_logout_all_yes() {
+        use subcmds::auth::AuthCommand;
+        let cli = Cli::try_parse_from(["clw", "auth", "logout", "--all", "--yes"]).unwrap();
+        match cli.command {
+            Commands::Auth(a) => match a.command {
+                AuthCommand::Logout(l) => {
+                    assert!(l.all);
+                    assert!(l.yes);
+                }
+                other => panic!("expected Logout, got {other:?}"),
+            },
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_whoami() {
+        use subcmds::auth::AuthCommand;
+        let cli = Cli::try_parse_from(["clw", "auth", "whoami"]).unwrap();
+        match cli.command {
+            Commands::Auth(a) => assert!(matches!(a.command, AuthCommand::Whoami)),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_whoami_with_json() {
+        let cli = Cli::try_parse_from(["clw", "--json", "auth", "whoami"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Commands::Auth(_)));
+    }
+
+    #[test]
+    fn parse_auth_rotate() {
+        use subcmds::auth::AuthCommand;
+        let cli = Cli::try_parse_from(["clw", "auth", "rotate"]).unwrap();
+        match cli.command {
+            Commands::Auth(a) => assert!(matches!(a.command, AuthCommand::Rotate)),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M5.7 — --no-color / color policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_no_color_flag() {
+        let cli = Cli::try_parse_from(["clw", "--no-color", "doctor"]).unwrap();
+        assert!(cli.no_color);
+    }
+
+    #[test]
+    fn no_color_defaults_false() {
+        let cli = Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        assert!(!cli.no_color);
+    }
+
+    #[test]
+    fn color_disabled_when_flag_set() {
+        // --no-color always wins, regardless of TTY/env.
+        assert!(!color_enabled(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Redaction: no auth output path includes the token value.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auth_help_does_not_mention_token_value() {
+        // Sanity: the auth subcommand surface never takes a positional token, so
+        // a token value can't leak via usage/help text. (The token comes from the
+        // global --token/CLW_TOKEN/config, redacted everywhere it is echoed.)
+        let err = Cli::try_parse_from(["clw", "auth", "--help"]).unwrap_err();
+        let help = err.to_string();
+        assert!(
+            !help.to_lowercase().contains("token value"),
+            "auth help must not surface a token value, got: {help}"
+        );
     }
 
     #[test]

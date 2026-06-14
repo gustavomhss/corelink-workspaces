@@ -1,12 +1,12 @@
 //! `clw init` — write ~/.clw/config.toml from resolved config.
 
-use std::io::Write as _;
-use std::path::Path;
-
 use clap::Args;
 use clw_types::ClwError;
+use serde_json::json;
 
-use crate::config::{clw_config_path, toml_escape, ResolvedConfig};
+use crate::config::{
+    clw_config_path, ensure_config_parent_0700, toml_escape, write_config_file_0600, ResolvedConfig,
+};
 
 #[derive(Debug, Args)]
 #[command(about = "Write ~/.clw/config.toml from the resolved config values")]
@@ -22,7 +22,7 @@ pub struct InitArgs {
 
 // All subcommand entry points are async to satisfy a uniform dispatch signature.
 #[allow(clippy::unused_async)]
-pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
+pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
         ClwError::Transport("cannot determine home directory for config file".to_string())
     })?;
@@ -36,10 +36,7 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
 
     // Ensure parent directory exists and is private (0700) — it holds the
     // plaintext PAT. Tighten perms even if ~/.clw pre-existed with a looser mode.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        harden_dir_0700(parent)?;
-    }
+    ensure_config_parent_0700(&path)?;
 
     let content = format!(
         "# clw configuration\n\
@@ -57,46 +54,16 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
     // config.toml holds the plaintext token: force owner-only (0600) perms.
     write_config_file_0600(&path, &content)?;
 
-    eprintln!("wrote config to {}", path.display());
-    Ok(())
-}
-
-/// Write `content` to `path`, truncating any existing file and forcing
-/// owner-only (`0600`) permissions on Unix. The file contains the plaintext
-/// PAT, so it must never be group- or world-readable.
-///
-/// `OpenOptions::mode(0o600)` only applies when the file is **created**; if the
-/// file already exists (e.g. `clw init --force` over a prior `0644` config) the
-/// open does NOT change its mode. We therefore `set_permissions(0o600)`
-/// explicitly after writing so a pre-existing loose mode is always tightened.
-fn write_config_file_0600(path: &Path, content: &str) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
-    file.write_all(content.as_bytes())?;
-    // `mode()` above only applies on CREATION; force 0600 on an already-existing
-    // file too (the file holds the plaintext PAT).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// Tighten a directory to owner-only (`0700`) on Unix. No-op on other platforms.
-/// The directory holds `config.toml` (plaintext PAT), so it must not be
-/// traversable by group/world.
-fn harden_dir_0700(_dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(_dir, std::fs::Permissions::from_mode(0o700))?;
+    // The token is NEVER echoed; only the path is reported.
+    if json {
+        let out = json!({
+            "wrote": path.display().to_string(),
+            // token presence only — never the value.
+            "token": if cfg.clw_config.token.is_empty() { "<unset>" } else { "<set>" },
+        });
+        println!("{out}");
+    } else {
+        eprintln!("wrote config to {}", path.display());
     }
     Ok(())
 }
@@ -107,7 +74,7 @@ fn harden_dir_0700(_dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::{harden_dir_0700, write_config_file_0600};
 
     // -----------------------------------------------------------------------
     // config.toml must be written 0600 (it holds the plaintext PAT).

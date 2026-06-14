@@ -6,6 +6,7 @@
 
 use clap::Args;
 use clw_types::ClwError;
+use serde_json::json;
 
 use crate::config::{clw_config_path, ResolvedConfig};
 
@@ -18,10 +19,46 @@ pub struct DoctorArgs {}
 const REDACTED_SET: &str = "<set>";
 const REDACTED_UNSET: &str = "<unset>";
 
-pub async fn run(_args: DoctorArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
-    let report = build_report(&cfg);
-    print!("{report}");
+pub async fn run(_args: DoctorArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+    if json {
+        print!("{}", build_report_json(&cfg));
+    } else {
+        let report = build_report(&cfg);
+        print!("{report}");
+    }
     Ok(())
+}
+
+/// Build the diagnostics report as a machine-readable JSON object.
+///
+/// Same redaction invariant as [`build_report`]: the token is reported as
+/// `<set>`/`<unset>` presence only, NEVER its value.
+fn build_report_json(cfg: &ResolvedConfig) -> String {
+    let c = &cfg.clw_config;
+    let (config_file, config_exists, config_mode) = match clw_config_path() {
+        Some(path) => {
+            let exists = path.exists();
+            let mode = if exists { Some(file_mode(&path)) } else { None };
+            (Some(path.display().to_string()), exists, mode)
+        }
+        None => (None, false, None),
+    };
+    let out = json!({
+        "clw_version": env!("CARGO_PKG_VERSION"),
+        "os": OS,
+        "arch": ARCH,
+        "config_file": config_file,
+        "config_exists": config_exists,
+        "config_mode": config_mode,
+        "endpoint": c.endpoint,
+        "tenant": redact_present(&c.tenant),
+        "tenant_value": if c.tenant.is_empty() { None } else { Some(c.tenant.clone()) },
+        // NEVER print the token value — presence only.
+        "token": redact_present(&c.token),
+        "cache_dir": c.cache_dir.display().to_string(),
+        "cache_exists": c.cache_dir.exists(),
+    });
+    format!("{out}\n")
 }
 
 /// Build the full diagnostics report as a string.
@@ -198,5 +235,28 @@ mod tests {
     fn redact_present_maps_correctly() {
         assert_eq!(redact_present(""), "<unset>");
         assert_eq!(redact_present("x"), "<set>");
+    }
+
+    #[test]
+    fn json_report_never_leaks_token() {
+        let secret = "super-secret-pat-abc123XYZ";
+        let cfg = cfg_with_token(secret);
+        let report = build_report_json(&cfg);
+        assert!(
+            !report.contains(secret),
+            "token value must NEVER appear in doctor --json output, got:\n{report}"
+        );
+        // Must be valid JSON with the redacted presence sentinel.
+        let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(v["token"], "<set>");
+        assert_eq!(v["endpoint"], "https://example.com");
+    }
+
+    #[test]
+    fn json_report_shows_unset_for_empty_token() {
+        let cfg = cfg_with_token("");
+        let report = build_report_json(&cfg);
+        let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(v["token"], "<unset>");
     }
 }

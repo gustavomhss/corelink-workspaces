@@ -194,6 +194,92 @@ pub fn clw_config_path() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared config-file writer (used by `clw init` and `clw auth`)
+//
+// config.toml holds the plaintext PAT, so the file is forced owner-only (0600)
+// and its parent (~/.clw) owner-only (0700). These helpers live here so both
+// `init` and `auth` share ONE implementation instead of duplicating it.
+// ---------------------------------------------------------------------------
+
+/// Write `content` to `path`, truncating any existing file and forcing
+/// owner-only (`0600`) permissions on Unix. The file contains the plaintext
+/// PAT, so it must never be group- or world-readable.
+///
+/// `OpenOptions::mode(0o600)` only applies when the file is **created**; if the
+/// file already exists (e.g. `clw init --force` over a prior `0644` config) the
+/// open does NOT change its mode. We therefore `set_permissions(0o600)`
+/// explicitly after writing so a pre-existing loose mode is always tightened.
+pub(crate) fn write_config_file_0600(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(content.as_bytes())?;
+    // `mode()` above only applies on CREATION; force 0600 on an already-existing
+    // file too (the file holds the plaintext PAT).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Tighten a directory to owner-only (`0700`) on Unix. No-op on other platforms.
+/// The directory holds `config.toml` (plaintext PAT), so it must not be
+/// traversable by group/world.
+pub(crate) fn harden_dir_0700(_dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Ensure the parent of `path` (i.e. `~/.clw`) exists and is hardened to 0700.
+pub(crate) fn ensure_config_parent_0700(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        harden_dir_0700(parent)?;
+    }
+    Ok(())
+}
+
+/// Read `~/.clw/config.toml` into an ordered list of `(key, raw_value)` lines.
+///
+/// Unlike [`read_config_file`], this preserves only the flat string keys clw
+/// writes and returns the unescaped values. Used by `clw auth logout` to rewrite
+/// the file with a single key removed while keeping the others intact. Returns
+/// an empty vec if the file is missing or unreadable.
+pub(crate) fn read_config_pairs(path: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut map = HashMap::new();
+    parse_config_lines(&content, &mut map);
+    // Emit in a stable order so rewrites are deterministic.
+    let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// Serialize `(key, value)` pairs back into the minimal `key = "value"` config
+/// format that [`parse_config_lines`] reads.
+pub(crate) fn render_config(pairs: &[(String, String)]) -> String {
+    let mut out = String::from("# clw configuration\n");
+    for (k, v) in pairs {
+        out.push_str(&format!("{k} = \"{}\"\n", toml_escape(v)));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 

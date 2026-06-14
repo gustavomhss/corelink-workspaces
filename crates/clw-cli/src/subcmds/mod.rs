@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod auth;
 pub mod doctor;
 pub mod hydrate;
 pub mod init;
