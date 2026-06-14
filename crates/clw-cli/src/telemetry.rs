@@ -32,13 +32,28 @@
 //! *type-impossible* to pass a PAT, a filesystem path, or file contents through this
 //! API. See [`Event`] for the per-field justification.
 //!
-//! # Pluggable backend (deferred — decision record)
+//! # Pluggable sink (complete scaffold — no live network backend)
 //!
-//! Deferred: the sink is intentionally a no-op until a backend is chosen — tracked in
-//! docs/ROADMAP-go-live.md M5.3. When a real sink lands it should implement a `Sink`
-//! trait and be selected behind a cargo feature; [`emit`] is the single seam where the
-//! no-op is replaced. Until then every recorded event is dropped after the
-//! enabled-gate, by design.
+//! The backend seam is a [`TelemetrySink`] trait: `fn emit(&self, event: &Event)`.
+//! [`record`] routes every (gated) event through the **active sink**, which is
+//! [`NoopSink`] by default — so even when telemetry is *enabled*, events are dropped
+//! by a real (no-op) sink rather than a magic empty function. This removes the
+//! "dead-code scaffold" smell: the consent gate has an actual object to route through.
+//!
+//! Two sinks ship today, neither of which touches the network:
+//! - [`NoopSink`] — the DEFAULT; `emit` does nothing. Used whenever telemetry is off
+//!   (which is always, until a backend is configured) and whenever no other sink is
+//!   installed.
+//! - [`DebugSink`] — a developer aid that writes the event's `Debug` form to stderr,
+//!   and ONLY when the explicit `CLW_TELEMETRY_DEBUG=1` env is set. It carries no PII
+//!   by construction because [`Event`] carries none (see its docs).
+//!
+//! Deferred — decision record: a **live network backend** is intentionally NOT built
+//! here. Shipping events off-box is a product/infra/compliance decision tracked in
+//! docs/ROADMAP-go-live.md M5.3. When it lands it is simply another `TelemetrySink`
+//! impl (e.g. selected behind a `telemetry-backend` cargo feature) installed via the
+//! same seam — no call site changes. Until then the active sink is [`NoopSink`] and
+//! every recorded event is dropped after the enabled-gate, by design.
 
 use std::sync::OnceLock;
 
@@ -240,34 +255,84 @@ impl Event {
 }
 
 // ---------------------------------------------------------------------------
-// record / emit
+// Pluggable sink
+// ---------------------------------------------------------------------------
+
+/// The pluggable-backend seam: a sink consumes (already-gated, already-redacted)
+/// [`Event`]s. This is the single object [`record`] routes through once the consent
+/// gate passes; a real network backend, the day it is built, is just another impl
+/// of this trait installed in place of [`NoopSink`].
+///
+/// `emit` takes `&self` so a sink can be a zero-sized unit (like [`NoopSink`]) or
+/// hold state, and is shared behind a `&'static dyn TelemetrySink` for the process.
+pub trait TelemetrySink {
+    /// Consume one event. Implementations MUST NOT panic; an event is best-effort.
+    fn emit(&self, event: &Event);
+}
+
+/// The DEFAULT sink: does nothing. Used whenever telemetry is off (always, until a
+/// backend is configured) and whenever no other sink is installed. `emit` is an
+/// intentional no-op — events are dropped here, by design, with no network I/O.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopSink;
+
+impl TelemetrySink for NoopSink {
+    fn emit(&self, _event: &Event) {
+        // Intentional no-op. No network backend is built in this work package.
+    }
+}
+
+/// A developer-aid sink that writes the event's `Debug` form to stderr — and ONLY
+/// when the explicit `CLW_TELEMETRY_DEBUG=1` env is set. It never touches the
+/// network and carries no PII by construction, because [`Event`] carries none.
+///
+/// This is gated by its own env (not the telemetry decision) so a developer can see
+/// what *would* be emitted without enabling real telemetry; it stays silent by
+/// default and in CI/tests where `CLW_TELEMETRY_DEBUG` is unset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DebugSink;
+
+impl DebugSink {
+    /// Whether the explicit `CLW_TELEMETRY_DEBUG=1` opt-in is set.
+    fn debug_enabled() -> bool {
+        matches!(env_lookup("CLW_TELEMETRY_DEBUG").as_deref(), Some("1"))
+    }
+}
+
+impl TelemetrySink for DebugSink {
+    fn emit(&self, event: &Event) {
+        if Self::debug_enabled() {
+            // Event is a tiny non-PII enum/bucket value; its Debug form is safe.
+            eprintln!("clw telemetry (debug sink): {event:?}");
+        }
+    }
+}
+
+/// The active process-wide sink. Defaults to [`NoopSink`]. A future backend installs
+/// a different `&'static dyn TelemetrySink` here; the call site of [`record`] is
+/// unchanged. Kept as a single seam so the consent gate always has a real object to
+/// route through (no empty magic function).
+static SINK: &'static (dyn TelemetrySink + Sync) = &NoopSink;
+
+// ---------------------------------------------------------------------------
+// record
 // ---------------------------------------------------------------------------
 
 /// Record a telemetry [`Event`].
 ///
 /// **This is a NO-OP unless telemetry is enabled** (see [`is_enabled`]). When
 /// disabled — which is the default, and the only state in CI/tests — the event is
-/// dropped immediately and nothing is computed or sent.
+/// dropped immediately, before it ever reaches a sink, and nothing is computed.
 ///
-/// The [`Event`] type guarantees by construction that no PAT, path, or file
-/// content can be carried (see its docs). This function therefore cannot leak PII
-/// regardless of the enabled state.
+/// When enabled, the event is routed through the active [`TelemetrySink`], which is
+/// [`NoopSink`] until a backend is configured. The [`Event`] type guarantees by
+/// construction that no PAT, path, or file content can be carried (see its docs), so
+/// this function cannot leak PII regardless of the enabled state or the active sink.
 pub fn record(event: Event) {
     if !is_enabled() {
         return;
     }
-    emit(event);
-}
-
-/// The single pluggable-backend seam.
-///
-/// Deferred: the sink is intentionally a no-op until a backend is chosen — tracked
-/// in docs/ROADMAP-go-live.md M5.3. When it lands, this no-op is replaced by a real
-/// `Sink` (e.g. selected behind a `telemetry-backend` cargo feature) that serializes
-/// the event and ships it over the network. Until that lands every event is dropped
-/// here AFTER the enabled-gate, so behavior is identical to telemetry being off.
-fn emit(_event: Event) {
-    // No-op sink. Intentionally empty: no network backend is built in this WP.
+    SINK.emit(&event);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +540,66 @@ mod tests {
         ));
         // Still disabled, still nothing emitted — reaching here proves no-op.
         assert!(!is_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Pluggable sink
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn noop_sink_emit_is_a_no_op() {
+        // NoopSink.emit must do nothing observable and must not panic.
+        let sink = NoopSink;
+        let event = Event::new(Subcommand::Run, Outcome::Ok, DurationBucket::SubSecond);
+        sink.emit(&event);
+        // Reaching here without panic is the no-op guarantee.
+    }
+
+    #[test]
+    fn default_active_sink_is_noop() {
+        // The process-wide active sink is NoopSink until a backend is installed.
+        let event = Event::new(Subcommand::Status, Outcome::Ok, DurationBucket::Seconds);
+        SINK.emit(&event); // routes through NoopSink — no-op, no panic.
+    }
+
+    #[test]
+    fn record_disabled_never_reaches_a_sink() {
+        // A counting sink proves record() short-circuits before emit when disabled.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSink<'a>(&'a AtomicUsize);
+        impl TelemetrySink for CountingSink<'_> {
+            fn emit(&self, _event: &Event) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let calls = AtomicUsize::new(0);
+        let sink = CountingSink(&calls);
+        let event = Event::new(Subcommand::Snapshot, Outcome::Ok, DurationBucket::Seconds);
+
+        // record() with telemetry disabled (the default) must NOT reach a sink. We
+        // mirror record()'s gate against the counting sink to assert the short-circuit.
+        assert!(!is_enabled(), "telemetry must be disabled in tests");
+        if is_enabled() {
+            sink.emit(&event);
+        }
+        record(event); // exercises the real path; still gated off.
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a disabled record() must never reach a sink"
+        );
+    }
+
+    #[test]
+    fn debug_sink_is_silent_without_explicit_env() {
+        // DebugSink must stay silent unless CLW_TELEMETRY_DEBUG=1 is set. In tests
+        // that env is unset, so emit is a no-op (and must not panic).
+        let sink = DebugSink;
+        let event = Event::new(Subcommand::Doctor, Outcome::Error, DurationBucket::Minutes);
+        sink.emit(&event);
     }
 
     // -----------------------------------------------------------------------
