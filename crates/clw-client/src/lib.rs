@@ -2175,6 +2175,56 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn is_loopback_http_resists_exotic_forms() {
+        // Adversarial hardening of the CRIT fix: prove the `url`-parsed guard is
+        // safe across exotic host/credential representations, not just the two
+        // cases that motivated it. Invariant: return `true` only for a host the
+        // SAME parser (and thus reqwest) resolves to genuine loopback.
+
+        // MUST be refused — non-loopback hosts, embedded credentials, or hosts the
+        // parser keeps as a domain (never dialed as loopback).
+        for ep in [
+            "http://127.0.0.1:8080@evil.com/v1", // userinfo smuggle (the CRIT)
+            "http://localhost:1@evil.com",
+            "http://[::1]:1@evil.com",
+            "http://user:pass@127.0.0.1/", // explicit userinfo on a real loopback host
+            "http://127.0.0.1.evil.com/",  // suffix attack
+            "http://localhost.evil.com/",
+            "http://notlocalhost/",
+            "http://169.254.169.254/", // link-local metadata, NOT loopback
+            "http://10.0.0.1/",
+            "ftp://127.0.0.1/", // non-http scheme
+        ] {
+            assert!(
+                !is_loopback_http(ep),
+                "exotic non-loopback {ep:?} must NOT be treated as loopback"
+            );
+        }
+
+        // MUST be accepted — genuine loopback the parser resolves to 127.0.0.0/8,
+        // ::1, or `localhost`, regardless of case, port, path, query, or a `@`
+        // that lands in the PATH (not userinfo).
+        for ep in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080/v1/cas?x=1",
+            "http://127.5.6.7/", // all of 127.0.0.0/8 is loopback
+            "http://LOCALHOST/", // host is case-insensitive
+            "http://localhost:3000/path@stillpath", // `@` in the PATH, host stays loopback
+            "http://[::1]/",
+            // Alternate IPv4 encodings: url canonicalizes these to 127.0.0.1 for
+            // the http scheme — the SAME value reqwest dials — so judging them
+            // loopback is consistent and safe (the PAT never leaves the machine).
+            "http://2130706433/", // decimal 127.0.0.1
+            "http://0x7f000001/", // hex 127.0.0.1
+        ] {
+            assert!(
+                is_loopback_http(ep),
+                "genuine loopback {ep:?} must be accepted"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
