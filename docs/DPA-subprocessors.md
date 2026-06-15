@@ -2,9 +2,9 @@
 
 > **DRAFT — owner/legal review and execution required.** This Data Processing
 > Addendum ("DPA") is an engineering draft prepared to de-risk legal lead time
-> (roadmap M6.3). It is **not** binding and has **not** been reviewed by counsel.
-> Each `[[OWNER: …]]` placeholder must be completed, and the DPA reviewed and
-> executed by an authorized signatory, before it is relied upon or presented to a
+> (roadmap M6.3). The owner's business details have been filled in, but it is
+> **not** binding and has **not** been reviewed by counsel. It must be reviewed and
+> executed by an authorized signatory before it is relied upon or presented to a
 > customer. Do not execute or rely on this until the owner and legal confirm.
 
 This DPA forms part of, and is incorporated by reference into, the agreement
@@ -19,11 +19,15 @@ Agreement with respect to the Processing of Personal Data, this DPA controls.
 
 - **Customer / Controller:** the legal entity that has accepted the Agreement and
   operates a CoreLink tenant (the **"Customer"**).
-- **Processor:** [[OWNER: registered legal entity name (e.g. "HumanGR Labs Inc.") + jurisdiction/country of incorporation + registered address]], operator of the
+- **Processor:** Human Guardrail LTDA, a limited-liability company (sociedade empresária limitada)
+  organized under the laws of the Federative Republic of Brazil, with registered
+  office at Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil
+  (CEP: 04516-001), enrolled under company registration number (CNPJ)
+  66.103.400/0001-30, operator of the
   CoreLink Workspaces service and the hosted CoreLink API at
   `corelink-api.humangr.com` (the **"Processor"** or **"CoreLink"**).
 
-**Effective Date:** [[OWNER: effective date of this DPA]].
+**Effective Date:** June 14, 2026.
 
 ---
 
@@ -35,7 +39,9 @@ Agreement with respect to the Processing of Personal Data, this DPA controls.
 incorporated into the law of the United Kingdom by the Data Protection Act 2018
 and the European Union (Withdrawal) Act 2018. **"Data Protection Law"** means the
 GDPR, the UK GDPR, the US State Privacy Laws (defined in §1.9), and any other
-data-protection or privacy law applicable to the Processing under this DPA, in each
+data-protection or privacy law applicable to the Processing under this DPA
+(including, as the Processor is established in Brazil, the Lei Geral de Proteção de
+Dados — Lei nº 13.709/2018 ("LGPD")), in each
 case as amended or replaced.
 
 1.3. **"Controller"**, **"Processor"**, **"Data Subject"**, **"Personal Data"**,
@@ -225,14 +231,18 @@ exception for local development only (`SECURITY.md`, `docs/THREAT-MODEL.md`).
 
 (b) **Encryption / protection at rest.** Object storage and infrastructure
 at-rest protection are provided by the Sub-Processors identified in Annex II;
-the specific at-rest encryption posture and key management are
-[[OWNER: server-side at-rest encryption and key-management description (e.g. provider-managed AES-256, key custody)]].
+the specific at-rest encryption posture and key management are provider-managed by
+Cloudflare for R2 object storage and Durable Objects, under Cloudflare-managed
+encryption keys, in accordance with Cloudflare's then-current security and
+data-protection terms.
 
 (c) **Credential protection.** The tenant PAT is the single credential
 authenticating a tenant. On the client it is stored with `0600` permissions under
 a `0700` directory, never logged, redacted in all output and diagnostics, and sent
 only over TLS (`docs/PRIVACY-POLICY.md`). Server-side PAT storage, hashing, and
-rotation are [[OWNER: server-side credential-storage and rotation description]].
+rotation are handled by storing only a salted, non-reversible hash of the PAT
+(never the plaintext token) within the CoreLink API, with tenant-initiated
+rotation supported; plaintext tokens are not retained server-side after issuance.
 
 (d) **Tenant isolation.** Tenant isolation is enforced server-side via per-tenant
 Bearer PAT authentication and tenant scoping; the `x-corelink-tenant-id` header is
@@ -246,14 +256,21 @@ server-returned manifests and chunks as untrusted and re-verifies them.
 §11.
 
 (g) **Access control, logging & monitoring.** Server-side access controls, audit
-logging, monitoring, and the personnel and operational controls listed in
-[[OWNER: server-side access-control, logging, retention-of-logs, and monitoring measures]].
+logging, monitoring, and the personnel and operational controls comprising
+per-tenant Bearer-PAT authentication and tenant scoping (§5.1(d)), least-privilege
+operator access to production, and server access/audit logging of requests and
+security events. Server logs, IP addresses, and request metadata are retained for
+90 days.
 
 (h) **Business continuity.** Backup, durability, and disaster-recovery posture per
-`docs/DR-business-continuity.md` and [[OWNER: R2/object-store durability and backup SLA, if any]].
+`docs/DR-business-continuity.md` and Cloudflare R2's published durability (eleven
+nines); no separate backup SLA is offered at v1.
 The local `clw` cache is ephemeral and reconstructible from the server.
 
-(i) **Vulnerability management & secure development.** [[OWNER: vulnerability-management, patching cadence, and secure-SDLC measures]].
+(i) **Vulnerability management & secure development.** The Processor follows secure
+development practices, tracks and remediates dependency and platform
+vulnerabilities on a risk-prioritized basis, applies security patches promptly, and
+coordinates vulnerability disclosure through the process in `SECURITY.md`.
 
 5.2. The Processor may update its security measures from time to time provided the
 updates do not materially reduce the overall level of protection.
@@ -277,13 +294,13 @@ performance of each Sub-Processor's obligations.
 
 6.4. **Change notice.** Before authorizing any new Sub-Processor or replacing an
 existing one, the Processor shall give the Customer at least
-[[OWNER: change-notice period, e.g. 30 days]] prior notice by
-[[OWNER: change-notice mechanism (e.g. email to the tenant admin and/or a published sub-processor page URL)]],
+30 days' prior notice by means of a published sub-processor page together with an
+email and/or in-product (account-admin) notice to the Customer,
 so the Customer has the opportunity to object on reasonable data-protection
 grounds.
 
 6.5. **Objection.** If the Customer objects on reasonable, documented
-data-protection grounds within [[OWNER: objection window, e.g. 30 days]] of the
+data-protection grounds within 30 days of the
 notice, the Parties shall work together in good faith to resolve the objection,
 including by the Processor offering a commercially reasonable alternative. If no
 resolution is reached within a reasonable period, the Customer may, as its sole and
@@ -292,8 +309,8 @@ Annex II is load-bearing for the content-addressed store such that no severable
 portion exists, the Agreement) on written notice, and the Processor shall refund any
 prepaid fees for the terminated service covering the period after the effective date
 of termination, calculated on a pro-rata basis. This is reconciled with the
-termination and refund provisions of the Agreement at
-[[OWNER: termination/refund section reference in the Agreement]].
+termination and refund provisions of the Agreement set out in the Terms of Service
+(`docs/TERMS-OF-SERVICE.md`).
 
 ---
 
@@ -302,7 +319,9 @@ termination and refund provisions of the Agreement at
 This §6A applies to the extent the Processor Processes Personal Information subject
 to the US State Privacy Laws on the Customer's behalf. In that case the Customer is
 the **Business** and the Processor is the **Service Provider**, and the following
-covenants apply (in addition to the rest of this DPA):
+covenants apply (in addition to the rest of this DPA). The equivalent
+processor-on-instruction obligations under Brazil's LGPD (Lei nº 13.709/2018) apply
+in parallel where the Processing is subject to the LGPD.
 
 6A.1. **Limited purpose.** The Processor shall Process Personal Information only on
 behalf of the Customer and solely for the specific **Business Purpose** of providing
@@ -348,13 +367,14 @@ to demonstrate compliance with GDPR Art. 28 and this DPA, and shall allow for an
 contribute to audits, including inspections, conducted by the Customer or an
 auditor mandated by the Customer.
 
-7.2. To satisfy 7.1, the Processor may, in the first instance, provide
-[[OWNER: available audit artifacts — e.g. SOC 2 / ISO 27001 reports, penetration-test summaries, or the Sub-Processors' equivalent certifications]].
+7.2. To satisfy 7.1, the Processor may, in the first instance, provide its SOC 2
+Type II and/or ISO 27001 reports once obtained and, in the meantime, the
+Sub-Processors' (Cloudflare's) equivalent certifications and audit reports.
 
 7.3. Where such artifacts are insufficient to address a specific, reasonable
 concern, the Customer may request an audit, on at least
-[[OWNER: audit notice period, e.g. 30 days]] prior written notice, no more than
-[[OWNER: audit frequency cap, e.g. once per 12-month period]] (except where
+30 days' prior written notice, no more than
+once per 12-month period (except where
 required by a Supervisory Authority or following a Personal Data Breach), during
 business hours, subject to confidentiality, and conducted so as not to disrupt the
 Processor's operations or the security or confidentiality of other customers'
@@ -380,12 +400,17 @@ including erasure requests as governed by §10.
 ## 9. Retention, return & deletion
 
 9.1. The Processor Processes and retains Customer Personal Data for the term of the
-Agreement. Default server-side retention periods are
-[[OWNER: server-side retention period(s) for Customer Data after last access / after account closure]].
+Agreement. Default server-side retention periods are: account Customer Content for
+the life of the account plus 30 days after account closure; server logs, IP
+addresses, and request metadata for 90 days; and billing records for 5 years
+(Brazilian fiscal standard). Deletion is propagated to backups and replicas within
+35 days.
 
 9.2. On termination or expiry of the Agreement, the Processor shall, at the
 Customer's choice, delete or return all Customer Personal Data and delete existing
-copies within [[OWNER: post-termination deletion window, e.g. 30 days]], unless
+copies within 30 days (with a further export window of 30 days during which the
+Customer may retrieve its data, and deletion propagated to backups and replicas
+within 35 days), unless
 Union or Member State law requires continued storage, in which case the Processor
 shall protect the data and Process it only as required by that law. Because the
 content-addressed (CAS) blobs cannot yet be erased by self-service means (§10.2),
@@ -434,7 +459,10 @@ roadmap item **M6.4** (`docs/ROADMAP-go-live.md`).
 Customer's verified written erasure request to the contact in §15, effect deletion
 of the affected Customer Data — **including the underlying CAS blobs** — by an
 operator-side process, and confirm completion **without undue delay and in any
-event within [[OWNER: interim erasure SLA — a committed number of days; must be filled before launch (an Art. 17 obligation cannot be left open) and the operator-side process must in fact delete CAS blobs and be verifiable]]**. This interim
+event within 30 days**. This erasure is operator-assisted pending roadmap item M6.4
+(server-side D-7/D-8 reference-enumeration and CAS DELETE/LIST); the Processor does
+not represent that fully automated, instant self-service CAS erasure is available
+before M6.4 lands. This interim
 operator-side process is the means by which the deletion-or-return obligations in
 §4.7 and §9.2 are performed for server-side Customer Data until M6.4 lands.
 
@@ -462,40 +490,49 @@ applicable **Module determined conditionally by the Customer's role under §2.1*
 and **Module Three (Processor→Processor)** applies where the Customer is itself a
 processor. The Parties incorporate whichever Module corresponds to the Customer's
 actual role for the relevant transfer; the document is not limited to a single
-fixed Module. [[OWNER: confirm both Modules Two and Three are populated/annexed so the correct one binds per the Customer's §2.1 role, rather than a single pre-selected Module]];
+fixed Module. Both **Module Two (controller→processor)** and **Module Three
+(processor→processor)** are incorporated and annexed, and the Module corresponding
+to the Customer's actual role under §2.1 binds for the relevant transfer. The SCCs
+apply only where EU personal data is transferred; for Customer Personal Data
+subject to Brazil's LGPD, the LGPD's international-transfer rules (Lei nº
+13.709/2018, Arts. 33–36) govern instead;
 
 (b) For UK GDPR transfers, the UK Addendum applies on top of the EU SCCs;
 
 (c) For Swiss transfers, the EU SCCs apply as adapted by the Swiss Federal Data
-Protection and Information Commissioner (FDPIC) — [[OWNER: confirm Switzerland is an in-scope export jurisdiction for the chosen regions and that the FDPIC is a relevant authority before retaining this paragraph; delete if no Swiss transfers occur]].
+Protection and Information Commissioner (FDPIC), and the FDPIC is the relevant
+authority, in each case only where and to the extent a transfer of Swiss personal
+data actually occurs.
 
 11.3. **SCC operative selections.** Where the SCCs apply:
 
-(a) the optional docking clause (Clause 7) [[OWNER: applies / does not apply]];
+(a) the optional docking clause (Clause 7) applies;
 
-(b) under Clause 9, **Option [[OWNER: 1 (specific) or 2 (general)]]** for
+(b) under Clause 9, **Option 2 (general written authorization)** for
 sub-processor authorization applies, with the change-notice period in §6.4;
 
-(c) under Clause 11, the independent-dispute-resolution option
-[[OWNER: applies / does not apply]];
+(c) under Clause 11, the independent-dispute-resolution option does not apply;
 
-(d) under Clause 17, the governing law is [[OWNER: governing law of the SCCs, e.g. the law of the EU Member State of the data exporter]];
+(d) under Clause 17, the governing law is the law of the EU Member State in which
+the data exporter is established (for example, the law of Ireland);
 
-(e) under Clause 18, the forum for disputes is [[OWNER: courts/forum for SCC disputes]];
+(e) under Clause 18, the forum for disputes is the courts of that EU Member State;
 
 (f) Annexes I, II, and III to the SCCs are populated by §3 (Annex I), §13 (Annex
 II — sub-processors), and §5 (Annex III — security measures) of this DPA, with the
 data exporter, data importer, and competent Supervisory Authority as set out in
 this DPA.
 
-11.4. **Competent Supervisory Authority.** The competent Supervisory Authority is
-[[OWNER: competent supervisory authority for the SCCs]]. This designation depends on
-first resolving the Art. 27 representative (§15.6): where the Processor is **not**
-established in the EEA/UK, an Art. 27 representative is **required, not optional**,
-and the competent authority is generally that of the Member State where the EU
-representative is established (and, for UK transfers, the ICO). The supervisory
-authority designation **cannot be completed until the Art. 27 representative
-determination in §15.6 is made**.
+11.4. **Competent Supervisory Authority.** Where EU personal data is in scope, the
+competent Supervisory Authority is the authority of the EU Member State in which the
+data exporter (or its EU representative) is established (for example, the Irish Data
+Protection Commission), and for UK transfers the Information Commissioner's Office
+(ICO). During the open beta the Service may be accessed by EU/UK Data Subjects; the
+Processor has **not yet appointed** an Art. 27 representative (an outstanding obligation
+and known interim compliance gap — see §15.6) and will appoint one before general
+availability, at which point this Supervisory-Authority designation is confirmed
+accordingly. Where the Processing is subject to Brazil's LGPD,
+the competent authority is the Autoridade Nacional de Proteção de Dados (ANPD).
 
 11.5. **Transfer-impact assessment.** The Processor shall, on the Customer's
 reasonable request, provide information to assist the Customer's transfer-impact
@@ -510,7 +547,7 @@ SCCs prevail with respect to the relevant restricted transfer.
 ## 12. Personal Data Breach notification
 
 12.1. The Processor shall notify the Customer without undue delay, and in any event
-within [[OWNER: breach-notification deadline, e.g. 72 hours]] after becoming aware
+within 72 hours after becoming aware
 of a Personal Data Breach affecting Customer Personal Data.
 
 12.2. The notification shall, to the extent known and as it becomes available,
@@ -534,13 +571,13 @@ Data:
 
 | Sub-Processor | Service provided | Data Processed | Location / residency |
 |---|---|---|---|
-| **Cloudflare R2** | Object storage backing the content-addressed store (CAS) — stores uploaded file **contents** (chunks) and manifests | File contents; file paths (within manifests) | Customer-selected region; specific R2 jurisdiction(s) configured per tenant region — [[OWNER: configured R2 region/jurisdiction(s)]] |
-| **Cloudflare Durable Objects** | Coordination and per-tenant write-path control for the CoreLink API | Tenant-scoped coordination metadata; mediates CAS writes | Cloudflare network; region binding per Customer-selected region — [[OWNER: configured DO region binding]] |
-| [[OWNER: payment processor — name, service (billing / card-token handling), data (billing contact, card token, billing email), location/jurisdiction; or state "none — no payment sub-processor at v1" if billing is not yet live]] | | | |
-| [[OWNER: billing / CRM / account-portal provider — name, service, data, location; or "none at v1"]] | | | |
-| [[OWNER: transactional-email / notification provider used for the §6.4 change-notice and §12 breach-notice mechanisms — name, service, data, location; or state "none — v1 ships no email backend and §6.4/§12 notices are delivered by <the actual mechanism, e.g. published sub-processor page + in-product/account-admin notice>"]] | | | |
-| [[OWNER: error / crash-reporting provider, if any — name, service, data, location; or "none — clw ships no telemetry/crash-reporting network backend at v1"]] | | | |
-| [[OWNER: underlying cloud provider / CDN beneath the Cloudflare edge, if any distinct sub-processor exists — name, service, data, location; or "none — Cloudflare is the sole infrastructure sub-processor"]] | | | |
+| **Cloudflare, Inc. — R2** | Object storage backing the content-addressed store (CAS) — stores uploaded file **contents** (chunks) and manifests | File contents; file paths (within manifests) | Cloudflare global edge; currently configured to the **"enam"** (Eastern North America) region. Customer-selectable regional residency is on the roadmap (M7.1); an indicated region does **not** yet guarantee data residency |
+| **Cloudflare, Inc. — Durable Objects** | Coordination and per-tenant write-path control for the CoreLink API | Tenant-scoped coordination metadata; mediates CAS writes | Cloudflare network; currently configured to the **"enam"** region. As with R2, customer-selectable residency is roadmap M7.1 and an indicated region does not yet guarantee residency |
+| Payment processor | — | — | none — no payment sub-processor at v1 (billing not yet live) |
+| Billing / CRM / account-portal provider | — | — | none at v1 |
+| Transactional-email / notification provider | — | — | none — v1 ships no email backend; the §6.4 change-notice and §12 breach-notice are delivered via a published sub-processor page plus in-product / account-admin notice |
+| Error / crash-reporting provider | — | — | none — `clw` ships no telemetry or crash-reporting network backend at v1 (removed by decision) |
+| Underlying cloud provider / CDN beneath the Cloudflare edge | — | — | none — Cloudflare is the sole infrastructure sub-processor |
 
 **Notes:**
 
@@ -556,14 +593,21 @@ telemetry by default and v1 ships with no telemetry network backend.
 
 13.3. The Processor shall maintain Cloudflare's then-current data-protection terms,
 sub-processor disclosures, and transfer safeguards as part of the flow-down under
-§6.2; the current Cloudflare DPA reference is
-[[OWNER: link/reference to the executed Cloudflare DPA and its SCCs]].
+§6.2; the current Cloudflare DPA reference is the Cloudflare Customer DPA (which
+incorporates the EU SCCs and UK Addendum), available at
+https://www.cloudflare.com/cloudflare-customer-dpa/.
 
 13.4. **Notice-delivery mechanism.** The change-notice (§6.4), Sub-Processor
 objection (§6.5), breach-notice (§12), and erasure-confirmation (§10.3) mechanisms
 require a means of contacting the Customer. The Processor must ensure the mechanism
 referenced in §6.4 actually exists at launch and lists any email/notification
-provider used as a Sub-Processor in the Annex II table above. [[OWNER: confirm the actual notice-delivery mechanism for §6.4/§6.5/§10.3/§12 (e.g. email to the tenant admin via a transactional-email sub-processor, a published sub-processor page, and/or in-product/account-admin notice); if v1 has no email backend, the table and §6.4 must reference the mechanism that does exist so the DPA does not promise a capability it lacks]].
+provider used as a Sub-Processor in the Annex II table above. At v1 the Processor
+operates **no transactional-email backend**; accordingly, the change-notice (§6.4),
+Sub-Processor objection (§6.5), erasure-confirmation (§10.3), and breach-notice
+(§12) mechanisms are delivered by a **published sub-processor page together with
+in-product / account-admin notice** (and, where contact details are on file,
+direct email). No email/notification Sub-Processor is therefore listed in Annex II,
+and this DPA does not promise an email-delivery capability the Service lacks.
 
 ---
 
@@ -573,7 +617,15 @@ provider used as a Sub-Processor in the Annex II table above. [[OWNER: confirm t
 contract, tort, or otherwise, is subject to the limitations and exclusions of
 liability set out in the Agreement, and any reference to liability of a Party
 means the aggregate liability of that Party under the Agreement and this DPA
-combined, **except as provided in §14.2 and §14.3**. [[OWNER: (1) confirm the Agreement in fact contains the liability cap incorporated here, and its amount, before relying on this incorporation by reference; and (2) decide whether data-protection and confidentiality breaches sit OUTSIDE the general liability cap — a separate higher "super-cap" or an uncapped carve-out for such breaches is market-standard for processor liability and a generic SaaS cap may be commercially unacceptable or, in some jurisdictions, unenforceable against GDPR statutory liability]].
+combined, **except as provided in §14.2 and §14.3**. The general aggregate
+liability cap is the greater of (i) the fees paid by the Customer in the 12 months
+preceding the event giving rise to the claim, or (ii) US$100 (or its BRL
+equivalent). For breaches of the data-protection and confidentiality obligations of
+this DPA, a separate, higher **super-cap of 2× the fees paid in the 12 months
+preceding the claim** applies and sits **above** the general cap, reflecting the
+Processor's liability as a processor under the GDPR and Brazil's LGPD (Lei nº
+13.709/2018). This super-cap is subject to §14.2 (which excludes from any cap those
+liabilities that cannot lawfully be limited).
 
 14.2. Nothing in this DPA limits or excludes either Party's liability to Data
 Subjects under the SCCs, or to the extent such limitation or exclusion is not
@@ -584,8 +636,14 @@ fines or compensation that cannot lawfully be capped).
 shall indemnify the Customer against regulatory fines, Data-Subject compensation
 claims, and reasonable associated costs to the extent directly caused by the
 Processor's breach of this DPA or its obligations under Data Protection Law as a
-Processor, subject to the cap and carve-out treatment to be fixed under §14.1.
-[[OWNER: confirm scope, cap treatment, and reciprocity of this data-protection indemnity (e.g. whether the Customer gives a reciprocal indemnity for unlawful instructions/content it uploads), or replace with an express statement that no indemnity is given and the reason why]].
+Processor, subject to the data-protection super-cap in §14.1 and the non-excludable
+liabilities preserved by §14.2. Reciprocally, and to the extent permitted by law,
+the Customer shall indemnify the Processor against regulatory fines, Data-Subject
+compensation claims, and reasonable associated costs to the extent directly caused
+by the Customer's unlawful Processing instructions or by content the Customer
+uploaded without a lawful basis or the right to store it. This indemnity reflects
+the parties' respective roles as processor and controller under the GDPR and
+Brazil's LGPD (Lei nº 13.709/2018).
 
 ---
 
@@ -604,8 +662,9 @@ Sub-Processor under §6, provided such amendments do not materially reduce the
 protection of Customer Personal Data.
 
 15.4. **Governing law & venue.** Except where the SCCs require otherwise, this DPA
-is governed by the law and subject to the venue stated in the Agreement, namely
-[[OWNER: governing law and dispute venue]].
+is governed by the laws of the Federative Republic of Brazil and subject to the
+exclusive jurisdiction of the courts of the Judicial District (Comarca) of São
+Paulo, State of São Paulo, Brazil.
 
 15.5. **Severability.** If any provision of this DPA is held invalid or
 unenforceable, the remaining provisions remain in full force, and the Parties
@@ -614,10 +673,10 @@ closely as possible.
 
 15.6. **Contacts.**
 
-- Data Protection Officer / privacy contact: [[OWNER: DPO / privacy contact email on the humangr.com domain]].
-- Security / incident contact: [[OWNER: security/abuse contact email on the humangr.com domain (e.g. security@humangr.com once confirmed); this must be the same address used in SECURITY.md]] (`SECURITY.md`). Breach notifications under §12 and Data Subject communications routed to the Processor must use this address; it must be confirmed and live before launch so notice is validly given and not mis-routed.
-- Legal notices to the Processor: [[OWNER: legal-notice postal address for the Processor]].
-- EU/UK representative (GDPR Art. 27): [[OWNER: EU and/or UK Art. 27 representative name and contact, or "not applicable" only if the Processor is established in the EEA/UK]]. **Note:** if the Processor is **not** established in the EEA/UK and offers the service to EU/UK Data Subjects, an Art. 27 representative is **mandatory, not optional**, and the §11.4 Supervisory-Authority designation cannot be completed until it is resolved (see §11.4).
+- Data Protection Officer / privacy contact (LGPD Encarregado): Gustavo Schneiter — privacy@humangr.com.
+- Security / incident contact: security@humangr.com (`SECURITY.md`). Breach notifications under §12 and Data Subject communications routed to the Processor must use this address; it must be confirmed and live before launch so notice is validly given and not mis-routed.
+- Legal notices to the Processor: Human Guardrail LTDA, Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP: 04516-001); legal@humangr.com.
+- EU/UK representative (GDPR Art. 27): **not yet appointed.** During the open beta the Service may be accessed by EU/UK Data Subjects; appointing a representative is an outstanding Art. 27 obligation and a known interim compliance gap, which the Processor will close before general availability, at which point the §11.4 Supervisory-Authority designation is confirmed (see §11.4).
 
 15.7. **Signatures.** Where this DPA is executed as a stand-alone document, it is
 signed by authorized representatives of each Party; otherwise, acceptance of the
@@ -625,6 +684,6 @@ Agreement constitutes acceptance of this DPA.
 
 | Processor | Customer |
 |---|---|
-| Name: [[OWNER: signatory name]] | Name: ____________________ |
-| Title: [[OWNER: signatory title]] | Title: ____________________ |
+| Name: Gustavo Schneiter | Name: ____________________ |
+| Title: Head of Engineering / CEO | Title: ____________________ |
 | Date: ____________________ | Date: ____________________ |
