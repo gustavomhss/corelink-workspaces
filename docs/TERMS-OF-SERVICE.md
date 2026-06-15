@@ -1,10 +1,10 @@
 # Terms of Service — CoreLink Workspaces (the hosted CoreLink API and `clw` client)
 
-**Effective date:** [[OWNER: effective date / last-updated date]]
+**Effective date:** June 14, 2026
 
 These Terms of Service ("**Terms**") form a binding agreement between
-[[OWNER: registered legal entity name (e.g. "HumanGR, Inc.")]], a company
-incorporated in [[OWNER: jurisdiction/country of incorporation]] ("**HumanGR**",
+Human Guardrail LTDA, a limited-liability company (sociedade empresária limitada)
+organized under the laws of Brazil ("**HumanGR**",
 "**we**", "**us**", or "**our**"), and the individual or legal entity that creates
 a CoreLink tenant or otherwise accesses or uses the Service ("**Customer**",
 "**you**", or "**your**"). By creating a tenant, configuring a Personal Access
@@ -144,18 +144,23 @@ to provide, secure, maintain, and support the Service, and as further described 
 the Privacy Policy and DPA. HumanGR does not acquire any ownership of your Customer
 Data.
 
-5.4 **Data residency.** Customer Data is stored in the region you select. Regional
+5.4 **Data residency.** Customer Data is currently stored in the "enam" (Eastern
+North America) region via our infrastructure sub-processor, Cloudflare, Inc.
+Customer-selectable regional residency is on our roadmap (M7.1) but is not yet
+available, and an indicated region does not yet guarantee residency. Regional
 residency, sub-processors, and the technical and organizational measures applicable
 to your Customer Data are described in the Privacy Policy and the DPA
 (`docs/DPA-subprocessors.md`).
 
 5.5 **Deletion and erasure.** You may delete your Customer Data through the Service,
 and, where applicable data-protection law confers a right to erasure (including
-Article 17 of the GDPR), you may request deletion of all Customer Data stored for
-your Tenant, in each case as described in, and subject to the limitations and
-processes set out in, the Privacy Policy and the DPA. Deletion is subject to a
-reasonable processing period and to retention HumanGR is required by law to
-maintain.
+Article 17 of the GDPR and Article 18 of Brazil's LGPD (Lei nº 13.709/2018)), you
+may request deletion of all Customer Data stored for your Tenant, in each case as
+described in, and subject to the limitations and processes set out in, the Privacy
+Policy and the DPA. Erasure is currently operator-assisted, pending roadmap M6.4
+(server-side D-7/D-8), and HumanGR will give effect to a valid erasure request
+within thirty (30) days; deletion is subject to a reasonable processing period and
+to retention HumanGR is required by law to maintain.
 
 5.6 **CCPA/CPRA service-provider status.** To the extent Customer Data includes
 personal information subject to the California Consumer Privacy Act, as amended by
@@ -165,7 +170,10 @@ secure, maintain, and support the Service on your behalf and for no other purpos
 HumanGR does not "sell" or "share" (as those terms are defined under the CCPA/CPRA)
 Customer Data, and will not retain, use, or disclose Customer Data outside the
 direct business relationship with you or otherwise except as permitted under the
-CCPA/CPRA, in each case as further described in the DPA.
+CCPA/CPRA, in each case as further described in the DPA. As a Brazilian controller,
+HumanGR likewise processes such personal data as an operator (operador) on your
+behalf under Brazil's LGPD (Lei nº 13.709/2018), solely for the purposes set out
+above.
 
 ## 6. Acceptable use
 
@@ -216,16 +224,17 @@ intended for such use.
 7.1 **Charges.** Fees, billing frequency, payment terms, and any usage- or
 capacity-based metering are set out in the applicable Order or published pricing.
 Unless the applicable Order states otherwise, fees are non-cancelable and amounts
-paid are non-refundable, except as required by law. [[OWNER: pricing, billing
-cadence, and any free-tier / evaluation terms]]
+paid are non-refundable, except as required by law. Billing is not yet live; during
+the current incubation phase the Service is provided without charge, and any
+pricing, billing cadence, free-tier, or evaluation terms will be set out in the
+applicable Order or published pricing before fees take effect.
 
 7.2 **Taxes.** Fees are exclusive of taxes, levies, and duties. You are responsible
 for all such amounts, excluding taxes based on HumanGR's net income.
 
-7.3 **Late payment.** Overdue amounts may accrue interest at the rate of
-[[OWNER: late-payment interest rate, if any]] or the maximum permitted by law,
-whichever is lower, and HumanGR may suspend the Service for non-payment in
-accordance with Section 9.
+7.3 **Late payment.** Overdue amounts may accrue interest at the rate of 1.5% per
+month or the maximum permitted by applicable law, whichever is lower, and HumanGR
+may suspend the Service for non-payment in accordance with Section 9.
 
 ## 8. Service availability and support
 
@@ -233,8 +242,9 @@ accordance with Section 9.
 Service available, but the Service is otherwise provided on an "as-available" basis.
 Any committed service-level objective, uptime percentage, and associated remedy
 (such as service credits) apply only if and to the extent set out in a written
-Service Level Agreement. [[OWNER: SLA uptime commitment, measurement window, and
-service-credit schedule, if any]]
+Service Level Agreement. HumanGR does not currently offer a committed uptime
+service-level objective or service-credit schedule; any such commitment will apply
+only if and to the extent set out in a written Service Level Agreement.
 
 8.2 **Maintenance.** HumanGR may perform scheduled and emergency maintenance and may
 modify, suspend, or discontinue features of the Service, using commercially
@@ -242,12 +252,13 @@ reasonable efforts to limit disruption and to give reasonable advance notice of
 materially adverse changes where practicable.
 
 8.3 **Support.** Support channels and target response times, if any, are as
-described in the applicable Order or published support policy. [[OWNER: support
-contact email and support response-time targets, if any]]
+described in the applicable Order or published support policy. Support requests may
+be sent to support@humangr.com; HumanGR does not commit to a specific
+response-time target during the current incubation phase.
 
 8.4 **Security and vulnerability reporting.** Do not publicly disclose any suspected
 vulnerability. Report it privately, in accordance with the coordinated-disclosure
-process in `SECURITY.md`, to [[OWNER: security/abuse contact email]]. Pre-1.0, only
+process in `SECURITY.md`, to security@humangr.com. Pre-1.0, only
 the latest released version of the Client is supported.
 
 8.5 **Confidentiality.** "**Confidential Information**" means non-public information
@@ -293,10 +304,11 @@ written notice.
 
 9.5 **Effect of termination.** On termination, your right to access the Service and
 to use the Client ceases; you must stop using and remove the Client. For a period of
-[[OWNER: post-termination data-export/retention window, e.g. 30 days]] following
-termination (other than termination by HumanGR for your breach of Section 6),
-HumanGR will make your Customer Data available for export; thereafter HumanGR may
-delete your Customer Data in accordance with the Privacy Policy and DPA. Your right
+thirty (30) days following termination (other than termination by HumanGR for your
+breach of Section 6), HumanGR will make your Customer Data available for export;
+thereafter HumanGR may delete your Customer Data in accordance with the Privacy
+Policy and DPA, with deletion completed within thirty (30) days of the end of that
+export window and propagated to backups and replicas within thirty-five (35) days. Your right
 to request erasure under Section 5.5 is unaffected.
 
 9.6 **Survival.** Sections 1, 2.3, 3.3, 5.1, 5.3 (as to processing already
@@ -337,18 +349,18 @@ POSSIBILITY OF SUCH DAMAGES.
 
 11.2 **General liability cap.** SUBJECT TO SECTIONS 11.3 AND 11.4 AND TO THE MAXIMUM
 EXTENT PERMITTED BY APPLICABLE LAW, EACH PARTY'S TOTAL AGGREGATE LIABILITY ARISING
-OUT OF OR RELATED TO THESE TERMS WILL NOT EXCEED THE TOTAL FEES PAID OR PAYABLE BY
-YOU FOR THE SERVICE IN THE TWELVE (12) MONTHS PRECEDING THE EVENT GIVING RISE TO THE
-CLAIM. [[OWNER: confirm the general liability-cap amount/formula]]
+OUT OF OR RELATED TO THESE TERMS WILL NOT EXCEED THE GREATER OF (A) THE TOTAL FEES
+PAID OR PAYABLE BY YOU FOR THE SERVICE IN THE TWELVE (12) MONTHS PRECEDING THE EVENT
+GIVING RISE TO THE CLAIM, OR (B) US$100 (OR ITS EQUIVALENT IN BRAZILIAN REAIS).
 
 11.3 **HumanGR super-cap.** Notwithstanding Section 11.2 and to the maximum extent
 permitted by applicable law, HumanGR's total aggregate liability for (a) its
 indemnification obligations under Section 13.2 (IP infringement); (b) its breach of
 its confidentiality obligations under Section 8.5; and (c) its breach of its
 obligations under the DPA or applicable data-protection law in respect of Customer
-Data (including a data breach attributable to HumanGR) will not exceed
-[[OWNER: HumanGR super-cap amount/formula, e.g. a multiple (2x or 3x) of the fees
-paid or payable in the preceding 12 months]]. This Section 11.3 caps HumanGR's
+Data (including a data breach attributable to HumanGR) will not exceed two times
+(2×) the total fees paid or payable by you for the Service in the twelve (12) months
+preceding the event giving rise to the claim. This Section 11.3 caps HumanGR's
 liability for the listed matters in lieu of the uncapped treatment in Section 11.4,
 and the matters in this Section 11.3 are correspondingly carved out of Section 11.4
 as they relate to HumanGR.
@@ -375,8 +387,12 @@ ordinarily resident in any country or territory subject to comprehensive sanctio
 and that you are not a person with whom dealings are prohibited under applicable
 export-control or sanctions law. You will not access, use, export, or re-export the
 Service or Client in violation of such law. The Client ships cryptography (TLS via
-rustls, and BLAKE3 content digests); its self-classification is described in
-`docs/EXPORT-CONTROL.md`.
+rustls, and BLAKE3 content digests). The Client is self-classified as mass-market
+cryptography under ECCN 5D992.c (no ENC §740.17 license required; self-classified
+and subject to counsel confirmation), as described in `docs/EXPORT-CONTROL.md`. You
+may not access, use, export, or re-export the Service or Client to any OFAC
+comprehensively-sanctioned destination, including Cuba, Iran, North Korea, Syria, or
+the Crimea, Donetsk, or Luhansk regions of Ukraine.
 
 ## 13. Indemnification
 
@@ -417,8 +433,10 @@ Terms, the EULA, or the Documentation; (v) your continued use after notice to mo
 or cease, or after a non-infringing version is made available; or (vi) any item
 provided on a no-charge, beta, or evaluation basis.
 
-[[OWNER: confirm the scope, the monetary super-cap (see Section 11.3), and any
-negotiated exclusions for the HumanGR IP-infringement indemnity above.]]
+HumanGR's liability under this Section 13.2 is subject to the monetary super-cap in
+Section 11.3 (two times (2×) the fees paid or payable in the preceding 12 months),
+and is subject to the exclusions in Section 13.2(b); no other exclusions to this
+indemnity apply.
 
 13.3 **Procedure.** The indemnified party will promptly notify the indemnifying
 party of the claim (provided that a failure to give prompt notice relieves the
@@ -432,14 +450,15 @@ participate in the defense with its own counsel at its own expense.
 ## 14. Governing law and dispute resolution
 
 14.1 **Governing law.** These Terms are governed by and construed in accordance with
-the laws of [[OWNER: governing law jurisdiction]], without regard to its
+the laws of the Federative Republic of Brazil, without regard to its
 conflict-of-laws principles, and excluding the United Nations Convention on
 Contracts for the International Sale of Goods.
 
 14.2 **Venue and dispute resolution.** The parties submit to the exclusive
-jurisdiction and venue of [[OWNER: dispute venue / courts]] for any dispute arising
-out of or relating to these Terms. [[OWNER: optional arbitration agreement and/or
-class-action waiver, if desired]] Any arbitration agreement or class-action waiver
+jurisdiction and venue of the courts of the Judicial District (Comarca) of São
+Paulo, State of São Paulo, Brazil, for any dispute arising out of or relating to
+these Terms. The parties do not agree to mandatory arbitration or a class-action
+waiver. Any arbitration agreement or class-action waiver
 inserted in this Section 14.2 applies only to Customers that are not consumers under
 applicable mandatory consumer-protection law; it does not apply to, and does not
 deprive any consumer of, any non-waivable forum, collective-redress, or remedy that
@@ -448,9 +467,9 @@ such law confers (see Section 2.5).
 ## 15. General
 
 15.1 **Changes to these Terms.** HumanGR may update these Terms from time to time.
-HumanGR will provide notice of changes by [[OWNER: change-notification mechanism,
-e.g. email to the Tenant admin and/or posting at humangr.com with an updated
-effective date]].
+HumanGR will provide notice of changes by posting the updated Terms at
+https://humangr.com/legal/terms with an updated effective date and, where the
+Service supports it, by in-product or account-admin notice to the Tenant admin.
 
 (a) For changes that are not materially adverse to you (for example, clarifications,
 new optional features, or changes required by law), the updated Terms take effect as
@@ -474,9 +493,10 @@ acquisition, or sale of substantially all assets, provided the successor is not 
 competitor of HumanGR and assumes these Terms. HumanGR may assign these Terms to an
 affiliate or successor. Any non-permitted assignment is void.
 
-15.3 **Notices.** Notices to HumanGR must be sent to [[OWNER: legal notice address
-and/or legal contact email]]. Notices to you may be given via the email associated
-with your Tenant or through the Service.
+15.3 **Notices.** Notices to HumanGR must be sent to Human Guardrail LTDA, Avenida
+Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP: 04516-001), with a
+copy by email to legal@humangr.com. Notices to you may be given via the email
+associated with your Tenant or through the Service.
 
 15.4 **Force majeure.** Neither party is liable for any delay or failure to perform
 (other than payment obligations) due to causes beyond its reasonable control.
@@ -498,7 +518,6 @@ understandings on that subject.
 
 ---
 
-For questions about these Terms, contact [[OWNER: legal/contact email]].
+For questions about these Terms, contact legal@humangr.com.
 
-Copyright © [[OWNER: copyright year(s)]] [[OWNER: registered legal entity name]].
-All rights reserved.
+Copyright © 2026 Human Guardrail LTDA All rights reserved.

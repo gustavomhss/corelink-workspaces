@@ -1,9 +1,9 @@
 # Privacy Policy — CoreLink Workspaces (`clw`)
 
-**Effective date:** [[OWNER: effective / last-updated date]]
-**Last updated:** [[OWNER: effective / last-updated date]]
+**Effective date:** June 14, 2026
+**Last updated:** June 14, 2026
 
-This Privacy Policy explains how [[OWNER: registered legal entity name]] ("**HumanGR**",
+This Privacy Policy explains how Human Guardrail LTDA ("**HumanGR**",
 "**we**", "**us**", or "**our**"), operating the product **CoreLink Workspaces** — the
 `clw` command-line client and the hosted CoreLink API at `corelink-api.humangr.com`
 (together, the "**Service**") — collects, uses, discloses, retains, and protects
@@ -12,7 +12,9 @@ personal data, and the rights you have over that data.
 It is written to satisfy the EU General Data Protection Regulation (Regulation (EU)
 2016/679, "**GDPR**"), the UK GDPR and the UK Data Protection Act 2018, and the
 California Consumer Privacy Act as amended by the California Privacy Rights Act
-(together, "**CCPA/CPRA**"). Where those regimes use different terms for the same
+(together, "**CCPA/CPRA**"). As HumanGR is a Brazilian controller, this policy is also
+written to satisfy Brazil's Lei Geral de Proteção de Dados (Lei nº 13.709/2018,
+"**LGPD**"). Where those regimes use different terms for the same
 concept (for example "personal data" vs. "personal information", or "data subject"
 vs. "consumer"), we use them interchangeably.
 
@@ -43,9 +45,10 @@ distinct processing roles apply:
 This Privacy Policy describes both roles. Where a processing activity is governed by
 the Data Processing Agreement rather than this policy, we say so.
 
-**Controller of record:** [[OWNER: registered legal entity name]],
-[[OWNER: registered company address for legal notices]], incorporated in
-[[OWNER: country/jurisdiction of incorporation]].
+**Controller of record:** Human Guardrail LTDA, a limited-liability company (sociedade
+limitada) with registered office at Avenida Rouxinol, 857, apt. 113, Moema, São Paulo
+– SP, Brazil (CEP: 04516-001), enrolled under CNPJ 66.103.400/0001-30, incorporated
+in Brazil.
 
 ---
 
@@ -76,6 +79,11 @@ client to snapshot.
 
 The PAT is the **single** credential the client sends. The internal
 `x-corelink-tenant-id` header is set server-side and is never set by `clw`.
+
+Under the LGPD, the corresponding legal bases (Lei nº 13.709/2018, Art. 7) are the
+execution of a contract (Art. 7, V), compliance with a legal or regulatory obligation
+(Art. 7, II), and the controller's legitimate interests (Art. 7, IX), mirroring the
+GDPR bases identified above.
 
 ### 2.3 Telemetry — none
 
@@ -174,9 +182,14 @@ actually stored are those listed below, and a region you may indicate at sign-up
 yet, by itself, guarantee residency in that region.** The regions in which Customer
 Content is stored today, and the region(s) we make available, are:
 
-[[OWNER: the region(s) in which Customer Content is actually stored today (e.g. North
-America), and the set of customer-selectable regions once M7.1 region routing is live and
-verified — note in particular whether EEA/UK residency is available]]
+- **Today.** All Customer Content is stored in Cloudflare's **"enam" (Eastern North
+  America)** region. This is currently the only region in which Customer Content is
+  stored, regardless of any region you may indicate at sign-up.
+- **Customer-selectable regions (roadmap M7.1).** Customer-selectable regional
+  residency is being rolled out and is **not yet live**. Until it ships and is verified
+  end to end, indicating a region does not guarantee residency in that region. **EEA/UK
+  residency is not available today**; the Service is not yet offered to EEA/UK data
+  subjects during incubation (see the EU/UK representative note in §15).
 
 If you have a contractual or regulatory residency requirement (for example, EEA or UK
 residency under the GDPR), contact us at the address in §15 to confirm that the required
@@ -185,9 +198,20 @@ region is available **before** you rely on residency for compliance purposes.
 **Sub-processors.** We use the third-party infrastructure and service providers listed
 in `docs/DPA-subprocessors.md`, namely:
 
-[[OWNER: definitive list of sub-processors (e.g. cloud / object-storage / CDN /
-payment / support providers), each with its name, the processing it performs, and the
-country/region in which it processes data]]
+- **Cloudflare, Inc.** — R2 object storage (content-addressed store) and Durable
+  Objects (compute/state), provided over Cloudflare's global edge. Customer Content is
+  currently processed and stored in the **"enam" (Eastern North America)** region.
+  Cloudflare is the **sole** infrastructure sub-processor; there is no separate
+  underlying cloud or CDN provider beneath it. Cloudflare's data-protection terms and
+  Standard Contractual Clauses are available at
+  <https://www.cloudflare.com/cloudflare-customer-dpa/>.
+
+At v1 there is **no** payment, billing/CRM, transactional-email/notification,
+crash-reporting, or telemetry sub-processor: billing is not yet live, the client ships
+no email backend or telemetry, and change/breach notices are given via a published
+sub-processor page together with in-product/account-admin notice. We give at least
+**30 days' advance notice** of any new or replacement sub-processor via that page and an
+email/in-product notice.
 
 We impose data-protection obligations on each sub-processor by written contract that
 are no less protective than those in this policy and our Data Processing Agreement, and
@@ -199,8 +223,11 @@ EEA, the UK, or another jurisdiction whose laws require a transfer mechanism, we
 on an appropriate safeguard under GDPR Chapter V — an adequacy decision where one
 applies, or otherwise the European Commission's Standard Contractual Clauses (and the
 UK International Data Transfer Addendum for UK transfers), together with any
-supplementary measures required following a transfer-impact assessment. You may request
-a copy of the relevant safeguard via the contact in §15.
+supplementary measures required following a transfer-impact assessment. For
+international transfers of personal data subject to Brazil's LGPD, we likewise rely on
+an appropriate transfer mechanism under LGPD Arts. 33–35 (such as standard contractual
+clauses or adequacy, as recognized by the ANPD). You may request a copy of the relevant
+safeguard via the contact in §15.
 
 These Chapter V safeguards apply to **both** categories of data: processor-side **Customer
 Content** (covered by the Data Processing Agreement) and controller-side **Account &
@@ -213,8 +240,9 @@ the case, the transfer safeguards in this paragraph apply. The sub-processor lis
 (once completed) identifies which providers receive controller-side personal data and the
 corresponding transfer mechanism.
 
-Governing law and dispute venue for this policy and the Service are as stated in
-[[OWNER: governing law and dispute venue]].
+This policy and the Service are governed by the laws of the Federative Republic of
+Brazil, and any dispute arising from them is subject to the exclusive jurisdiction of
+the courts of the Judicial District (Comarca) of São Paulo, State of São Paulo, Brazil.
 
 ---
 
@@ -260,8 +288,10 @@ absolute security. Our detailed security posture is described in `SECURITY.md` a
 result in a risk to individuals' rights and freedoms, we will notify the competent
 supervisory authority without undue delay and, where required, within 72 hours of
 becoming aware of it, and will notify affected individuals where the law requires.
-Where we are your processor, we will notify you without undue delay after becoming
-aware of a breach affecting your Customer Content.
+Under the LGPD (Art. 48), we will likewise notify Brazil's Autoridade Nacional de
+Proteção de Dados (ANPD) and affected data subjects within a reasonable period where a
+breach may create risk or relevant harm. Where we are your processor, we will notify you
+without undue delay after becoming aware of a breach affecting your Customer Content.
 
 ---
 
@@ -269,21 +299,22 @@ aware of a breach affecting your Customer Content.
 
 **Customer Content.** We retain Customer Content for as long as your tenant maintains
 it, and delete it on your instruction or following termination of your account, subject
-to the erasure rights in §10 and to the retention period specified in
-[[OWNER: Customer Content retention / post-termination deletion period]].
+to the erasure rights in §10. Following termination, we delete Customer Content within
+**30 days**, and you have a **30-day** post-termination window to export it before
+deletion. Deletion propagates to backups and replicas within a further **35 days**.
 
 **Account & Operational Data.** We retain account, billing, and operational data for as
 long as your account is active and thereafter only as long as needed for the purposes
 described in this policy or as required by law (for example, tax and accounting records).
-Specific retention periods, by category, are set out in [[OWNER: retention schedule for
-account, billing, and log data]]. In particular, request metadata (including source IP)
-and server operational/security/audit logs are retained for
-[[OWNER: server operational-log and request-metadata (incl. IP) retention period — required
-for the GDPR Art. 13(2)(a) and CPRA per-category retention disclosures]], after which they
+Specific retention periods, by category, are: **account data** — for the life of the
+account plus **30 days**; **server operational/security/audit logs and request metadata
+(including source IP)** — **90 days**; and **billing records** — **5 years** (the
+Brazilian fiscal standard). In particular, request metadata (including source IP) and
+server operational/security/audit logs are retained for **90 days**, after which they
 are deleted or aggregated/anonymized.
 
-**Right to erasure (GDPR Art. 17).** We honor erasure requests as described here and in
-§10. The mechanics differ between the self-service client operation and the full erasure
+**Right to erasure (GDPR Art. 17; LGPD Art. 18).** We honor erasure requests as
+described here and in §10. The mechanics differ between the self-service client operation and the full erasure
 of stored content, and we describe both honestly:
 
 - **Reference deletion (self-service, available today).** The client `clw rm` operation
@@ -296,8 +327,8 @@ of stored content, and we describe both honestly:
   through the client alone. Until that capability ships (a roadmap item tracked as M6.4 in
   `docs/ROADMAP-go-live.md`), we effect full erasure of your stored Customer Content
   through an **operator-assisted process** on a verified written request to the contact in
-  §15, within [[OWNER: interim operator-assisted erasure SLA, e.g. number of days]]. When
-  self-service CAS erasure ships, we will update this section.
+  §15, within **30 days** of the request. When self-service CAS erasure ships, we will
+  update this section.
 
 On account closure, and on a valid erasure request, we delete the affected Customer
 Content through the process above and we delete Account & Operational Data subject to the
@@ -313,7 +344,8 @@ server-side, which is handled through the erasure process above.
 
 **Backups.** Residual copies may persist in routine, time-limited backups after
 deletion from production systems; such copies are isolated, are not used for any other
-purpose, and are overwritten or deleted on the ordinary backup-rotation cycle.
+purpose, and are overwritten or deleted on the ordinary backup-rotation cycle, within
+**35 days** of deletion from production.
 
 ---
 
@@ -349,6 +381,12 @@ it directly.
   Information Commissioner's Office (in the UK). We would, however, appreciate the
   chance to address your concern first.
 
+Under Brazil's LGPD (Art. 18), data subjects hold equivalent rights — including
+confirmation of processing, access, correction, anonymization/blocking/deletion,
+portability, information about sharing, and revocation of consent — and may petition
+Brazil's ANPD; the mechanisms described in this section and §10.3 apply equally to LGPD
+requests.
+
 ### 10.2 Rights under CCPA/CPRA (California residents)
 
 - **Right to know / access** the categories and specific pieces of personal information
@@ -373,10 +411,10 @@ not sell or share any of the categories below.
 
 | CCPA/CPRA category | Personal information (per §2) | Categories of sources | Business / commercial purpose | Categories of recipients | Retention period / criteria |
 |---|---|---|---|---|---|
-| **Identifiers** | Account / billing identity and contact details; tenant identifier; Personal Access Token (credential) | You / your organization; generated at provisioning | Provide, authenticate, administer, and bill for the Service; enforce tenant isolation | Sub-processors / service providers (§6, §11); professional advisers; legal/government recipients where required | While the account is active and as needed for the purposes in §9, then per the schedule in §9 / [[OWNER: retention schedule for account, billing, and log data]] |
-| **Internet or other electronic network activity information** | Request metadata: source IP, timestamp, `User-Agent`; server operational/security/audit logs | Generated by your use of the Service | Routing, authentication, security monitoring, abuse prevention, debugging, compatibility | Sub-processors / service providers (§6); legal/government recipients where required | [[OWNER: server operational-log and request-metadata (incl. IP) retention period]] |
-| **Commercial information** | Billing / transaction records | You / your organization | Bill for the Service; keep required financial records | Payment / billing sub-processor (§6); professional advisers; tax/legal recipients | As required for tax and accounting law and otherwise per §9 / [[OWNER: billing-records retention period]] |
-| **Customer Content** (file contents, paths/tree structure, ref names) | The workspace bytes and metadata you explicitly snapshot. For this category HumanGR is a **service provider/processor**, not a business collecting for its own purposes; any personal information it contains is determined by you (the controller) | You, via the `clw` client | Provide the snapshot / hydrate functionality you request | Object-storage / infrastructure sub-processors (§6, `docs/DPA-subprocessors.md`) | As your tenant maintains it, then per §9 and the erasure mechanism in §9 / [[OWNER: Customer Content retention / post-termination deletion period]] |
+| **Identifiers** | Account / billing identity and contact details; tenant identifier; Personal Access Token (credential) | You / your organization; generated at provisioning | Provide, authenticate, administer, and bill for the Service; enforce tenant isolation | Sub-processors / service providers (§6, §11); professional advisers; legal/government recipients where required | While the account is active and as needed for the purposes in §9, then per the schedule in §9 (account data: life of account + 30 days; billing: 5 years) |
+| **Internet or other electronic network activity information** | Request metadata: source IP, timestamp, `User-Agent`; server operational/security/audit logs | Generated by your use of the Service | Routing, authentication, security monitoring, abuse prevention, debugging, compatibility | Sub-processors / service providers (§6); legal/government recipients where required | 90 days |
+| **Commercial information** | Billing / transaction records | You / your organization | Bill for the Service; keep required financial records | Payment / billing sub-processor (§6); professional advisers; tax/legal recipients | As required for tax and accounting law (5 years, Brazilian fiscal standard) and otherwise per §9 |
+| **Customer Content** (file contents, paths/tree structure, ref names) | The workspace bytes and metadata you explicitly snapshot. For this category HumanGR is a **service provider/processor**, not a business collecting for its own purposes; any personal information it contains is determined by you (the controller) | You, via the `clw` client | Provide the snapshot / hydrate functionality you request | Object-storage / infrastructure sub-processors (§6, `docs/DPA-subprocessors.md`) | As your tenant maintains it, then per §9 and the erasure mechanism in §9 (deleted within 30 days of termination; 30-day export window) |
 
 We do not collect special-category or sensitive personal information for our own purposes
 (see §2.4), and we do not use personal information for cross-context behavioral
@@ -385,13 +423,15 @@ and §11.
 
 ### 10.3 How to exercise your rights
 
-Submit a request to [[OWNER: data-subject-request / privacy contact email]]. We will
+Submit a request to privacy@humangr.com. We will
 verify your identity (and an authorized agent's authority, where applicable) before
 acting. We respond to GDPR/UK GDPR requests within **one month**, extendable by up to
 two further months for complex or numerous requests with notice to you; and to
-CCPA/CPRA requests within **45 days**, extendable by a further 45 days with notice. We
-do not charge a fee unless a request is manifestly unfounded or excessive, as permitted
-by law.
+CCPA/CPRA requests within **45 days**, extendable by a further 45 days with notice; and
+to LGPD requests within the timeframes set by Brazilian law (in general, without undue
+delay, and immediately or within 15 days for confirmation-of-processing and access
+requests). We do not charge a fee unless a request is manifestly unfounded or excessive,
+as permitted by law.
 
 ---
 
@@ -418,9 +458,11 @@ behavioral advertising.
 
 ## 12. Cookies and tracking
 
-The `clw` command-line client uses no cookies and performs no tracking. To the extent
-[[OWNER: confirm whether humangr.com / the hosted account portal uses cookies or
-similar technologies; if so, describe them or link to a separate cookie notice]].
+The `clw` command-line client uses no cookies and performs no tracking. At v1 there is
+no hosted account portal, and humangr.com uses only the strictly necessary cookies (if
+any) required to serve the site; we do not use cookies for analytics, advertising, or
+cross-site tracking. If this changes, we will describe the cookies used here or in a
+separate cookie notice before any such use begins.
 
 ---
 
@@ -437,8 +479,9 @@ personal data, contact us (see §15) and we will delete it.
 
 We may update this policy from time to time. When we make material changes, we will
 update the "Last updated" date above and notify you by a reasonable means before the
-change takes effect — for example, by email to your account contact or by notice within
-the Service, as described in [[OWNER: change-notification method and notice period]].
+change takes effect. We give such notice through a published policy/sub-processor page
+together with an in-product or account-admin notice, with at least **30 days'** advance
+notice of material changes.
 Where a change relies on a lawful basis of **consent**, the change will not apply to you
 until you have given that consent; we will not treat continued use of the Service as
 consent. For changes that do **not** require consent as their lawful basis, your continued
@@ -452,20 +495,19 @@ updated policy, without prejudice to any objection or other right you may exerci
 
 | Purpose | Contact |
 |---|---|
-| Privacy / data-subject requests / Data Protection Officer | [[OWNER: DPO / privacy contact email]] |
-| Customer support | [[OWNER: support contact email]] |
-| Security and abuse reports | [[OWNER: security / abuse contact email]] (see `SECURITY.md`) |
-| Legal notices (postal) | [[OWNER: registered legal-notice postal address]] |
+| Privacy / data-subject requests / Data Protection Officer (LGPD Encarregado: Gustavo Schneiter) | privacy@humangr.com |
+| Customer support | support@humangr.com |
+| Security and abuse reports | security@humangr.com (see `SECURITY.md`) |
+| Legal notices (postal) | Human Guardrail LTDA, Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP: 04516-001) |
 
-**Controller:** [[OWNER: registered legal entity name]],
-[[OWNER: country/jurisdiction of incorporation]].
+**Controller:** Human Guardrail LTDA, a sociedade empresária limitada incorporated in Brazil
+(CNPJ 66.103.400/0001-30).
 
-**EU / UK representative (GDPR Art. 27).** If HumanGR is not established in the EEA and/or
-the UK and offers the Service to data subjects there, the appointment of an Art. 27
-representative is **mandatory** and the representative's name and contact must appear here
-before any EU/UK marketing or sign-up goes live. Whether this applies depends on the
-jurisdiction of incorporation above, which is itself an open placeholder; resolving that
-jurisdiction is a **hard launch gate** for EU/UK availability.
-[[OWNER: EU and/or UK Art. 27 representative name and contact address — REQUIRED before
-EU/UK launch if HumanGR is established outside the EEA/UK; state "not applicable" only if
-HumanGR is established in the EEA/UK]].
+**EU / UK representative (GDPR Art. 27).** HumanGR is established in Brazil, outside the
+EEA and the UK. During the current open beta the Service may be accessed by EU/UK data
+subjects, but HumanGR has **not yet appointed** an Art. 27 representative. We acknowledge
+that, where a service is offered to EU/UK data subjects, Art. 27 makes appointing a
+representative **mandatory**; until one is appointed this is an **outstanding obligation
+and a known, time-limited compliance gap** during the beta. HumanGR will appoint a
+representative — and publish that representative's name and contact here — **before general
+availability (the end of the open beta)**.

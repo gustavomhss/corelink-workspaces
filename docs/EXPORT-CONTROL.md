@@ -5,7 +5,7 @@ the hosted CoreLink API at `corelink-api.humangr.com` (the "**Service**").
 **Publisher:** HumanGR (the "**Company**", "**we**", "**us**").
 **Document type:** Export-control and economic-sanctions notice and end-user
 compliance obligations.
-**Effective date / last updated:** [[OWNER: effective date / last-updated date for this notice]]
+**Effective date / last updated:** June 14, 2026
 
 This Notice forms part of, and is incorporated by reference into, the
 Terms of Service (`docs/TERMS-OF-SERVICE.md`) and the End-User License Agreement
@@ -80,11 +80,15 @@ The Software is "information security" software within Category 5, Part 2 of the
 U.S. Export Administration Regulations (EAR) because it uses encryption (TLS).
 
 - **Export Control Classification Number (ECCN):**
-  [[OWNER: confirmed ECCN for the clw binary as a shipped commercial product — engineering self-classification expects 5D992.c (mass-market) but legal must confirm vs. 5D002 + License Exception ENC §740.17]].
+  `5D992.c` (mass-market encryption software), self-classified by the Company. This
+  classification is self-determined and remains subject to confirmation by counsel.
 - **Applicable license exception (if any):**
-  [[OWNER: applicable EAR license exception, e.g., ENC (§740.17) or the basis for mass-market 5D992.c treatment, as confirmed by legal]].
+  None required. The Software is treated as mass-market under ECCN `5D992.c`, so no
+  License Exception ENC (§740.17) authorization is required for its export. (Self-classified;
+  subject to counsel confirmation.)
 - **CCATS / self-classification status:**
-  [[OWNER: whether a CCATS classification request was filed and its outcome, or that self-classification was used, with date]].
+  No CCATS classification request was filed; the Company relies on self-classification
+  (self-classified June 14, 2026, subject to counsel confirmation).
 
 ### Classification rationale (engineering view, subject to the confirmations above)
 
@@ -121,8 +125,10 @@ controls may impose reporting obligations on the Company:
   report or a supplemental email at first export.
 
 Whether any `clw` distribution triggers these obligations, and the cadence and
-content of any filing, is:
-[[OWNER: confirmed encryption reporting obligations and filing cadence (annual self-classification report and/or one-time BIS/NSA email), or a statement that none apply]].
+content of any filing, is as follows: based on the Company's self-classification of
+`clw` as mass-market under ECCN `5D992.c`, no annual self-classification report and no
+one-time or supplemental BIS/NSA reporting obligation applies to the Software. (This
+posture is self-classified and subject to counsel confirmation.)
 
 This is a Company obligation and is stated here for transparency; it does not
 create an obligation on you.
@@ -134,8 +140,13 @@ create an obligation on you.
 Distribution from, or into, jurisdictions other than the United States may engage
 parallel controls, including the EU Dual-Use Regulation (Regulation (EU)
 2021/821), UK export-control law, and local cryptography-import/use rules in the
-destination country. The Company's posture under non-U.S. controls is:
-[[OWNER: confirmed non-U.S. export-control posture per target market (EU Dual-Use Reg. 2021/821, UK controls, and any country-specific crypto import/use restrictions)]].
+destination country. The Company's posture under non-U.S. controls is as follows: the
+Software's cryptography is standard, published mass-market cryptography, and the Company
+treats it as not requiring an additional export license under the EU Dual-Use Regulation
+(Regulation (EU) 2021/821) or UK export-control law for the Company's target markets. (This
+posture is self-classified and subject to counsel confirmation; it does not address every
+country-specific cryptography import/use restriction, which remains your responsibility under
+Sections 5 and 7.)
 
 You remain responsible for compliance with the export- and import-control laws of
 your own jurisdiction and of any jurisdiction into or from which you use, export,
@@ -166,13 +177,17 @@ region offered by the Service in order to cause customer data to be stored or
 processed, in or for the benefit of any country or territory subject to
 comprehensive U.S. or other applicable embargoes or comprehensive sanctions. As of
 the effective date these comprehensively sanctioned destinations include
-**Cuba, Iran, North Korea, Syria, and the Crimea, Donetsk, Luhansk, Zaporizhzhia,
-and Kherson regions of Ukraine**, and any other destination later designated as
+**Cuba, Iran, North Korea, Syria, and the Crimea, Donetsk, Luhansk, Zaporizhzhia, and
+Kherson regions of Ukraine**, and any other destination later designated as
 comprehensively embargoed. For the avoidance of doubt, this prohibition applies to
 the data-residency regions the Service actually makes available and honors; it does
 not represent that the Service offers a residency region in, or screens residency
-selections by reference to, any particular country.
-[[OWNER: confirm and date the comprehensively-embargoed destination list against current OFAC/BIS designations at publication, and state which additional non-U.S. (EU/UK/UN) measures the Company applies]].
+selections by reference to, any particular country. This list was confirmed against the
+OFAC/BIS designations in force as of June 14, 2026; in addition to the U.S. measures, the
+Company applies the comprehensive sanctions and restricted-party measures of the EU, the UK,
+and the United Nations to the extent they apply. The list is subject to change and should be
+re-confirmed against the then-current OFAC/BIS, EU, UK, and UN designations at each
+publication.
 
 ### 6.2 Denied, blocked, and restricted parties
 
@@ -198,8 +213,10 @@ semiconductor end-uses subject to control. The same prohibition applies to the
 equivalent dual-use and weapons-of-mass-destruction end-use controls under the EU
 Dual-Use Regulation (Regulation (EU) 2021/821), UK export-control law, and any
 other applicable measures, to the extent they govern your use, export, or
-re-export of the Software or Service.
-[[OWNER: confirm whether any country-specific end-use controls in target markets require an explicit overlay beyond the U.S. EAR and EU/UK measures named here]].
+re-export of the Software or Service. The Company has not identified any country-specific
+end-use control in its target markets that requires an explicit overlay beyond the U.S. EAR
+and the EU/UK measures named here; this determination is subject to counsel confirmation and
+to re-assessment as the Company's target markets change.
 
 ### 6.4 Screening and enforcement
 
@@ -210,8 +227,14 @@ material risk of a violation of this Notice or applicable law. Where the Service
 honors a customer-selected data-residency region, the Company may also treat that
 selection as a screening signal. The current state of automated destination,
 denied-party, and residency-region screening at the download and registration
-surface is:
-[[OWNER: confirm whether automated destination/denied-party screening (and, where residency selection is honored, residency-region screening) is enforced at the download and tenant-registration surface, and describe its scope]].
+surface is as follows: during the Company's incubation phase, automated
+destination, denied-party, and residency-region screening at the download and
+tenant-registration surface is not yet fully in place; the Company relies on the
+contractual representations in Section 7, manual review where information indicates
+risk, and the screening rights reserved above, and is building out automated
+screening as the Service matures. The Company does not represent that automated
+screening currently blocks every prohibited destination, party, or residency
+selection.
 
 ---
 
@@ -294,7 +317,7 @@ binding government determination, applicable law and that determination control.
 Export-control and sanctions questions regarding the Software or Service may be
 directed to:
 
-- **Export-control / compliance contact:** [[OWNER: export-control / trade-compliance contact email]]
-- **Legal notices:** [[OWNER: legal notice address for the contracting entity]]
-- **Contracting entity:** [[OWNER: registered legal entity name + jurisdiction/country of incorporation]]
-- **Governing law and venue (for disputes under this Notice):** [[OWNER: governing law and dispute venue — must be filled consistently with Terms of Service §14 so the export-matter priority clause (lines 13-15) does not create a divergent forum or governing law for the same dispute]]
+- **Export-control / compliance contact:** legal@humangr.com
+- **Legal notices:** Human Guardrail LTDA, Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP: 04516-001); legal@humangr.com
+- **Contracting entity:** Human Guardrail LTDA, a limited-liability company (sociedade empresária limitada) organized under the laws of Brazil (CNPJ: 66.103.400/0001-30)
+- **Governing law and venue (for disputes under this Notice):** This Notice is governed by the laws of the Federative Republic of Brazil, and any dispute arising under it is subject to the exclusive jurisdiction of the courts of the Judicial District (Comarca) of São Paulo, State of São Paulo, Brazil, consistent with the Terms of Service §14.

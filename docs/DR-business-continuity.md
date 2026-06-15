@@ -1,13 +1,13 @@
 # Disaster Recovery & Business Continuity Policy — CoreLink Workspaces
 
 **Product:** CoreLink Workspaces (CLI binary `clw`) and the hosted CoreLink API (`corelink-api.humangr.com`)
-**Publisher:** [[OWNER: registered legal entity name]] ("HumanGR," "we," "us," or "our")
-**Document owner:** [[OWNER: role/title of the accountable owner, e.g. Head of Engineering / CTO]]
+**Publisher:** Human Guardrail LTDA, a limited-liability company (sociedade empresária limitada) organized under the laws of Brazil ("HumanGR," "we," "us," or "our"), with registered office at Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP: 04516-001); company registration number (CNPJ): 66.103.400/0001-30
+**Document owner:** Gustavo Schneiter — Head of Engineering / CEO (accountable owner)
 **Classification:** Internal operational policy with customer-facing commitments (Sections 4, 9, and 11)
 **Version:** 1.0
-**Effective date:** [[OWNER: effective date]]
-**Last reviewed / last updated:** [[OWNER: last-updated date]]
-**Next scheduled review:** [[OWNER: next review date — recommended at least annually and after any major incident]]
+**Effective date:** June 14, 2026
+**Last reviewed / last updated:** June 14, 2026
+**Next scheduled review:** annually and after any major incident; next due June 14, 2027
 
 > **Completion gate — not yet final for customer-facing use.** This policy is not final
 > and must not be published or relied on as a customer-facing commitment until the
@@ -96,17 +96,19 @@ Agreement between HumanGR and the customer.
 
 | Role | Responsibility | Holder |
 |---|---|---|
-| **Incident Commander (IC)** | Declares a disaster, owns the response, authorizes failover and recovery actions, and approves customer communications. | [[OWNER: named role/individual and deputy]] |
-| **Communications Lead** | Drafts and issues customer, sub-processor, and (where required) regulator notifications; maintains the status channel. | [[OWNER: named role/individual]] |
-| **Engineering / Recovery Lead** | Executes technical recovery (rebuild, re-sign, failover, restore). | [[OWNER: named role/individual]] |
-| **Security Lead** | Handles compromise containment, key revocation/rotation, and forensic preservation. | [[OWNER: named role/individual]] |
-| **Data Protection Officer / Privacy contact** | Assesses personal-data impact and breach-notification obligations. | [[OWNER: DPO / privacy contact name and email]] |
-| **Executive sponsor** | Final escalation, authorizes extraordinary spend and break-glass access. | [[OWNER: named individual]] |
+| **Incident Commander (IC)** | Declares a disaster, owns the response, authorizes failover and recovery actions, and approves customer communications. | Gustavo Schneiter — Head of Engineering / CEO (sole operator during incubation; deputy: same) |
+| **Communications Lead** | Drafts and issues customer, sub-processor, and (where required) regulator notifications; maintains the status channel. | Gustavo Schneiter — Head of Engineering / CEO |
+| **Engineering / Recovery Lead** | Executes technical recovery (rebuild, re-sign, failover, restore). | Gustavo Schneiter — Head of Engineering / CEO |
+| **Security Lead** | Handles compromise containment, key revocation/rotation, and forensic preservation. | Gustavo Schneiter — Head of Engineering / CEO (security/abuse: security@humangr.com) |
+| **Data Protection Officer / Privacy contact** | Assesses personal-data impact and breach-notification obligations. | Gustavo Schneiter — LGPD Encarregado / DPO — privacy@humangr.com |
+| **Executive sponsor** | Final escalation, authorizes extraordinary spend and break-glass access. | Gustavo Schneiter — Head of Engineering / CEO |
 
 A current contact tree, including out-of-hours contacts, escalation order, and
-break-glass access list, is maintained at [[OWNER: location of the live contact tree /
-on-call rotation]] and reviewed on the cadence in Section 11. No role above may be held
-by a single individual without a named deputy.
+break-glass access list, is maintained by the accountable owner (Gustavo Schneiter —
+legal@humangr.com), who is the sole operator during incubation, and reviewed on the
+cadence in Section 11. No role above may be held by a single individual without a named
+deputy; during incubation a single operator holds all roles and is his own deputy, a
+posture to be revisited as the team grows.
 
 ---
 
@@ -118,15 +120,16 @@ applicable SLA; this table must not be read to enlarge or reduce a contractual S
 
 | Event | RTO (target) | RPO (target) |
 |---|---|---|
-| Code-signing key compromise → revoke, re-key, re-sign, re-publish trust root, notify | [[OWNER: RTO target]] | Not applicable — no customer data loss; existing installs continue to function. |
-| Download-surface outage → failover to alternate host / restore | [[OWNER: RTO target]] | Not applicable — release artifacts and signed checksums are reproducible from tags. |
-| CI / source-control / org loss → rebuild from tag on fresh infrastructure | [[OWNER: RTO target]] | Not applicable — Git tags are the source of truth. |
-| CoreLink API regional outage (no data loss) → restore service in-region | [[OWNER: RTO target]] | [[OWNER: RPO target]] |
-| Loss of CAS data in a region → restore from backup/replica | [[OWNER: RTO target]] | [[OWNER: RPO target]] |
-| Loss of auth/metadata datastore → restore from backup | [[OWNER: RTO target]] | [[OWNER: RPO target]] |
+| Code-signing key compromise → revoke, re-key, re-sign, re-publish trust root, notify | 24 hours | Not applicable — no customer data loss; existing installs continue to function. |
+| Download-surface outage → failover to alternate host / restore | 24 hours | Not applicable — release artifacts and signed checksums are reproducible from tags. |
+| CI / source-control / org loss → rebuild from tag on fresh infrastructure | 24 hours | Not applicable — Git tags are the source of truth. |
+| CoreLink API regional outage (no data loss) → restore service in-region | 24 hours | 24 hours |
+| Loss of CAS data in a region → restore from backup/replica | 24 hours | 24 hours |
+| Loss of auth/metadata datastore → restore from backup | 24 hours | 24 hours |
 
-[[OWNER: confirm each RTO/RPO target above, and confirm whether any of these are
-expressed as contractual SLA percentages or response times in the customer agreement.]]
+These RTO/RPO targets are internal recovery objectives. None of them is expressed as a
+contractual SLA percentage or response time in the customer agreement; any binding
+service level, if agreed, is set out separately in writing per Section 12.
 
 These objectives are **targets**, not warranties, except to the extent a binding SLA is
 separately agreed in writing with a customer. Nothing in this policy creates a service
@@ -143,10 +146,14 @@ level beyond what the applicable customer agreement provides.
   `SOURCE_DATE_EPOCH`), so any released binary can be regenerated bit-for-bit from a
   tag on clean infrastructure.
 - **Release artifacts and signed SHA-256 checksums** are retained and re-publishable
-  from CI. Retention period: [[OWNER: artifact retention period]].
-- **Repository backup.** A mirror of the repository and tags is maintained independently
-  of the primary host at [[OWNER: location/provider of the off-host repository mirror]],
-  refreshed at least [[OWNER: mirror frequency]].
+  from CI. Retention period: 35 days (test records of recovery exercises are retained for
+  1 year per Section 11).
+- **Repository backup.** An off-host mirror of the repository and tags, maintained on a
+  secondary region/provider independent of the primary host, is **to be established**: a
+  secondary region/provider is planned but not yet in place during incubation. Until it is
+  in place, the authoritative source of truth remains the Git repository and its release
+  tags, from which any released binary is reproducible bit-for-bit. Once established, the
+  mirror is refreshed at least daily.
 - **Signing material.** Signing private keys are non-exportable and held in an HSM /
   cloud signing service; CI holds only scoped credentials, never raw private keys. Any
   recoverable signing material follows the "back up write-only secrets" discipline so
@@ -166,10 +173,12 @@ level beyond what the applicable customer agreement provides.
   This policy must not be read to assert selected-Region enforcement as an in-force
   guarantee before M7.1 lands.
 - **Encryption.** Backups are encrypted at rest and in transit.
-- **Backup scope and frequency.** [[OWNER: confirm backup mechanism, frequency, and
-  retention for CAS content/manifests and for the auth/metadata datastore — e.g. R2
-  versioning/replication settings, snapshot cadence, and retention window. The RPO
-  targets in Section 4 must be supported by this configuration.]]
+- **Backup scope and frequency.** CAS content/manifests and the auth/metadata datastore
+  are backed up daily (continuous on Cloudflare R2 where available), with backups retained
+  for 35 days. This cadence supports the 24-hour RPO targets in Section 4. The configured
+  data region for R2/Durable Objects is currently "enam" (Eastern North America) via
+  Cloudflare; customer-selectable regional residency is on the roadmap (M7.1) and an
+  indicated region does not yet guarantee residency (see the residency limitation above).
 - **Restore-from-backup ownership.** Durability and restoration of server-side data is
   HumanGR's operational responsibility, exercised through the provider configuration in
   `docs/DPA-subprocessors.md` (storage provider durability guarantees are documented and
@@ -200,10 +209,11 @@ the following thresholds:
 
 - **SEV-1 (Critical):** suspected or confirmed compromise of a code-signing trust root;
   confirmed loss or unauthorized disclosure of customer data; full unavailability of the
-  CoreLink API in a Region exceeding [[OWNER: SEV-1 duration threshold]].
+  CoreLink API in a Region exceeding 1 hour of downtime.
 - **SEV-2 (Major):** loss of the authenticated download surface; partial CoreLink API
-  unavailability or degradation in a Region exceeding [[OWNER: SEV-2 duration
-  threshold]]; loss of CI / source-control org access.
+  unavailability or degradation in a Region that persists but does not amount to full
+  unavailability exceeding the SEV-1 1-hour downtime threshold; loss of CI /
+  source-control org access.
 - **SEV-3 (Minor):** degraded but available service; single-component failure with no
   customer-data impact and within RTO.
 
@@ -256,8 +266,10 @@ notify.
   downloads but does not affect already-installed CLIs or the CoreLink API.
 - **Failover.** Release artifacts and signed checksums are reproducible and
   re-publishable from CI, so the surface can be restored or failed over to a documented
-  alternate host without loss of artifacts. The alternate publish target is maintained at
-  [[OWNER: alternate download host / failover target]].
+  alternate host without loss of artifacts. A secondary region/provider to serve as the
+  alternate publish target is **to be established** — planned but not yet in place during
+  incubation; until it is, recovery relies on re-publishing the reproducible artifacts and
+  signed checksums from CI.
 - **Verification is host-independent.** Trust rests on the signature and checksum, not on
   the host, so a surface move does not weaken verification.
 
@@ -270,8 +282,9 @@ notify.
   5.1 mirror).
 - **Account/org recovery.** Recovery procedures are maintained for the GitHub
   organization, the signing accounts (Apple Developer / Authenticode CA), and the cloud
-  accounts, including a break-glass access list and named recovery contacts: [[OWNER:
-  break-glass / account-recovery contacts and procedure location]].
+  accounts, including a break-glass access list and named recovery contacts. During
+  incubation the sole named recovery contact and break-glass holder is the accountable
+  owner, Gustavo Schneiter (legal@humangr.com).
 - **CI secrets** are re-provisionable from the secret manager and are rotated on any
   suspected exposure.
 
@@ -318,16 +331,24 @@ impairment is therefore an **accepted residual risk** rather than a hot alternat
 failover, mitigated by the provider's own regional failover and durability controls and
 by the in-Region restore path in Section 8.2. HumanGR must state, per critical
 sub-processor and consistently with `docs/DPA-subprocessors.md`, whether a real
-alternate-provider plan exists or the concentration risk is accepted:
-[[OWNER: confirm, per critical sub-processor, alternate-provider plan OR explicitly
-accepted residual risk; if accepted, confirm this single-vendor concentration is
-disclosed to customers in procurement/security review consistent with the DPA]].
+alternate-provider plan exists or the concentration risk is accepted: for the sole
+critical infrastructure sub-processor, Cloudflare, Inc. (R2 object storage and Durable
+Objects; the only infrastructure sub-processor, with no underlying cloud/CDN beneath it),
+there is no named alternate-provider failover plan today, and the single-vendor
+concentration is treated as an **explicitly accepted residual risk**. This concentration
+is disclosed to customers in procurement / security review consistent with the Data
+Processing Agreement (`docs/DPA-subprocessors.md`), and is mitigated by Cloudflare's own
+regional failover and published R2 durability (eleven nines) and by the in-Region restore
+path in Section 8.2.
 
 ### 8.4 Data-subject rights during recovery
 
-The right to erasure under GDPR Article 17 applies through and after recovery, subject to
-the current product limitation disclosed in `docs/DPA-subprocessors.md` §10 and mirrored
-here so this policy does not overstate the capability.
+The right to erasure under GDPR Article 17 (and, for the Brazilian controller, the
+corresponding right under Brazil's LGPD — Lei nº 13.709/2018, Art. 18) applies through and
+after recovery, subject to the current product limitation disclosed in
+`docs/DPA-subprocessors.md` §10 and mirrored here so this policy does not overstate the
+capability. The interim erasure SLA is 30 days, effected operator-assisted pending roadmap
+item M6.4 (server D-7/D-8); this is not instant erasure.
 
 - **Current limitation (until roadmap item M6.4).** As of the effective date, the client
   `clw rm` operation deletes only the reference (AC) pointer and **cannot
@@ -341,9 +362,8 @@ here so this policy does not overstate the capability.
 - **Backward-looking commitment (in force once erasure executes).** When an erasure is
   executed — whether by the interim operator-side process today or by the M6.4
   self-service path once live — backups and replicas are not used to resurrect data a
-  tenant has erased; the erasure propagates to backups and replicas within
-  [[OWNER: maximum time within which an executed deletion propagates to backups/replicas]]
-  and superseded backup copies age out within their retention window.
+  tenant has erased; the erasure propagates to backups and replicas within 35 days and
+  superseded backup copies age out within their retention window.
 
 Any erasure request received during an incident is routed to the Data Protection Officer
 and tracked to completion under the DPA timelines; an active incident does not suspend
@@ -363,25 +383,25 @@ explicitly snapshots and the auth token required to reach the API.
 
 ### 9.1 Internal
 
-On declaration, the Incident Commander convenes the response team via [[OWNER: incident
-bridge / channel]] and opens an incident record. Status is updated at intervals
-appropriate to severity (at least every [[OWNER: SEV-1 internal update interval]] for
-SEV-1).
+On declaration, the Incident Commander convenes the response team via the internal
+incident channel maintained by the accountable owner (Gustavo Schneiter,
+legal@humangr.com) and opens an incident record. Status is updated at intervals
+appropriate to severity (at least every 30 minutes for SEV-1).
 
 ### 9.2 Customer notification
 
-- **Channel:** the official status page / customer notification channel at [[OWNER:
-  status page URL and notification channel]], supplemented by direct notice to affected
-  customers at their administrative contact.
+- **Channel:** because v1 ships no email backend, customer notices are given via an
+  in-product / account-admin notice and the published sub-processor / status page,
+  supplemented by direct notice to affected customers at their administrative contact.
 - **Timing:** initial customer notice for a SEV-1 or SEV-2 affecting availability or data
-  is issued within [[OWNER: customer-notification target time]] of declaration, followed
-  by periodic updates until resolution and a final summary.
+  is issued within 24 hours of confirmation, followed by periodic updates until resolution
+  and a final summary.
 - **Content:** nature and scope of the event, services and Regions affected, current
   status, expected restoration where known, required customer actions (e.g. trust-root
   re-verification per Section 7.1), and a point of contact.
 - **Approval:** all customer-facing communications are approved by the Incident Commander;
-  the exact legal language of any notice is approved by [[OWNER: legal review/approver for
-  customer notices]].
+  the exact legal language of any notice is approved by HumanGR Legal
+  (legal@humangr.com).
 
 ### 9.3 Regulatory and personal-data breach notification
 
@@ -389,18 +409,23 @@ Where an event constitutes a personal-data breach, the Data Protection Officer a
 and, where required, notifies the competent supervisory authority and affected data
 subjects within the timelines required by applicable law (including, where GDPR applies,
 the obligation to notify the supervisory authority without undue delay and, where
-feasible, within 72 hours of becoming aware). HumanGR also notifies controllers/customers
-of a personal-data breach without undue delay as required by the Data Processing
-Agreement. Governing law and competent authority: [[OWNER: governing law and competent
-supervisory authority / jurisdiction]]. Privacy contact: [[OWNER: DPO / privacy contact
-email]]; security/abuse contact: [[OWNER: security/abuse email]]; general support:
-[[OWNER: support email]].
+feasible, within 72 hours of becoming aware). As HumanGR is a Brazilian controller, the
+parallel obligation under Brazil's LGPD (Lei nº 13.709/2018) to communicate a security
+incident to the Autoridade Nacional de Proteção de Dados (ANPD) and affected data subjects
+within a reasonable time also applies. HumanGR also notifies controllers/customers of a
+personal-data breach without undue delay as required by the Data Processing Agreement.
+Governing law and competent authority: this policy is governed by the laws of the
+Federative Republic of Brazil, with the ANPD as the competent supervisory authority for
+LGPD matters; where EU personal data is in scope, the relevant EU Member State supervisory
+authority of the data exporter (e.g., Ireland's Data Protection Commission) is also
+competent. Privacy contact: privacy@humangr.com; security/abuse contact:
+security@humangr.com; general support: support@humangr.com.
 
 ---
 
 ## 10. Post-incident review
 
-Within [[OWNER: post-incident review deadline, e.g. 5 business days]] of resolving a SEV-1
+Within 5 business days of resolving a SEV-1
 or SEV-2, the Incident Commander leads a blameless post-incident review producing: a
 timeline, root-cause analysis, customer impact, whether RTO/RPO were met, and tracked
 corrective actions with owners and due dates. Corrective actions are tracked to closure
@@ -410,24 +435,22 @@ and verified at the next test cycle.
 
 ## 11. Testing, maintenance, and review cadence
 
-- **Backup restore tests:** at least [[OWNER: restore-test frequency, recommended
-  quarterly]], including a CAS restore and a metadata restore, validated by integrity
-  check.
-- **Release-pipeline rebuild test:** at least [[OWNER: frequency]] — rebuild a released
+- **Backup restore tests:** at least annually, including a CAS restore and a metadata
+  restore, validated by integrity check.
+- **Release-pipeline rebuild test:** at least annually — rebuild a released
   tag on clean infrastructure and confirm reproducible, verifiable output.
-- **Trust-root rotation drill:** at least [[OWNER: frequency]] — exercise the re-key /
+- **Trust-root rotation drill:** at least annually — exercise the re-key /
   re-publish path in a non-production context.
-- **Failover exercise:** at least [[OWNER: frequency]] — exercise download-surface
+- **Failover exercise:** at least annually — exercise download-surface
   failover and a CoreLink API Regional failover.
 - **Tabletop incident exercise:** at least annually, covering a SEV-1 scenario end to
   end, including the communication plan.
 - **Plan review:** this policy is reviewed at least annually and after any SEV-1
   incident, any material architecture change, or any change to sub-processors. The
-  contact tree and break-glass list are reviewed at least [[OWNER: contact-tree review
-  frequency]].
+  contact tree and break-glass list are reviewed at least annually.
 
 Each test produces a dated record of scope, result, and any corrective actions, retained
-for [[OWNER: test-record retention period]].
+for 1 year.
 
 ---
 
@@ -438,5 +461,6 @@ any service levels expressly stated in a signed customer agreement or SLA, the o
 and procedures here are targets and do not constitute warranties or guarantees, and do not
 create third-party rights. In the event of any conflict between this policy and the
 customer agreement, Data Processing Agreement, or a binding SLA, those documents control.
-This policy is governed by, and construed under, [[OWNER: governing law]], with disputes
-subject to [[OWNER: dispute venue]].
+This policy is governed by, and construed under, the laws of the Federative Republic of
+Brazil, with disputes subject to the courts of the Judicial District (Comarca) of São
+Paulo, State of São Paulo, Brazil.

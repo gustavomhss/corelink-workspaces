@@ -3,12 +3,12 @@
 **CoreLink Workspaces (`clw`)**
 HumanGR proprietary software
 
-**Effective date:** [[OWNER: effective date / last-updated date of this EULA]]
+**Effective date:** June 14, 2026
 
 THIS END USER LICENSE AGREEMENT ("**Agreement**" or "**EULA**") is a legal
 agreement between you (either an individual or a single legal entity, "**Licensee**"
-or "**you**") and [[OWNER: registered legal entity name]], a company incorporated
-under the laws of [[OWNER: jurisdiction/country of incorporation]] ("**Licensor**",
+or "**you**") and Human Guardrail LTDA, a limited-liability company (sociedade
+limitada) organized under the laws of Brazil ("**Licensor**",
 "**HumanGR**", "**we**", "**us**"), for the CoreLink Workspaces software,
 including the `clw` command-line interface and all associated executable
 components, libraries, configuration tooling, and accompanying documentation
@@ -151,7 +151,7 @@ snapshots.
 Service, including data residency, data retention and erasure, security, support,
 service levels, and the processing of personal data, are governed by the Terms of
 Service and Data Processing Addendum referenced at
-[[OWNER: URL or location of the Terms of Service and DPA]], and not by this
+https://humangr.com/legal/terms and https://humangr.com/legal/dpa, and not by this
 Agreement. In the event of a conflict between this Agreement and such Service
 terms with respect to the Service, the Service terms control as to the Service.
 
@@ -198,8 +198,8 @@ Except as expressly set forth in a separate written agreement or Order, Licensor
 has no obligation under this Agreement to provide support, maintenance, training,
 or professional services for the Software. Any support actually provided is
 governed by the terms of the applicable Order or support plan. Support and abuse
-matters may be directed to [[OWNER: support email]] and
-[[OWNER: security/abuse email]], respectively.
+matters may be directed to support@humangr.com and
+security@humangr.com, respectively.
 
 ## 10. Term and Termination
 
@@ -317,10 +317,14 @@ condition of Licensee's use of the Software and the Service.
 data subjects' rights with respect to, among other things: (a) regional data
 residency, under which customer data is stored in a customer-selected region; (b)
 the right to erasure under Article 17 of the EU General Data Protection
-Regulation, under which a tenant may delete all of its stored data; (c) the
-rights of consumers under the California Consumer Privacy Act and California
-Privacy Rights Act, including limitations on the "sale" or "sharing" of personal
-information; and (d) the allocation of controller and processor responsibilities.
+Regulation (and the corresponding right under Article 18 of Brazil's Lei Geral
+de Proteção de Dados, Lei nº 13.709/2018 ("LGPD")), under which a tenant may
+delete all of its stored data; (c) the rights of consumers under the California
+Consumer Privacy Act and California Privacy Rights Act, including limitations on
+the "sale" or "sharing" of personal information; and (d) the allocation of
+controller and processor responsibilities. As Licensor is a Brazilian
+controller, the LGPD applies in parallel with the foregoing laws, which continue
+to serve Licensee's own end users abroad.
 In the event of a conflict between this Agreement and the DPA with respect to the
 processing of personal data, the DPA controls. Privacy inquiries and requests to
 exercise data-protection rights may be directed to the Data Protection Officer /
@@ -372,11 +376,11 @@ rights granted to all other end users under this Agreement, consistent with FAR
 ## 18. General
 
 18.1 **Governing law and venue.** This Agreement is governed by and construed in
-accordance with the laws of [[OWNER: governing law jurisdiction]], without regard
+accordance with the laws of the Federative Republic of Brazil, without regard
 to its conflict-of-laws principles. The United Nations Convention on Contracts
 for the International Sale of Goods does not apply. The parties consent to the
-exclusive jurisdiction and venue of the courts located in
-[[OWNER: dispute venue (city/court)]] for any dispute arising out of or relating
+exclusive jurisdiction and venue of the courts of the Judicial District
+(Comarca) of São Paulo, State of São Paulo, Brazil, for any dispute arising out of or relating
 to this Agreement, and each party waives any objection to such jurisdiction and
 venue. Notwithstanding the foregoing, where Licensee is an individual acting as a
 consumer and mandatory consumer-protection law of Licensee's country of habitual
@@ -393,8 +397,10 @@ violation of this Section is void. Licensor may freely assign this Agreement.
 This Agreement binds and inures to the benefit of the parties' permitted
 successors and assigns.
 
-18.3 **Notices.** Legal notices to Licensor must be sent in writing to
-[[OWNER: legal notice address]]. Notices are deemed given upon receipt.
+18.3 **Notices.** Legal notices to Licensor must be sent in writing to HumanGR
+Ltda., Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP:
+04516-001), with a copy to legal@humangr.com. Notices are deemed given upon
+receipt.
 
 18.4 **Audit.** Upon reasonable prior written notice and no more than once per
 twelve (12) months, Licensor may verify Licensee's compliance with this
@@ -431,10 +437,10 @@ suppliers as beneficiaries of the disclaimers and limitations in Sections 11 and
 
 ---
 
-For licensing inquiries, contact [[OWNER: licensing/sales contact email]].
-For privacy inquiries, contact the Data Protection Officer / privacy contact at
-[[OWNER: DPO / privacy contact email]].
+For licensing inquiries, contact sales@humangr.com.
+For privacy inquiries, contact the Data Protection Officer / privacy contact
+(LGPD Encarregado), Gustavo Schneiter, at privacy@humangr.com.
 
-Copyright © [[OWNER: copyright year(s)]] [[OWNER: registered legal entity name]]. All rights reserved.
+Copyright © 2026 Human Guardrail LTDA All rights reserved.
 "CoreLink", "CoreLink Workspaces", "HumanGR", and `clw` are trademarks of
 Licensor.
