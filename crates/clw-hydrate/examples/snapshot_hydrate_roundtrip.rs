@@ -71,6 +71,15 @@ impl CasTransport for MemStore {
         self.cas.lock().await.insert(*digest, bytes);
         Ok(())
     }
+
+    async fn delete(&self, digest: &Digest) -> Result<()> {
+        self.cas.lock().await.remove(digest);
+        Ok(())
+    }
+
+    async fn list_blobs(&self) -> Result<Vec<Digest>> {
+        Ok(self.cas.lock().await.keys().copied().collect())
+    }
 }
 
 #[async_trait::async_trait]
@@ -87,6 +96,10 @@ impl AcTransport for MemStore {
     async fn delete(&self, key: &Digest) -> Result<()> {
         self.ac.lock().await.remove(key);
         Ok(())
+    }
+
+    async fn list_refs(&self) -> Result<Vec<Digest>> {
+        Ok(self.ac.lock().await.keys().copied().collect())
     }
 }
 
