@@ -70,6 +70,14 @@ fn run_suffix() -> String {
     format!("{:08x}{:08x}", pid, nanos)
 }
 
+/// True if `err` is the optimistic "endpoint not yet deployed" signal (the
+/// client maps 405/501 to a `Transport` error whose message says so). Live tests
+/// SKIP rather than fail during the ratified-but-not-yet-deployed window
+/// (corelink-server PR #269).
+fn is_not_deployed(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+}
+
 // ---------------------------------------------------------------------------
 // cas_roundtrip
 // ---------------------------------------------------------------------------
@@ -214,24 +222,16 @@ async fn auth_rejected() {
 // ref_delete_roundtrip
 // ---------------------------------------------------------------------------
 
-/// PUT a ref → confirm present → DELETE it → confirm gone (`get` → `None`).
+/// D-1: PUT a ref → confirm present → `AcTransport::delete` → confirm gone.
 ///
-/// # Optimistic / pending-capability skip
-///
-/// The server `DELETE /v1/ac/{tenant}/{key}` endpoint is still pending, so the
-/// `AcTransport` contract does not yet carry a `delete` method. This test issues
-/// the DELETE directly against the same URL the client would use. When the
-/// server has not deployed the capability it answers `405 Method Not Allowed`
-/// or `501 Not Implemented`; in that case (or when no PAT is configured) the
-/// test logs a skip notice and returns early — it must **never** fail for a
-/// not-yet-deployed endpoint. Once the endpoint ships this test asserts the full
-/// round-trip and an `AcTransport::delete` impl can replace the raw request.
+/// Exercises the real client `delete` impl (the server chose `204`-for-both,
+/// idempotent). During the ratified-but-not-yet-deployed window the client maps
+/// 405/501 to a "not yet deployed" error → the test SKIPS, never fails.
 #[tokio::test]
 async fn ref_delete_roundtrip() {
-    let Some(config) = try_config() else {
+    let Some((client, _tenant)) = try_client() else {
         return;
     };
-    let client = HttpClient::new(config.clone()).expect("failed to build HttpClient");
 
     let suffix = run_suffix();
     let key_input = format!("clw/ref/v1/conformance-delete-{suffix}");
@@ -253,32 +253,143 @@ async fn ref_delete_roundtrip() {
         "ref must be present after put, before delete"
     );
 
-    // DELETE via the same URL the client uses. `AcTransport::delete` is not yet
-    // in the contract because the server endpoint is pending, so we issue the
-    // raw request here and decide skip-vs-assert on the status code.
-    let url = config.ac_url(&key);
-    let resp = reqwest::Client::new()
-        .delete(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
-        .send()
-        .await
-        .expect("delete request should reach the server");
-
-    let status = resp.status().as_u16();
-    if status == 405 || status == 501 {
-        eprintln!(
-            "SKIPPED: DELETE /v1/ac not yet deployed (HTTP {status}); ref-delete round-trip pending"
-        );
-        return;
+    // DELETE via the real client impl (D-1).
+    match AcTransport::delete(&client, &key).await {
+        Ok(()) => {}
+        Err(e) if is_not_deployed(&e) => {
+            eprintln!(
+                "SKIPPED: DELETE /v1/ac (D-1) not yet deployed; ref-delete round-trip pending"
+            );
+            return;
+        }
+        Err(e) => panic!("ac delete failed: {e}"),
     }
-    assert!(
-        matches!(status, 200 | 202 | 204),
-        "expected a success status from DELETE, got HTTP {status}"
-    );
 
     // Confirm the ref is gone.
     let after = AcTransport::get(&client, &key)
         .await
         .expect("ac get after delete should succeed");
     assert_eq!(after, None, "ref must be absent after delete (get → None)");
+
+    // Idempotent: a second delete of the same (now-absent) key still succeeds.
+    AcTransport::delete(&client, &key)
+        .await
+        .expect("second delete of an absent ref must be idempotent (204)");
+}
+
+// ---------------------------------------------------------------------------
+// ref_list_roundtrip (D-7)
+// ---------------------------------------------------------------------------
+
+/// D-7: PUT a ref → `list_refs` must include its key → best-effort cleanup.
+/// SKIPS while `GET /v1/ac/{tenant}` is not yet deployed.
+#[tokio::test]
+async fn ref_list_roundtrip() {
+    let Some((client, _tenant)) = try_client() else {
+        return;
+    };
+
+    let suffix = run_suffix();
+    let key = Digest::of_bytes(format!("clw/ref/v1/conformance-list-{suffix}").as_bytes());
+    let value = format!("ref-list-value-{suffix}").into_bytes();
+
+    AcTransport::put(&client, &key, value)
+        .await
+        .expect("ac put should succeed");
+
+    let refs = match AcTransport::list_refs(&client).await {
+        Ok(r) => r,
+        Err(e) if is_not_deployed(&e) => {
+            eprintln!("SKIPPED: GET /v1/ac (D-7) not yet deployed; ref-list round-trip pending");
+            return;
+        }
+        Err(e) => panic!("list_refs failed: {e}"),
+    };
+    assert!(
+        refs.contains(&key),
+        "list_refs must include the just-put ref key"
+    );
+
+    // Best-effort cleanup (ignore not-deployed / transient errors).
+    let _ = AcTransport::delete(&client, &key).await;
+}
+
+// ---------------------------------------------------------------------------
+// cas_delete_roundtrip (D-8)
+// ---------------------------------------------------------------------------
+
+/// D-8: PUT a blob → exists true → `CasTransport::delete` → exists false.
+/// SKIPS while `DELETE /v1/cas/{tenant}/{hash}` is not yet deployed.
+#[tokio::test]
+async fn cas_delete_roundtrip() {
+    let Some((client, _tenant)) = try_client() else {
+        return;
+    };
+
+    let suffix = run_suffix();
+    let bytes = format!("cas-delete-{suffix}").into_bytes();
+    let digest = Digest::of_bytes(&bytes);
+
+    CasTransport::put(&client, &digest, bytes)
+        .await
+        .expect("cas put should succeed");
+    assert!(
+        CasTransport::exists(&client, &digest)
+            .await
+            .expect("cas exists should succeed"),
+        "blob must be present after put"
+    );
+
+    match CasTransport::delete(&client, &digest).await {
+        Ok(()) => {}
+        Err(e) if is_not_deployed(&e) => {
+            eprintln!(
+                "SKIPPED: DELETE /v1/cas (D-8) not yet deployed; cas-delete round-trip pending"
+            );
+            return;
+        }
+        Err(e) => panic!("cas delete failed: {e}"),
+    }
+
+    let still = CasTransport::exists(&client, &digest)
+        .await
+        .expect("cas exists after delete should succeed");
+    assert!(!still, "blob must be absent after delete");
+}
+
+// ---------------------------------------------------------------------------
+// cas_list_roundtrip (D-8)
+// ---------------------------------------------------------------------------
+
+/// D-8: PUT a blob → `list_blobs` must include its hash → best-effort cleanup.
+/// SKIPS while `GET /v1/cas/{tenant}` is not yet deployed.
+#[tokio::test]
+async fn cas_list_roundtrip() {
+    let Some((client, _tenant)) = try_client() else {
+        return;
+    };
+
+    let suffix = run_suffix();
+    let bytes = format!("cas-list-{suffix}").into_bytes();
+    let digest = Digest::of_bytes(&bytes);
+
+    CasTransport::put(&client, &digest, bytes)
+        .await
+        .expect("cas put should succeed");
+
+    let blobs = match CasTransport::list_blobs(&client).await {
+        Ok(b) => b,
+        Err(e) if is_not_deployed(&e) => {
+            eprintln!("SKIPPED: GET /v1/cas (D-8) not yet deployed; cas-list round-trip pending");
+            return;
+        }
+        Err(e) => panic!("list_blobs failed: {e}"),
+    };
+    assert!(
+        blobs.contains(&digest),
+        "list_blobs must include the just-put blob hash"
+    );
+
+    // Best-effort cleanup.
+    let _ = CasTransport::delete(&client, &digest).await;
 }

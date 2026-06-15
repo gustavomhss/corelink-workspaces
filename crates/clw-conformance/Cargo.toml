@@ -12,10 +12,6 @@ clw-client = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-# Used only by the `live` ref-delete test to issue the raw DELETE /v1/ac request
-# directly, since the server endpoint (and thus an `AcTransport::delete` impl) is
-# still pending. Confined to the conformance crate's test lane.
-reqwest = { workspace = true }
 
 [features]
 # Live conformance against corelink-api.humangr.com — requires CLW_TOKEN. Never on in CI default lane.
