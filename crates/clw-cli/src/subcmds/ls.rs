@@ -1,4 +1,10 @@
-//! `clw ls --name <NAME>` — list ref info for a workspace.
+//! `clw ls --name <NAME>` — list ref info for one workspace.
+//! `clw ls --all`         — enumerate every ref in the tenant.
+//!
+//! `--all` is OPTIMISTIC against a frozen contract: the corelink-server ref
+//! enumeration capability is pending ratification (docs/REQUESTS-to-other-TLs.md
+//! D-7). Until it deploys the real transport surfaces the 405/501 not-deployed
+//! case as an actionable error rather than a silent empty list.
 
 use clap::Args;
 use clw_client::HttpClient;
@@ -9,26 +15,47 @@ use crate::config::ResolvedConfig;
 use crate::subcmds::status::map_auth_error;
 
 #[derive(Debug, Args)]
-#[command(about = "List ref info (root digest, file count, size) for a workspace name")]
+#[command(about = "List ref info for a workspace name, or every ref with --all")]
 pub struct LsArgs {
-    /// Workspace name (ref key).
-    #[arg(long, help = "Workspace name to look up")]
-    pub name: String,
+    /// Workspace name (ref key). Mutually exclusive with `--all`.
+    #[arg(long, conflicts_with = "all", help = "Workspace name to look up")]
+    pub name: Option<String>,
+
+    /// Enumerate every ref in the tenant (requires the server enumeration
+    /// capability, D-7).
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "List every ref in the tenant (instead of a single --name)"
+    )]
+    pub all: bool,
 }
 
 pub async fn run(args: LsArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+    match (&args.name, args.all) {
+        (Some(name), false) => run_one(name, cfg, json).await,
+        (None, true) => run_all(cfg, json).await,
+        // clap's `conflicts_with` already rejects `--name X --all`; this guards
+        // the `neither` case with an actionable message instead of a panic.
+        _ => Err(ClwError::Transport(
+            "specify exactly one of --name <NAME> or --all".to_string(),
+        )),
+    }
+}
+
+/// `clw ls --name <NAME>` — the single-workspace lookup (root digest, files, size).
+async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let tenant = cfg.clw_config.tenant.clone();
     let client = HttpClient::new(cfg.clw_config)?;
 
     // Fetch ref record from AC.
-    let rk = ref_key(&args.name);
+    let rk = ref_key(name);
     let ref_bytes = AcTransport::get(&client, &rk)
         .await
         .map_err(map_auth_error)?
         .ok_or_else(|| {
             ClwError::Transport(format!(
-                "workspace '{}' not found for tenant '{}' — run 'clw snapshot --name {}' first or check --tenant",
-                args.name, tenant, args.name
+                "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
             ))
         })?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
@@ -69,6 +96,90 @@ pub async fn run(args: LsArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
     }
 
     Ok(())
+}
+
+/// `clw ls --all` — enumerate every ref in the tenant.
+///
+/// `list_refs` returns ref KEYS (one-way `BLAKE3(domain‖name)`), so we fetch each
+/// record to recover its human name + root. A key that 404s between enumeration
+/// and fetch (a concurrent `rm`) is skipped rather than failing the whole listing.
+async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+    let tenant = cfg.clw_config.tenant.clone();
+    let client = HttpClient::new(cfg.clw_config)?;
+
+    let keys = match AcTransport::list_refs(&client).await {
+        Ok(keys) => keys,
+        Err(e) if is_not_deployed(&e) => return not_deployed_err(json, "ref enumeration", "D-7"),
+        Err(e) => return Err(map_auth_error(e)),
+    };
+
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in &keys {
+        // A ref deleted between enumeration and fetch simply drops out of the list.
+        if let Some(bytes) = AcTransport::get(&client, key)
+            .await
+            .map_err(map_auth_error)?
+        {
+            let record = RefRecord::from_bytes(&bytes)?;
+            rows.push(record);
+        }
+    }
+
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.name,
+                    "root": r.root.to_hex(),
+                    "created_at_unix": r.created_at_unix,
+                    "parent": r.parent.map(|d| d.to_hex()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({ "tenant": tenant, "count": rows.len(), "refs": arr })
+        );
+    } else if rows.is_empty() {
+        println!("no refs for tenant '{tenant}'");
+    } else {
+        for r in &rows {
+            println!(
+                "{}  {}  {}",
+                &r.root.to_hex()[..16],
+                r.created_at_unix,
+                r.name
+            );
+        }
+        println!("({} refs in tenant '{tenant}')", rows.len());
+    }
+
+    Ok(())
+}
+
+/// True if the error is the optimistic-pending "server capability not deployed"
+/// case (the client maps 405/501 to a `Transport` error naming the gap).
+fn is_not_deployed(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+}
+
+/// Render the optimistic-pending case: graceful JSON note, or an actionable error.
+fn not_deployed_err(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+    if json {
+        println!(
+            "{}",
+            json!({
+                "error": "not-deployed",
+                "note": format!("{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"),
+            })
+        );
+        Ok(())
+    } else {
+        Err(ClwError::Transport(format!(
+            "{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,5 +235,23 @@ mod tests {
             msg.contains("CLW_TOKEN") || msg.contains("config.toml"),
             "auth error message must mention CLW_TOKEN or config.toml, got: {msg}"
         );
+    }
+
+    #[test]
+    fn not_deployed_detects_pending_capability_message() {
+        let err = ClwError::Transport(
+            "ref enumeration requires a corelink-server capability not yet deployed (D-7)"
+                .to_string(),
+        );
+        assert!(is_not_deployed(&err));
+        assert!(!is_not_deployed(&ClwError::Transport("unrelated".into())));
+        assert!(!is_not_deployed(&ClwError::Auth));
+    }
+
+    #[test]
+    fn not_deployed_err_json_is_ok_human_is_err() {
+        // JSON mode degrades gracefully (Ok with a note); human mode is a hard error.
+        assert!(not_deployed_err(true, "ref enumeration", "D-7").is_ok());
+        assert!(not_deployed_err(false, "ref enumeration", "D-7").is_err());
     }
 }
