@@ -1,93 +1,300 @@
-# Export-control self-classification — `clw` (CoreLink Workspaces CLI)
+# Export-Control & Sanctions Notice — CoreLink Workspaces (`clw`)
 
-> **DRAFT — owner/legal review required.** Engineering self-classification draft
-> for roadmap M6.2. **Not** legal advice and **not** a filed classification. The
-> actual ECCN, the applicable license exception, and any CCATS/self-classification
-> report or **encryption-registration / annual-self-classification-report** filing
-> obligations are **OWNER/LEGAL TO CONFIRM BEFORE any international distribution**
-> of the signed binary under the M3 release pipeline
-> (`.github/workflows/release.yml`, `docs/DISTRIBUTION.md`). This note exists to
-> start that process early because it has lead time and **gates the M3.1
-> international release**.
+**Product:** CoreLink Workspaces, command-line client `clw` (the "**Software**") and
+the hosted CoreLink API at `corelink-api.humangr.com` (the "**Service**").
+**Publisher:** HumanGR (the "**Company**", "**we**", "**us**").
+**Document type:** Export-control and economic-sanctions notice and end-user
+compliance obligations.
+**Effective date / last updated:** [[OWNER: effective date / last-updated date for this notice]]
 
-## 1. What cryptography the binary ships
+This Notice forms part of, and is incorporated by reference into, the
+Terms of Service (`docs/TERMS-OF-SERVICE.md`) and the End-User License Agreement
+(`EULA.md`, at the repository root) (the "**EULA**"). Capitalized terms not
+defined here have the meaning given in those documents. In the event of a conflict
+between this Notice and the Terms of Service or EULA on an export-control matter,
+this Notice controls to the extent of that conflict.
 
-`clw` is a commercial, closed-source binary that links and ships:
+> **Plain-language summary (not a substitute for the full text below).** The
+> Software contains encryption (TLS) and cryptographic hashing and is therefore
+> subject to export-control law. You may not download, install, use, export, or
+> re-export the Software or Service in or to embargoed/sanctioned destinations,
+> to denied or restricted parties, or for prohibited end-uses. By using the
+> Software or Service you make the representations in Section 7. The Company's
+> own classification and filing posture is set out in Sections 3–5.
 
-- **TLS via `rustls`** (with `webpki-roots`) — the client requires `https://` for
-  every CoreLink API call (`SECURITY.md`); this provides confidentiality and
-  integrity in transit using standard TLS (AEAD ciphersuites, X25519/ECDHE key
-  agreement, etc.).
-- **BLAKE3 hashing** — used for content-addressing and chunk integrity
-  verification (`docs/THREAT-MODEL.md`). BLAKE3 is a cryptographic **hash**, not
-  an encryption primitive.
+---
 
-`clw` performs **no client-side encryption of file contents at rest before
-upload**; its cryptography is (a) TLS for transport and (b) a hash for integrity.
-This matters for classification: the controlled functionality is the **TLS /
-"information security" symmetric+asymmetric crypto**, not a bespoke encryption
-feature.
+## 1. Scope and applicability
 
-## 2. Likely classification (engineering view — to be confirmed)
+This Notice applies to your acquisition, download, installation, access, use,
+export, re-export, transfer, and onward distribution of the Software and the
+Service. Because the Software is distributed as binaries for macOS (Intel
+and Apple Silicon), Windows, and Linux (which the Company intends to code-sign and
+notarize), and because the Service is a multi-tenant hosted offering,
+export-control and sanctions law can be implicated by (a) the
+geographic location from which you download or use the Software, (b) the
+geographic location of the CoreLink data-residency region you select, (c) your
+nationality or that of your personnel, and (d) the parties with whom and
+end-uses for which you use the Software or Service.
 
-Under the U.S. Export Administration Regulations (EAR), Category 5 Part 2
-("Information Security"):
+The Company distributes the Software through an authenticated download surface
+(`docs/DISTRIBUTION.md`); the Software is not published to a public package
+registry or anonymous mirror. This does not relieve you of the obligations in
+Section 6.
 
-- **Most likely ECCN: `5D992.c`** — "mass-market" encryption software that does
-  not meet the `5D002` decontrol-excluded criteria, i.e. software that performs or
-  uses cryptography but qualifies for mass-market treatment. A commercial CLI
-  distributed broadly to end users, using **standard/published** crypto
-  (TLS/rustls) and not customer-customizable cryptography, is the textbook
-  mass-market profile.
-- The **components themselves** (rustls, the underlying ring/aws-lc-rs, BLAKE3) are
-  widely available open-source primitives; the relevant question is the
-  classification of **`clw` as the shipped commercial product**, not of each
-  dependency.
+---
 
-### EAR considerations to evaluate
+## 2. Cryptographic functionality of the Software
 
-1. **The Cryptography Note (Note 3 to Cat. 5 Part 2).** Mass-market items "generally
-   available to the public" via retail/over-the-counter-equivalent channels, where
-   the crypto functionality cannot be easily changed by the user, are eligible for
-   mass-market treatment (`5D992` / `5A992` family). `clw`'s download surface is
-   **authenticated** (`docs/DISTRIBUTION.md`), not anonymous retail — **legal must
-   assess whether the authenticated commercial channel still qualifies as
-   "mass-market"** or whether the stricter `5D002` + License Exception ENC
-   (§740.17) analysis and reporting applies.
-2. **"Publicly available" / open-source decontrol (§742.15(b), §734.3(b)(3)).** The
-   *source* of the crypto libraries is publicly available, but `clw` ships as a
-   **proprietary closed-source binary** sold commercially — so the open-source/TSU
-   self-classification-email path likely does **not** apply to the product even
-   though it applies to the upstream libraries. Confirm.
-3. **ENC reporting / self-classification report.** If the item is `5A992`/`5D992`
-   mass-market or `5D002` under License Exception ENC, an **annual
-   self-classification report** (and possibly a one-time email to BIS/NSA) may be
-   required for certain crypto items. Owner/legal to determine whether any
-   `clw` distribution triggers this.
-4. **Sanctions / embargoes (EAR + OFAC).** Independent of ECCN, distribution to
-   embargoed destinations and denied/blocked persons is prohibited. The Terms of
-   Service (`docs/TERMS-OF-SERVICE.md` §7) carries the end-user export
-   representation; the **release/download surface must enforce destination
-   screening** if required — owner to wire into M3.3.
-5. **Non-US controls.** If distributed from or into the EU/UK or other
-   jurisdictions, the EU Dual-Use Regulation (2021/821) and local crypto rules may
-   impose parallel obligations. Owner/legal scope per target market.
+The Software incorporates and ships the following cryptographic functionality,
+which is the basis for its classification under encryption controls:
 
-## 3. Action items (owner/legal, BEFORE international release)
+- **Transport Layer Security (TLS).** The client requires `https://` for every
+  call to the CoreLink API (`SECURITY.md`), implemented via the `rustls` TLS
+  stack with `webpki-roots`. This provides confidentiality and integrity in
+  transit using standard, published TLS primitives (AEAD ciphersuites; X25519 /
+  ECDHE key agreement; standard certificate validation).
+- **Cryptographic hashing (BLAKE3).** Used for content-addressing and chunk
+  integrity verification (`docs/THREAT-MODEL.md`). BLAKE3 is a cryptographic
+  **hash** function, not an encryption (confidentiality) primitive.
 
-- [ ] **Confirm the ECCN** (expected `5D992.c`; rule out `5D002` + ENC).
-- [ ] Determine whether mass-market treatment applies given the **authenticated**
-      (non-retail) download surface.
-- [ ] Determine filing obligations: CCATS vs self-classification report vs none;
-      any one-time BIS/NSA email; annual self-classification report cadence.
-- [ ] Decide destination-screening / denied-party enforcement at the download
-      surface (M3.3) and the export representation in the ToS/EULA.
-- [ ] Record the confirmed classification + license exception in this file and in
-      the release artifact metadata (SBOM/attribution bundle, roadmap M4.3).
+The Software performs **no proprietary or non-standard cryptography** and **no
+client-side encryption of file contents at rest before upload**. Its only
+confidentiality control is standard TLS in transit; at rest, customer data is
+protected by tenant isolation and sub-processor controls on the Service side
+(see the Privacy Policy and DPA). The underlying cryptographic libraries
+(`rustls`, the `ring` / `aws-lc-rs` backends, and BLAKE3) are widely available,
+published open-source primitives; the relevant classification question is the
+classification of `clw` **as the shipped commercial product**, not of each
+upstream dependency.
 
-## 4. Status
+The Software does not provide an open cryptographic interface, end-user-modifiable
+cryptography, or a software development kit enabling third parties to add or
+substitute cryptographic functionality.
 
-**BLOCKING for international distribution under M3.1.** Domestic-only or
-internal-testing distribution may proceed at owner discretion, but **no signed
-binary should be distributed internationally until the boxes above are checked and
-this file records a legal-confirmed classification.**
+---
+
+## 3. Export classification posture (U.S. EAR)
+
+The Software is "information security" software within Category 5, Part 2 of the
+U.S. Export Administration Regulations (EAR) because it uses encryption (TLS).
+
+- **Export Control Classification Number (ECCN):**
+  [[OWNER: confirmed ECCN for the clw binary as a shipped commercial product — engineering self-classification expects 5D992.c (mass-market) but legal must confirm vs. 5D002 + License Exception ENC §740.17]].
+- **Applicable license exception (if any):**
+  [[OWNER: applicable EAR license exception, e.g., ENC (§740.17) or the basis for mass-market 5D992.c treatment, as confirmed by legal]].
+- **CCATS / self-classification status:**
+  [[OWNER: whether a CCATS classification request was filed and its outcome, or that self-classification was used, with date]].
+
+### Classification rationale (engineering view, subject to the confirmations above)
+
+The Software is a commercial, closed-source binary distributed broadly to end
+users, using only standard/published cryptography (TLS via `rustls`) that is not
+customer-customizable. That profile is consistent with **mass-market** treatment
+under the Cryptography Note (Note 3 to Category 5, Part 2), pointing toward
+**`5D992.c`**. The principal open questions for legal confirmation are:
+
+1. **Mass-market eligibility vs. the authenticated channel.** The Software's
+   download surface is authenticated and commercial rather than anonymous retail
+   (`docs/DISTRIBUTION.md`). Legal must confirm whether the authenticated
+   commercial channel still satisfies the "generally available to the public"
+   mass-market criteria, or whether the stricter `5D002` + License Exception ENC
+   (§740.17) analysis and its reporting obligations apply.
+2. **Open-source / publicly-available decontrol does not transfer to the
+   product.** The *source* of the upstream crypto libraries is publicly available
+   and may itself qualify under §742.15(b) / §734.3(b)(3) (TSU). The Software,
+   however, ships as a **proprietary closed-source binary sold commercially**, so
+   the open-source self-classification path does **not** apply to the product as
+   shipped, even though it applies to the upstream libraries.
+
+---
+
+## 4. Encryption reporting obligations (U.S.)
+
+Depending on the confirmed ECCN and license-exception basis, U.S. encryption
+controls may impose reporting obligations on the Company:
+
+- **Annual self-classification report.** Certain `5A992` / `5D992` mass-market and
+  `5D002` (License Exception ENC) items require an annual self-classification
+  report to BIS/NSA.
+- **One-time / supplemental reporting.** Certain ENC items require a one-time
+  report or a supplemental email at first export.
+
+Whether any `clw` distribution triggers these obligations, and the cadence and
+content of any filing, is:
+[[OWNER: confirmed encryption reporting obligations and filing cadence (annual self-classification report and/or one-time BIS/NSA email), or a statement that none apply]].
+
+This is a Company obligation and is stated here for transparency; it does not
+create an obligation on you.
+
+---
+
+## 5. Non-U.S. export controls
+
+Distribution from, or into, jurisdictions other than the United States may engage
+parallel controls, including the EU Dual-Use Regulation (Regulation (EU)
+2021/821), UK export-control law, and local cryptography-import/use rules in the
+destination country. The Company's posture under non-U.S. controls is:
+[[OWNER: confirmed non-U.S. export-control posture per target market (EU Dual-Use Reg. 2021/821, UK controls, and any country-specific crypto import/use restrictions)]].
+
+You remain responsible for compliance with the export- and import-control laws of
+your own jurisdiction and of any jurisdiction into or from which you use, export,
+or re-export the Software or Service (Section 6).
+
+Because the Software contains encryption (TLS), certain destinations impose
+cryptography **import or use** restrictions that can require a permit, license, or
+registration merely to download, install, or use cryptography-bearing software
+locally — independently of any U.S. export control. Determining whether such an
+import or use authorization is required, and obtaining and maintaining it, is your
+responsibility (Section 7.5).
+
+---
+
+## 6. Embargoed destinations, restricted parties, and prohibited end-uses
+
+The following prohibitions apply regardless of the Software's ECCN and regardless
+of any license exception. They derive from U.S. sanctions and export-control law
+(administered by the U.S. Office of Foreign Assets Control (OFAC) and the Bureau
+of Industry and Security (BIS)) and, where applicable, from EU, UK, and United
+Nations measures.
+
+### 6.1 Embargoed and sanctioned destinations
+
+You may not download, install, access, use, export, re-export, or transfer the
+Software or Service, and you may not request, select, or use any data-residency
+region offered by the Service in order to cause customer data to be stored or
+processed, in or for the benefit of any country or territory subject to
+comprehensive U.S. or other applicable embargoes or comprehensive sanctions. As of
+the effective date these comprehensively sanctioned destinations include
+**Cuba, Iran, North Korea, Syria, and the Crimea, Donetsk, Luhansk, Zaporizhzhia,
+and Kherson regions of Ukraine**, and any other destination later designated as
+comprehensively embargoed. For the avoidance of doubt, this prohibition applies to
+the data-residency regions the Service actually makes available and honors; it does
+not represent that the Service offers a residency region in, or screens residency
+selections by reference to, any particular country.
+[[OWNER: confirm and date the comprehensively-embargoed destination list against current OFAC/BIS designations at publication, and state which additional non-U.S. (EU/UK/UN) measures the Company applies]].
+
+### 6.2 Denied, blocked, and restricted parties
+
+You may not provide the Software or Service to, or use it on behalf of or for the
+benefit of, any person or entity that is:
+
+- listed on OFAC's Specially Designated Nationals and Blocked Persons (SDN) List
+  or any other OFAC sanctions list, or owned 50% or more (individually or in the
+  aggregate) by one or more such persons;
+- listed on the BIS Entity List, Denied Persons List, or Unverified List, or
+  otherwise denied U.S. export privileges; or
+- listed on any analogous EU, UK, UN, or other applicable consolidated sanctions
+  or restricted-party list that the Company is required to screen against.
+
+### 6.3 Prohibited end-uses
+
+You may not use, and you may not permit any third party to use, the Software or
+Service in connection with any prohibited end-use under the EAR or applicable law,
+including the design, development, production, stockpiling, or use of nuclear,
+chemical, or biological weapons or missiles, or the unauthorized development or
+production of certain military, military-intelligence, or advanced-computing or
+semiconductor end-uses subject to control. The same prohibition applies to the
+equivalent dual-use and weapons-of-mass-destruction end-use controls under the EU
+Dual-Use Regulation (Regulation (EU) 2021/821), UK export-control law, and any
+other applicable measures, to the extent they govern your use, export, or
+re-export of the Software or Service.
+[[OWNER: confirm whether any country-specific end-use controls in target markets require an explicit overlay beyond the U.S. EAR and EU/UK measures named here]].
+
+### 6.4 Screening and enforcement
+
+The Company may screen tenants, account registrations, and the download surface
+against applicable sanctions and restricted-party lists and may refuse, suspend,
+or terminate access where screening or other information indicates a violation or
+material risk of a violation of this Notice or applicable law. Where the Service
+honors a customer-selected data-residency region, the Company may also treat that
+selection as a screening signal. The current state of automated destination,
+denied-party, and residency-region screening at the download and registration
+surface is:
+[[OWNER: confirm whether automated destination/denied-party screening (and, where residency selection is honored, residency-region screening) is enforced at the download and tenant-registration surface, and describe its scope]].
+
+---
+
+## 7. Your representations and obligations
+
+By downloading, installing, accessing, or using the Software or Service, you
+represent, warrant, and covenant, on your own behalf and on behalf of any
+organization you represent, that:
+
+1. you are not located in, organized under the laws of, ordinarily resident in,
+   or a national or government of, any destination identified in Section 6.1;
+2. you are not, and are not owned or controlled by or acting on behalf of, any
+   party identified in Section 6.2;
+3. you will not export, re-export, transfer, or otherwise make the Software or
+   Service available, directly or indirectly, to any destination, party, or
+   end-use prohibited by Section 6 or by applicable export-control or sanctions
+   law;
+4. you will not request or use any data-residency region made available by the
+   Service, or otherwise route or store customer data, in a manner that violates
+   Section 6;
+5. you have obtained, and will maintain, any license, authorization, or
+   registration required under the export- and import-control and cryptography
+   laws applicable to you and to your use of the Software or Service; and
+6. you will not use the Software or Service for any prohibited end-use described
+   in Section 6.3.
+
+These representations are made each time you access or use the Software or
+Service. The export-compliance representation in the Terms of Service
+(`docs/TERMS-OF-SERVICE.md` §12, "Export compliance and sanctions") is
+incorporated here, and this Notice is the detailed statement of those obligations.
+
+---
+
+## 8. Suspension, termination, and survival
+
+A breach of this Notice is a material breach of the Terms of Service and the
+EULA. Without limiting any other remedy, the Company may immediately suspend or
+terminate your access to the Software and Service, and decline to provide
+support, where it reasonably determines that continued provision would violate, or
+create a material risk of violating, applicable export-control or sanctions law.
+Your obligations and representations under Sections 6 and 7 survive termination,
+together with any provision that by its nature should survive.
+
+---
+
+## 9. No facilitation; cooperation
+
+You will not take any action that would cause the Company, or any of its
+affiliates, personnel, or sub-processors, to violate applicable export-control or
+sanctions law, and you will not use the Software or Service to facilitate any
+transaction that you could not lawfully conduct directly. You will reasonably
+cooperate with the Company in connection with any export-control or sanctions
+inquiry, audit, or screening relating to your use of the Software or Service.
+
+---
+
+## 10. Changes to this Notice
+
+The Company may update this Notice to reflect changes in applicable law, in the
+Software's cryptographic functionality, or in the Company's classification or
+filing posture. Material changes will be notified through the mechanism stated in
+the Terms of Service. Your continued use of the Software or Service after a change
+takes effect constitutes acceptance of the updated Notice.
+
+---
+
+## 11. No legal advice; relationship to government determinations
+
+This Notice describes the Company's export-control posture and your obligations;
+it is **not legal advice** to you and is **not** a substitute for your own
+determination of the export-, import-, and sanctions-law requirements applicable
+to you. Export-control classifications and sanctions designations change over
+time; in the event of any conflict between this Notice and applicable law or a
+binding government determination, applicable law and that determination control.
+
+---
+
+## 12. Contact
+
+Export-control and sanctions questions regarding the Software or Service may be
+directed to:
+
+- **Export-control / compliance contact:** [[OWNER: export-control / trade-compliance contact email]]
+- **Legal notices:** [[OWNER: legal notice address for the contracting entity]]
+- **Contracting entity:** [[OWNER: registered legal entity name + jurisdiction/country of incorporation]]
+- **Governing law and venue (for disputes under this Notice):** [[OWNER: governing law and dispute venue — must be filled consistently with Terms of Service §14 so the export-matter priority clause (lines 13-15) does not create a divergent forum or governing law for the same dispute]]
