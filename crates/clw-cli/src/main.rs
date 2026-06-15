@@ -140,6 +140,10 @@ pub enum Commands {
     Ls(subcmds::ls::LsArgs),
     /// Delete a workspace ref by name.
     Rm(subcmds::rm::RmArgs),
+    /// Garbage-collect unreferenced CAS blobs (dry-run unless --yes).
+    Prune(subcmds::prune::PruneArgs),
+    /// Irreversibly delete ALL of a tenant's data (GDPR erasure; dry-run unless --yes).
+    Erase(subcmds::erase::EraseArgs),
     /// Print a support-ready, redacted diagnostics bundle.
     Doctor(subcmds::doctor::DoctorArgs),
     /// Manage the locally-stored CoreLink identity (login/logout/whoami).
@@ -343,6 +347,8 @@ async fn dispatch(
         Commands::Run(args) => subcmds::run::run(args, cfg).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
         Commands::Rm(args) => subcmds::rm::run(args, cfg, json).await,
+        Commands::Prune(args) => subcmds::prune::run(args, cfg, json).await,
+        Commands::Erase(args) => subcmds::erase::run(args, cfg, json).await,
         Commands::Doctor(args) => subcmds::doctor::run(args, cfg, json).await,
         Commands::Auth(args) => subcmds::auth::run(args, cfg, json).await,
         Commands::Uninstall(args) => {
@@ -472,9 +478,30 @@ mod tests {
     fn parse_ls() {
         let cli = Cli::try_parse_from(["clw", "ls", "--name", "some-ws"]).unwrap();
         match &cli.command {
-            Commands::Ls(a) => assert_eq!(a.name, "some-ws"),
+            Commands::Ls(a) => {
+                assert_eq!(a.name.as_deref(), Some("some-ws"));
+                assert!(!a.all);
+            }
             other => panic!("expected Ls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_ls_all() {
+        let cli = Cli::try_parse_from(["clw", "ls", "--all"]).unwrap();
+        match &cli.command {
+            Commands::Ls(a) => {
+                assert!(a.all);
+                assert!(a.name.is_none());
+            }
+            other => panic!("expected Ls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ls_name_and_all_conflict() {
+        // `--name` and `--all` are mutually exclusive (clap rejects the combo).
+        assert!(Cli::try_parse_from(["clw", "ls", "--name", "x", "--all"]).is_err());
     }
 
     #[test]
@@ -495,6 +522,45 @@ mod tests {
         match &cli.command {
             Commands::Rm(a) => assert!(a.yes),
             other => panic!("expected Rm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_prune_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["clw", "prune"]).unwrap();
+        match &cli.command {
+            Commands::Prune(a) => assert!(!a.yes, "prune must default to dry-run"),
+            other => panic!("expected Prune, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["clw", "prune", "--yes"]).unwrap();
+        match &cli.command {
+            Commands::Prune(a) => assert!(a.yes),
+            other => panic!("expected Prune, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_erase_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["clw", "erase"]).unwrap();
+        match &cli.command {
+            Commands::Erase(a) => {
+                assert!(!a.yes, "erase must default to dry-run");
+                assert!(a.confirm_tenant.is_none());
+            }
+            other => panic!("expected Erase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_erase_yes_with_confirm_tenant() {
+        let cli =
+            Cli::try_parse_from(["clw", "erase", "--yes", "--confirm-tenant", "acme"]).unwrap();
+        match &cli.command {
+            Commands::Erase(a) => {
+                assert!(a.yes);
+                assert_eq!(a.confirm_tenant.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Erase, got {other:?}"),
         }
     }
 
