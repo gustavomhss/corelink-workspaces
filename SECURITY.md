@@ -9,7 +9,7 @@ take its security posture seriously.
 
 **Do not open a public issue, PR, or discussion for a suspected vulnerability.**
 
-Report privately to **security@corelink.dev** (PGP available on request).
+Report privately to **[[OWNER: security/abuse contact email on the humangr.com domain, e.g. security@humangr.com once the domain/mailbox is confirmed]]** (PGP available on request).
 
 Please include, where possible:
 
