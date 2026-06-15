@@ -61,28 +61,28 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
             }
             Ok(())
         }
-        // Optimistic-pending: the server lacks the DELETE handler. Surface an
-        // actionable message rather than a raw transport error.
-        Err(e) if is_not_deployed(&e) => {
-            if json {
-                println!(
-                    "{}",
-                    json!({
-                        "name": args.name,
-                        "deleted": false,
-                        "error": "not-deployed",
-                        "note": "ref deletion requires a corelink-server capability not yet deployed — tracked"
-                    })
-                );
-                Ok(())
-            } else {
-                Err(ClwError::Transport(
-                    "ref deletion requires a corelink-server capability not yet deployed — tracked (DELETE /v1/ac; see docs/REQUESTS-to-other-TLs.md D-1)".to_string(),
-                ))
-            }
-        }
+        // Optimistic-pending: the server lacks the DELETE handler. ALWAYS fails
+        // (non-zero exit) in BOTH modes — a destructive command that deleted
+        // nothing must never report success. In `--json` the structured note is
+        // printed first, then the same error propagates (mirrors ls/prune/erase).
+        Err(e) if is_not_deployed(&e) => not_deployed(json),
         Err(e) => Err(map_auth_error(e)),
     }
+}
+
+/// Render the optimistic-pending case. ALWAYS returns `Err` so the process exits
+/// non-zero regardless of `--json`; in JSON mode the structured note is emitted
+/// to stdout first. Identical exit-code contract to `ls`/`prune`/`erase` — the
+/// brutal-audit (2026-06-15) caught `rm` as the lone outlier that PR #34 missed.
+fn not_deployed(json: bool) -> Result<(), ClwError> {
+    let msg = "ref deletion requires a corelink-server capability not yet deployed — tracked (DELETE /v1/ac; see docs/REQUESTS-to-other-TLs.md D-1)".to_string();
+    if json {
+        println!(
+            "{}",
+            json!({ "deleted": false, "error": "not-deployed", "note": msg })
+        );
+    }
+    Err(ClwError::Transport(msg))
 }
 
 /// True if the error is the optimistic-pending "server delete not deployed" case
@@ -142,6 +142,15 @@ mod tests {
         let err = ClwError::Transport("some unrelated transport issue".to_string());
         assert!(!is_not_deployed(&err));
         assert!(!is_not_deployed(&ClwError::Auth));
+    }
+
+    #[test]
+    fn not_deployed_fails_in_both_modes() {
+        // A destructive delete that did nothing must NEVER report success — both
+        // JSON and human mode return an error (non-zero exit). Regression for the
+        // brutal-audit CRIT/HIGH: rm was the sibling PR #34 missed.
+        assert!(not_deployed(true).is_err());
+        assert!(not_deployed(false).is_err());
     }
 
     #[test]

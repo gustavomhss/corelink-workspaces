@@ -202,8 +202,9 @@ token-rotation endpoint:
 
 ```sh
 clw auth rotate
-# clw auth rotate: not yet supported — tracked (server dependency).
-# Use `clw auth login` with a new --token to replace the stored token.
+# clw auth rotate: to rotate your token, run `clw auth login` with the new
+# token — this replaces the stored credential. (v1 has no one-step rotate;
+# a dedicated mint-and-revoke command is planned post-launch.)
 ```
 
 To rotate today, run `clw auth login` with a fresh `--token`.
@@ -372,8 +373,8 @@ enforced on **every** platform, not just Windows.
 | `error: authentication failed — check CLW_TOKEN or ~/.clw/config.toml` | Missing or invalid token | Verify `CLW_TOKEN` is set and the PAT is correct in your CoreLink dashboard (or run `clw auth whoami` to see the resolved identity) |
 | `error: not found in CAS: <digest>` on `clw hydrate` | Wrong workspace name or wrong tenant | Check `--name` matches what was passed to `clw snapshot`; verify `CLW_TENANT` is the same tenant that created the snapshot |
 | `error: transport error: config file already exists at ...; use --force to overwrite` | `clw init` run on a machine that already has a config | Run `clw init --force` to overwrite, or edit `~/.clw/config.toml` manually |
-| `error: missing tenant: ...` | `CLW_TENANT` not set and not in config | Set `CLW_TENANT=<your-tenant>` or run `clw init` |
-| `error: missing token: ...` | `CLW_TOKEN` not set and not in config | Set `CLW_TOKEN=<pat>` or run `clw init` |
+| `error: missing tenant: ...` | `CLW_TENANT` not set and not in config | Set `CLW_TENANT=<your-tenant>` (env or `--tenant`), then run `clw init` to persist it — `clw init` reads the resolved config, so the value must be supplied first |
+| `error: missing token: ...` | `CLW_TOKEN` not set and not in config | Set `CLW_TOKEN=<pat>` (env or `--token`), then run `clw init` to persist it — `clw init` reads the resolved config, so the token must be supplied first |
 | `clw hydrate` fails with a non-empty destination directory | Destination directory exists and is not empty | Choose a new (non-existent) path, or remove the existing directory first |
 | `[clw] cache miss` on every run despite no source changes | An `--env` variable is fluctuating (e.g., `TMPDIR`, timestamps) | Audit `--env` flags and remove any variables that change between runs |
 

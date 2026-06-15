@@ -46,7 +46,7 @@ This Privacy Policy describes both roles. Where a processing activity is governe
 the Data Processing Agreement rather than this policy, we say so.
 
 **Controller of record:** Human Guardrail LTDA, a limited-liability company (sociedade
-limitada) with registered office at Avenida Rouxinol, 857, apt. 113, Moema, São Paulo
+empresária limitada) with registered office at Avenida Rouxinol, 857, apt. 113, Moema, São Paulo
 – SP, Brazil (CEP: 04516-001), enrolled under CNPJ 66.103.400/0001-30, incorporated
 in Brazil.
 
@@ -188,8 +188,10 @@ Content is stored today, and the region(s) we make available, are:
 - **Customer-selectable regions (roadmap M7.1).** Customer-selectable regional
   residency is being rolled out and is **not yet live**. Until it ships and is verified
   end to end, indicating a region does not guarantee residency in that region. **EEA/UK
-  residency is not available today**; the Service is not yet offered to EEA/UK data
-  subjects during incubation (see the EU/UK representative note in §15).
+  data *residency* is not available today** — all Customer Content is stored in `enam`
+  (US). EEA/UK data subjects **may** access the Service during the open beta, but an
+  EU/UK Article 27 representative has not yet been appointed — a known, time-limited
+  compliance gap (see the EU/UK representative note in §15 and the DPA).
 
 If you have a contractual or regulatory residency requirement (for example, EEA or UK
 residency under the GDPR), contact us at the address in §15 to confirm that the required

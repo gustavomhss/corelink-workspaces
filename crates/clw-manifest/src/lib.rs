@@ -122,6 +122,12 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
 
         if file_type.is_symlink() {
             let link_target = std::fs::read_link(&abs)?;
+            // Normalize separators ('\\' → '/') so a Windows-produced relative
+            // target is portable, then validate at the PRODUCER. Without this a
+            // target that can't pass consumer-side validation (backslash,
+            // absolute, `..`-escape, colon) would publish a manifest no client
+            // can hydrate; failing fast here surfaces an actionable error at
+            // snapshot time instead.
             let target = link_target
                 .to_str()
                 .ok_or_else(|| {
@@ -130,7 +136,8 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
                         link_target.to_string_lossy()
                     ))
                 })?
-                .to_string();
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            clw_types::validate_symlink_target(&target)?;
             entries.push(WalkedEntry::Symlink { rel, target });
         } else if file_type.is_dir() {
             // Record as a candidate empty dir; we'll filter after collecting all entries.

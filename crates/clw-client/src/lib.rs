@@ -393,10 +393,7 @@ impl HttpClient {
 
                         match resp.status().as_u16() {
                             200 => {
-                                let bytes = resp
-                                    .bytes()
-                                    .await
-                                    .map_err(|e| ClwError::Transport(e.to_string()))?;
+                                let bytes = read_body_capped(resp, LIST_PAGE_CAP_BYTES).await?;
                                 serde_json::from_slice::<P>(&bytes).map_err(|e| {
                                     ClwError::Transport(format!(
                                         "malformed list page from {base_url}: {e}"
@@ -507,26 +504,73 @@ fn record_retry_after(slot: &AtomicU64, resp: &reqwest::Response) {
 }
 
 /// Returns `true` iff `ep` is a plaintext `http://` URL whose host is *exactly* a
-/// loopback (`127.0.0.1`, `localhost`, or `[::1]`), with an optional `:port` and
-/// path. This is an exact-host check, **not** a prefix check: a prefix match would
-/// accept attacker-controlled hosts like `http://127.0.0.1.evil.com` or
-/// `http://localhostx` and leak the PAT in cleartext to them.
+/// loopback (`127.0.0.0/8`, `localhost`, or `::1`) and which carries **no**
+/// userinfo.
+///
+/// SECURITY (CRIT): parsed with the same `url` crate reqwest uses to dial, so the
+/// loopback judgement is made on the EXACT host that will receive the bearer PAT
+/// — never a hand-split authority. A hand parser cannot see that
+/// `http://127.0.0.1:80@evil.com` actually dials `evil.com` (the `127.0.0.1:80`
+/// is *userinfo*), which would leak the token in cleartext to the attacker host.
+/// Embedded credentials are therefore rejected outright. Only `http://` is gated
+/// here; `https://` is always allowed and never reaches this function.
 fn is_loopback_http(ep: &str) -> bool {
-    let Some(rest) = ep.trim().strip_prefix("http://") else {
+    let Ok(url) = url::Url::parse(ep.trim()) else {
         return false;
     };
-    // Authority = everything before the first '/' (drop any path).
-    let authority = rest.split('/').next().unwrap_or(rest);
-    // IPv6 literal: `[::1]` optionally followed by `:port`.
-    if let Some(after) = authority.strip_prefix('[') {
-        return match after.split_once(']') {
-            Some((host, port)) => host == "::1" && (port.is_empty() || port.starts_with(':')),
-            None => false,
-        };
+    // Plaintext only, and NEVER with embedded credentials (the `@`-smuggling
+    // vector that makes a non-loopback host masquerade as loopback).
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return false;
     }
-    // `host[:port]` — strip an optional trailing `:port`.
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    host == "127.0.0.1" || host == "localhost"
+    match url.host() {
+        // `is_loopback()` covers all of 127.0.0.0/8 (v4) and ::1 (v6).
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d == "localhost",
+        None => false,
+    }
+}
+
+/// Generous ceiling for a single list page (D-7/D-8): ≤1000 small JSON items per
+/// page, so 16 MiB is orders of magnitude above any legitimate page while still
+/// bounding a hostile/buggy server's response.
+const LIST_PAGE_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a response body into memory with a HARD size ceiling, so a hostile or
+/// buggy server cannot OOM the client by answering a small request with a
+/// multi-gigabyte body. The CAS contract caps blobs at `CAS_BLOB_CAP_BYTES`, but
+/// that is enforced only on `put`; the download side (`get`/list) must defend
+/// itself too — and for CAS the BLAKE3 integrity check runs *after* the body is
+/// buffered, so this cap is the only thing between an oversized body and the
+/// allocation. We reject early on an honest `Content-Length`, then stream with a
+/// running ceiling so a server that omits or lies about the length still cannot
+/// exceed `cap`.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(ClwError::TooLarge {
+                size: len,
+                cap: cap as u64,
+            });
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ClwError::Transport(e.to_string()))?
+    {
+        let projected = buf.len() as u64 + chunk.len() as u64;
+        if projected > cap as u64 {
+            return Err(ClwError::TooLarge {
+                size: projected,
+                cap: cap as u64,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Returns `true` if the error warrants a retry.
@@ -707,10 +751,10 @@ impl CasTransport for HttpClient {
 
                 match resp.status().as_u16() {
                     200 => {
-                        let bytes = resp
-                            .bytes()
-                            .await
-                            .map_err(|e| ClwError::Transport(e.to_string()))?;
+                        // Cap the download: a blob can never legitimately exceed
+                        // CAS_BLOB_CAP_BYTES (put enforces it), and the integrity
+                        // check below only runs AFTER the body is buffered.
+                        let bytes = read_body_capped(resp, CAS_BLOB_CAP_BYTES).await?;
                         let actual = Digest::of_bytes(&bytes);
                         if actual != digest {
                             return Err(ClwError::Integrity {
@@ -718,7 +762,7 @@ impl CasTransport for HttpClient {
                                 actual,
                             });
                         }
-                        Ok(bytes.to_vec())
+                        Ok(bytes)
                     }
                     404 => Err(ClwError::NotFound(digest)),
                     401 => Err(ClwError::Auth),
@@ -881,11 +925,10 @@ impl AcTransport for HttpClient {
 
                 match resp.status().as_u16() {
                     200 => {
-                        let bytes = resp
-                            .bytes()
-                            .await
-                            .map_err(|e| ClwError::Transport(e.to_string()))?;
-                        Ok(Some(bytes.to_vec()))
+                        // AC values are small ref records; the CAS cap is a
+                        // generous ceiling that still bounds a hostile response.
+                        let bytes = read_body_capped(resp, CAS_BLOB_CAP_BYTES).await?;
+                        Ok(Some(bytes))
                     }
                     404 => Ok(None),
                     401 => Err(ClwError::Auth),
@@ -1217,6 +1260,31 @@ mod tests {
         let err = CasTransport::get(&client, &digest).await.unwrap_err();
         assert!(
             matches!(err, ClwError::Integrity { expected, actual } if expected == digest && actual != digest)
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_get_oversized_body_rejected_before_oom() {
+        // Brutal-audit (2026-06-15) MED: a hostile/buggy server answering a CAS
+        // GET with a body larger than CAS_BLOB_CAP_BYTES must be rejected (TooLarge)
+        // rather than buffered into memory. The integrity check never gets the
+        // chance to run — the cap is what stands between the body and the alloc.
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let oversized = vec![0u8; CAS_BLOB_CAP_BYTES + 1];
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("GET"))
+            .and(path(&path_str))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::get(&client, &digest).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == CAS_BLOB_CAP_BYTES as u64),
+            "oversized CAS body must be refused as TooLarge, got {err:?}"
         );
     }
 
@@ -2080,6 +2148,14 @@ mod tests {
             "http://localhost.attacker.net",
             "http://127.0.0.1@evil.com/",
             "http://[::1].evil.com",
+            // Regression (CRIT, brutal-audit 2026-06-15): the `:port@host` userinfo
+            // smuggle. The hand-rolled parser split the single colon and read the
+            // host as `127.0.0.1`, while url/reqwest dial the REAL host `evil.com`
+            // — a one-line PAT-exfiltration. All must be refused.
+            "http://127.0.0.1:8080@evil.com/v1",
+            "http://localhost:1@evil.com",
+            "http://[::1]:1@evil.com",
+            "http://127.0.0.1:80@evil.com:443/v1/cas",
         ] {
             let err = HttpClient::new(test_config(ep.into())).unwrap_err();
             assert!(
