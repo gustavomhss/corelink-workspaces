@@ -30,11 +30,10 @@
   `NO_COLOR` env var is set or stdout is not a TTY (single `color_enabled` policy seam). (M5.7)
 - **`--json` coverage** audited across commands as a documented contract; `clw run` is the
   one **documented exception** (the wrapped command owns stdout, so it has no `--json` form). (M5.7)
-- **Telemetry consent scaffolding** — off by default, with kill-switches (`DO_NOT_TRACK=1` and
-  `CLW_TELEMETRY=0` always win; `CLW_TELEMETRY=1` opts in; `telemetry = "on"|"off"` in config).
-  **No network backend** — events route to a documented no-op sink; the `Event` type is a
-  fixed enum (no String/PathBuf/token field) so PII is redaction-proof by construction; never
-  prompts in CI/non-TTY. (M5.3)
+- **No telemetry (by decision).** clw collects no usage data and ships with no mechanism to
+  send any — there is no telemetry sink, opt-in flag, or phone-home path in the binary. The
+  only data transmitted is the workspace content you explicitly `snapshot`/`run` plus the auth
+  token. (M5.3 — owner decision: ship with zero telemetry rather than a dormant backend.)
 - **Windows support** — the entire workspace now compiles and runs on Windows x86_64
   (`USERPROFILE` home resolution, `#[cfg]`-gated unix-only constructs). (M2.1)
 - **Client resource-safety bounds** in `hydrate` — manifest entry-count / byte / symlink

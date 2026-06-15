@@ -6,14 +6,6 @@
 
 mod config;
 mod subcmds;
-// Justification: the telemetry module ships the off-by-default policy + consent +
-// redaction gate (M5.3). Only `init_from_env_and_config` is wired today; the
-// `record`/`Event` consent/redaction API is scaffolding that the per-subcommand
-// call sites adopt when the pluggable backend lands (tracked in
-// docs/ROADMAP-go-live.md M5.3). It is intentionally unused now so the interface
-// is reviewed and frozen ahead of the backend — hence the scoped dead_code allow.
-#[allow(dead_code)]
-mod telemetry;
 
 use clap::Parser;
 use clw_types::ClwError;
@@ -148,7 +140,7 @@ pub enum Commands {
     Doctor(subcmds::doctor::DoctorArgs),
     /// Manage the locally-stored CoreLink identity (login/logout/whoami).
     Auth(subcmds::auth::AuthArgs),
-    /// Remove clw's on-disk footprint (config + PAT, cache, telemetry record).
+    /// Remove clw's on-disk footprint (config + PAT, cache).
     Uninstall(subcmds::uninstall::UninstallArgs),
     /// Generate a shell-completion script (bash|zsh|fish|powershell|elvish).
     Completions(subcmds::completions::CompletionsArgs),
@@ -284,7 +276,7 @@ async fn main() {
     // `completions` is a pure, offline, client-only command: it reflects the
     // derived clap surface and needs NO endpoint/tenant/token. Handle it before
     // config resolution so a fresh user (no config, no token) can still generate
-    // completions. It bypasses the telemetry gate for the same reason.
+    // completions. (It is a pure offline reflection of the clap surface.)
     if let Commands::Completions(args) = cli.command {
         if let Err(e) = subcmds::completions::run(args).await {
             exit_err(&e);
@@ -316,12 +308,6 @@ async fn main() {
     // Resolve the color policy once (flag > NO_COLOR env > non-TTY). clw emits
     // no ANSI today, so this currently only documents/guarantees the contract.
     let _color = color_enabled(cli.no_color);
-
-    // Resolve the telemetry gate once (M5.3). Off by default; honors
-    // DO_NOT_TRACK / CLW_TELEMETRY kill-switches and recorded consent. This is
-    // no-op-safe: it never errors, prompts, or blocks, so it is safe in CI and
-    // scripts. The sink is a documented no-op until a backend is plugged in.
-    telemetry::init_from_env_and_config();
 
     let result = dispatch(cli.command, resolved, cli.json, cli.concurrency).await;
     if let Err(e) = result {
