@@ -164,22 +164,17 @@ fn is_not_deployed(err: &ClwError) -> bool {
     matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
 }
 
-/// Render the optimistic-pending case: graceful JSON note, or an actionable error.
+/// Render the optimistic-pending case. ALWAYS fails (non-zero exit) so a script
+/// never mistakes "endpoint not deployed" for "tenant has no refs" — in `--json`
+/// mode the structured note is printed first, then the error propagates.
 fn not_deployed_err(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+    let msg = format!(
+        "{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/RELAY-server-D1-D7-D8.md)"
+    );
     if json {
-        println!(
-            "{}",
-            json!({
-                "error": "not-deployed",
-                "note": format!("{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"),
-            })
-        );
-        Ok(())
-    } else {
-        Err(ClwError::Transport(format!(
-            "{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"
-        )))
+        println!("{}", json!({ "error": "not-deployed", "note": msg }));
     }
+    Err(ClwError::Transport(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn not_deployed_err_json_is_ok_human_is_err() {
-        // JSON mode degrades gracefully (Ok with a note); human mode is a hard error.
-        assert!(not_deployed_err(true, "ref enumeration", "D-7").is_ok());
+    fn not_deployed_err_fails_in_both_modes() {
+        // Both modes return an error (non-zero exit) so a script never mistakes
+        // "endpoint not deployed" for "tenant has no refs".
+        assert!(not_deployed_err(true, "ref enumeration", "D-7").is_err());
         assert!(not_deployed_err(false, "ref enumeration", "D-7").is_err());
     }
 }

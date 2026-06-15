@@ -95,21 +95,32 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         return abort(json, &tenant);
     }
 
-    // Execute: delete every blob, then every ref. (Blobs first so a partial
-    // failure never leaves refs pointing at already-deleted content.)
-    let mut blobs_deleted = 0usize;
-    for d in &blobs {
-        CasTransport::delete(&client, d)
-            .await
-            .map_err(map_auth_error)?;
-        blobs_deleted += 1;
-    }
+    // Echo the blast radius immediately before deleting, so even when the typed
+    // confirmation passes (e.g. a wrong-but-confirmed tenant in CI) the target and
+    // scale are auditable on screen and in the job log.
+    eprintln!(
+        "erase: IRREVERSIBLY deleting tenant '{tenant}' — {} ref(s) + {} blob(s)…",
+        ref_keys.len(),
+        blobs.len()
+    );
+
+    // Execute: delete every REF first, then every blob. Refs-first keeps the store
+    // consistent on a partial failure — a failure after the ref loop leaves only
+    // UNREFERENCED blobs (orphans, reclaimable by `prune` or an idempotent re-run),
+    // never a live ref pointing at already-deleted content.
     let mut refs_deleted = 0usize;
     for k in &ref_keys {
         AcTransport::delete(&client, k)
             .await
             .map_err(map_auth_error)?;
         refs_deleted += 1;
+    }
+    let mut blobs_deleted = 0usize;
+    for d in &blobs {
+        CasTransport::delete(&client, d)
+            .await
+            .map_err(map_auth_error)?;
+        blobs_deleted += 1;
     }
 
     if json {
@@ -150,17 +161,20 @@ fn confirm_tenant(expected: &str, supplied: Option<&str>) -> Result<bool, ClwErr
     Ok(line.trim() == expected)
 }
 
-/// Emit the aborted-confirmation outcome (Ok in JSON, soft message in human mode).
+/// Emit the aborted-confirmation outcome and FAIL with a non-zero exit, so
+/// automation can distinguish a refused erase from a completed one (they would
+/// otherwise share exit 0). In `--json` mode the structured note is still printed
+/// to stdout before the error; in human mode `exit_err` prints the message.
 fn abort(json: bool, tenant: &str) -> Result<(), ClwError> {
     if json {
         println!(
             "{}",
             json!({ "tenant": tenant, "erased": false, "note": "aborted — tenant confirmation did not match" })
         );
-    } else {
-        eprintln!("aborted — tenant confirmation did not match; '{tenant}' left unchanged");
     }
-    Ok(())
+    Err(ClwError::Transport(format!(
+        "aborted — tenant confirmation did not match; '{tenant}' left unchanged"
+    )))
 }
 
 /// True if the error is the optimistic-pending "server capability not deployed"
@@ -169,22 +183,18 @@ fn is_not_deployed(err: &ClwError) -> bool {
     matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
 }
 
-/// Render the optimistic-pending case: graceful JSON note, or actionable error.
+/// Render the optimistic-pending case. ALWAYS fails (non-zero exit) so a
+/// destructive command that did nothing never reports success — in `--json` mode
+/// the structured note is printed first, then the error propagates (same exit
+/// code as human mode).
 fn not_deployed(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+    let msg = format!(
+        "{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/RELAY-server-D1-D7-D8.md)"
+    );
     if json {
-        println!(
-            "{}",
-            json!({
-                "error": "not-deployed",
-                "note": format!("{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"),
-            })
-        );
-        Ok(())
-    } else {
-        Err(ClwError::Transport(format!(
-            "{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"
-        )))
+        println!("{}", json!({ "error": "not-deployed", "note": msg }));
     }
+    Err(ClwError::Transport(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,15 +224,18 @@ mod tests {
     }
 
     #[test]
-    fn not_deployed_json_is_ok_human_is_err() {
-        assert!(not_deployed(true, "erase", "D-7").is_ok());
+    fn not_deployed_fails_in_both_modes() {
+        // A destructive command that did nothing must NEVER report success —
+        // both JSON and human mode return an error (non-zero exit).
+        assert!(not_deployed(true, "erase", "D-7").is_err());
         assert!(not_deployed(false, "erase", "D-7").is_err());
     }
 
     #[test]
-    fn abort_is_non_fatal() {
-        // An aborted confirmation is a clean no-op, not an error.
-        assert!(abort(true, "acme").is_ok());
-        assert!(abort(false, "acme").is_ok());
+    fn abort_fails_in_both_modes() {
+        // A refused/mismatched confirmation must exit non-zero so automation can
+        // distinguish it from a completed erase.
+        assert!(abort(true, "acme").is_err());
+        assert!(abort(false, "acme").is_err());
     }
 }

@@ -360,6 +360,13 @@ impl HttpClient {
         let client = &self.inner;
         let mut out: Vec<Digest> = Vec::new();
         let mut cursor: Option<String> = None;
+        // Liveness guards: the cursor is opaque, so a buggy/regressed server that
+        // returns a non-null cursor that never advances (or cycles) would loop
+        // forever. Require STRICT advancement (a cursor never repeats) and cap the
+        // total pages. `limit=1000` ⇒ the cap still allows ~10^9 entries.
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages: u64 = 0;
+        const MAX_PAGES: u64 = 1_000_000;
 
         loop {
             let page: P = self
@@ -417,8 +424,26 @@ impl HttpClient {
 
             let (keys, next) = page.into_parts();
             out.extend(keys);
+
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Err(ClwError::Transport(format!(
+                    "pagination exceeded {MAX_PAGES} pages at {base_url}; aborting a likely \
+                     unbounded server cursor"
+                )));
+            }
             match next {
-                Some(c) => cursor = Some(c),
+                Some(c) => {
+                    // A cursor that repeats means the server is not advancing —
+                    // abort rather than loop forever.
+                    if !seen_cursors.insert(c.clone()) {
+                        return Err(ClwError::Transport(format!(
+                            "pagination cursor did not advance at {base_url} (repeated cursor); \
+                             aborting to avoid an unbounded loop"
+                        )));
+                    }
+                    cursor = Some(c);
+                }
                 None => break,
             }
         }
@@ -533,9 +558,14 @@ trait ListPage: serde::de::DeserializeOwned {
 }
 
 /// AC ref listing (D-7): `{"refs": [{"ref_key": "<hex>", "updated_at", "size"}], "next_cursor"}`.
+///
+/// `refs` is REQUIRED (no `#[serde(default)]`): a 200 whose body omits the array
+/// (server bug, schema drift, a proxy returning `{}` or an unrelated JSON 200)
+/// must be a hard parse error, NOT a silently-empty list — an empty live set
+/// would otherwise drive `prune` to delete the whole tenant. Only `next_cursor`
+/// defaults (absent/null = terminal page, which IS contract-correct).
 #[derive(Debug, Deserialize)]
 struct AcListPage {
-    #[serde(default)]
     refs: Vec<AcRefItem>,
     #[serde(default)]
     next_cursor: Option<String>,
@@ -547,9 +577,11 @@ struct AcRefItem {
 }
 
 /// CAS blob listing (D-8): `{"blobs": [{"hash": "<hex>", "size", "created_at"}], "next_cursor"}`.
+///
+/// `blobs` is REQUIRED (see [`AcListPage`] for why a missing array must be a hard
+/// error, not a silent empty list). Only `next_cursor` defaults.
 #[derive(Debug, Deserialize)]
 struct CasListPage {
-    #[serde(default)]
     blobs: Vec<CasBlobItem>,
     #[serde(default)]
     next_cursor: Option<String>,
