@@ -110,6 +110,10 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
     }
 
     // --- DELETE: remove each orphan, never discarding progress on failure ----
+    // Live counter on an interactive TTY (stderr only, so --json stdout stays
+    // clean) so a long serial sweep isn't mistaken for a hang.
+    let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let total = orphans.len();
     let mut deleted = 0usize;
     let mut failure: Option<(Digest, ClwError)> = None;
     for d in &orphans {
@@ -118,6 +122,14 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
             break;
         }
         deleted += 1;
+        if show_progress {
+            eprint!("\rpruning {deleted}/{total}…");
+            use std::io::Write as _;
+            std::io::stderr().flush().ok();
+        }
+    }
+    if show_progress && deleted > 0 {
+        eprintln!("\rpruned {deleted}/{total} orphan(s).   ");
     }
 
     if let Some((digest, err)) = failure {
