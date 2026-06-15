@@ -39,9 +39,9 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), 
     // plaintext PAT. Tighten perms even if ~/.clw pre-existed with a looser mode.
     ensure_config_parent_0700(&path)?;
 
-    // Preserve any unrelated keys already in the file (e.g. recorded `telemetry`
-    // consent) — only the four identity keys are overwritten. The token is NEVER
-    // echoed; it is written to the 0600 file only.
+    // Preserve any unrelated keys already in the file (e.g. one a future config
+    // feature adds) — only the four identity keys are overwritten. The token is
+    // NEVER echoed; it is written to the 0600 file only.
     let c = &cfg.clw_config;
     let updates = vec![
         ("endpoint".to_string(), c.endpoint.clone()),
@@ -81,17 +81,17 @@ mod tests {
     };
 
     // -----------------------------------------------------------------------
-    // init must PRESERVE unrelated keys (e.g. telemetry consent) when rewriting.
+    // init must PRESERVE unrelated keys (any future config key) when rewriting.
     // -----------------------------------------------------------------------
     #[test]
     fn init_rewrite_preserves_unrelated_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        // Pre-existing file with a telemetry consent key plus a stale token.
+        // Pre-existing file with an unrelated key plus a stale token.
         write_config_file_0600(
             &path,
-            "# clw configuration\ntelemetry = \"on\"\ntoken = \"old-tok\"\n",
+            "# clw configuration\nunrelated_key = \"keep-me\"\ntoken = \"old-tok\"\n",
         )
         .unwrap();
 
@@ -109,9 +109,9 @@ mod tests {
         after.sort();
         let map: std::collections::HashMap<_, _> = after.into_iter().collect();
         assert_eq!(
-            map.get("telemetry").map(String::as_str),
-            Some("on"),
-            "telemetry consent key must survive an init rewrite"
+            map.get("unrelated_key").map(String::as_str),
+            Some("keep-me"),
+            "an unrelated config key must survive an init rewrite"
         );
         assert_eq!(map.get("token").map(String::as_str), Some("new-tok"));
         assert_eq!(map.get("tenant").map(String::as_str), Some("acme"));

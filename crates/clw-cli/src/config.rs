@@ -290,10 +290,9 @@ pub(crate) fn read_config_pairs(path: &std::path::Path) -> Vec<(String, String)>
 /// keys being set and PRESERVING every other key already in the file.
 ///
 /// This is the shared preserve-then-overwrite primitive used by `clw init` and
-/// `clw auth login` (and mirrors [`telemetry::persist_decision`]) so that writing
-/// the four identity keys never wipes an unrelated key such as the recorded
-/// `telemetry` consent. Returns the merged pairs in a stable (sorted) order ready
-/// for [`render_config`].
+/// `clw auth login`, so that writing the identity keys never wipes an unrelated
+/// key a future config feature may add. Returns the merged pairs in a stable
+/// (sorted) order ready for [`render_config`].
 pub(crate) fn merge_config_pairs(
     path: &std::path::Path,
     updates: &[(String, String)],

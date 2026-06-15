@@ -4,7 +4,8 @@
 //! - `login`  — persist endpoint/tenant/token to ~/.clw/config.toml (0600).
 //! - `logout` — remove the token (or clear the file) from ~/.clw/config.toml.
 //! - `whoami` — print the RESOLVED identity, redacted, offline (no network).
-//! - `rotate` — OUT OF SCOPE (needs a server token-rotation endpoint).
+//! - `rotate` — in v1, rotate by re-running `login` with the new token; a
+//!   dedicated one-step rotate command is planned post-launch.
 //!
 //! INVARIANT: the personal access token is NEVER printed to stdout/stderr.
 //! Presence is reported as `<set>`/`<unset>` only. The config file is the only
@@ -38,7 +39,7 @@ pub enum AuthCommand {
     Logout(LogoutArgs),
     /// Print the resolved identity (redacted, offline — no network call).
     Whoami,
-    /// Token rotation — not yet supported (server dependency).
+    /// Token rotation — in v1, re-run `login` with the new token.
     Rotate,
 }
 
@@ -108,8 +109,8 @@ fn build_login_summary_json(cfg: &ResolvedConfig, wrote: &std::path::Path) -> se
 /// `clw auth login` — persist the resolved identity to ~/.clw/config.toml.
 ///
 /// Reuses the shared 0600 writer/`toml_escape` helpers (no duplication). NEVER
-/// prints the token — only the path and `<set>`/`<unset>` presence. Unrelated keys
-/// already in the file (e.g. recorded `telemetry` consent) are PRESERVED.
+/// prints the token — only the path and `<set>`/`<unset>` presence. Any unrelated
+/// key already in the file (e.g. one a future config feature adds) is PRESERVED.
 fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
         ClwError::Transport("cannot determine home directory for config file".to_string())
@@ -118,8 +119,8 @@ fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
     ensure_config_parent_0700(&path)?;
 
     let c = &cfg.clw_config;
-    // Merge over existing keys so an unrelated key (e.g. `telemetry`) survives;
-    // only the four identity keys are overwritten. NEVER echoed — the token is
+    // Merge over existing keys so any unrelated key survives; only the four
+    // identity keys are overwritten. NEVER echoed — the token is
     // written to the 0600 file only.
     let updates = vec![
         ("endpoint".to_string(), c.endpoint.clone()),
@@ -253,20 +254,24 @@ fn whoami(cfg: &ResolvedConfig, json: bool) {
     }
 }
 
-/// `clw auth rotate` — OUT OF SCOPE. Server token-rotation endpoint does not yet
-/// exist; print a clear message and exit 0 (handled by caller returning Ok).
+/// `clw auth rotate` — in v1, rotation is performed by RE-AUTHENTICATING: run
+/// `clw auth login` with the new token to atomically replace the stored
+/// credential. A dedicated one-step rotate (mint-new + revoke-old in a single
+/// call) is a post-launch nicety that needs a server endpoint; until then this
+/// directs the user to the supported path and exits 0.
 fn rotate(json: bool) {
     if json {
         let out = json!({
             "rotated": false,
-            "supported": false,
-            "reason": "not yet supported — tracked (server dependency)",
+            "action_required": "run `clw auth login` with the new token",
+            "note": "v1 rotates by re-authenticating; a one-step rotate command is post-launch",
         });
         println!("{out}");
     } else {
         eprintln!(
-            "clw auth rotate: not yet supported — tracked (server dependency). \
-             Use `clw auth login` with a new --token to replace the stored token."
+            "clw auth rotate: to rotate your token, run `clw auth login` with the new \
+             token — this replaces the stored credential. (v1 has no one-step rotate; \
+             a dedicated mint-and-revoke command is planned post-launch.)"
         );
     }
 }
@@ -340,16 +345,16 @@ mod tests {
         );
     }
 
-    // login must PRESERVE an unrelated key (e.g. telemetry consent) on rewrite.
+    // login must PRESERVE an unrelated key (any future config key) on rewrite.
     #[test]
     fn login_rewrite_preserves_unrelated_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        // Pre-existing file holding telemetry consent + a stale token.
+        // Pre-existing file holding an unrelated key + a stale token.
         write_config_file_0600(
             &path,
-            "# clw configuration\ntelemetry = \"on\"\ntoken = \"old-tok\"\n",
+            "# clw configuration\nunrelated_key = \"keep-me\"\ntoken = \"old-tok\"\n",
         )
         .unwrap();
 
@@ -367,9 +372,9 @@ mod tests {
 
         let map: std::collections::HashMap<_, _> = read_config_pairs(&path).into_iter().collect();
         assert_eq!(
-            map.get("telemetry").map(String::as_str),
-            Some("on"),
-            "telemetry consent key must survive an auth login rewrite"
+            map.get("unrelated_key").map(String::as_str),
+            Some("keep-me"),
+            "an unrelated config key must survive an auth login rewrite"
         );
         assert_eq!(map.get("token").map(String::as_str), Some("new-tok"));
         assert_eq!(map.get("tenant").map(String::as_str), Some("acme-tenant"));
@@ -418,16 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn rotate_json_reports_unsupported() {
+    fn rotate_json_directs_to_login() {
+        // v1 rotate is a re-login: the JSON must say it did not rotate and point
+        // the user at `clw auth login` as the supported path.
         let out = json!({
             "rotated": false,
-            "supported": false,
-            "reason": "not yet supported — tracked (server dependency)",
+            "action_required": "run `clw auth login` with the new token",
+            "note": "v1 rotates by re-authenticating; a one-step rotate command is post-launch",
         });
-        assert_eq!(out["supported"], false);
-        assert!(out["reason"]
+        assert_eq!(out["rotated"], false);
+        assert!(out["action_required"]
             .as_str()
             .unwrap()
-            .contains("not yet supported"));
+            .contains("clw auth login"));
     }
 }

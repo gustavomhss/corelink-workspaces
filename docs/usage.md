@@ -329,28 +329,13 @@ clw --json ls --name myapp-dev
 
 ---
 
-## Telemetry — off by default, with kill-switches
+## No telemetry
 
-Telemetry is **off by default** and currently has **no network backend** — events
-route to a documented no-op sink. It activates only on explicit opt-in. Resolution
-precedence (first match wins):
-
-1. **Kill-switches, always.** `DO_NOT_TRACK=1` or `CLW_TELEMETRY=0` force it OFF
-   and cannot be overridden.
-2. `CLW_TELEMETRY=1` opts in.
-3. `telemetry = "on"|"off"` recorded in `~/.clw/config.toml`.
-4. Otherwise OFF.
-
-clw **never prompts** for consent in CI / non-interactive / non-TTY contexts. The
-event type is a fixed enum carrying only a coarse subcommand/outcome/duration — by
-construction it cannot carry a PAT, a path, a workspace name, or file contents.
-
-```sh
-# Force telemetry off regardless of config (cross-vendor standard):
-export DO_NOT_TRACK=1
-# or
-export CLW_TELEMETRY=0
-```
+clw collects **no usage data** and ships with **no mechanism** to send any — there
+is no telemetry sink, no opt-in flag, and no phone-home path in the binary. The
+only data clw transmits is the workspace content you explicitly `snapshot`/`run`
+and the auth token needed to reach the API. Nothing is reported about how you use
+the tool.
 
 ---
 

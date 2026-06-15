@@ -170,10 +170,9 @@ color is also auto-disabled when `NO_COLOR` is set or stdout is not a TTY.
 `--concurrency` caps concurrent CAS requests for `snapshot`/`hydrate` (lower it if
 you hit rate limits).
 
-**Telemetry** is **off by default** and has no network backend today. It only
-activates on explicit opt-in (`CLW_TELEMETRY=1`, or `telemetry = "on"` in the
-config). The kill-switches `DO_NOT_TRACK=1` and `CLW_TELEMETRY=0` always win and
-cannot be overridden. clw never prompts for consent in CI / non-interactive runs.
+**No telemetry.** clw collects **no usage data** and has **no mechanism** to send
+any — it never phones home. The only data it transmits is the workspace content
+you explicitly `snapshot`/`run`, plus the auth token needed to reach the API.
 
 `~/.clw/config.toml` format (written by `clw init` or `clw auth login`):
 

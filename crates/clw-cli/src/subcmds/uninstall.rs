@@ -3,8 +3,7 @@
 //! clw persists two sensitive things on disk: the plaintext personal access
 //! token (PAT) in `~/.clw/config.toml`, and a potentially LARGE cache of
 //! customer file content under the resolved cache dir. `uninstall` removes both,
-//! plus the telemetry-decision record (which lives in the same config file), so a
-//! user can fully scrub the machine.
+//! so a user can fully scrub the machine.
 //!
 //! INVARIANTS (match the rest of the CLI):
 //! - The PAT is NEVER printed. We report PATHS that were/would be removed, never
@@ -26,7 +25,7 @@ use serde_json::json;
 use crate::config::home_dir;
 
 #[derive(Debug, Args)]
-#[command(about = "Remove clw's on-disk footprint (~/.clw config + PAT, cache, telemetry record)")]
+#[command(about = "Remove clw's on-disk footprint (~/.clw config + PAT, cache)")]
 pub struct UninstallArgs {
     /// Skip the confirmation prompt (REQUIRED in --json/non-interactive mode).
     #[arg(
@@ -56,7 +55,7 @@ struct Target {
 ///
 /// PURE over its inputs (the resolved config dir + cache dir), so it can be unit
 /// tested without touching `$HOME`. Returns the config dir (`~/.clw`, holding the
-/// PAT + telemetry record) and the resolved cache dir. The cache dir is only
+/// PAT) and the resolved cache dir. The cache dir is only
 /// listed separately when it is NOT already inside the config dir (the default
 /// `~/.clw/cache` is removed transitively by removing `~/.clw`).
 fn resolve_targets(
@@ -68,7 +67,7 @@ fn resolve_targets(
     if let Some(cfg) = &config_dir {
         targets.push(Target {
             path: cfg.clone(),
-            label: "config dir (config.toml with PAT + telemetry record)",
+            label: "config dir (config.toml with PAT)",
         });
     }
 
@@ -306,7 +305,7 @@ mod tests {
         (
             Target {
                 path: PathBuf::from("/home/u/.clw"),
-                label: "config dir (config.toml with PAT + telemetry record)",
+                label: "config dir (config.toml with PAT)",
             },
             Target {
                 path: PathBuf::from("/var/tmp/clw-cache"),
