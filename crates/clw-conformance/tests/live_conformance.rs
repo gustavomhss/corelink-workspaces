@@ -10,8 +10,21 @@
 //! runs cleanly in environments without credentials (e.g. standard CI) while
 //! still exercising real network behaviour when credentials are supplied.
 //!
+//! # The require gate (closes the skip-equals-pass false-green — M4.5 / exit-gate #6)
+//!
+//! A silent skip-as-pass is safe for everyday CI but DANGEROUS as a release
+//! pre-tag gate: a release run that forgot the credentials — or hit an endpoint
+//! that regressed to not-deployed — would report GREEN having asserted nothing.
+//! Set `CLW_CONFORMANCE_REQUIRE=1` (only in the pre-tag release gate) to make
+//! EVERY skip a hard failure: missing creds and not-yet-deployed endpoints then
+//! PANIC instead of passing. With the variable unset, behaviour is identical to
+//! before (skips pass) — so this change is invisible to the normal lane.
+//!
 //! Run with:
 //!   CLW_TENANT=<tenant> CLW_TOKEN=<pat> cargo test -p clw-conformance --features live
+//! Pre-tag gate (skips become failures):
+//!   CLW_CONFORMANCE_REQUIRE=1 CLW_TENANT=<tenant> CLW_TOKEN=<pat> \
+//!     cargo test -p clw-conformance --features live
 
 #![cfg(feature = "live")]
 
@@ -52,10 +65,34 @@ fn try_config() -> Option<Config> {
             })
         }
         _ => {
-            eprintln!("SKIPPED: set CLW_TOKEN + CLW_TENANT to run live conformance");
+            skip_or_fail("set CLW_TOKEN + CLW_TENANT to run live conformance");
             None
         }
     }
+}
+
+/// True only in the **release pre-tag gate**, where a skip must be a hard
+/// failure rather than a silent pass. Set `CLW_CONFORMANCE_REQUIRE=1` (or
+/// `=true`) to require every live test to actually execute its assertions.
+fn require_live() -> bool {
+    matches!(
+        std::env::var("CLW_CONFORMANCE_REQUIRE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Emit a skip notice to stderr — or PANIC when running under the require gate
+/// (`CLW_CONFORMANCE_REQUIRE=1`). This is what closes the skip-equals-pass
+/// false-green: in the release gate a missing credential or a not-yet-deployed
+/// endpoint fails loudly instead of reporting a green that asserted nothing.
+fn skip_or_fail(reason: &str) {
+    if require_live() {
+        panic!(
+            "CONFORMANCE REQUIRED but a test skipped: {reason} \
+             (CLW_CONFORMANCE_REQUIRE=1 forbids skips at the pre-tag gate)"
+        );
+    }
+    eprintln!("SKIPPED: {reason}");
 }
 
 /// A unique, per-run suffix that avoids key collisions between test invocations.
@@ -188,7 +225,7 @@ async fn auth_rejected() {
     let tenant = match std::env::var("CLW_TENANT") {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("SKIPPED: set CLW_TOKEN + CLW_TENANT to run live conformance");
+            skip_or_fail("set CLW_TOKEN + CLW_TENANT to run live conformance");
             return;
         }
     };
@@ -257,9 +294,7 @@ async fn ref_delete_roundtrip() {
     match AcTransport::delete(&client, &key).await {
         Ok(()) => {}
         Err(e) if is_not_deployed(&e) => {
-            eprintln!(
-                "SKIPPED: DELETE /v1/ac (D-1) not yet deployed; ref-delete round-trip pending"
-            );
+            skip_or_fail("DELETE /v1/ac (D-1) not yet deployed; ref-delete round-trip pending");
             return;
         }
         Err(e) => panic!("ac delete failed: {e}"),
@@ -300,7 +335,7 @@ async fn ref_list_roundtrip() {
     let refs = match AcTransport::list_refs(&client).await {
         Ok(r) => r,
         Err(e) if is_not_deployed(&e) => {
-            eprintln!("SKIPPED: GET /v1/ac (D-7) not yet deployed; ref-list round-trip pending");
+            skip_or_fail("GET /v1/ac (D-7) not yet deployed; ref-list round-trip pending");
             return;
         }
         Err(e) => panic!("list_refs failed: {e}"),
@@ -343,9 +378,7 @@ async fn cas_delete_roundtrip() {
     match CasTransport::delete(&client, &digest).await {
         Ok(()) => {}
         Err(e) if is_not_deployed(&e) => {
-            eprintln!(
-                "SKIPPED: DELETE /v1/cas (D-8) not yet deployed; cas-delete round-trip pending"
-            );
+            skip_or_fail("DELETE /v1/cas (D-8) not yet deployed; cas-delete round-trip pending");
             return;
         }
         Err(e) => panic!("cas delete failed: {e}"),
@@ -380,7 +413,7 @@ async fn cas_list_roundtrip() {
     let blobs = match CasTransport::list_blobs(&client).await {
         Ok(b) => b,
         Err(e) if is_not_deployed(&e) => {
-            eprintln!("SKIPPED: GET /v1/cas (D-8) not yet deployed; cas-list round-trip pending");
+            skip_or_fail("GET /v1/cas (D-8) not yet deployed; cas-list round-trip pending");
             return;
         }
         Err(e) => panic!("list_blobs failed: {e}"),
