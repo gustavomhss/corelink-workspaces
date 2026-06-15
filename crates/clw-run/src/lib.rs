@@ -118,17 +118,36 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
     } else {
         search_path(cmd0)
     };
+    // Not locatable on PATH/cwd → nothing to hash; a literal marker keeps the key
+    // well-defined (the command string itself is already in the payload).
+    let Some(path) = candidate else {
+        return format!("literal:{cmd0}");
+    };
     // Read via tokio::fs so the (potentially large) toolchain binary is not read
     // with a BLOCKING std::fs call on the async worker (matches how the inputs
-    // above are digested). If the file can't be located or read, fall back to a
-    // literal marker so the key is still well-defined.
-    let bytes = match candidate {
-        Some(p) => tokio::fs::read(&p).await.ok(),
-        None => None,
-    };
-    match bytes {
-        Some(bytes) => format!("digest:{}", Digest::of_bytes(&bytes).to_hex()),
-        None => format!("literal:{cmd0}"),
+    // above are digested).
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => format!("digest:{}", Digest::of_bytes(&bytes).to_hex()),
+        Err(_) => {
+            // The file EXISTS but is unreadable (e.g. exec-only / no read bit —
+            // exec and read are independent perms on unix). A content-free
+            // `literal:` would make two different builds of the tool collide and
+            // replay stale output across an in-place upgrade. Fold in a non-content
+            // identity (len + mtime) that still changes when the binary does;
+            // fall back to literal only if even the metadata is unavailable.
+            match tokio::fs::metadata(&path).await {
+                Ok(m) => {
+                    let mtime_ns = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    format!("meta:{}:{}", m.len(), mtime_ns)
+                }
+                Err(_) => format!("literal:{cmd0}"),
+            }
+        }
     }
 }
 
@@ -345,6 +364,29 @@ mod tests {
         assert!(looks_like_path("../bin/tool"));
         assert!(looks_like_path("/usr/bin/cargo"));
         assert!(looks_like_path("dir/tool"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_only_tool_uses_metadata_not_content_free_literal() {
+        // A binary that is executable but NOT readable (no read bit) must NOT
+        // collapse to a content-free `literal:` key — that would replay stale
+        // output across an in-place upgrade. It should fold in len+mtime instead.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let id = resolve_tool_id(dir.path(), tool.to_str().unwrap()).await;
+        assert!(
+            id.starts_with("meta:"),
+            "exec-only tool must use a metadata identity, got {id:?}"
+        );
+        assert!(
+            !id.starts_with("literal:"),
+            "must not be a content-free key"
+        );
     }
 
     // -----------------------------------------------------------------------

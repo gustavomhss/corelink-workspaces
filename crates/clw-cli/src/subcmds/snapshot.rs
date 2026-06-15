@@ -39,6 +39,16 @@ pub async fn run(
     // Clamp to at least 1 so `--concurrency 0` can't stall the stream.
     opts.concurrency = concurrency.max(1);
 
+    // Progress feedback on a long, otherwise-silent op: tell an interactive user
+    // work has started so a slow snapshot isn't mistaken for a hung one. stderr
+    // only (keeps --json stdout clean) and TTY-gated (no noise in CI/pipelines).
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        eprintln!(
+            "snapshotting '{}' — large workspaces can take a while (silent until complete)…",
+            args.name
+        );
+    }
+
     let report = snapshot(&args.path, &client, &cache, &opts)
         .await
         .map_err(map_auth_error)?;

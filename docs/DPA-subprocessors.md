@@ -1,11 +1,14 @@
 # Data Processing Addendum & Sub-Processor List — CoreLink Workspaces (`clw`)
 
-> **DRAFT — owner/legal review and execution required.** This Data Processing
-> Addendum ("DPA") is an engineering draft prepared to de-risk legal lead time
-> (roadmap M6.3). The owner's business details have been filled in, but it is
-> **not** binding and has **not** been reviewed by counsel. It must be reviewed and
-> executed by an authorized signatory before it is relied upon or presented to a
-> customer. Do not execute or rely on this until the owner and legal confirm.
+> **Status — operative for the open beta; full counsel review tracked before GA.**
+> This Data Processing Addendum ("DPA") is the operative data-processing terms
+> incorporated by reference into the Terms of Service and the EULA — acceptance of
+> it is a condition of using the service (roadmap M6.3). The owner's business
+> details are filled in and it is in effect for the current open-beta / incubation
+> period. A full review by external counsel has **not** yet been completed and is a
+> tracked obligation to close **before general availability** — a known, time-limited
+> compliance gap, consistent with the EU/UK Article 27 representative note in the
+> Privacy Policy. Any material revisions from that review will be published here.
 
 This DPA forms part of, and is incorporated by reference into, the agreement
 between the Processor and the Customer governing the Customer's use of the

@@ -41,6 +41,17 @@ pub async fn run(
     let mut opts = HydrateOptions::new(&args.name);
     opts.concurrency = concurrency;
 
+    // Progress feedback on a long, otherwise-silent op (stderr only, TTY-gated):
+    // tell an interactive user work has started so a slow hydrate over a throttled
+    // link isn't mistaken for a hang. CI/pipelines stay quiet and --json stays clean.
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        eprintln!(
+            "hydrating '{}' into {} (silent until complete)…",
+            args.name,
+            args.dest.display()
+        );
+    }
+
     let report = hydrate(&args.dest, &client, &cache, &opts)
         .await
         .map_err(|e| map_hydrate_error(e, &args.name, &tenant, &args.dest))?;
