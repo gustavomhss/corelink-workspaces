@@ -342,39 +342,44 @@ impl HttpClient {
     }
 
     /// GET a paginated digest-listing endpoint at `base_url` and flatten every
-    /// page into a single `Vec<Digest>`.
+    /// page into a single `Vec<Digest>`. Generic over the page type `P` so the AC
+    /// (`refs`/`ref_key`) and CAS (`blobs`/`hash`) envelopes share one paginator.
     ///
-    /// Tolerates both ratified-pending wire shapes (bare hex array OR
-    /// `{keys,cursor?}`; see [`ListPage`]) and follows a non-empty `cursor`
-    /// internally via `?cursor=<opaque>` until the server stops returning one.
-    /// Each page GET rides the SAME [`with_retry`](Self::with_retry) /
-    /// [`Governor`] / `User-Agent` path as every other request. The OPTIMISTIC
-    /// not-yet-deployed signal (405|501) is surfaced as
-    /// `ClwError::Transport(not_deployed_msg)`, so the AC (D-7) and CAS (D-8)
-    /// messages stay distinct per caller.
-    async fn list_digests(&self, base_url: &str, not_deployed_msg: &str) -> Result<Vec<Digest>> {
+    /// Sends `?limit=1000` (the ratified max, 1..1000) to minimize round-trips and
+    /// follows a non-null `next_cursor` internally via `?cursor=<opaque>` (URL-
+    /// encoded) until the server returns `null`. Each page GET rides the SAME
+    /// [`with_retry`](Self::with_retry) / [`Governor`] / `User-Agent` path as every
+    /// other request. Until corelink-server PR #269 deploys, a 405|501 is surfaced
+    /// as `ClwError::Transport(not_deployed_msg)`, distinct per caller (D-7/D-8).
+    async fn list_digests<P: ListPage + Send>(
+        &self,
+        base_url: &str,
+        not_deployed_msg: &str,
+    ) -> Result<Vec<Digest>> {
         let auth = self.auth_header();
         let client = &self.inner;
         let mut out: Vec<Digest> = Vec::new();
         let mut cursor: Option<String> = None;
 
         loop {
-            // Append the opaque cursor as a query param when continuing.
-            let url = match &cursor {
-                Some(c) => format!("{base_url}?cursor={c}"),
-                None => base_url.to_string(),
-            };
-
-            let page: ListPage = self
+            let page: P = self
                 .with_retry(|retry_slot| {
-                    let url = url.clone();
+                    let base_url = base_url.to_string();
                     let auth = auth.clone();
+                    let cursor = cursor.clone();
                     let not_deployed_msg = not_deployed_msg.to_string();
                     async move {
-                        let resp = client
-                            .get(&url)
+                        // `?limit=1000` always; the opaque cursor is appended
+                        // (reqwest URL-encodes it) only when continuing.
+                        let mut req = client
+                            .get(&base_url)
                             .header("Authorization", &auth)
                             .header(reqwest::header::USER_AGENT, user_agent())
+                            .query(&[("limit", "1000")]);
+                        if let Some(c) = &cursor {
+                            req = req.query(&[("cursor", c.as_str())]);
+                        }
+                        let resp = req
                             .send()
                             .await
                             .map_err(|e| ClwError::Transport(e.to_string()))?;
@@ -385,25 +390,25 @@ impl HttpClient {
                                     .bytes()
                                     .await
                                     .map_err(|e| ClwError::Transport(e.to_string()))?;
-                                serde_json::from_slice::<ListPage>(&bytes).map_err(|e| {
+                                serde_json::from_slice::<P>(&bytes).map_err(|e| {
                                     ClwError::Transport(format!(
-                                        "malformed list page from {url}: {e}"
+                                        "malformed list page from {base_url}: {e}"
                                     ))
                                 })
                             }
                             401 => Err(ClwError::Auth),
-                            // OPTIMISTIC-pending: the listing endpoint isn't deployed yet.
+                            // OPTIMISTIC-pending: ratified+implemented, not yet deployed.
                             405 | 501 => Err(ClwError::Transport(not_deployed_msg)),
                             429 => {
                                 record_retry_after(&retry_slot, &resp);
                                 Err(ClwError::Http {
                                     status: 429,
-                                    context: format!("GET {url}"),
+                                    context: format!("GET {base_url}"),
                                 })
                             }
                             s => Err(ClwError::Http {
                                 status: s,
-                                context: format!("GET {url}"),
+                                context: format!("GET {base_url}"),
                             }),
                         }
                     }
@@ -508,40 +513,70 @@ fn is_retryable(e: &ClwError) -> bool {
     }
 }
 
-/// One page of a digest-listing endpoint (AC `list_refs` / CAS `list_blobs`).
+/// One page of a digest-listing endpoint, per the RATIFIED server contract
+/// (corelink-server PR #269; D-7/D-8 — see `docs/RELAY-server-D1-D7-D8.md`).
 ///
-/// The server contract (docs/REQUESTS-to-other-TLs.md D-7/D-8) is not yet
-/// ratified to one exact shape, so the client tolerates BOTH wire forms:
+/// Both endpoints share the cursor envelope
+/// `{ "<items>": [ { "<key>": "<hex>", … } ], "next_cursor": "<opaque|null>" }`
+/// but differ in the array field and the per-item key field, so each has its own
+/// page type implementing [`ListPage`]:
 ///
-/// * a bare JSON array of hex digests: `["aa..","bb.."]`
-/// * an object: `{"keys":["aa.."],"cursor":"<opaque>"}` (cursor optional)
+/// * AC  `GET /v1/ac/{tenant}`  → [`AcListPage`]  — `{"refs":  [{"ref_key":"<hex>", …}], "next_cursor"}`
+/// * CAS `GET /v1/cas/{tenant}` → [`CasListPage`] — `{"blobs": [{"hash":   "<hex>", …}], "next_cursor"}`
 ///
-/// `Digest`'s own `Deserialize` validates each hex string. A present, non-empty
-/// `cursor` means more pages follow; the caller re-requests with `?cursor=...`.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ListPage {
-    /// Bare hex array, no pagination envelope.
-    Bare(Vec<Digest>),
-    /// `{keys:[...], cursor?}` envelope.
-    Paged {
-        keys: Vec<Digest>,
-        #[serde(default)]
-        cursor: Option<String>,
-    },
+/// `Digest`'s own `Deserialize` validates each hex string; extra item fields
+/// (`updated_at`/`size`/`created_at`) are ignored. A non-null `next_cursor` means
+/// more pages follow; the caller re-requests with `?cursor=…`.
+trait ListPage: serde::de::DeserializeOwned {
+    /// Split a page into its digests and the next cursor (`None` ⇒ last page).
+    fn into_parts(self) -> (Vec<Digest>, Option<String>);
 }
 
-impl ListPage {
-    /// Split a page into `(keys, next_cursor)`. A bare array never paginates.
+/// AC ref listing (D-7): `{"refs": [{"ref_key": "<hex>", "updated_at", "size"}], "next_cursor"}`.
+#[derive(Debug, Deserialize)]
+struct AcListPage {
+    #[serde(default)]
+    refs: Vec<AcRefItem>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcRefItem {
+    ref_key: Digest,
+}
+
+/// CAS blob listing (D-8): `{"blobs": [{"hash": "<hex>", "size", "created_at"}], "next_cursor"}`.
+#[derive(Debug, Deserialize)]
+struct CasListPage {
+    #[serde(default)]
+    blobs: Vec<CasBlobItem>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CasBlobItem {
+    hash: Digest,
+}
+
+/// Treat an empty-string cursor as "no more pages". The contract uses JSON
+/// `null` for the terminal page, but an empty string would otherwise loop.
+fn norm_cursor(c: Option<String>) -> Option<String> {
+    c.filter(|c| !c.is_empty())
+}
+
+impl ListPage for AcListPage {
     fn into_parts(self) -> (Vec<Digest>, Option<String>) {
-        match self {
-            ListPage::Bare(keys) => (keys, None),
-            ListPage::Paged { keys, cursor } => {
-                // Treat an empty-string cursor as "no more pages".
-                let next = cursor.filter(|c| !c.is_empty());
-                (keys, next)
-            }
-        }
+        let keys = self.refs.into_iter().map(|r| r.ref_key).collect();
+        (keys, norm_cursor(self.next_cursor))
+    }
+}
+
+impl ListPage for CasListPage {
+    fn into_parts(self) -> (Vec<Digest>, Option<String>) {
+        let keys = self.blobs.into_iter().map(|b| b.hash).collect();
+        (keys, norm_cursor(self.next_cursor))
     }
 }
 
@@ -749,8 +784,9 @@ impl CasTransport for HttpClient {
                     200 | 202 | 204 | 404 => Ok(()),
                     401 => Err(ClwError::Auth),
                     405 | 501 => Err(ClwError::Transport(format!(
-                        "CAS delete not yet deployed (D-8) — corelink-server has no DELETE \
-                         /v1/cas handler yet; see docs/REQUESTS-to-other-TLs.md D-8 ({url})"
+                        "CAS delete not yet deployed (D-8) — ratified & implemented in \
+                         corelink-server (PR #269), pending deploy; see \
+                         docs/RELAY-server-D1-D7-D8.md ({url})"
                     ))),
                     429 => {
                         record_retry_after(&retry_slot, &resp);
@@ -770,19 +806,19 @@ impl CasTransport for HttpClient {
     }
 
     /// List the tenant's CAS blob hashes (`GET /v1/cas/{tenant}`), paginating
-    /// internally into a flat `Vec`. Tolerates a bare hex array OR
-    /// `{keys,cursor?}`. OPTIMISTIC: 405|501 surface a clear "CAS listing not yet
-    /// deployed (D-8)" error — see docs/REQUESTS-to-other-TLs.md D-8.
+    /// internally into a flat `Vec` per the ratified D-8 envelope
+    /// `{"blobs":[{"hash":…}],"next_cursor"}`. Until corelink-server PR #269
+    /// deploys, 405|501 surface a clear "CAS listing not yet deployed (D-8)" error.
     async fn list_blobs(&self) -> Result<Vec<Digest>> {
         let base_url = format!(
             "{}/v1/cas/{}",
             self.config.endpoint.trim_end_matches('/'),
             self.config.tenant
         );
-        self.list_digests(
+        self.list_digests::<CasListPage>(
             &base_url,
-            "CAS listing not yet deployed (D-8) — corelink-server has no GET /v1/cas \
-             listing endpoint yet; see docs/REQUESTS-to-other-TLs.md D-8",
+            "CAS listing not yet deployed (D-8) — ratified & implemented in \
+             corelink-server (PR #269), pending deploy; see docs/RELAY-server-D1-D7-D8.md",
         )
         .await
     }
@@ -901,8 +937,9 @@ impl AcTransport for HttpClient {
                     // Optimistic-pending case: the server has no DELETE handler yet
                     // (this branch is HELD until corelink-server ships D-1).
                     405 | 501 => Err(ClwError::Transport(format!(
-                        "ref deletion requires a corelink-server capability not yet deployed \
-                         (DELETE /v1/ac); tracked — see docs/REQUESTS-to-other-TLs.md D-1 ({url})"
+                        "ref deletion not yet deployed (D-1) — ratified & implemented in \
+                         corelink-server (PR #269), pending deploy; see \
+                         docs/RELAY-server-D1-D7-D8.md ({url})"
                     ))),
                     429 => {
                         record_retry_after(&retry_slot, &resp);
@@ -922,21 +959,21 @@ impl AcTransport for HttpClient {
     }
 
     /// List the tenant's ref keys (`GET /v1/ac/{tenant}`), paginating internally
-    /// into a flat `Vec`. Needed because `ref_key = BLAKE3(domain‖name)` is
-    /// one-way and the client keeps no name→key index. Tolerates a bare hex
-    /// array OR `{keys,cursor?}`. OPTIMISTIC: 405|501 surface a clear "ref
-    /// listing not yet deployed (D-7)" error — see docs/REQUESTS-to-other-TLs.md
-    /// D-7.
+    /// into a flat `Vec` per the ratified D-7 envelope
+    /// `{"refs":[{"ref_key":…}],"next_cursor"}`. Needed because
+    /// `ref_key = BLAKE3(domain‖name)` is one-way and the client keeps no
+    /// name→key index. Until corelink-server PR #269 deploys, 405|501 surface a
+    /// clear "ref listing not yet deployed (D-7)" error.
     async fn list_refs(&self) -> Result<Vec<Digest>> {
         let base_url = format!(
             "{}/v1/ac/{}",
             self.config.endpoint.trim_end_matches('/'),
             self.config.tenant
         );
-        self.list_digests(
+        self.list_digests::<AcListPage>(
             &base_url,
-            "ref listing not yet deployed (D-7) — corelink-server has no GET /v1/ac \
-             listing endpoint yet; see docs/REQUESTS-to-other-TLs.md D-7",
+            "ref listing not yet deployed (D-7) — ratified & implemented in \
+             corelink-server (PR #269), pending deploy; see docs/RELAY-server-D1-D7-D8.md",
         )
         .await
     }
@@ -1605,15 +1642,20 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn ac_list_refs_bare_array() {
+    async fn ac_list_refs_single_page() {
+        // Ratified D-7 envelope: {"refs":[{"ref_key":"<hex>",..}], "next_cursor":null}.
         let server = MockServer::start().await;
         let d1 = Digest::of_bytes(b"ref-one");
         let d2 = Digest::of_bytes(b"ref-two");
-        let body = format!(r#"["{d1}","{d2}"]"#);
+        // Include the extra contract fields to prove they're tolerated/ignored.
+        let body = format!(
+            r#"{{"refs":[{{"ref_key":"{d1}","updated_at":"2026-06-14T00:00:00Z","size":10}},{{"ref_key":"{d2}","updated_at":"2026-06-14T00:00:01Z","size":20}}],"next_cursor":null}}"#
+        );
 
         Mock::given(method("GET"))
             .and(path("/v1/ac/test-tenant"))
             .and(header("Authorization", "Bearer test-token"))
+            .and(query_param("limit", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -1629,29 +1671,27 @@ mod tests {
         let d1 = Digest::of_bytes(b"page1-a");
         let d2 = Digest::of_bytes(b"page2-a");
 
-        // Page 1: a cursor envelope pointing at the next page.
+        // Page 2 (continuation): cursor present → terminal page (next_cursor null).
         Mock::given(method("GET"))
             .and(path("/v1/ac/test-tenant"))
             .and(query_param("cursor", "next-1"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(format!(r#"{{"keys":["{d2}"],"cursor":""}}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"refs":[{{"ref_key":"{d2}"}}],"next_cursor":null}}"#
+            )))
             .mount(&server)
             .await;
-        // The first (cursor-less) request: keys + a non-empty cursor.
+        // Page 1 (first, cursor-less): a non-null next_cursor points at page 2.
         Mock::given(method("GET"))
             .and(path("/v1/ac/test-tenant"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(format!(r#"{{"keys":["{d1}"],"cursor":"next-1"}}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"refs":[{{"ref_key":"{d1}"}}],"next_cursor":"next-1"}}"#
+            )))
             .mount(&server)
             .await;
 
         let client = make_client(server.uri());
         let refs = AcTransport::list_refs(&client).await.unwrap();
-        // Both pages flattened, in page order. (Empty cursor on page 2 stops.)
+        // Both pages flattened, in page order. (null cursor on page 2 stops.)
         assert_eq!(refs, vec![d1, d2]);
     }
 
@@ -1793,15 +1833,19 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn cas_list_blobs_bare_array() {
+    async fn cas_list_blobs_single_page() {
+        // Ratified D-8 envelope: {"blobs":[{"hash":"<hex>",..}], "next_cursor":null}.
         let server = MockServer::start().await;
         let d1 = Digest::of_bytes(b"blob-one");
         let d2 = Digest::of_bytes(b"blob-two");
-        let body = format!(r#"["{d1}","{d2}"]"#);
+        let body = format!(
+            r#"{{"blobs":[{{"hash":"{d1}","size":10,"created_at":"2026-06-14T00:00:00Z"}},{{"hash":"{d2}","size":20,"created_at":"2026-06-14T00:00:01Z"}}],"next_cursor":null}}"#
+        );
 
         Mock::given(method("GET"))
             .and(path("/v1/cas/test-tenant"))
             .and(header("Authorization", "Bearer test-token"))
+            .and(query_param("limit", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&server)
             .await;
@@ -1817,20 +1861,21 @@ mod tests {
         let d1 = Digest::of_bytes(b"cblob-1");
         let d2 = Digest::of_bytes(b"cblob-2");
 
+        // Page 2 (continuation): terminal page (next_cursor null).
         Mock::given(method("GET"))
             .and(path("/v1/cas/test-tenant"))
             .and(query_param("cursor", "c2"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(format!(r#"{{"keys":["{d2}"]}}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"blobs":[{{"hash":"{d2}"}}],"next_cursor":null}}"#
+            )))
             .mount(&server)
             .await;
+        // Page 1: a non-null next_cursor points at page 2.
         Mock::given(method("GET"))
             .and(path("/v1/cas/test-tenant"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(format!(r#"{{"keys":["{d1}"],"cursor":"c2"}}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"blobs":[{{"hash":"{d1}"}}],"next_cursor":"c2"}}"#
+            )))
             .mount(&server)
             .await;
 
