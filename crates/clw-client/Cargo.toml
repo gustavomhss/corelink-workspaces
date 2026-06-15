@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 clw-types = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }

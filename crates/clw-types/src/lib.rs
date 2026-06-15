@@ -178,19 +178,10 @@ impl Manifest {
     }
 }
 
-/// True if `comp` begins with a Windows drive-letter spec (`C:`, `d:`...). Such a
-/// component is drive-relative/absolute on Windows and would escape `dest` via
-/// `Path::join`, so it is rejected on EVERY platform (a manifest must hydrate
-/// identically everywhere). `:` is also forbidden in Windows filenames, so this
-/// rule keeps manifests portable.
-fn starts_with_drive_letter(comp: &str) -> bool {
-    let b = comp.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
-}
-
 /// Validate that a manifest entry path is a safe RELATIVE path (the documented
-/// invariant). Rejects absolute paths, backslashes, Windows drive-letters, and
-/// any '.'/'..'/empty component — on every platform, for portable hydration.
+/// invariant). Rejects absolute paths, backslashes, any component containing a
+/// colon, and any '.'/'..'/empty component — on every platform, for portable
+/// hydration.
 pub fn validate_rel_path(p: &str) -> Result<()> {
     if p.is_empty() {
         return Err(ClwError::InvalidManifest("empty path".into()));
@@ -211,9 +202,14 @@ pub fn validate_rel_path(p: &str) -> Result<()> {
                 "unsafe path component in: {p}"
             )));
         }
-        if starts_with_drive_letter(comp) {
+        // Reject ANY colon in a component, not just a leading drive-letter (`C:`):
+        // on Windows a mid-component colon (`secret.txt:hidden`) names an NTFS
+        // Alternate Data Stream, so `File::create` would write into a hidden
+        // stream and clobber the visible sibling. `:` is illegal in Windows
+        // filenames anyway, so this rule keeps manifests portable on every host.
+        if comp.contains(':') {
             return Err(ClwError::InvalidManifest(format!(
-                "Windows drive-letter component not allowed: {p}"
+                "colon not allowed in path component (Windows drive-letter / NTFS ADS): {p}"
             )));
         }
     }
@@ -243,9 +239,9 @@ pub fn validate_symlink_target(t: &str) -> Result<()> {
                 "symlink target escapes workspace: {t}"
             )));
         }
-        if starts_with_drive_letter(comp) {
+        if comp.contains(':') {
             return Err(ClwError::InvalidManifest(format!(
-                "Windows drive-letter symlink target not allowed: {t}"
+                "colon not allowed in symlink target (Windows drive-letter / NTFS ADS): {t}"
             )));
         }
     }
@@ -532,8 +528,12 @@ mod tests {
         assert!(validate_rel_path("C:foo").is_err());
         assert!(validate_rel_path("C:/evil").is_err());
         assert!(validate_rel_path("dir/D:bar").is_err());
-        // A colon mid-component is NOT a drive-letter and stays allowed.
-        assert!(validate_rel_path("foo:bar").is_ok());
+        // ANY colon is rejected: a mid-component colon names an NTFS Alternate
+        // Data Stream on Windows (`secret.txt:hidden` → hidden stream + sibling
+        // clobber), so it is refused on every platform for portable hydration.
+        assert!(validate_rel_path("foo:bar").is_err());
+        assert!(validate_rel_path("secret.txt:hidden").is_err());
+        assert!(validate_rel_path("dir/file.txt:$DATA").is_err());
     }
 
     #[test]
@@ -547,5 +547,7 @@ mod tests {
         assert!(validate_symlink_target("..\\..\\x").is_err());
         assert!(validate_symlink_target("C:\\evil").is_err());
         assert!(validate_symlink_target("C:/evil").is_err());
+        // NTFS ADS colon rejected on every platform.
+        assert!(validate_symlink_target("a.txt:hidden").is_err());
     }
 }

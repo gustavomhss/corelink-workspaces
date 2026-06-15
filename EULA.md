@@ -8,7 +8,7 @@ HumanGR proprietary software
 THIS END USER LICENSE AGREEMENT ("**Agreement**" or "**EULA**") is a legal
 agreement between you (either an individual or a single legal entity, "**Licensee**"
 or "**you**") and Human Guardrail LTDA, a limited-liability company (sociedade
-limitada) organized under the laws of Brazil ("**Licensor**",
+empresária limitada) organized under the laws of Brazil ("**Licensor**",
 "**HumanGR**", "**we**", "**us**"), for the CoreLink Workspaces software,
 including the `clw` command-line interface and all associated executable
 components, libraries, configuration tooling, and accompanying documentation

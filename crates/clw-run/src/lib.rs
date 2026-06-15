@@ -67,7 +67,7 @@ struct KeyPayload {
 /// `PATH` is searched for the first matching file. When the executable can be
 /// read, the identity is its content digest; if it cannot be located or read,
 /// we fall back to a literal marker so the key is still well-defined.
-fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
+async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
     // If cmd0 is a path, resolve it against the RUN cwd — a relative tool path
     // must resolve where the command actually runs, not against the orchestrator
     // process cwd (else the digest is unstable / wrong). `Path::join` returns
@@ -81,7 +81,15 @@ fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
                 .find(|p| p.is_file())
         })
     };
-    match candidate.and_then(|p| std::fs::read(&p).ok()) {
+    // Read via tokio::fs so the (potentially large) toolchain binary is not read
+    // with a BLOCKING std::fs call on the async worker (matches how the inputs
+    // above are digested). If the file can't be located or read, fall back to a
+    // literal marker so the key is still well-defined.
+    let bytes = match candidate {
+        Some(p) => tokio::fs::read(&p).await.ok(),
+        None => None,
+    };
+    match bytes {
         Some(bytes) => format!("digest:{}", Digest::of_bytes(&bytes).to_hex()),
         None => format!("literal:{cmd0}"),
     }
@@ -170,7 +178,7 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     let tool = if opts.command.is_empty() {
         String::new()
     } else {
-        resolve_tool_id(cwd, &opts.command[0])
+        resolve_tool_id(cwd, &opts.command[0]).await
     };
 
     // --- canonical JSON ---
