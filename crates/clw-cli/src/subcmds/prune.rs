@@ -39,27 +39,48 @@ pub struct PruneArgs {
 pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let client = HttpClient::new(cfg.clw_config)?;
 
-    // --- MARK: compute the live set (reachable roots + their chunks) --------
+    // ORDER MATTERS for GC correctness. Snapshot the blob CANDIDATE set FIRST
+    // (at T0), THEN compute the live set (refs read at T1 > T0). With candidates
+    // frozen before the mark, any blob that becomes live in the gap is reflected
+    // in `live` (so it is never orphaned), and any blob written after T0 is simply
+    // not a candidate. The reverse order (mark, then list blobs) would sweep a
+    // concurrently-pushed ref's blobs as orphans — live-data loss.
+    //
+    // RESIDUAL (documented, not closed client-side): a push whose blobs were
+    // already in CAS before T0 but whose ref write lands AFTER the mark read can
+    // still have those blobs swept. The fully-correct fix is a server-side GC
+    // lease/epoch (a corelink-server item). Until then `prune` is dry-run-by-
+    // default; run it in a low-write window and review the dry-run first.
+    let all_blobs = match CasTransport::list_blobs(&client).await {
+        Ok(b) => b,
+        Err(e) if is_not_deployed(&e) => return not_deployed(json, "prune (CAS GC)", "D-8"),
+        Err(e) => return Err(map_auth_error(e)),
+    };
     let live = match compute_live_set(&client).await {
         Ok(live) => live,
-        Err(e) if is_not_deployed(&e) => {
-            return not_deployed(json, "prune (CAS GC)", "D-7/D-8");
-        }
+        Err(e) if is_not_deployed(&e) => return not_deployed(json, "prune (CAS GC)", "D-7/D-8"),
         Err(e) => return Err(map_auth_error(e)),
     };
 
-    // --- SWEEP: every blob not in the live set is an orphan -----------------
-    let all_blobs = match CasTransport::list_blobs(&client).await {
-        Ok(b) => b,
-        Err(e) if is_not_deployed(&e) => {
-            return not_deployed(json, "prune (CAS GC)", "D-8");
-        }
-        Err(e) => return Err(map_auth_error(e)),
-    };
+    let total_blobs = all_blobs.len();
     let orphans: Vec<Digest> = all_blobs
         .into_iter()
         .filter(|d| !live.contains(d))
         .collect();
+
+    // SAFETY FLOOR: an empty live set turning 100% of a non-empty CAS into orphans
+    // is indistinguishable from a transiently-empty/stale ref index (a D-7 200 with
+    // `{"refs":[]}` during replica lag or a reindex). Refuse the full wipe rather
+    // than risk deleting a live tenant on a spurious empty page.
+    if args.yes && live.is_empty() && !orphans.is_empty() {
+        return Err(ClwError::Transport(format!(
+            "refusing to prune: the live set is empty but CAS holds {total_blobs} blob(s) — \
+             pruning would delete the ENTIRE tenant, which usually means the ref index is \
+             transiently empty/stale (D-7 returned no refs), not that every blob is truly \
+             orphaned. Verify with `clw ls --all`; if the tenant is genuinely empty, use \
+             `clw erase` (which requires typed-tenant confirmation) instead"
+        )));
+    }
 
     // Dry run (default): report and stop. A delete this broad must be explicit.
     if !args.yes {
@@ -88,13 +109,32 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         return Ok(());
     }
 
-    // --- DELETE: remove each orphan -----------------------------------------
+    // --- DELETE: remove each orphan, never discarding progress on failure ----
     let mut deleted = 0usize;
+    let mut failure: Option<(Digest, ClwError)> = None;
     for d in &orphans {
-        CasTransport::delete(&client, d)
-            .await
-            .map_err(map_auth_error)?;
+        if let Err(e) = CasTransport::delete(&client, d).await {
+            failure = Some((*d, map_auth_error(e)));
+            break;
+        }
         deleted += 1;
+    }
+
+    if let Some((digest, err)) = failure {
+        // Partial GC: report what WAS deleted (resumable/auditable) then fail.
+        if json {
+            println!(
+                "{}",
+                json!({ "dry_run": false, "live": live.len(), "deleted": deleted, "failed_at": digest.to_hex() })
+            );
+        } else {
+            eprintln!(
+                "prune: deleted {deleted} of {} orphan(s) before failing at {}; re-run to resume",
+                orphans.len(),
+                digest.to_hex()
+            );
+        }
+        return Err(err);
     }
 
     if json {
@@ -144,22 +184,18 @@ fn is_not_deployed(err: &ClwError) -> bool {
     matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
 }
 
-/// Render the optimistic-pending case: graceful JSON note, or actionable error.
+/// Render the optimistic-pending case. ALWAYS fails (non-zero exit) so a
+/// destructive command that did nothing never reports success — in `--json` mode
+/// the structured note is printed first, then the error propagates (same exit
+/// code as human mode).
 fn not_deployed(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+    let msg = format!(
+        "{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/RELAY-server-D1-D7-D8.md)"
+    );
     if json {
-        println!(
-            "{}",
-            json!({
-                "error": "not-deployed",
-                "note": format!("{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"),
-            })
-        );
-        Ok(())
-    } else {
-        Err(ClwError::Transport(format!(
-            "{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/REQUESTS-to-other-TLs.md)"
-        )))
+        println!("{}", json!({ "error": "not-deployed", "note": msg }));
     }
+    Err(ClwError::Transport(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +246,9 @@ mod tests {
     }
 
     #[test]
-    fn not_deployed_json_is_ok_human_is_err() {
-        assert!(not_deployed(true, "prune (CAS GC)", "D-8").is_ok());
+    fn not_deployed_fails_in_both_modes() {
+        // A destructive command that did nothing must never report success.
+        assert!(not_deployed(true, "prune (CAS GC)", "D-8").is_err());
         assert!(not_deployed(false, "prune (CAS GC)", "D-8").is_err());
     }
 }
