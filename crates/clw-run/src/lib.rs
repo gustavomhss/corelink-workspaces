@@ -61,25 +61,62 @@ struct KeyPayload {
     tool: String,
 }
 
+/// True if `cmd0` is a path (resolve directly) rather than a bare name to look up
+/// on `PATH`. Cross-platform: matches a forward slash (every platform), the OS
+/// path separator (`\` on Windows), and absolute paths incl. Windows drive-letters
+/// (`C:\tool.exe`, `C:/tool.exe`). Without the Windows arms, a backslash/drive
+/// path would fall into the PATH branch, miss, and silently degrade the tool key.
+fn looks_like_path(cmd0: &str) -> bool {
+    cmd0.contains('/') || cmd0.contains(std::path::MAIN_SEPARATOR) || Path::new(cmd0).is_absolute()
+}
+
+/// Search `PATH` for a bare command name. On Windows a bare `cargo` is launched as
+/// `cargo.exe`, so we also try each `PATHEXT` extension — otherwise the lookup
+/// misses and the tool key degrades to a content-free literal.
+fn search_path(cmd0: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let direct = dir.join(cmd0);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(windows)]
+        {
+            // PATHEXT is `;`-separated (".COM;.EXE;.BAT;..."), which is exactly the
+            // Windows PATH separator, so `split_paths` parses it; each entry keeps
+            // its leading dot.
+            if let Some(exts) = std::env::var_os("PATHEXT") {
+                for ext in std::env::split_paths(&exts) {
+                    let ext = ext.to_string_lossy();
+                    if ext.is_empty() {
+                        continue;
+                    }
+                    let candidate = dir.join(format!("{cmd0}{ext}"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve `command[0]` to a stable tool-identity string.
 ///
-/// If `cmd0` looks like a path (contains `/`), it is used directly; otherwise
-/// `PATH` is searched for the first matching file. When the executable can be
-/// read, the identity is its content digest; if it cannot be located or read,
-/// we fall back to a literal marker so the key is still well-defined.
+/// If `cmd0` is a path (see [`looks_like_path`]) it is resolved against the RUN
+/// cwd; otherwise `PATH` is searched (with `PATHEXT` on Windows). When the
+/// executable can be read, the identity is its content digest; if it cannot be
+/// located or read, we fall back to a literal marker so the key is still
+/// well-defined.
 async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
-    // If cmd0 is a path, resolve it against the RUN cwd — a relative tool path
-    // must resolve where the command actually runs, not against the orchestrator
-    // process cwd (else the digest is unstable / wrong). `Path::join` returns
-    // cmd0 unchanged when it is already absolute. Otherwise search PATH.
-    let candidate: Option<std::path::PathBuf> = if cmd0.contains('/') {
+    // A relative tool path must resolve where the command actually RUNS, not
+    // against the orchestrator process cwd (else the digest is unstable / wrong).
+    // `Path::join` returns cmd0 unchanged when it is already absolute.
+    let candidate: Option<std::path::PathBuf> = if looks_like_path(cmd0) {
         Some(cwd.join(cmd0))
     } else {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|d| d.join(cmd0))
-                .find(|p| p.is_file())
-        })
+        search_path(cmd0)
     };
     // Read via tokio::fs so the (potentially large) toolchain binary is not read
     // with a BLOCKING std::fs call on the async worker (matches how the inputs
@@ -295,6 +332,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn looks_like_path_detects_paths_cross_platform() {
+        // Bare names are PATH lookups (false); anything with a separator or an
+        // absolute prefix is a direct path (true). These cases hold on every
+        // platform; the Windows-only `\`/drive-letter arms are exercised by the
+        // cross-compile gate and behave per std::path on a Windows host.
+        assert!(!looks_like_path("cargo"));
+        assert!(!looks_like_path("rustc"));
+        assert!(looks_like_path("./tool"));
+        assert!(looks_like_path("../bin/tool"));
+        assert!(looks_like_path("/usr/bin/cargo"));
+        assert!(looks_like_path("dir/tool"));
+    }
 
     // -----------------------------------------------------------------------
     // In-memory fake transport
