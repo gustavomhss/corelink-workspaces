@@ -3,3 +3,5 @@
 .DS_Store
 *.local
 .env*
+# Owner's local legal-fill worksheet — prefilled scratch, never tracked.
+/OWNER-LEGAL-FILLINS.html
