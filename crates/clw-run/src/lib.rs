@@ -61,6 +61,38 @@ struct KeyPayload {
     tool: String,
 }
 
+/// FIX 3: normalize a path string to `/` separators so the run key is stable
+/// regardless of how the path was discovered. A top-level input is recorded
+/// verbatim while the dir-walk joins nested entries with `/`; on Windows the
+/// two forms differ (`a\b` vs `a/b`), spuriously splitting the cache and risking
+/// a cross-platform key mismatch. Normalizing every path that feeds the key to
+/// `/` makes it separator-stable. On unix `MAIN_SEPARATOR` is already `/`, so
+/// this is a no-op there (a literal `\` in a unix filename is left untouched).
+fn norm_sep(p: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        p.to_string()
+    } else {
+        p.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
+/// FIX 2: the unix permission bits (masked to `0o777`) of an input file, folded
+/// into the key so a `chmod +x` invalidates a stale memoized result even though
+/// the content is byte-identical. On non-unix there is no mode concept, so a
+/// stable constant is returned (matching how `clw-manifest::walk` treats it).
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0o644
+    }
+}
+
 /// True if `cmd0` is a path (resolve directly) rather than a bare name to look up
 /// on `PATH`. Cross-platform: matches a forward slash (every platform), the OS
 /// path separator (`\` on Windows), and absolute paths incl. Windows drive-letters
@@ -157,10 +189,18 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
 /// `Err(ClwError::InvalidManifest(...))` for walk errors.
 async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     // --- inputs ---
+    // NOTE (cache-key change): this key now folds in (a) empty input directories
+    // by path, (b) each input file's unix mode (exec/perm bits), and (c) `/`-
+    // normalized path separators. All three CORRECTLY invalidate pre-existing
+    // cache entries — that is expected, not a regression.
     let mut input_pairs: Vec<[String; 2]> = Vec::new();
 
     for rel in &opts.inputs {
-        let abs = cwd.join(rel);
+        // Normalize the top-level input path so a key is stable regardless of the
+        // separator the caller used (`\` on Windows) and identical to the form the
+        // dir-walk emits for nested entries (which join with `/`). See `norm_sep`.
+        let rel = norm_sep(rel);
+        let abs = cwd.join(&rel);
         let meta = tokio::fs::symlink_metadata(&abs).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 std::io::Error::new(
@@ -175,36 +215,54 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
         if meta.file_type().is_symlink() {
             // Symlink: contribute target string.
             let target = tokio::fs::read_link(&abs).await?;
-            let target_str = target.to_string_lossy().into_owned();
+            let target_str = norm_sep(&target.to_string_lossy());
             input_pairs.push([rel.clone(), format!("symlink:{}", target_str)]);
         } else if meta.file_type().is_dir() {
             // Directory: walk it, digest each file, collect entries sorted by rel path.
             let walked = walk(&abs)?;
+            // FIX 1: a directly-declared input directory that is ITSELF empty walks
+            // to zero entries (`walk` skips its own root), so without this it would
+            // contribute nothing and adding/removing the dir would be a false hit.
+            // Anchor its path so its presence/absence moves the key.
+            if walked.is_empty() {
+                input_pairs.push([rel.clone(), "emptydir".to_string()]);
+            }
             for entry in walked {
                 match entry {
                     clw_manifest::WalkedEntry::File(f) => {
                         let content = tokio::fs::read(&f.abs).await?;
                         let digest = Digest::of_bytes(&content);
-                        let entry_rel = format!("{}/{}", rel, f.rel);
-                        input_pairs.push([entry_rel, digest.to_hex()]);
+                        let entry_rel = format!("{}/{}", rel, norm_sep(&f.rel));
+                        // FIX 2: fold the file's mode (perm bits) into the value so a
+                        // `chmod +x` on a declared input changes the key even though
+                        // the content is byte-identical. `walk` already masks to 0o777.
+                        input_pairs.push([entry_rel, format!("{}:{:o}", digest.to_hex(), f.mode)]);
                     }
                     clw_manifest::WalkedEntry::Symlink {
                         rel: sym_rel,
                         target,
                     } => {
-                        let entry_rel = format!("{}/{}", rel, sym_rel);
-                        input_pairs.push([entry_rel, format!("symlink:{}", target)]);
+                        let entry_rel = format!("{}/{}", rel, norm_sep(&sym_rel));
+                        input_pairs.push([entry_rel, format!("symlink:{}", norm_sep(&target))]);
                     }
-                    clw_manifest::WalkedEntry::EmptyDir { .. } => {
-                        // Empty dirs contribute no content; skip.
+                    clw_manifest::WalkedEntry::EmptyDir { rel: dir_rel } => {
+                        // FIX 1: an empty input directory must still contribute its
+                        // path to the key — otherwise a build that depends on the
+                        // dir's presence/absence gets a false hit when it appears or
+                        // disappears. Content-free, but path-bearing.
+                        let entry_rel = format!("{}/{}", rel, norm_sep(&dir_rel));
+                        input_pairs.push([entry_rel, "emptydir".to_string()]);
                     }
                 }
             }
         } else {
-            // Regular file: digest bytes.
+            // Regular file: digest bytes + fold in the unix mode (FIX 2).
             let content = tokio::fs::read(&abs).await?;
             let digest = Digest::of_bytes(&content);
-            input_pairs.push([rel.clone(), digest.to_hex()]);
+            input_pairs.push([
+                rel.clone(),
+                format!("{}:{:o}", digest.to_hex(), file_mode(&meta)),
+            ]);
         }
     }
 
@@ -1034,6 +1092,160 @@ mod tests {
     // Test: mutating the tool's content in place (same path) changes the key.
     // This is the toolchain-upgrade scenario M3 guards against.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // FIX 1: an empty input subdir must contribute its path to the key, so a
+    // build that depends on the dir's presence/absence does not get a false hit
+    // when it appears or disappears. Same inputs, empty subdir present vs absent
+    // → different keys.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn empty_input_dir_presence_changes_key() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        // A declared directory input with one file plus an empty subdir.
+        std::fs::create_dir(cwd.join("d")).unwrap();
+        std::fs::write(cwd.join("d/file.txt"), b"data").unwrap();
+
+        let opts = RunOptions {
+            inputs: vec!["d".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+
+        // Without the empty subdir.
+        let key_absent = compute_key(cwd, &opts).await.unwrap();
+
+        // Now add an empty subdir (no content change to any file).
+        std::fs::create_dir(cwd.join("d/empty")).unwrap();
+        let key_present = compute_key(cwd, &opts).await.unwrap();
+
+        assert_ne!(
+            key_absent, key_present,
+            "an empty input subdir appearing must change the key (no false hit)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 1 (directly-declared variant): an input directory that is ITSELF empty
+    // must still be path-bearing — adding/removing it changes the key. `walk`
+    // skips its own root, so this exercises the `walked.is_empty()` anchor.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn directly_declared_empty_dir_input_is_keyed() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("a.txt"), b"x").unwrap();
+        std::fs::create_dir(cwd.join("e")).unwrap();
+
+        let with_dir = RunOptions {
+            inputs: vec!["a.txt".to_string(), "e".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+        let without_dir = RunOptions {
+            inputs: vec!["a.txt".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+
+        let key_with = compute_key(cwd, &with_dir).await.unwrap();
+        let key_without = compute_key(cwd, &without_dir).await.unwrap();
+        assert_ne!(
+            key_with, key_without,
+            "an empty directory declared as an input must contribute to the key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 2: toggling an input file's exec bit (same content) must change the
+    // key — the command's behavior depends on the mode even though bytes are
+    // identical.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_file_mode_change_yields_different_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let f = cwd.join("script");
+        std::fs::write(&f, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let opts = RunOptions {
+            inputs: vec!["script".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+        let key_nonexec = compute_key(cwd, &opts).await.unwrap();
+
+        // chmod +x — content unchanged, only the exec bit flips.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key_exec = compute_key(cwd, &opts).await.unwrap();
+
+        assert_ne!(
+            key_nonexec, key_exec,
+            "toggling the exec bit on an input file must change the key"
+        );
+    }
+
+    // Same as above but for a file discovered INSIDE a directory input, so the
+    // dir-walk path also folds in mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_dir_file_mode_change_yields_different_key() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir(cwd.join("bin")).unwrap();
+        let f = cwd.join("bin/run");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let opts = RunOptions {
+            inputs: vec!["bin".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+        let before = compute_key(cwd, &opts).await.unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let after = compute_key(cwd, &opts).await.unwrap();
+        assert_ne!(
+            before, after,
+            "exec-bit change on a file inside a dir input must change the key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 3: a path with `\` separators must normalize to the same key bytes as
+    // its `/` form, so the key is separator-stable (cross-platform). On unix
+    // `MAIN_SEPARATOR` is `/`, so we test `norm_sep` directly to keep the
+    // behavior assertion platform-independent.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn norm_sep_normalizes_to_forward_slash() {
+        // On Windows the OS separator is collapsed to `/`.
+        #[cfg(windows)]
+        {
+            assert_eq!(norm_sep(r"a\b\c"), "a/b/c");
+            assert_eq!(norm_sep("a/b/c"), "a/b/c");
+            // Mixed separators land on the same canonical form.
+            assert_eq!(norm_sep(r"a\b/c"), "a/b/c");
+        }
+        // On unix `/` is already canonical and a literal backslash is a valid
+        // filename character, so it is preserved untouched.
+        #[cfg(not(windows))]
+        {
+            assert_eq!(norm_sep("a/b/c"), "a/b/c");
+            assert_eq!(norm_sep(r"a\b"), r"a\b");
+        }
+    }
 
     #[cfg(unix)] // shell-script tooling + mode bits are unix-only (Windows port: M2)
     #[tokio::test]
