@@ -207,13 +207,16 @@ impl HttpClient {
     /// exceeds — `max` concurrent CAS/AC requests. `max` is floored at 1.
     pub fn with_concurrency(config: Config, max: usize) -> Result<Self> {
         // Refuse to send the PAT over plaintext http://, except loopback for
-        // dev/tests (the wiremock suite uses http://127.0.0.1:<port>).
+        // dev/tests (the wiremock suite uses http://127.0.0.1:<port>). BOTH the
+        // https and the loopback judgements parse with the `url` crate reqwest
+        // dials with, so neither can be fooled by embedded `@`-userinfo (the
+        // PAT-smuggling vector — see `is_safe_https` / `is_loopback_http`).
         let ep = config.endpoint.trim();
-        let is_https = ep.starts_with("https://");
+        let is_https = is_safe_https(ep);
         let is_local_http = is_loopback_http(ep);
         if !is_https && !is_local_http {
             return Err(ClwError::Transport(format!(
-                "refusing to send PAT over plaintext: endpoint must be https:// (got '{ep}'); http:// is only allowed for loopback"
+                "refusing to send PAT over plaintext: endpoint must be https:// with no embedded credentials (got '{ep}'); http:// is only allowed for loopback"
             )));
         }
 
@@ -514,7 +517,8 @@ fn record_retry_after(slot: &AtomicU64, resp: &reqwest::Response) {
 /// `http://127.0.0.1:80@evil.com` actually dials `evil.com` (the `127.0.0.1:80`
 /// is *userinfo*), which would leak the token in cleartext to the attacker host.
 /// Embedded credentials are therefore rejected outright. Only `http://` is gated
-/// here; `https://` is always allowed and never reaches this function.
+/// here; `https://` endpoints go through [`is_safe_https`] (same `@`-userinfo
+/// defense on the TLS path).
 fn is_loopback_http(ep: &str) -> bool {
     let Ok(url) = url::Url::parse(ep.trim()) else {
         return false;
@@ -531,6 +535,25 @@ fn is_loopback_http(ep: &str) -> bool {
         Some(url::Host::Domain(d)) => d == "localhost",
         None => false,
     }
+}
+
+/// Returns `true` iff `ep` is an `https://` URL with a real host and **no**
+/// embedded userinfo.
+///
+/// SECURITY (HIGH): a naive `ep.starts_with("https://")` accepts
+/// `https://legit-looking-host@evil.com`, but the part before the `@` is
+/// *userinfo* — reqwest dials `evil.com` and the bearer PAT is sent (over TLS) to
+/// the attacker host. Parsing with the same `url` crate reqwest uses to dial
+/// makes the host judgement on the EXACT authority that receives the token, and
+/// rejects any embedded credentials outright.
+fn is_safe_https(ep: &str) -> bool {
+    let Ok(url) = url::Url::parse(ep.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    url.host().is_some()
 }
 
 /// Generous ceiling for a single list page (D-7/D-8): ≤1000 small JSON items per
@@ -2166,6 +2189,38 @@ mod tests {
             assert!(
                 HttpClient::new(test_config(ep.into())).is_ok(),
                 "genuine loopback {ep:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_https_userinfo_smuggling() {
+        // Regression (HIGH, brutal-audit 2026-06-15): the https gate was a naive
+        // `starts_with("https://")`, so `https://legit@evil.com` passed while
+        // reqwest dials `evil.com` (the `legit` is userinfo) — the PAT is sent
+        // over TLS to the attacker host. Same `@`-smuggle class as the loopback
+        // CRIT, on the TLS path. All embedded-credential forms must be refused.
+        for ep in [
+            "https://legit-host@evil.com/v1",
+            "https://127.0.0.1@evil.com",
+            "https://user:pass@evil.com/v1/cas",
+            "https://api.corelink.dev:443@evil.com",
+        ] {
+            let err = HttpClient::new(test_config(ep.into())).unwrap_err();
+            assert!(
+                matches!(err, ClwError::Transport(_)),
+                "https userinfo smuggle {ep:?} must be refused, got {err:?}"
+            );
+        }
+        // Genuine https endpoints (with/without port/path) stay accepted.
+        for ep in [
+            "https://api.corelink.dev",
+            "https://api.corelink.dev:8443/v1",
+            "https://10.0.0.5/v1/cas",
+        ] {
+            assert!(
+                HttpClient::new(test_config(ep.into())).is_ok(),
+                "genuine https {ep:?} must be accepted"
             );
         }
     }

@@ -93,6 +93,75 @@ fn clw_config_dir() -> Option<std::path::PathBuf> {
     home_dir().map(|h| h.join(".clw"))
 }
 
+/// Defensive guard for the recursive `remove_dir_all`. The cache dir is
+/// user-configurable and may resolve to ANYWHERE (e.g. `cache_dir = "."` or a
+/// fat-fingered `/`), so refuse to recursively delete a path that is clearly not
+/// a dedicated clw directory: the filesystem root or a top-level dir, the user's
+/// home directory, or the current working directory / any ancestor of it.
+/// Returns `Some(reason)` when the path must NOT be auto-removed.
+///
+/// SECURITY (HIGH): without this, `clw uninstall --yes` would `remove_dir_all`
+/// the resolved cache dir unconditionally — a `cache_dir` of `.` wipes the CWD
+/// tree. The config dir (`~/.clw`) is safe by construction; this primarily
+/// guards the externally-configurable cache dir.
+fn unsafe_removal_reason(path: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+
+    // Make absolute WITHOUT canonicalizing (the path need not exist yet), then
+    // fold away `.`/`..` so depth + ancestor checks see the real target.
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut norm = std::path::PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                norm.pop();
+            }
+            other => norm.push(other.as_os_str()),
+        }
+    }
+
+    // A clw cache lives several levels deep (`~/.clw/cache`, or an explicit
+    // project path) — never at the root or a single-segment top-level dir.
+    let depth = norm
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    if depth < 2 {
+        return Some(format!(
+            "resolves to '{}', the filesystem root or a top-level directory",
+            norm.display()
+        ));
+    }
+    if home_dir().is_some_and(|h| h == norm) {
+        return Some(format!(
+            "resolves to your home directory '{}'",
+            norm.display()
+        ));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd == norm {
+            return Some(format!(
+                "resolves to the current working directory '{}'",
+                norm.display()
+            ));
+        }
+        if cwd.starts_with(&norm) {
+            return Some(format!(
+                "resolves to '{}', an ancestor of the current working directory",
+                norm.display()
+            ));
+        }
+    }
+    None
+}
+
 /// Whether we may prompt interactively (stdin is a TTY).
 fn is_interactive() -> bool {
     use std::io::IsTerminal as _;
@@ -113,6 +182,21 @@ pub async fn run(
     json: bool,
 ) -> Result<(), ClwError> {
     let targets = resolve_targets(clw_config_dir(), &cache_dir);
+
+    // --- safety -----------------------------------------------------------
+    // Validate EVERY target before removing ANY of them, so a misconfigured
+    // cache dir (e.g. `.` or `/`) can never trigger a catastrophic
+    // `remove_dir_all` — and we don't half-remove the config dir before hitting
+    // a bad cache target. Fail loud and remove nothing.
+    for t in &targets {
+        if let Some(reason) = unsafe_removal_reason(&t.path) {
+            return Err(ClwError::Transport(format!(
+                "refusing to uninstall: {} ({}) {reason} — this looks like a misconfigured cache_dir, not a dedicated clw directory. Remove it by hand if you truly intend to.",
+                t.label,
+                t.path.display()
+            )));
+        }
+    }
 
     // --- consent ----------------------------------------------------------
     // A real (non-dry-run) deletion needs consent. `--json` and non-interactive
@@ -349,6 +433,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/usr/local/bin/clw"));
+    }
+
+    // -----------------------------------------------------------------------
+    // unsafe_removal_reason: the recursive-delete safety guard (HIGH)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsafe_removal_reason_blocks_root_and_shallow_paths() {
+        // Root and single-segment top-level dirs must be refused (depth < 2).
+        for p in ["/", "/usr", "/home", "/var"] {
+            assert!(
+                unsafe_removal_reason(std::path::Path::new(p)).is_some(),
+                "{p} must be refused as a removal target"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_removal_reason_allows_a_deep_dedicated_dir() {
+        // A genuine, deep, non-ancestor cache dir is allowed. Use a path that is
+        // not an ancestor of the test CWD.
+        assert!(
+            unsafe_removal_reason(std::path::Path::new("/var/tmp/clw-cache/blobs")).is_none(),
+            "a deep dedicated cache dir must be allowed"
+        );
+    }
+
+    #[test]
+    fn unsafe_removal_reason_blocks_cwd_and_dot() {
+        // The CWD itself and `.` (which resolves to the CWD) must be refused —
+        // this is the `cache_dir = "."` wipes-the-tree footgun.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            unsafe_removal_reason(&cwd).is_some(),
+            "the current working directory must be refused"
+        );
+        assert!(
+            unsafe_removal_reason(std::path::Path::new(".")).is_some(),
+            "'.' (resolves to CWD) must be refused"
+        );
     }
 
     #[test]

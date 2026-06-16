@@ -100,8 +100,9 @@ allow = [
 ]
 
 [bans]
-# A single duplicate (windows-sys, 2 versions) exists today; warn rather than
-# block so a transitive bump does not break CI on an unrelated PR.
+# A few transitive duplicate versions exist today (e.g. windows-sys); warn rather
+# than block so a transitive bump does not break CI on an unrelated PR. The exact
+# count is left unstated so this note does not go stale on a dependency bump.
 multiple-versions = "warn"
 # The internal path deps use wildcard ("*") version reqs. Every workspace crate
 # is `publish = false`, so `allow-wildcard-paths` exempts exactly those
