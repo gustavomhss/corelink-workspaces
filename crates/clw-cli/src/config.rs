@@ -32,6 +32,11 @@ pub struct ResolvedConfig {
     pub clw_config: Config,
     /// Ref keyspace selector (`CLW_REF_DOMAIN`): user (default) or runner.
     pub ref_domain: RefDomain,
+    /// The raw, unparseable ref-domain input (`Some(raw)`) — set ONLY on the
+    /// lenient path when the value could not be parsed, so `doctor` can surface
+    /// it as a diagnostic instead of silently falling back to `user`. `None` on
+    /// the strict path (which errors on an invalid value before reaching here).
+    pub ref_domain_invalid: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -103,6 +108,9 @@ impl ResolvedConfig {
                 cache_dir,
             },
             ref_domain,
+            // Strict resolve errors on an invalid ref-domain above, so by here it
+            // was always valid.
+            ref_domain_invalid: None,
         })
     }
 
@@ -149,6 +157,18 @@ impl ResolvedConfig {
             .or_else(|| file_cfg.get("cache_dir").cloned())
             .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
 
+        // Local-only commands don't touch refs; a bad value here must not error
+        // the diagnostic path, so fall back to the default keyspace — but capture
+        // the raw input so `doctor` can SURFACE it rather than silently swallow it.
+        let raw_ref_domain = cli
+            .ref_domain
+            .clone()
+            .or_else(|| file_cfg.get("ref_domain").cloned());
+        let (ref_domain, ref_domain_invalid) = match parse_ref_domain(raw_ref_domain.as_deref()) {
+            Ok(d) => (d, None),
+            Err(_) => (RefDomain::User, raw_ref_domain),
+        };
+
         ResolvedConfig {
             clw_config: Config {
                 endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -156,14 +176,8 @@ impl ResolvedConfig {
                 token,
                 cache_dir: expand_tilde(&cache_dir_str),
             },
-            // Local-only commands don't touch refs; a bad value here must not
-            // error the diagnostic path, so fall back to the default keyspace.
-            ref_domain: parse_ref_domain(
-                cli.ref_domain
-                    .as_deref()
-                    .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
-            )
-            .unwrap_or(RefDomain::User),
+            ref_domain,
+            ref_domain_invalid,
         }
     }
 
@@ -1361,6 +1375,44 @@ cache_dir = "~/.clw/cache"
             ResolvedConfig::resolve(&cli_bad),
             Err(ClwError::Config(_))
         ));
+    }
+
+    #[test]
+    fn resolve_lenient_surfaces_invalid_ref_domain() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = HomeEnvGuard::new();
+        let _vars = VarGuard::capture(&["CLW_REF_DOMAIN"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        std::env::remove_var("CLW_REF_DOMAIN");
+
+        // Lenient resolve must NOT error on a bad ref-domain (it powers `doctor`);
+        // it falls back to the user keyspace BUT records the raw value so the bad
+        // input can be surfaced as a diagnostic instead of silently swallowed.
+        let cli = crate::Cli::try_parse_from([
+            "clw",
+            "--tenant",
+            "acme",
+            "--token",
+            "k",
+            "--ref-domain",
+            "bogus",
+            "doctor",
+        ])
+        .unwrap();
+        let resolved = ResolvedConfig::resolve_lenient(&cli);
+        assert_eq!(
+            resolved.ref_domain,
+            RefDomain::User,
+            "an invalid ref-domain must coerce to the default user keyspace"
+        );
+        assert_eq!(
+            resolved.ref_domain_invalid,
+            Some("bogus".into()),
+            "the raw invalid ref-domain must be captured for diagnostics"
+        );
     }
 
     // -----------------------------------------------------------------------
