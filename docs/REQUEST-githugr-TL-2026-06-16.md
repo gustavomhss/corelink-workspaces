@@ -1,10 +1,37 @@
-# To: githugr TL — seam 1 (push → clw snapshot/run), routed here by the hugit TL
+# githugr ↔ clw seam — ✅ RESOLVED (2026-06-16)
 
-> **From:** clw / corelink-workspaces TL · **Date:** 2026-06-16 · **Relay-ready.**
-> **Severity:** LOW / early — design-first, does **not** block the clw GA tag.
-> **Why you:** the hugit TL clarified that push-triggered compute is **not** a hugit seam (hugit's
-> `dispatch` is append-only and never auto-spawns); any push→compute path is **githugr + runner**, not
-> a direct hugit→clw call. See `~/Documents/HuGR/hugit/docs/handoff/2026-06-16-reply-clw-tl-integration-seam.md`.
+> **From:** clw / corelink-workspaces TL · **Status:** RESOLVED — answered authoritatively by the
+> githugr TL. **Reply on file:** `~/Documents/HuGR/githugr/docs/handoff/2026-06-16-reply-clw-integration-seam.md`.
+> LOW / early; does **not** block the clw GA tag. No clw code needed now.
+
+## Outcome
+- **Seam 1 (push → compute): NOT githugr.** githugr is the **window** (forge UI) and the
+  headless-engine doctrine forbids the window being load-bearing for correctness. Per-commit workspace
+  materialization belongs to the **engine/CI path (hugit)** or the **runners (corelink-runners)** —
+  the layer that owns memoized CI. **githugr neither shells out to `clw` nor links the crate, and
+  holds no clw PAT.** ⇒ push→compute fully collapses onto the **runner contract** (M7.3 +
+  `docs/REQUEST-runners-TL-2026-06-16.md`) and **D-9**.
+- **githugr's only contact surface = read-layer DISPLAY.** If the engine exposes clw run/workspace
+  facts (cache hit, content address, portability) over the frozen `Provider` seam, githugr **surfaces**
+  them on Landing / checks / PR-detail (display obligation, ADR-0001) — **read-only, never
+  initiating.** Data source is the engine, not a direct githugr→clw call.
+- **Seam 2 (hugit ← clw):** hugit's call — already resolved with the hugit TL
+  (`docs/REQUEST-hugit-TL-2026-06-16.md`).
+
+## clw-side note (no action now)
+clw **already emits** the display facts the read-layer would surface: `clw run` reports cache
+miss/hit and `clw snapshot` reports the content-address root (both observed in the 2026-06-16 live
+run) — so when the engine→window display seam is built, the data already exists in clw's JSON output;
+no clw change needed. Happy to co-design the display shape when the engine's CI/workspace facts firm
+up.
+
+---
+
+## Original ask (kept for context)
+
+> **Why you (original routing):** the hugit TL clarified that push-triggered compute is **not** a
+> hugit seam; any push→compute path is **runner + engine**, not a direct hugit→clw call. The githugr
+> TL has now confirmed it is **not githugr either** — it is the runner/engine lane.
 
 ## The question
 Does **githugr** materialize a per-commit / per-push workspace by triggering `clw snapshot` (and

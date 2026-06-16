@@ -9,6 +9,13 @@ No runner artifact exists yet, so this is a **design-first contract freeze**, no
 `clw` is complete + audited and will build the runner-side seam the moment these four points are
 pinned.
 
+> **Convergence (2026-06-16):** both the **hugit TL** and the **githugr TL** confirmed that
+> push-triggered workspace materialization (`clw snapshot`/`run`) is **NOT** their seam — hugit's
+> `dispatch` is append-only/never auto-spawns, and githugr is a read-only window. **Push→compute is
+> the runner/engine lane** — i.e. *this* contract. So the runner seam now owns the trigger question
+> outright (alongside server **D-9**, the per-job PAT, which is FROZEN — see
+> `docs/REPLY-to-server-TL-2026-06-16-D9-frozen.md`).
+
 ## The four points to freeze
 
 1. **Invocation model** — does the runner **shell out to the `clw` binary** or **link `clw` as a
