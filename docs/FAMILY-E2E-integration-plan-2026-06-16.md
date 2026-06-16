@@ -7,6 +7,16 @@
 > must be aligned with the server + runner TLs.** This doc is relay-ready — hand the relevant section
 > to each TL.
 
+> ✅ **UPDATE (2026-06-16, later) — the keystone SHIPPED.** corelink-server merged **D-9**:
+> `POST /internal/v1/runner/mint` (+ `/revoke`) is in `main` (PR #305), and they delivered the
+> per-tier **seed** (`corelink-server/scripts/family-e2e-tier-seed.sql`, #303 — 6 tenants
+> free→enterprise, deterministic ids `…0f0001..0006`). "Finding 1 — D-9 doesn't exist" below is now
+> HISTORICAL. Remaining blockers are **not clw code**: a D1-active test env + applying the seed +
+> minting test-tenant PATs (**server TL**, see `RELAY-family-e2e-to-server-TL-ROUND2.md`); the runner's
+> clw-invocation build (**runner TL** wave); the shared-host rustup-nuke root cause (owner/infra —
+> clw's CI is now isolated, PR #68). clw's three test suites are merged (PR #64 runner-model, #66
+> per-tier matrix, #67 solo-live).
+
 ---
 
 ## The three test layers (what the user asked for)
@@ -14,7 +24,7 @@
 | Layer | Scope | Status |
 |---|---|---|
 | **Solo** | clw ↔ live corelink-server, full lifecycle | clw side ready; an **automated** solo live suite is the next clw build (runs once a fresh conformance PAT is dropped) |
-| **Cross-repo (family)** | signup → runner mints/injects PAT → runner invokes `clw` → snapshot/hydrate/run → cache-hit | clw half **DONE + proven (mock)** — PR #64; **live is BLOCKED** (see cross-team asks) |
+| **Cross-repo (family)** | signup → runner mints/injects PAT → runner invokes `clw` → snapshot/hydrate/run → cache-hit | clw half **DONE + proven (mock)** — PR #64; **D-9 mint route SHIPPED** (server #305); live run now waits on the runner's clw-invocation build + a D1 test env |
 | **Per-plan/tier** | behavior across the 6 tiers (free/solo/starter/pro/max/enterprise) | clw-side response-handling testable now; **live per-tier enforcement is server-side + fail-open without D1** |
 
 ### What clw has already done (build against this)
@@ -31,7 +41,7 @@
 
 ## TO: corelink-server TL — findings + asks (evidence from a read-only recon of corelink-server)
 
-### 🚨 Finding 1 — the D-9 runner-mint route does NOT exist in code yet
+### ✅ Finding 1 — RESOLVED: D-9 runner-mint route SHIPPED (server #305). *(Was unbuilt at recon time; recorded below for history.)*
 Grep of corelink-server finds **no** `/internal/v1/runner/mint`, `POST /v1/tokens`, or `mintScopedPat`.
 What exists: `POST /_internal/pat/mint` (`crates/corelink-container/src/routes/internal_pat.rs:490` —
 the **signup auto-provision** mint, scopes `admin|cas:rw`, long-TTL, **not** per-job) and
