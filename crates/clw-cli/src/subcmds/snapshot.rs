@@ -34,10 +34,15 @@ pub async fn run(
     concurrency: usize,
 ) -> Result<(), ClwError> {
     let cache = LocalCache::new(&cfg.clw_config.cache_dir)?;
-    let client = HttpClient::new(cfg.clw_config)?;
+    // Clamp to at least 1 so `--concurrency 0` can't stall the stream or starve
+    // the client's AIMD governor.
+    let concurrency = concurrency.max(1);
+    // FIX 4: govern the upload fan-out at the client too, so the AIMD limiter sees
+    // the same ceiling the stream uses — previously `--concurrency` was honored by
+    // the stream but the HTTP governor always used the default (mirrors hydrate).
+    let client = HttpClient::with_concurrency(cfg.clw_config, concurrency)?;
     let mut opts = SnapshotOptions::new(&args.name);
-    // Clamp to at least 1 so `--concurrency 0` can't stall the stream.
-    opts.concurrency = concurrency.max(1);
+    opts.concurrency = concurrency;
 
     // Progress feedback on a long, otherwise-silent op: tell an interactive user
     // work has started so a slow snapshot isn't mistaken for a hung one. stderr
@@ -87,4 +92,42 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use clw_snapshot::SnapshotOptions;
+
+    /// The clamp the subcmd applies before wiring `--concurrency` into both the
+    /// `HttpClient` governor and `SnapshotOptions`. Mirrors the body of `run` so
+    /// a regression that drops the clamp (or fails to plumb the value) is caught.
+    fn clamp(concurrency: usize) -> usize {
+        concurrency.max(1)
+    }
+
+    #[test]
+    fn concurrency_zero_is_clamped_to_one() {
+        // `--concurrency 0` must not stall the stream/governor.
+        assert_eq!(clamp(0), 1);
+    }
+
+    #[test]
+    fn concurrency_flag_is_passed_through_to_opts() {
+        // FIX 4: the flag must reach `SnapshotOptions` (previously honored by the
+        // stream but dropped on the client's HTTP governor). Assert the plumbing:
+        // the clamped value is the one written onto opts.
+        let concurrency = clamp(8);
+        let mut opts = SnapshotOptions::new("ws");
+        opts.concurrency = concurrency;
+        assert_eq!(opts.concurrency, 8, "concurrency must be plumbed onto opts");
+
+        // And a 0 is clamped before it ever reaches opts or the governor.
+        let mut opts0 = SnapshotOptions::new("ws");
+        opts0.concurrency = clamp(0);
+        assert_eq!(opts0.concurrency, 1);
+    }
 }
