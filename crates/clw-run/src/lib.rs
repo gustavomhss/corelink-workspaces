@@ -1072,6 +1072,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Pass-2 audit: the cap BOUNDARY. The capture predicate is `projected > cap`
+    // (see `read_capped`), so output of EXACTLY the cap must still be captured +
+    // memoized, while cap+1 must abort as TooLarge. The prior coverage only had a
+    // well-under-cap case (1 KiB) and a far-over case (~6 MiB), never touching the
+    // boundary byte where an off-by-one (`>=` vs `>`) would flip behavior. These two
+    // siblings pin both sides of the boundary by driving the REAL `run_memoized`.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_output_exactly_at_cap_is_captured() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // Emit EXACTLY CAS_BLOB_CAP_BYTES of stdout — the largest output that is
+        // still within the cap (`projected > cap` is false at projected == cap).
+        let cap = CAS_BLOB_CAP_BYTES;
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("yes A | head -c {cap}"),
+            ],
+            env_keys: vec![],
+        };
+        let outcome = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.stdout.len(),
+            cap,
+            "output of exactly the cap must be captured in full"
+        );
+        let stored = AcTransport::get(&store, &outcome.key).await.unwrap();
+        assert!(stored.is_some(), "exactly-at-cap success must be memoized");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_output_one_over_cap_aborts_as_too_large() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // Emit EXACTLY cap + 1 byte — the smallest output that exceeds the cap and
+        // must abort (`projected > cap` becomes true at the boundary + 1).
+        let over = CAS_BLOB_CAP_BYTES + 1;
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("yes A | head -c {over}"),
+            ],
+            env_keys: vec![],
+        };
+        let err = run_memoized(cwd, &store, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == CAS_BLOB_CAP_BYTES as u64),
+            "cap+1 output must abort as TooLarge, got: {err:?}"
+        );
+        // A cap-blow aborts before memoization: nothing is stored.
+        let key = compute_key(cwd, &opts).await.unwrap();
+        let stored = AcTransport::get(&store, &key).await.unwrap();
+        assert!(stored.is_none(), "an over-cap run must NOT be memoized");
+    }
+
+    // -----------------------------------------------------------------------
     // CRIT regression (pass-2 audit 2026-06-16): the dual-stream DEADLOCK. A
     // command that floods BOTH stdout and stderr UNBOUNDED is the exact case a
     // `join!`-based capture hangs on forever (one reader hits the cap and stops
@@ -1328,8 +1399,33 @@ mod tests {
         // filename character, so it is preserved untouched.
         #[cfg(not(windows))]
         {
+            // Pass-2 audit: the prior assertions only exercised the unix no-op
+            // branch with `/`-already / `\`-preserved inputs. We KEEP those (they
+            // pin the unix contract) AND add assertions that prove the function's
+            // FULL contract as it actually runs on this platform — that `norm_sep`
+            // is, on unix, the identity over the path string (it neither rewrites
+            // `/` nor strips `\`, and is byte-for-byte stable / idempotent).
+
+            // A `/`-form path is returned unchanged (the dir-walk's nested form).
             assert_eq!(norm_sep("a/b/c"), "a/b/c");
+            // A literal backslash is a valid unix filename byte and is PRESERVED —
+            // it must NOT be collapsed to `/` (that would corrupt the run key on
+            // unix). This is the load-bearing platform-specific branch.
             assert_eq!(norm_sep(r"a\b"), r"a\b");
+            // Mixed separators on unix keep the `\` verbatim and the `/` verbatim:
+            // exactly the input, proving no rewrite happens on this platform.
+            assert_eq!(norm_sep(r"a\b/c"), r"a\b/c");
+            // Identity over an arbitrary string with no separator of either kind.
+            assert_eq!(norm_sep("plain"), "plain");
+            assert_eq!(norm_sep(""), "");
+            // The key-stability contract: feeding the output back in is a fixpoint
+            // (idempotent), so the value that feeds the run key is stable.
+            let once = norm_sep(r"x\y/z");
+            assert_eq!(norm_sep(&once), once, "norm_sep must be idempotent on unix");
+            // And the result is byte-for-byte the input on unix (the no-op branch),
+            // which is the property `MAIN_SEPARATOR == '/'` guarantees here.
+            let s = r"left\mid/right.txt";
+            assert_eq!(norm_sep(s).as_bytes(), s.as_bytes());
         }
     }
 

@@ -327,58 +327,19 @@ mod tests {
         .unwrap()
     }
 
-    /// Mirror of `run_all`'s per-record loop: parse each fetched record, push the
-    /// good ones, SKIP (collect) the corrupt ones. This is the exact tolerance the
-    /// command relies on — a single bad record must not blind the rest.
-    fn partition(records: &[(Digest, Vec<u8>)]) -> (Vec<RefRecord>, Vec<(String, String)>) {
-        let mut rows = Vec::new();
-        let mut skipped = Vec::new();
-        for (key, bytes) in records {
-            match RefRecord::from_bytes(bytes) {
-                Ok(r) => rows.push(r),
-                Err(e) => skipped.push((key.to_hex(), e.to_string())),
-            }
-        }
-        (rows, skipped)
-    }
-
-    // FIX 2 — a listing with one bad record still returns the good ones, and the
-    // bad record is reported (skipped), never aborting the whole `--all` listing.
-    #[test]
-    fn one_bad_record_still_lists_the_good_ones() {
-        let bad_key = Digest::of_bytes(b"corrupt");
-        let records = vec![
-            (Digest::of_bytes(b"a"), good_record("alpha")),
-            (bad_key, b"{ this is not valid json".to_vec()),
-            (Digest::of_bytes(b"b"), good_record("bravo")),
-        ];
-        let (rows, skipped) = partition(&records);
-
-        // Both good refs survive — partial output beats no output.
-        assert_eq!(rows.len(), 2, "good records must still list");
-        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"alpha"));
-        assert!(names.contains(&"bravo"));
-
-        // The one bad record is skipped and named by its ref key.
-        assert_eq!(skipped.len(), 1, "exactly one record skipped");
-        assert_eq!(
-            skipped[0].0,
-            bad_key.to_hex(),
-            "skip entry names the ref key"
-        );
-
-        // The --json shape carries the skip as a structured {ref_key, error} entry.
-        let errors: Vec<_> = skipped
-            .iter()
-            .map(|(key, err)| json!({ "ref_key": key, "error": err }))
-            .collect();
-        let out =
-            json!({ "count": rows.len(), "refs": [], "skipped": errors.len(), "errors": errors });
-        assert_eq!(out["count"], 2);
-        assert_eq!(out["skipped"], 1);
-        assert_eq!(out["errors"][0]["ref_key"], bad_key.to_hex());
-    }
+    // NOTE (pass-2 audit de-vacuous): the previous `one_bad_record_still_lists_the_good_ones`
+    // test drove a test-local `partition` helper whose doc literally read "Mirror of
+    // run_all's per-record loop" — it reimplemented the `RefRecord::from_bytes` ⇒
+    // push-good/skip-corrupt tolerance IN THE TEST and asserted on its own reimplementation,
+    // never running `run_all`. The REAL `--all` tolerance (good refs still list while a
+    // corrupt AC record is reported as `skipped` with its `ref_key`, exit 0) is now driven
+    // end-to-end against the live binary by `ls_all_lists_refs_tolerates_corruption_and_reflects_rm`
+    // in `crates/clw-cli/tests/e2e.rs`, which snapshots a real ref, injects a non-decodable
+    // value under a fake ref key in the AC store, and asserts the real JSON `count`/`skipped`/
+    // `errors[0].ref_key` against the binary's stdout. The `partition` mirror helper is
+    // deleted; the `collect_listing` helper below is RETAINED because it exercises the
+    // distinct per-record fetch-RESULT branching (Auth-fatal vs transport-skip vs Ok(None))
+    // that the e2e store cannot easily inject mid-fetch, calling REAL `map_auth_error`.
 
     /// Exact mirror of `run_all`'s per-record fetch loop (FIX 4 logic): given each
     /// key's fetch RESULT, AUTH aborts the whole listing; Ok(None) drops out;

@@ -297,34 +297,18 @@ fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(),
 mod tests {
     use super::*;
 
-    fn digest(byte: u8) -> Digest {
-        Digest::of_bytes(&[byte])
-    }
-
-    #[test]
-    fn orphan_set_is_all_blobs_minus_live() {
-        // The sweep is exactly set difference: blobs not in `live` are orphans.
-        let live: HashSet<Digest> = [digest(1), digest(2)].into_iter().collect();
-        let all = vec![digest(1), digest(2), digest(3), digest(4)];
-        let orphans: Vec<Digest> = all.into_iter().filter(|d| !live.contains(d)).collect();
-        assert_eq!(orphans, vec![digest(3), digest(4)]);
-    }
-
-    #[test]
-    fn empty_live_set_makes_everything_an_orphan() {
-        let live: HashSet<Digest> = HashSet::new();
-        let all = vec![digest(7), digest(8)];
-        let orphans: Vec<Digest> = all.into_iter().filter(|d| !live.contains(d)).collect();
-        assert_eq!(orphans.len(), 2);
-    }
-
-    #[test]
-    fn full_live_set_prunes_nothing() {
-        let live: HashSet<Digest> = [digest(7), digest(8)].into_iter().collect();
-        let all = vec![digest(7), digest(8)];
-        let orphans: Vec<Digest> = all.into_iter().filter(|d| !live.contains(d)).collect();
-        assert!(orphans.is_empty());
-    }
+    // NOTE (pass-2 audit de-vacuous): the previous `orphan_set_is_all_blobs_minus_live`,
+    // `empty_live_set_makes_everything_an_orphan`, and `full_live_set_prunes_nothing`
+    // tests reimplemented the `all_blobs.filter(!live.contains)` set difference IN THE
+    // TEST and asserted on their own reimplementation — they never ran `run`'s real
+    // sweep. The REAL orphan computation, the dry-run/`--yes` deletion, and the
+    // keep-reachable/sweep-orphan invariant are now driven end-to-end against the live
+    // binary by `prune_dry_run_then_yes_removes_only_orphans` in
+    // `crates/clw-cli/tests/e2e.rs` (snapshots a tree, plants an orphan, asserts CAS
+    // store state after both the dry-run and `--yes`). The genuine helper/predicate
+    // tests that exercise REAL functions (`live_set_incomplete`,
+    // `is_live_set_incomplete`, `is_capability_unavailable`, `capability_unavailable`)
+    // are kept below.
 
     #[test]
     fn capability_unavailable_detects_405_501_message() {
@@ -385,43 +369,14 @@ mod tests {
         assert!(!is_live_set_incomplete(&cap));
     }
 
-    // FIX 1b — an empty live set over a NON-empty CAS ("delete everything") is the
-    // mis-enumeration signature: refuse to sweep and point at `clw erase`. This is
-    // the decision the run() safety floor makes; assert the predicate + message.
-    #[test]
-    fn empty_live_set_with_blobs_is_refused() {
-        let live: HashSet<Digest> = HashSet::new();
-        let all = [digest(1), digest(2), digest(3)];
-        let orphans: Vec<Digest> = all.iter().copied().filter(|d| !live.contains(d)).collect();
-        // The floor condition: empty live AND non-empty CAS ⇒ refuse.
-        let refuse = live.is_empty() && !orphans.is_empty();
-        assert!(refuse, "empty-live-with-blobs must trip the refusal");
-
-        // The refusal message points at `clw ls --all` to verify and `clw erase`
-        // for an intentional delete-all (never a silent full wipe).
-        let total_blobs = all.len();
-        let msg = format!(
-            "refusing to prune: the live set is empty but CAS holds {total_blobs} blob(s) — \
-             pruning would delete the ENTIRE tenant, which usually means the ref index is \
-             transiently empty/stale (D-7 returned no refs), not that every blob is truly \
-             orphaned. Verify with `clw ls --all`; if the tenant is genuinely empty, use \
-             `clw erase` (which requires typed-tenant confirmation) instead"
-        );
-        assert!(msg.contains("clw erase"), "must point at clw erase: {msg}");
-        assert!(
-            msg.contains("clw ls --all"),
-            "must point at clw ls --all: {msg}"
-        );
-    }
-
-    #[test]
-    fn empty_live_set_with_empty_cas_does_not_trip_the_floor() {
-        // A genuinely empty tenant (no live, no blobs) is NOT a mis-enumeration —
-        // there is simply nothing to prune, so the floor must not fire.
-        let live: HashSet<Digest> = HashSet::new();
-        let all: Vec<Digest> = Vec::new();
-        let orphans: Vec<Digest> = all.iter().copied().filter(|d| !live.contains(d)).collect();
-        let refuse = live.is_empty() && !orphans.is_empty();
-        assert!(!refuse, "empty CAS must not trip the full-wipe refusal");
-    }
+    // NOTE (pass-2 audit de-vacuous): the previous `empty_live_set_with_blobs_is_refused`
+    // and `empty_live_set_with_empty_cas_does_not_trip_the_floor` tests reimplemented the
+    // safety-floor condition (`live.is_empty() && !orphans.is_empty()`) and a copy-pasted
+    // refusal message IN THE TEST, asserting only on their own reimplementation — they
+    // never ran `run`'s real floor. The REAL floor (the exit-2 refusal over a non-empty
+    // CAS with no refs, deleting NOTHING) is now driven end-to-end against the live binary
+    // by `prune_empty_live_set_over_nonempty_cas_refuses` in `crates/clw-cli/tests/e2e.rs`,
+    // which clears the AC store, runs `prune --yes`, asserts exit 2, and asserts every CAS
+    // blob is still present. The benign empty-CAS case (nothing to prune, no refusal) is
+    // covered by the same e2e suite via the verified-empty `erase` path.
 }
