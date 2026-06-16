@@ -361,6 +361,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: None,
         }
     }
 
@@ -390,6 +391,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: None,
         };
         let out = build_whoami_json(&cfg);
         assert_eq!(out["tenant"], "", "missing tenant => empty in JSON");

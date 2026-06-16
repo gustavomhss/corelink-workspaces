@@ -158,6 +158,13 @@ fn config_problems(cfg: &ResolvedConfig) -> Vec<String> {
     if c.endpoint.is_empty() {
         problems.push("endpoint is empty — set --endpoint or CLW_ENDPOINT".to_string());
     }
+    // An invalid ref-domain input is silently coerced to 'user' on the lenient
+    // path; surface it here so `doctor` reports the bad value instead of hiding it.
+    if let Some(raw) = &cfg.ref_domain_invalid {
+        problems.push(format!(
+            "ref domain '{raw}' is invalid (expected 'user' or 'runner') — using 'user'"
+        ));
+    }
     problems
 }
 
@@ -212,6 +219,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: None,
         }
     }
 
@@ -322,6 +330,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: None,
         }
     }
 
@@ -354,11 +363,35 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: None,
         };
         let problems = config_problems(&cfg);
         assert!(
             problems.iter().any(|p| p.contains("tenant is invalid")),
             "an invalid present tenant must be a reported problem, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn config_problems_flags_invalid_ref_domain() {
+        // The lenient path coerces a bad ref-domain to 'user' but records the raw
+        // input; `doctor` must SURFACE it as a diagnostic rather than swallow it.
+        let cfg = ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://example.com".to_string(),
+                tenant: "acme-tenant".to_string(),
+                token: "tok".to_string(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+            ref_domain: clw_types::RefDomain::User,
+            ref_domain_invalid: Some("bogus".into()),
+        };
+        let problems = config_problems(&cfg);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("ref domain 'bogus' is invalid") && p.contains("using 'user'")),
+            "an invalid ref-domain input must be a reported problem, got: {problems:?}"
         );
     }
 
