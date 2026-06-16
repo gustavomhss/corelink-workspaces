@@ -211,6 +211,10 @@ pub async fn run(
             ));
         }
         if !confirm(&targets)? {
+            // EXIT-CODE CONTRACT (aligned with erase/rm): a DECLINED destructive
+            // confirmation exits NON-ZERO so automation can tell "removal did NOT
+            // happen" from a completed uninstall. (Was Ok(()) / exit 0 before the
+            // 2026-06-15 audit alignment.)
             if json {
                 // (Unreachable: json path already returned above, but keep the
                 // shape consistent if the guard ever changes.)
@@ -218,10 +222,10 @@ pub async fn run(
                     "{}",
                     json!({ "removed": [], "note": "aborted — confirmation declined" })
                 );
-            } else {
-                eprintln!("aborted — nothing was removed");
             }
-            return Ok(());
+            return Err(ClwError::Transport(
+                "aborted — confirmation declined; nothing was removed".to_string(),
+            ));
         }
     }
 

@@ -161,18 +161,32 @@ fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
 
     if args.all {
         // Clear the entire file (destructive) — consent is required regardless of
-        // output format. `--json` only affects the OUTPUT shape, never consent: a
-        // destructive clear needs `--yes` or an interactive y/N confirm.
-        if !args.yes && !confirm_clear(&path)? {
-            if json {
-                println!(
-                    "{}",
-                    json!({ "removed": [], "note": "aborted — confirmation declined" })
-                );
-            } else {
-                eprintln!("aborted — config file left unchanged");
+        // output format, and the rail must be no weaker than uninstall/erase.
+        // `--json` only affects the OUTPUT shape, never consent. In `--json` or any
+        // non-interactive (non-TTY) context we do NOT prompt and REQUIRE `--yes`,
+        // refusing with a non-zero exit otherwise (mirrors `clw uninstall`); on a
+        // TTY without `--yes` we prompt y/N.
+        if !args.yes {
+            if must_refuse_clear_without_consent(args.yes, json, is_interactive()) {
+                return Err(ClwError::Transport(
+                    "refusing to clear the config file without confirmation: pass --yes \
+                     (required with --json or when non-interactive)"
+                        .to_string(),
+                ));
             }
-            return Ok(());
+            if !confirm_clear(&path)? {
+                if json {
+                    // (Unreachable: the json path already returned above, but keep
+                    // the shape consistent if the guard above ever changes.)
+                    println!(
+                        "{}",
+                        json!({ "removed": [], "note": "aborted — confirmation declined" })
+                    );
+                } else {
+                    eprintln!("aborted — config file left unchanged");
+                }
+                return Ok(());
+            }
         }
         let existing = read_config_pairs(&path);
         let removed_keys: Vec<String> = existing.into_iter().map(|(k, _)| k).collect();
@@ -212,6 +226,23 @@ fn report_removed(removed: &[String], path: &std::path::Path, json: bool) {
     } else {
         eprintln!("removed from {}: {}", path.display(), removed.join(", "));
     }
+}
+
+/// Whether we may prompt interactively (stdin is a TTY). Mirrors the same guard in
+/// `uninstall.rs`: in `--json` or any non-TTY context a destructive `logout --all`
+/// must NOT be prompted — it requires `--yes`.
+fn is_interactive() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal()
+}
+
+/// Decide whether a `logout --all` must REFUSE for lack of consent in a non-
+/// interactive context. PURE over its inputs so the consent rail is unit-testable
+/// without a TTY: refuse when neither `--yes` is set NOR an interactive prompt is
+/// possible (i.e. `--json` or non-TTY). On a TTY without `--yes`, returns false
+/// (we fall through to the y/N prompt).
+fn must_refuse_clear_without_consent(yes: bool, json: bool, interactive: bool) -> bool {
+    !yes && (json || !interactive)
 }
 
 /// Prompt for confirmation before clearing the whole config file.
@@ -420,6 +451,46 @@ mod tests {
         // Mode must still be 0600 after the rewrite.
         let mode2 = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode2 & 0o777, 0o600, "config must stay 0600 after logout");
+    }
+
+    // FIX 3 — `logout --all` consent rail, consistent with uninstall/erase:
+    // non-interactive (`--json` or no TTY) without `--yes` must REFUSE; a TTY
+    // without `--yes` falls through to the y/N prompt; `--yes` always proceeds.
+    #[test]
+    fn logout_all_refuses_non_interactive_without_consent() {
+        // --json (non-interactive shape): refuse regardless of TTY state.
+        assert!(
+            must_refuse_clear_without_consent(false, true, true),
+            "--json without --yes must refuse even on a TTY"
+        );
+        assert!(
+            must_refuse_clear_without_consent(false, true, false),
+            "--json without --yes must refuse off a TTY"
+        );
+        // Plain non-TTY (piped) without --yes: refuse.
+        assert!(
+            must_refuse_clear_without_consent(false, false, false),
+            "non-interactive without --yes must refuse"
+        );
+    }
+
+    #[test]
+    fn logout_all_prompts_on_tty_and_proceeds_with_yes() {
+        // Interactive TTY without --yes: do NOT auto-refuse — fall through to the
+        // y/N prompt.
+        assert!(
+            !must_refuse_clear_without_consent(false, false, true),
+            "a TTY without --yes must prompt, not auto-refuse"
+        );
+        // --yes always proceeds (no prompt, no refusal), in every context.
+        for json in [true, false] {
+            for interactive in [true, false] {
+                assert!(
+                    !must_refuse_clear_without_consent(true, json, interactive),
+                    "--yes must always proceed (json={json}, interactive={interactive})"
+                );
+            }
+        }
     }
 
     #[test]

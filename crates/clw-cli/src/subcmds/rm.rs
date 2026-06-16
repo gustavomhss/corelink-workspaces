@@ -33,20 +33,14 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
     // OUTPUT, never bypasses consent: a delete needs `--yes` or an interactive
     // y/N confirm. In non-interactive contexts (no TTY, or `--json`) we require
     // `--yes` and never silently delete.
+    //
+    // EXIT-CODE CONTRACT (aligned with erase/uninstall): a DECLINED/aborted
+    // confirmation exits NON-ZERO — automation that branches on exit code must be
+    // able to tell "the delete did NOT happen" from a completed delete (they would
+    // otherwise share exit 0). So in `--json` the structured `deleted:false` note
+    // is printed FIRST, then an `Err` propagates carrying "left unchanged".
     if !args.yes && !confirm_rm(&args.name)? {
-        if json {
-            println!(
-                "{}",
-                json!({
-                    "name": args.name,
-                    "deleted": false,
-                    "note": "aborted — confirmation declined (use --yes for non-interactive delete)"
-                })
-            );
-        } else {
-            eprintln!("aborted — ref '{}' left unchanged", args.name);
-        }
-        return Ok(());
+        return declined(&args.name, json);
     }
 
     let client = HttpClient::new(cfg.clw_config)?;
@@ -69,6 +63,29 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
         Err(e) if is_capability_unavailable(&e) => capability_unavailable(json),
         Err(e) => Err(map_auth_error(e)),
     }
+}
+
+/// Emit the declined-confirmation outcome and FAIL with a non-zero exit. Aligns
+/// `rm` with `erase`/`uninstall`: a DECLINED destructive confirmation must exit
+/// non-zero so automation can tell "the delete did NOT happen" from a completed
+/// delete (they would otherwise share exit 0). In `--json` the structured
+/// `deleted:false` note is printed FIRST, then the `Err` propagates carrying
+/// "left unchanged". (Was Ok(()) / exit 0 before the 2026-06-15 audit; the rm
+/// declined-exit tests were updated to assert this Err in both modes.)
+fn declined(name: &str, json: bool) -> Result<(), ClwError> {
+    if json {
+        println!(
+            "{}",
+            json!({
+                "name": name,
+                "deleted": false,
+                "note": "aborted — confirmation declined (use --yes for non-interactive delete)"
+            })
+        );
+    }
+    Err(ClwError::Transport(format!(
+        "aborted — confirmation declined; ref '{name}' left unchanged"
+    )))
 }
 
 /// Render the server-regression case. ALWAYS returns `Err` so the process exits
@@ -151,6 +168,31 @@ mod tests {
         // brutal-audit CRIT/HIGH: rm was the sibling PR #34 missed.
         assert!(capability_unavailable(true).is_err());
         assert!(capability_unavailable(false).is_err());
+    }
+
+    // FIX 4 — a DECLINED rm confirmation must exit NON-ZERO in BOTH modes, aligned
+    // with erase/uninstall, so automation can distinguish "delete did not happen"
+    // from a completed delete. (Previously returned Ok(()) / exit 0; this test
+    // documents the intentionally-changed behavior.)
+    #[test]
+    fn declined_confirmation_is_err_in_both_modes() {
+        let json_res = declined("payroll", true);
+        let human_res = declined("payroll", false);
+        assert!(
+            json_res.is_err(),
+            "--json declined must be an Err (non-zero exit)"
+        );
+        assert!(
+            human_res.is_err(),
+            "human declined must be an Err (non-zero exit)"
+        );
+        // The error message says the ref was left unchanged and names the ref.
+        let msg = human_res.unwrap_err().to_string();
+        assert!(
+            msg.contains("left unchanged"),
+            "must say left unchanged: {msg}"
+        );
+        assert!(msg.contains("payroll"), "must name the ref: {msg}");
     }
 
     #[test]
