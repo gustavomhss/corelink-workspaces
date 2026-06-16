@@ -175,6 +175,11 @@ fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
                 ));
             }
             if !confirm_clear(&path)? {
+                // FIX F4: a DECLINED interactive confirmation must exit NON-ZERO, to
+                // match the destructive-command contract shared with rm/erase/
+                // uninstall (W2/Wave-A): a refused destructive action is an error,
+                // not a success. Returning Ok here would exit 0 and be
+                // indistinguishable from a completed clear in automation.
                 if json {
                     // (Unreachable: the json path already returned above, but keep
                     // the shape consistent if the guard above ever changes.)
@@ -182,10 +187,8 @@ fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
                         "{}",
                         json!({ "removed": [], "note": "aborted — confirmation declined" })
                     );
-                } else {
-                    eprintln!("aborted — config file left unchanged");
                 }
-                return Ok(());
+                return Err(declined_clear_err());
             }
         }
         let existing = read_config_pairs(&path);
@@ -243,6 +246,14 @@ fn is_interactive() -> bool {
 /// (we fall through to the y/N prompt).
 fn must_refuse_clear_without_consent(yes: bool, json: bool, interactive: bool) -> bool {
     !yes && (json || !interactive)
+}
+
+/// FIX F4: the error returned when an interactive `logout --all` confirmation is
+/// DECLINED. A refused destructive action exits non-zero (matching rm/erase/
+/// uninstall), not 0. Extracted as a seam so the declined-is-an-error contract is
+/// unit-testable without driving real stdin through `confirm_clear`.
+fn declined_clear_err() -> ClwError {
+    ClwError::Transport("aborted — config file left unchanged".to_string())
 }
 
 /// Prompt for confirmation before clearing the whole config file.
@@ -491,6 +502,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    // FIX F4 — a DECLINED interactive `logout --all` must be an Err (non-zero
+    // exit), consistent with rm/erase/uninstall. The declined-error seam is the
+    // exact value the logout decline path returns.
+    #[test]
+    fn declined_logout_all_is_an_error() {
+        let err = declined_clear_err();
+        assert!(
+            matches!(err, ClwError::Transport(ref m) if m.contains("left unchanged")),
+            "a declined logout --all must return an Err naming the unchanged file, got: {err:?}"
+        );
     }
 
     #[test]

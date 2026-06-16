@@ -25,13 +25,24 @@ use clw_types::ClwError;
 use crate::config::ResolvedConfig;
 
 #[derive(Debug, Args)]
-#[command(about = "Run a command and memoize its output; replays stdout/stderr on cache hit")]
+#[command(
+    about = "Run a command and memoize its output; replays stdout/stderr on cache hit",
+    long_about = "Run a command and memoize its output, replaying stdout/stderr on a cache hit.\n\n\
+                  The cache key is built from the --input paths, --env values, and the command \
+                  vector. CAVEAT: input DIRECTORIES are walked respecting .gitignore/.clwignore, \
+                  so an ignored file inside an input dir (e.g. a local .env) is NOT part of the \
+                  key — changing it will not invalidate the cache and a run may replay a stale \
+                  result. Pass such a file as an explicit --input <FILE> (named files are digested \
+                  regardless of ignore rules) or un-ignore it."
+)]
 pub struct RunArgs {
     /// Input paths (files or directories) that key the memoization.
     #[arg(
         long = "input",
         required = true,
-        help = "Input paths (files or dirs) that form the cache key; repeat for multiple"
+        help = "Input paths (files or dirs) that form the cache key; repeat for multiple. \
+                Dirs respect .gitignore/.clwignore — ignored files are NOT in the key; \
+                pass an ignored file as an explicit --input <FILE> to include it"
     )]
     pub input: Vec<String>,
 

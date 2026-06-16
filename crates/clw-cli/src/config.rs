@@ -529,6 +529,16 @@ fn restrict_to_owner_windows(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Ensure the parent of `path` (i.e. `~/.clw`) exists and is hardened to 0700.
+///
+/// V2 (audit pass-2): ORDER IS LOAD-BEARING for the Windows DACL-window concern.
+/// Every caller (`init`, `auth login`) invokes THIS before
+/// `write_config_file_0600` — see init.rs and auth.rs. Because the parent dir is
+/// hardened to an owner-only PROTECTED DACL HERE, before the config file is
+/// created inside it, the freshly-created `config.toml` inherits an owner-only
+/// ACL from the moment it exists — there is no window in which it carries a
+/// looser (group/Users-readable) inherited DACL. `write_config_file_0600` then
+/// additionally applies its OWN protected owner-only DACL to the file as
+/// defense-in-depth. So no readable window exists; no fix is required here.
 pub(crate) fn ensure_config_parent_0700(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

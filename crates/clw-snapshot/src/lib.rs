@@ -14,8 +14,8 @@ use clw_cache::LocalCache;
 use clw_chunk::{chunk_bytes, chunk_stream, to_chunk_refs};
 use clw_manifest::{walk, WalkedEntry};
 use clw_types::{
-    ref_key, AcTransport, CasTransport, ChunkRef, Digest, Entry, Manifest, RefRecord, Result,
-    MANIFEST_VERSION,
+    ref_key, AcTransport, CasTransport, ChunkRef, ClwError, Digest, Entry, Manifest, RefRecord,
+    Result, CAS_BLOB_CAP_BYTES, MANIFEST_VERSION,
 };
 use futures::stream::{self, StreamExt};
 
@@ -128,6 +128,25 @@ fn looks_like_secret(rel: &str) -> bool {
     }
 
     false
+}
+
+/// FIX F2: a manifest is serialized to a SINGLE CAS blob and uploaded under one
+/// digest. The CAS contract caps any blob at `CAS_BLOB_CAP_BYTES` (5 MiB), so a
+/// workspace with very many entries can produce a manifest blob that exceeds the
+/// cap — which would otherwise surface as an opaque server 413 LATE in the
+/// snapshot, after every chunk has already been uploaded. Check the serialized
+/// size UP FRONT and fail with a clear, actionable error naming the size and the
+/// cap. Pure over the byte length so it is unit-testable without a real upload.
+fn check_manifest_blob_fits(manifest_bytes_len: usize) -> Result<()> {
+    if manifest_bytes_len > CAS_BLOB_CAP_BYTES {
+        return Err(ClwError::InvalidManifest(format!(
+            "the workspace manifest serializes to {manifest_bytes_len} bytes, exceeding the \
+             single-blob CAS cap of {CAS_BLOB_CAP_BYTES} bytes — this workspace has too many \
+             entries to fit one manifest blob. Split the workspace or reduce the number of \
+             tracked files (a server-side multi-part manifest is a future capability)."
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +377,9 @@ where
 
     // --- 5. Upload manifest -------------------------------------------------
     let manifest_bytes = manifest.canonical_bytes()?;
+    // FIX F2: reject an oversized manifest BEFORE the upload, so the failure is a
+    // clear "too many entries" error instead of an opaque 413 from the server.
+    check_manifest_blob_fits(manifest_bytes.len())?;
     let manifest_digest = Digest::of_bytes(&manifest_bytes);
     let manifest_size = manifest_bytes.len() as u64;
 
@@ -782,6 +804,35 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 7: a clean tree yields no secret_warnings
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Test 8 (FIX F2): the manifest-blob size check rejects a serialized manifest
+    // that exceeds CAS_BLOB_CAP_BYTES with a clear, actionable error — exercised
+    // at the pure-helper boundary so no real (5 MiB+) manifest/upload is needed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manifest_blob_size_check_rejects_oversized() {
+        // At-or-below the cap is accepted.
+        assert!(check_manifest_blob_fits(0).is_ok());
+        assert!(check_manifest_blob_fits(CAS_BLOB_CAP_BYTES).is_ok());
+        // One byte over the cap is rejected with a clear, named error.
+        let err = check_manifest_blob_fits(CAS_BLOB_CAP_BYTES + 1).unwrap_err();
+        match err {
+            ClwError::InvalidManifest(ref m) => {
+                assert!(
+                    m.contains("too many entries"),
+                    "error must explain the entry-count cause, got: {m}"
+                );
+                assert!(
+                    m.contains(&(CAS_BLOB_CAP_BYTES + 1).to_string())
+                        && m.contains(&CAS_BLOB_CAP_BYTES.to_string()),
+                    "error must name both the size and the cap, got: {m}"
+                );
+            }
+            other => panic!("expected InvalidManifest, got: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn snapshot_clean_tree_no_warnings() {

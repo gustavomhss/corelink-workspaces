@@ -115,7 +115,38 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         remaining_refs,
         remaining_blobs,
         passes: pass,
-    } = erase_with_verification(&client, ref_keys, blobs).await?;
+    } = match erase_with_verification(&client, ref_keys, blobs).await {
+        Ok(o) => o,
+        // FIX F3: a mid-delete transport failure carries the partial-erasure
+        // counts. In --json, print a structured progress note to stdout BEFORE the
+        // error propagates (same shape as the other failure paths), so an audit
+        // log records exactly how much was erased before the abort.
+        Err(MidDeleteError {
+            refs_deleted,
+            blobs_deleted,
+            source,
+        }) => {
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "dry_run": false,
+                        "tenant": tenant,
+                        "refs_deleted": refs_deleted,
+                        "blobs_deleted": blobs_deleted,
+                        "complete": false,
+                        "note": "erasure failed mid-delete; counts reflect progress before the failure",
+                    })
+                );
+            }
+            return Err(ClwError::Transport(format!(
+                "erasure FAILED mid-delete for tenant '{tenant}': {refs_deleted} ref(s) + \
+                 {blobs_deleted} blob(s) were already erased before the error below. Re-run \
+                 `clw erase` to resume; do NOT record this tenant as erased until a run \
+                 completes. Underlying error: {source}"
+            )));
+        }
+    };
 
     // Truthful Art.17 outcome: only claim success when enumeration confirms the
     // tenant is empty. Otherwise FAIL loud (non-zero exit) so a caller never
@@ -163,12 +194,25 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
 /// counts of DISTINCT objects erased (the GDPR Art.17 audit numbers), NOT the
 /// number of delete calls. `remaining_*` are what enumeration still saw on the
 /// final pass; `passes` is how many passes ran.
+#[derive(Debug)]
 struct EraseOutcome {
     refs_deleted: usize,
     blobs_deleted: usize,
     remaining_refs: usize,
     remaining_blobs: usize,
     passes: usize,
+}
+
+/// FIX F3: a mid-delete failure carrying the partial-erasure counts (distinct
+/// refs + blobs erased BEFORE the failing delete) alongside the underlying error.
+/// Surfacing the counts keeps the GDPR Art.17 audit trail truthful about how much
+/// was actually erased when a run aborts. The caller renders both the structured
+/// `--json` note and the human-readable error from these fields.
+#[derive(Debug)]
+struct MidDeleteError {
+    refs_deleted: usize,
+    blobs_deleted: usize,
+    source: ClwError,
 }
 
 /// Delete every ref then every blob, RE-ENUMERATE, and repeat until empty or
@@ -190,7 +234,7 @@ async fn erase_with_verification<C>(
     client: &C,
     ref_keys: Vec<clw_types::Digest>,
     blobs: Vec<clw_types::Digest>,
-) -> Result<EraseOutcome, ClwError>
+) -> Result<EraseOutcome, MidDeleteError>
 where
     C: AcTransport + CasTransport,
 {
@@ -202,27 +246,48 @@ where
     let mut pending_refs = ref_keys;
     let mut pending_blobs = blobs;
     let mut pass = 0usize;
+    // FIX F3: any transport failure in this loop carries the partial-erasure
+    // counts (distinct refs + blobs erased SO FAR) so the caller can report
+    // progress before aborting — the GDPR Art.17 audit trail must record what was
+    // actually erased, not just an opaque error.
     let (remaining_refs, remaining_blobs) = loop {
         pass += 1;
         for k in &pending_refs {
             AcTransport::delete(client, k)
                 .await
-                .map_err(map_auth_error)?;
+                .map_err(|e| MidDeleteError {
+                    refs_deleted: deleted_refs.len(),
+                    blobs_deleted: deleted_blobs.len(),
+                    source: map_auth_error(e),
+                })?;
             deleted_refs.insert(*k);
         }
         for d in &pending_blobs {
             CasTransport::delete(client, d)
                 .await
-                .map_err(map_auth_error)?;
+                .map_err(|e| MidDeleteError {
+                    refs_deleted: deleted_refs.len(),
+                    blobs_deleted: deleted_blobs.len(),
+                    source: map_auth_error(e),
+                })?;
             deleted_blobs.insert(*d);
         }
-        // Verify: re-enumerate to confirm nothing remains.
+        // Verify: re-enumerate to confirm nothing remains. A failure here is also a
+        // mid-erase abort and carries the same progress counts.
         let r = AcTransport::list_refs(client)
             .await
-            .map_err(map_auth_error)?;
+            .map_err(|e| MidDeleteError {
+                refs_deleted: deleted_refs.len(),
+                blobs_deleted: deleted_blobs.len(),
+                source: map_auth_error(e),
+            })?;
         let b = CasTransport::list_blobs(client)
             .await
-            .map_err(map_auth_error)?;
+            .map_err(|e| MidDeleteError {
+                refs_deleted: deleted_refs.len(),
+                blobs_deleted: deleted_blobs.len(),
+                source: map_auth_error(e),
+            })?;
         if (r.is_empty() && b.is_empty()) || pass >= MAX_PASSES {
             break (r.len(), b.len());
         }
@@ -421,6 +486,83 @@ mod tests {
         assert_eq!(outcome.remaining_refs, 0);
         assert_eq!(outcome.remaining_blobs, 0);
         assert_eq!(outcome.passes, 2);
+    }
+
+    // FIX F3 — a transport that errors after N successful ref-deletes must yield a
+    // MidDeleteError whose counts reflect what was erased BEFORE the failure.
+    struct FailAfterNTransport {
+        // Number of ref deletes to allow before erroring.
+        allow_ref_deletes: usize,
+        ref_deletes: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for FailAfterNTransport {
+        async fn get(&self, _key: &Digest) -> ClwResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &Digest, _value: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &Digest) -> ClwResult<()> {
+            let mut n = self.ref_deletes.lock().unwrap();
+            if *n >= self.allow_ref_deletes {
+                return Err(ClwError::Transport("simulated mid-delete failure".into()));
+            }
+            *n += 1;
+            Ok(())
+        }
+        async fn list_refs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for FailAfterNTransport {
+        async fn exists(&self, _digest: &Digest) -> ClwResult<bool> {
+            Ok(false)
+        }
+        async fn get(&self, digest: &Digest) -> ClwResult<Vec<u8>> {
+            Err(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, _digest: &Digest, _bytes: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _digest: &Digest) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn list_blobs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_delete_failure_reports_count_erased_before_failure() {
+        // 5 refs to delete; the transport allows 2 then errors on the 3rd.
+        let client = FailAfterNTransport {
+            allow_ref_deletes: 2,
+            ref_deletes: Mutex::new(0),
+        };
+        let ref_keys: Vec<Digest> = (0..5u8).map(|i| Digest::of_bytes(&[i])).collect();
+        let blobs: Vec<Digest> = vec![];
+
+        let err = erase_with_verification(&client, ref_keys, blobs)
+            .await
+            .expect_err("a mid-delete failure must abort with an error");
+
+        // Exactly 2 distinct refs were erased before the 3rd delete failed.
+        assert_eq!(
+            err.refs_deleted, 2,
+            "must report the 2 refs erased before the failure"
+        );
+        assert_eq!(err.blobs_deleted, 0);
+
+        // The rendered message (as the caller builds it) names the partial counts.
+        let rendered = format!(
+            "{} ref(s) + {} blob(s) were already erased",
+            err.refs_deleted, err.blobs_deleted
+        );
+        assert!(rendered.contains("2 ref(s) + 0 blob(s)"));
     }
 
     #[test]
