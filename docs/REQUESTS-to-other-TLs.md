@@ -1,3 +1,8 @@
+> ⚠️ **SUPERSEDED (2026-06-16) by `docs/REQUESTS-to-other-TLs-2026-06-16.md`.** The P1 ask below
+> (ratify D-1/D-7/D-8) and both P2 CONFIRMs are now **CLOSED** — endpoints deployed (server #269),
+> live-conformance 8/8 green, binary e2e against live prod, CAS+AC scope proven. Read the dated
+> refresh for the current open asks; this file is kept for history only.
+
 # Cross-TL requests — relay-ready asks from the `clw` (corelink-workspaces) TL
 
 > **Purpose:** the `clw` client side is complete + audited; the remaining go-live work is

@@ -1,11 +1,15 @@
 # Release pipeline — clw signed, cross-platform distribution (WP M3 release scaffold).
 #
-# STATUS: SCAFFOLD. This workflow is a correct, well-structured skeleton that a
-# human fills in once the owner decisions in docs/DISTRIBUTION.md are made and the
-# deployment secrets are provisioned. It is NOT runnable end-to-end yet: every
-# step that needs an owner-gated secret or an owner-gated infra decision is marked
-# with a `TODO(OWNER):` comment and, where possible, guarded so the job no-ops
-# cleanly instead of failing when the secret/credential is absent.
+# STATUS: IMPLEMENTED, secret-gated. The signing (macOS/Windows/Linux), signed-
+# checksum, and publish steps are now fully implemented against the documented
+# vendor toolchains. Each is guarded by secret-presence: ABSENT secret -> the step
+# no-ops cleanly (dry-run, green); PRESENT secret -> the step runs for real. So the
+# whole pipeline is dry-runnable today and goes live end-to-end the moment the owner
+# provisions the secrets (docs/DISTRIBUTION.md + docs/go-live/LAUNCH-CHECKLIST.md).
+# CAVEAT (owner-authorized): the signing/publish bodies are written to spec but
+# cannot be exercised end-to-end until those owner-gated accounts/secrets exist
+# (there is no signing infra to test against pre-provision) — the first real run is
+# the owner's provisioning run. Every owner-gated value is still flagged TODO(OWNER).
 #
 # Pipeline shape (four serial stages, dependent jobs):
 #   preflight  -> build (5-target matrix, sign folded in) -> publish (checksum + upload)
@@ -98,16 +102,12 @@ jobs:
         run: bash scripts/gates.sh
 
       # -----------------------------------------------------------------------
-      # EXTENSION POINT — M3.1 supply-chain gate (cargo-deny + cargo-audit).
-      # Wire the HOOK only; do not implement the checks here (that is WP M3.1).
-      # When M3.1 lands, this becomes the env-guarded invocation of gates.sh
-      # (CLW_SUPPLY_CHAIN=1) or a standalone `cargo deny check` + `cargo audit`.
-      # TODO(M3.1): enable the supply-chain pre-tag gate here.
+      # Supply-chain gate (cargo-deny + cargo-audit) is ALREADY enforced by the
+      # `full gate` step above: scripts/gates.sh runs its FULL lane on a tag push
+      # (a tag is not a `pull_request`, so the scoped lane never applies), and the
+      # FULL lane runs `cargo deny check` + `cargo audit` across the whole workspace
+      # (see scripts/gates.sh). A separate step here would be redundant.
       # -----------------------------------------------------------------------
-      # - name: supply-chain gate (cargo-deny + cargo-audit)
-      #   env:
-      #     CLW_SUPPLY_CHAIN: "1"
-      #   run: bash scripts/gates.sh
 
       # -----------------------------------------------------------------------
       # EXTENSION POINT — M3.4 live-conformance pre-tag gate.
@@ -243,10 +243,9 @@ jobs:
         if: matrix.cross
         shell: bash
         run: |
-          # TODO(M2.2): pin cargo-zigbuild + zig versions to match the M2.2 matrix
-          # decision so the cross toolchain is reproducible.
-          pip install ziglang
-          cargo install --locked cargo-zigbuild
+          # Pinned for a reproducible cross toolchain (M2.2). Bump deliberately.
+          pip install "ziglang==0.16.0"
+          cargo install --locked cargo-zigbuild --version 0.23.0
 
       - name: build release binary
         shell: bash
@@ -285,18 +284,33 @@ jobs:
             echo "::warning::macOS signing secrets absent — SKIPPING sign+notarize (dry-run)."
             exit 0
           fi
-          # --- TODO(OWNER): implement, once secrets exist -------------------
-          #  1. Create a temporary keychain; import the Developer ID .p12.
-          #  2. codesign --force --options runtime --timestamp \
-          #       --sign "$MACOS_SIGN_IDENTITY" "dist/${ASSET}"
-          #  3. zip the signed binary: ditto -c -k --keepParent "dist/${ASSET}" "dist/${ASSET}.zip"
-          #  4. xcrun notarytool submit "dist/${ASSET}.zip" --wait \
-          #       --key <p8> --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID"
-          #  5. Verify: codesign --verify --strict "dist/${ASSET}" ; spctl -a -t install (on the zip/pkg)
-          #  6. Tear down the temporary keychain — leave NO key material on the runner.
-          #  (If DISTRIBUTION.md decision (c) chooses .pkg: build+sign+notarize+staple the .pkg here.)
-          echo "::error::macOS sign+notarize not yet implemented — fill TODO(OWNER) steps."
-          exit 1
+          # Real Developer ID codesign + notarize of a notarized ZIP (DISTRIBUTION.md (c)).
+          # 1. Import the Developer ID .p12 into an ephemeral keychain.
+          KEYCHAIN="$RUNNER_TEMP/clw-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          # shellcheck disable=SC2046  # intentional: word-split the existing keychain list to re-add it alongside ours
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          # 2. Sign the bare Mach-O with the hardened runtime + a secure timestamp.
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN" --sign "$MACOS_SIGN_IDENTITY" "dist/${ASSET}"
+          codesign --verify --strict --verbose=2 "dist/${ASSET}"
+          # 3. A bare CLI binary cannot be stapled; notarize a ZIP of it instead.
+          ditto -c -k --keepParent "dist/${ASSET}" "dist/${ASSET}.zip"
+          printf '%s' "$MACOS_NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool submit "dist/${ASSET}.zip" --wait \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID"
+          # 4. Gatekeeper assessment of the notarized zip (bare CLI -> no staple).
+          spctl -a -t open --context context:primary-signature -v "dist/${ASSET}.zip" || true
+          # 5. Leave NO key material on the runner.
+          security delete-keychain "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
 
       # =======================================================================
       # SIGN — Windows: Authenticode via CLOUD / HSM signing.
@@ -308,26 +322,40 @@ jobs:
         if: matrix.platform == 'windows'
         shell: bash
         env:
-          # TODO(OWNER): provision Azure Trusted Signing credentials (OIDC preferred).
+          # TODO(OWNER): provision Azure Trusted Signing credentials. OIDC via
+          # azure/login is the preferred alternative; the env-only path below uses a
+          # client secret (DefaultAzureCredential reads AZURE_TENANT_ID /
+          # AZURE_CLIENT_ID / AZURE_CLIENT_SECRET straight from the environment).
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           AZURE_CODE_SIGNING_ACCOUNT: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
           AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}   # e.g. https://eus.codesigning.azure.net
         run: |
           set -euo pipefail
           if [ -z "${AZURE_TENANT_ID:-}" ]; then
             echo "::warning::Windows signing credentials absent — SKIPPING Authenticode sign (dry-run)."
             exit 0
           fi
-          # --- TODO(OWNER): implement, once an Azure Trusted Signing account exists ---
-          #  Prefer the azure/trusted-signing-action@v0 marketplace action over a raw
-          #  signtool dlib invocation. Equivalent signtool call once the dlib is set up:
-          #    signtool sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com \
-          #      /td SHA256 /dlib <Azure.CodeSigning.Dlib.dll> /dmdf <metadata.json> "dist/${ASSET}"
-          #  Verify: signtool verify /pa /v "dist/${ASSET}"
-          echo "::error::Windows Authenticode signing not yet implemented — fill TODO(OWNER) steps."
-          exit 1
+          # Real Authenticode via Azure Trusted Signing, driven by the dotnet `sign`
+          # CLI (it speaks Trusted Signing and authenticates with DefaultAzureCredential
+          # from the AZURE_* env above). azure/login OIDC is the documented alternative
+          # to the client-secret env path.
+          dotnet tool install --global sign --version 1.1.5
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          sign code trusted-signing "dist/${ASSET}" \
+            --trusted-signing-endpoint "$AZURE_ENDPOINT" \
+            --trusted-signing-account "$AZURE_CODE_SIGNING_ACCOUNT" \
+            --trusted-signing-certificate-profile "$AZURE_CERT_PROFILE" \
+            --timestamp-url "http://timestamp.acs.microsoft.com" \
+            --file-digest SHA256 \
+            --verbosity information
+          # Verify the Authenticode signature chain (PowerShell fallback if signtool
+          # is not on PATH in the bash shell).
+          signtool verify //pa //v "dist/${ASSET}" \
+            || powershell -Command "\$s = Get-AuthenticodeSignature 'dist/${ASSET}'; \$s | Format-List; if (\$s.Status -ne 'Valid') { exit 1 }"
 
       # =======================================================================
       # SIGN — Linux: minisign detached signature (default). sigstore/cosign is a
@@ -347,14 +375,17 @@ jobs:
             echo "::warning::minisign secret absent — SKIPPING Linux signature (dry-run)."
             exit 0
           fi
-          # --- TODO(OWNER): implement, once the minisign keypair exists -------
-          #  sudo apt-get install -y minisign
-          #  printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
-          #  echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "dist/${ASSET}"
-          #    # -> produces dist/${ASSET}.minisig
-          #  rm -f minisign.key   # leave NO key material on the runner
-          echo "::error::Linux minisign signing not yet implemented — fill TODO(OWNER) steps."
-          exit 1
+          # Real minisign detached signature -> dist/${ASSET}.minisig.
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
+          echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "dist/${ASSET}"
+          rm -f minisign.key   # leave NO key material on the runner
+          # Self-verify against the committed public key (the trust-root) when present.
+          if [ -f "docs/minisign.pub" ]; then
+            minisign -V -p docs/minisign.pub -m "dist/${ASSET}"
+          else
+            echo "::warning::docs/minisign.pub not committed yet — signature produced but not self-verified."
+          fi
 
       # Upload the (eventually) signed binary + its signature/zip for the publish job.
       - name: upload signed artifact
@@ -479,11 +510,14 @@ jobs:
             echo "::warning::minisign secret absent — SHA256SUMS left UNSIGNED (dry-run)."
             exit 0
           fi
-          # --- TODO(OWNER): sign SHA256SUMS -> SHA256SUMS.minisig --------------
-          #  printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
-          #  echo "$MINISIGN_PASSWORD" | minisign -S -s ../minisign.key -m SHA256SUMS
-          #  rm -f ../minisign.key
-          echo "::warning::SHA256SUMS signing not yet implemented — fill TODO(OWNER) steps."
+          # Sign the checksum file itself -> SHA256SUMS.minisig (the cross-platform
+          # signed-checksum guarantee the roadmap demands).
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
+          echo "$MINISIGN_PASSWORD" | minisign -S -s ../minisign.key -m SHA256SUMS
+          rm -f ../minisign.key   # leave NO key material on the runner
+          echo "---- SHA256SUMS.minisig ----"
+          cat SHA256SUMS.minisig
 
       # Publish to the authenticated proprietary surface. Default per the brief:
       # Cloudflare R2 behind a versioned prefix. The EXACT surface is an OWNER
@@ -506,11 +540,15 @@ jobs:
             ls -la release/
             exit 0
           fi
-          # --- TODO(OWNER): implement upload to the chosen surface ------------
-          #  Default (R2, S3-compatible):
-          #    aws s3 cp release/ "s3://${R2_BUCKET}/releases/clw/${VERSION}/" \
-          #      --recursive --endpoint-url "${R2_ENDPOINT}"
-          #  Also publish: the committed minisign public key, and (when M2.4 lands)
-          #  EULA.md / NOTICE / THIRD-PARTY-LICENSES.md alongside the binaries.
-          echo "::error::publish not yet implemented — fill TODO(OWNER) steps."
-          exit 1
+          # Real upload to the R2 (S3-compatible) surface under a versioned prefix.
+          # R2 creds map onto the standard AWS env the aws CLI reads.
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"   # R2 ignores region but the CLI requires one
+          # Ship the trust-root (minisign pubkey) + license notices with the binaries.
+          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true
+          [ -f EULA.md ] && cp EULA.md release/ || true
+          [ -f NOTICE ] && cp NOTICE release/ || true
+          aws s3 cp release/ "s3://${R2_BUCKET}/releases/clw/${VERSION}/" \
+            --recursive --endpoint-url "${R2_ENDPOINT}"
+          echo "published release/ -> ${R2_BUCKET}/releases/clw/${VERSION}/"

@@ -20,7 +20,7 @@
 | 3 | Every tracked deferral closed (or logged waiver) | ✅ | — (shipped code clean; only `best-effort` *design* comments remain) |
 | 4 | Signed reproducible binaries; install **and** uninstall verified | 🔒 | Provision signing secrets (below); run the matrix |
 | 5 | Supply chain clean + SBOM + **signed** checksums | ⏳ / 🔒 | `cargo-deny`/`publish=false` ✅; SBOM in CI ✅; signed checksums need the signing key |
-| 6 | Live conformance green as a pre-tag gate | ✅ | — (8/8 green vs prod; wired into `release.yml` conformance job) |
+| 6 | Live conformance green as a pre-tag gate | ✅ / ⏳ | 8/8 green vs prod; the `release.yml` `conformance` job is wired as a REQUIRED predecessor but is **inert until `CLW_CI_TOKEN` is provisioned** (skip-not-fail) — provision that one secret to make it ship-blocking |
 | 7 | End-to-end **family** path proven across repos | 🔒 | M7 — needs server + runners + the other repos (cross-team) |
 | 8 | Region/residency correct + real right-to-erasure | ✅ / ⏳ | erasure ✅ (`clw erase`, audited); confirm the signup-worker region fix landed |
 | 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
@@ -34,7 +34,7 @@
 ## ⏳ Owner actions — do these (each is concrete + unblocked)
 
 ### A. Provision the signing & release secrets (gates 4, 5)
-Decisions are already made in `docs/DISTRIBUTION.md`; you only provision the secrets the chosen options imply, then delete the dry-run guards in `.github/workflows/release.yml` (each is marked `TODO(OWNER)`).
+Decisions are already made in `docs/DISTRIBUTION.md`, and the signing/publish **step bodies are now implemented** in `.github/workflows/release.yml` (macOS codesign+notarize, Windows Azure Trusted Signing via the `sign` CLI, Linux minisign, signed `SHA256SUMS`, R2 upload — each guarded by secret-presence, so it no-ops cleanly in dry-run and runs for real once the secret exists). You only **provision the secrets** the chosen options imply (each is flagged `TODO(OWNER)` in the step `env:` blocks); there are **no dry-run guards left to delete**. Caveat: the bodies are written to vendor spec but are first exercised end-to-end on your provisioning run (no signing infra exists to test against beforehand).
 
 - **Windows code-signing — Azure Trusted Signing** (decision (b); exportable `.pfx` was rejected — no longer obtainable from a reputable CA). Provision as GitHub **secrets** (OIDC preferred over a client secret):
   `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE`.
