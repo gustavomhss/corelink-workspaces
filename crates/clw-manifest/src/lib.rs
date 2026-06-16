@@ -147,8 +147,14 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
             // On unix, read the real permission bits. On Windows there is no
             // unix mode concept, so we record a constant default of 0o644 for
             // every regular file (symlink DETECTION below stays cross-platform).
+            //
+            // Mask to 0o777, NOT 0o7777: hydrate deliberately strips
+            // setuid/setgid/sticky from untrusted manifests (security), so
+            // recording those high bits here is both unusable AND breaks
+            // snapshot→hydrate→snapshot digest idempotency. Masking them off at
+            // walk time keeps the round-trip stable and matches what hydrate writes.
             #[cfg(unix)]
-            let mode = meta.permissions().mode() & 0o7777;
+            let mode = meta.permissions().mode() & 0o777;
             #[cfg(windows)]
             let mode = 0o644;
             let size = meta.len();

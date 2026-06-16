@@ -108,7 +108,10 @@ pub struct ChunkRef {
 pub enum Entry {
     File {
         path: String,
-        /// Unix permission bits (e.g. 0o644, 0o755). Windows is out of scope for v1.
+        /// Unix permission bits (e.g. 0o644, 0o755), masked to 0o777 at walk time
+        /// (setuid/setgid/sticky stripped; hydrate strips them too). On Windows,
+        /// which IS supported (M2.3), a constant 0o644 is recorded and the mode is
+        /// applied best-effort on hydrate.
         mode: u32,
         size: u64,
         /// In path order; concatenation of chunks == file content.
@@ -147,11 +150,40 @@ impl Manifest {
     /// whitespace), struct fields in declaration order, entries pre-sorted.
     /// The manifest's CAS digest is `Digest::of_bytes(canonical_bytes)`.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        debug_assert!(
-            self.entries.windows(2).all(|w| w[0].path() < w[1].path()),
-            "manifest entries must be sorted by path with no duplicates"
-        );
+        // Enforce canonical form in RELEASE (was a `debug_assert!`, stripped in
+        // release): a producer that built a non-canonical manifest must fail HERE,
+        // before it publishes an unhydratable digest, rather than silently ship it.
+        self.validate_canonical()?;
         Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Enforce the canonical-form invariant that makes `canonical_bytes` the ONE
+    /// legal serialization: entries STRICTLY ascending by path — a single check
+    /// that yields both deterministic ordering AND uniqueness — plus every entry
+    /// path a safe relative path and every symlink target in-workspace.
+    ///
+    /// Called by both [`from_bytes`](Self::from_bytes) (reject untrusted /
+    /// non-canonical input — this is what defeats the duplicate-path hydrate race,
+    /// where two entries sharing a path drove concurrent racing renames) and
+    /// [`canonical_bytes`](Self::canonical_bytes) (catch a producer bug before a
+    /// bad digest is published).
+    fn validate_canonical(&self) -> Result<()> {
+        for w in self.entries.windows(2) {
+            if w[0].path() >= w[1].path() {
+                return Err(ClwError::InvalidManifest(format!(
+                    "manifest entries must be strictly ascending by path (unsorted or \
+                     duplicate path at '{}')",
+                    w[1].path()
+                )));
+            }
+        }
+        for entry in &self.entries {
+            validate_rel_path(entry.path())?;
+            if let Entry::Symlink { target, .. } = entry {
+                validate_symlink_target(target)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn digest(&self) -> Result<Digest> {
@@ -166,14 +198,11 @@ impl Manifest {
                 m.version
             )));
         }
-        // Enforce the documented path invariant on EVERY entry before the
-        // manifest is trusted by hydrate (defense against traversal payloads).
-        for entry in &m.entries {
-            validate_rel_path(entry.path())?;
-            if let Entry::Symlink { target, .. } = entry {
-                validate_symlink_target(target)?;
-            }
-        }
+        // Enforce the full canonical invariant before the manifest is trusted by
+        // hydrate: STRICTLY ascending unique paths (defeats the duplicate-path
+        // racing-rename bug), safe relative paths, and in-workspace symlink targets
+        // (defense against traversal payloads).
+        m.validate_canonical()?;
         Ok(m)
     }
 }
@@ -237,6 +266,14 @@ pub fn validate_symlink_target(t: &str) -> Result<()> {
         if comp == ".." {
             return Err(ClwError::InvalidManifest(format!(
                 "symlink target escapes workspace: {t}"
+            )));
+        }
+        // Reject '.' and empty ('//', trailing '/') components too: a '.' target
+        // (or one that normalizes to the parent) makes the Windows copy-fallback
+        // recursively copy the link's own parent directory.
+        if comp.is_empty() || comp == "." {
+            return Err(ClwError::InvalidManifest(format!(
+                "unsafe '.'/empty component in symlink target: {t}"
             )));
         }
         if comp.contains(':') {
@@ -515,6 +552,95 @@ mod tests {
         assert_eq!(parsed, manifest);
     }
 
+    // A duplicate-path manifest must be REJECTED by from_bytes (HIGH): two entries
+    // sharing a path drove concurrent racing renames in hydrate (nondeterministic
+    // output). Serialize a hand-built duplicate directly (bypassing canonical_bytes,
+    // which would also reject it) to prove the PARSE side is guarded.
+    #[test]
+    fn from_bytes_rejects_duplicate_path() {
+        let dup = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![
+                Entry::File {
+                    path: "a.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+                Entry::File {
+                    path: "a.txt".into(),
+                    mode: 0o644,
+                    size: 1,
+                    chunks: vec![],
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&dup).unwrap();
+        assert!(
+            Manifest::from_bytes(&bytes).is_err(),
+            "a manifest with a duplicate path must be rejected"
+        );
+    }
+
+    // An unsorted manifest must be REJECTED by from_bytes (MED): canonical_bytes is
+    // the ONE legal serialization, so non-canonical input is untrusted.
+    #[test]
+    fn from_bytes_rejects_unsorted_entries() {
+        let unsorted = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![
+                Entry::File {
+                    path: "b.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+                Entry::File {
+                    path: "a.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&unsorted).unwrap();
+        assert!(
+            Manifest::from_bytes(&bytes).is_err(),
+            "unsorted entries must be rejected"
+        );
+    }
+
+    // canonical_bytes now ENFORCES the invariant in release (was a debug_assert):
+    // a producer that built a non-canonical manifest fails HERE, before publishing
+    // an unhydratable digest.
+    #[test]
+    fn canonical_bytes_rejects_noncanonical_producer_manifest() {
+        let bad = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![
+                Entry::File {
+                    path: "z.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+                Entry::File {
+                    path: "a.txt".into(),
+                    mode: 0o644,
+                    size: 0,
+                    chunks: vec![],
+                },
+            ],
+        };
+        assert!(
+            bad.canonical_bytes().is_err(),
+            "canonical_bytes must reject a non-canonical (unsorted) manifest in release"
+        );
+    }
+
     #[test]
     fn validate_rel_path_rejects_unsafe_and_accepts_clean() {
         assert!(validate_rel_path("a.txt").is_ok());
@@ -551,5 +677,11 @@ mod tests {
         assert!(validate_symlink_target("C:/evil").is_err());
         // NTFS ADS colon rejected on every platform.
         assert!(validate_symlink_target("a.txt:hidden").is_err());
+        // '.' and empty/'//' components rejected (LOW): a '.' target makes the
+        // Windows copy-fallback recursively copy the link's own parent dir.
+        assert!(validate_symlink_target(".").is_err());
+        assert!(validate_symlink_target("a/./b").is_err());
+        assert!(validate_symlink_target("a//b").is_err());
+        assert!(validate_symlink_target("dir/").is_err());
     }
 }
