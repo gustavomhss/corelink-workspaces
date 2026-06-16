@@ -425,33 +425,72 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // ceiling (CAS_BLOB_CAP_BYTES) and KILL the child the moment either exceeds it.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_fut = read_capped(stdout_pipe, CAS_BLOB_CAP_BYTES);
-    let stderr_fut = read_capped(stderr_pipe, CAS_BLOB_CAP_BYTES);
-    let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
-
-    // If either stream blew the cap, kill the child and fail fast — we never retain
-    // more than ~cap bytes per stream.
-    let cap_blown = matches!(&stdout_res, Err(CapErr::TooLarge(_)))
-        || matches!(&stderr_res, Err(CapErr::TooLarge(_)));
-    if cap_blown {
-        // Best-effort kill + reap so we don't leave a runaway child.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        let size = match (&stdout_res, &stderr_res) {
-            (Err(CapErr::TooLarge(n)), _) | (_, Err(CapErr::TooLarge(n))) => *n,
-            _ => CAS_BLOB_CAP_BYTES as u64 + 1,
-        };
-        return Err(ClwError::TooLarge {
-            size,
-            cap: CAS_BLOB_CAP_BYTES as u64,
-        });
+    // CRITICAL (deadlock-safe): read BOTH streams concurrently, and the MOMENT
+    // either exceeds the cap, KILL the child and RETURN immediately — do NOT wait
+    // for the other stream.
+    //
+    // A plain `join!` here DEADLOCKS: when one `read_capped` returns (cap blown)
+    // and stops draining its pipe, the child blocks on its next write to that
+    // now-unread pipe (the OS pipe buffer fills), starving the OTHER reader, which
+    // never sees EOF — `join!` never completes and there is no timeout.
+    //
+    // And we must not even *await* the surviving stream after a blow: the killed
+    // process may have leaked the pipe to a still-running grandchild (e.g.
+    // `sh -c "yes & yes 1>&2"`, or a `make` sub-job) that keeps the write end open,
+    // so that read would never EOF either. Returning drops both read futures, which
+    // closes our read ends → any orphaned writer gets SIGPIPE and dies. We reap the
+    // direct child to avoid a zombie; orphans reparent to init.
+    let mut stdout_fut = std::pin::pin!(read_capped(stdout_pipe, CAS_BLOB_CAP_BYTES));
+    let mut stderr_fut = std::pin::pin!(read_capped(stderr_pipe, CAS_BLOB_CAP_BYTES));
+    let mut stdout_res: Option<std::result::Result<Vec<u8>, CapErr>> = None;
+    let mut stderr_res: Option<std::result::Result<Vec<u8>, CapErr>> = None;
+    loop {
+        tokio::select! {
+            r = &mut stdout_fut, if stdout_res.is_none() => {
+                if let Err(CapErr::TooLarge(n)) = &r {
+                    let size = *n;
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(ClwError::TooLarge { size, cap: CAS_BLOB_CAP_BYTES as u64 });
+                }
+                stdout_res = Some(r);
+            }
+            r = &mut stderr_fut, if stderr_res.is_none() => {
+                if let Err(CapErr::TooLarge(n)) = &r {
+                    let size = *n;
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(ClwError::TooLarge { size, cap: CAS_BLOB_CAP_BYTES as u64 });
+                }
+                stderr_res = Some(r);
+            }
+        }
+        if stdout_res.is_some() && stderr_res.is_some() {
+            break;
+        }
     }
-    let stdout = stdout_res.map_err(CapErr::into_clw)?;
-    let stderr = stderr_res.map_err(CapErr::into_clw)?;
+    let stdout = stdout_res
+        .expect("loop breaks only when both are Some")
+        .map_err(CapErr::into_clw)?;
+    let stderr = stderr_res
+        .expect("loop breaks only when both are Some")
+        .map_err(CapErr::into_clw)?;
 
     // Both streams drained; now wait for the process to exit.
     let status = child.wait().await?;
-    let exit_code = status.code().unwrap_or(-1);
+    // A signal-killed child has no exit code; map it to the POSIX 128+signal
+    // convention so the propagated process exit is meaningful (e.g. SIGTERM → 143)
+    // instead of -1, which `process::exit` truncates to a useless 255.
+    let exit_code = match status.code() {
+        Some(c) => c,
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::process::ExitStatusExt as _;
+            status.signal().map(|s| 128 + s).unwrap_or(255)
+        }
+        #[cfg(not(unix))]
+        None => 255,
+    };
 
     // --- Memoize only on success (output is already within cap by construction) ---
     if exit_code == 0 {
@@ -1030,6 +1069,53 @@ mod tests {
         // Memoized on success.
         let stored = AcTransport::get(&store, &outcome.key).await.unwrap();
         assert!(stored.is_some(), "within-cap success must be memoized");
+    }
+
+    // -----------------------------------------------------------------------
+    // CRIT regression (pass-2 audit 2026-06-16): the dual-stream DEADLOCK. A
+    // command that floods BOTH stdout and stderr UNBOUNDED is the exact case a
+    // `join!`-based capture hangs on forever (one reader hits the cap and stops
+    // draining → the child blocks writing to that pipe → the other reader starves,
+    // never EOFs). The fix kills + returns on the first cap-blow without awaiting
+    // the other stream. We wrap in a real timeout so a regression FAILS LOUDLY
+    // (TooLarge returned) instead of hanging the whole test binary.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + `yes`
+    #[tokio::test]
+    async fn dual_stream_flood_aborts_without_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // Both streams blast forever; neither terminates on its own. With the old
+        // join! capture this hangs; the deadlock-safe path must return TooLarge.
+        // `yes` on stdout (foreground) + a backgrounded `yes` on stderr — the
+        // backgrounded one becomes an orphan on kill and keeps the stderr pipe
+        // open, exercising the "don't await the surviving stream" requirement.
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "yes B 1>&2 & yes A".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_memoized(cwd, &store, &opts),
+        )
+        .await;
+
+        let inner = res.expect("run_memoized must RETURN (deadlock regression), not time out");
+        let err = inner.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == CAS_BLOB_CAP_BYTES as u64),
+            "dual-stream flood must abort as TooLarge, got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
