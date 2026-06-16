@@ -326,9 +326,49 @@ pub fn ref_key(name: &str) -> Digest {
 // Client configuration
 // ---------------------------------------------------------------------------
 
+/// Validate a tenant id before it is interpolated RAW into a request URL path
+/// (`/v1/cas/{tenant}/...`, `/v1/ac/{tenant}/...`). The tenant is never encoded,
+/// so an unvalidated value containing `/`, `..`, whitespace, or control chars
+/// enables path injection / cross-tenant misroute (e.g. `../othertenant`).
+///
+/// Allowed set (closed to path-injection, permissive enough for realistic
+/// slug/UUID tenant ids): a NON-EMPTY string of ASCII alphanumerics plus `-`,
+/// `_`, and `.`. REJECTS: empty; any `/` or `\`; any whitespace or control
+/// char; any other non-allowed byte; a leading or trailing `.`; and the
+/// traversal forms `.` and `..`.
+pub fn validate_tenant(t: &str) -> Result<()> {
+    if t.is_empty() {
+        return Err(ClwError::InvalidTenant("tenant must not be empty".into()));
+    }
+    // `.` and `..` are path-traversal forms; a leading/trailing `.` is rejected
+    // by the boundary checks below, but call these out explicitly for a clear msg.
+    if t == "." || t == ".." {
+        return Err(ClwError::InvalidTenant(format!(
+            "tenant '{t}' is a path-traversal form"
+        )));
+    }
+    if t.starts_with('.') || t.ends_with('.') {
+        return Err(ClwError::InvalidTenant(format!(
+            "tenant '{t}' must not start or end with '.'"
+        )));
+    }
+    for c in t.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(ClwError::InvalidTenant(format!(
+                "tenant '{t}' contains an illegal character {c:?}; allowed: ASCII \
+                 alphanumerics and '-', '_', '.'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Resolved client configuration. Sources (precedence): CLI flags > env
 /// (`CLW_ENDPOINT`, `CLW_TENANT`, `CLW_TOKEN`, `CLW_CACHE_DIR`) > `~/.clw/config.toml`.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-written (NOT derived) to redact `token`: the PAT must never
+/// appear in logs/diagnostics, mirroring `HttpClient`'s redacting `Debug`.
+#[derive(Clone)]
 pub struct Config {
     /// e.g. "https://corelink-api.humangr.com" (no trailing slash).
     pub endpoint: String,
@@ -337,6 +377,20 @@ pub struct Config {
     pub token: String,
     /// Local content cache root (default `~/.clw/cache`).
     pub cache_dir: PathBuf,
+}
+
+// Manual Debug impl: redact the token (the PAT) while showing the other fields
+// normally. The derived Debug would print the plaintext token, contradicting the
+// field's own "NEVER logged" guarantee — mirror HttpClient's redacting Debug.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("endpoint", &self.endpoint)
+            .field("tenant", &self.tenant)
+            .field("token", &"<redacted>")
+            .field("cache_dir", &self.cache_dir)
+            .finish()
+    }
 }
 
 impl Config {
@@ -426,6 +480,8 @@ pub enum ClwError {
     InvalidDigest(String),
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
+    #[error("invalid tenant: {0}")]
+    InvalidTenant(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error(transparent)]
@@ -662,6 +718,48 @@ mod tests {
         assert!(validate_rel_path("foo:bar").is_err());
         assert!(validate_rel_path("secret.txt:hidden").is_err());
         assert!(validate_rel_path("dir/file.txt:$DATA").is_err());
+    }
+
+    #[test]
+    fn validate_tenant_accepts_safe_and_rejects_injection() {
+        // Realistic slug / UUID tenant ids are accepted.
+        assert!(validate_tenant("acme").is_ok());
+        assert!(validate_tenant("acme-prod").is_ok());
+        assert!(validate_tenant("t_1").is_ok());
+        assert!(validate_tenant("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(validate_tenant("a.b").is_ok());
+        // Path-injection / misroute vectors are rejected.
+        assert!(validate_tenant("").is_err());
+        assert!(validate_tenant("a/b").is_err());
+        assert!(validate_tenant("../x").is_err());
+        assert!(validate_tenant("a\\b").is_err());
+        assert!(validate_tenant("a b").is_err());
+        assert!(validate_tenant(".").is_err());
+        assert!(validate_tenant("..").is_err());
+        assert!(validate_tenant(".hidden").is_err());
+        assert!(validate_tenant("trail.").is_err());
+    }
+
+    #[test]
+    fn config_debug_redacts_token() {
+        let cfg = Config {
+            endpoint: "https://corelink-api.humangr.com".into(),
+            tenant: "acme".into(),
+            token: "super-secret-pat-value".into(),
+            cache_dir: PathBuf::from("/tmp/cache"),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("super-secret-pat-value"),
+            "Config Debug must NOT contain the token value, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Config Debug must contain '<redacted>', got: {dbg}"
+        );
+        // The other fields are still shown normally.
+        assert!(dbg.contains("acme"));
+        assert!(dbg.contains("corelink-api.humangr.com"));
     }
 
     #[test]
