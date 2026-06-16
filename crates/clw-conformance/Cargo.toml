@@ -11,7 +11,12 @@ clw-types = { workspace = true }
 clw-client = { workspace = true }
 
 [dev-dependencies]
+clw-snapshot = { workspace = true }
+clw-hydrate = { workspace = true }
+clw-run = { workspace = true }
+clw-cache = { workspace = true }
 tokio = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 # Live conformance against corelink-api.humangr.com — requires CLW_TOKEN. Never on in CI default lane.
