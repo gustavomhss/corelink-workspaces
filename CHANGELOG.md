@@ -84,6 +84,39 @@
 - Threat model updated to reflect the shipped Windows path validation and the erasure gap
   (see `docs/THREAT-MODEL.md`).
 
+### Security & correctness — go-live audit (2 adversarial passes, 71 findings closed)
+> Two read-only multi-agent audits (168 agents each: many finder lenses → dedup → 3-skeptic
+> refute-default verification) hardened the client before tag. Every finding was lead-cold-reviewed
+> and fixed gate-green; the headline items by category:
+
+- **PAT confidentiality.** Closed two `@`-userinfo PAT-exfiltration vectors — a loopback bypass
+  (`http://127.0.0.1:8080@evil.com`) and the same class on the TLS path (`https://legit@evil.com`),
+  both now parsed with the `url` crate (embedded credentials rejected). Redacted the PAT from the
+  derived `Debug` of `Config` and `Cli`. Added a Windows owner-only protected DACL on the PAT file
+  (`config.toml`), an over-permissive-config warning on unix, and SSRF hardening (`redirect::none`).
+- **Destructive-command safety.** `clw uninstall` now refuses to `remove_dir_all` a misconfigured
+  `cache_dir` (a `.` no longer wipes the CWD); `clw prune` is **fail-safe** — it aborts (deletes
+  nothing) on an incomplete live set rather than sweeping live blobs as false orphans; `clw erase`
+  re-enumerates to **verify** the tenant is empty before claiming a GDPR Art.17 erasure (and reports
+  distinct counts + progress on a mid-delete failure); declined confirmations exit non-zero uniformly.
+- **A `clw run` hang.** Fixed a deadlock in the command-output capture (a concurrent-stream `join!`
+  that hung when one stream exceeded the cap while the child wrote the other) — now kills the child
+  and returns on the first cap-blow, with a dual-stream-flood regression test under a real timeout.
+- **DoS / resource bounds** (hostile server or malicious manifest): disk-fill budget keyed on the real
+  summed chunk sizes, ref/blob list-enumeration caps, streamed `run` output capture, wired cache
+  eviction, and per-file/total chunk-count caps. Fetched chunks are length-checked against their
+  declared size; an over-cap root manifest is rejected before upload.
+- **Manifest & cache integrity.** Manifest canonical form (sorted + unique paths) is enforced in
+  release (was a stripped `debug_assert`), defeating a duplicate-path hydrate race; the `clw run`
+  memoization key now folds in file mode, empty input dirs, and separator-normalized paths; `clw
+  status` is mode-aware. Tenant ids are validated against URL-path injection.
+- **Real test coverage.** Added binary-level end-to-end tests for the destructive commands
+  (prune/erase/ls/rm against a stateful mock incl. DELETE + LIST routes) and replaced several vacuous
+  unit tests that asserted on their own reimplementation.
+- **Honest tracked items (not silent debt):** the Windows ACL FFI is compile-verified + cold-reviewed
+  but its *runtime* check is owner-runnable now via `docs/go-live/WINDOWS-ACL-VERIFICATION.md` (no
+  Windows CI needed); the Windows **test lane** itself remains M2.4 (billing-gated).
+
 ### CI
 - **`cargo-deny`** (advisories + licenses + bans + sources) wired into the local gate and the
   release lane. The **`cargo-audit`** RustSec scan is **CI-provisioned / best-effort locally**: the
