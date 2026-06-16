@@ -1,5 +1,11 @@
 //! Config resolution: CLI flags > env vars > ~/.clw/config.toml > defaults.
 //!
+//! Env vars: the `CLW_*` names (`CLW_ENDPOINT`/`CLW_TENANT`/`CLW_TOKEN`, merged by
+//! clap) take precedence; the CoreLink-wide `CORELINK_*` aliases
+//! (`CORELINK_ENDPOINT`/`CORELINK_TENANT`/`CORELINK_TOKEN`) are accepted as a
+//! fallback so a disposable runner injected with either namespace just works
+//! (server D-9 dispatch-time env injection; no `~/.clw/config.toml`).
+//!
 //! `tenant` and `token` have no default and produce a friendly error (exit 2)
 //! if still missing after all layers.
 
@@ -38,16 +44,18 @@ impl ResolvedConfig {
         let endpoint = cli
             .endpoint
             .clone()
+            .or_else(|| corelink_env("CORELINK_ENDPOINT"))
             .or_else(|| file_cfg.get("endpoint").cloned())
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
         let tenant = cli
             .tenant
             .clone()
+            .or_else(|| corelink_env("CORELINK_TENANT"))
             .or_else(|| file_cfg.get("tenant").cloned())
             .ok_or_else(|| {
                 ClwError::Config(
-                    "missing tenant: set --tenant, CLW_TENANT, or add tenant to ~/.clw/config.toml"
+                    "missing tenant: set --tenant, CLW_TENANT/CORELINK_TENANT, or add tenant to ~/.clw/config.toml"
                         .to_string(),
                 )
             })?;
@@ -62,10 +70,11 @@ impl ResolvedConfig {
         let token = cli
             .token
             .clone()
+            .or_else(|| corelink_env("CORELINK_TOKEN"))
             .or_else(|| file_cfg.get("token").cloned())
             .ok_or_else(|| {
                 ClwError::Config(
-                    "missing token: set --token, CLW_TOKEN, or add token to ~/.clw/config.toml"
+                    "missing token: set --token, CLW_TOKEN/CORELINK_TOKEN, or add token to ~/.clw/config.toml"
                         .to_string(),
                 )
             })?;
@@ -105,6 +114,7 @@ impl ResolvedConfig {
         let endpoint = cli
             .endpoint
             .clone()
+            .or_else(|| corelink_env("CORELINK_ENDPOINT"))
             .or_else(|| file_cfg.get("endpoint").cloned())
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
@@ -113,12 +123,14 @@ impl ResolvedConfig {
         let tenant = cli
             .tenant
             .clone()
+            .or_else(|| corelink_env("CORELINK_TENANT"))
             .or_else(|| file_cfg.get("tenant").cloned())
             .unwrap_or_default();
 
         let token = cli
             .token
             .clone()
+            .or_else(|| corelink_env("CORELINK_TOKEN"))
             .or_else(|| file_cfg.get("token").cloned())
             .unwrap_or_default();
 
@@ -154,6 +166,19 @@ impl ResolvedConfig {
             .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
         expand_tilde(&cache_dir_str)
     }
+}
+
+// ---------------------------------------------------------------------------
+// CoreLink-wide env fallback
+// ---------------------------------------------------------------------------
+
+/// Read a `CORELINK_*` env var as a fallback for the `CLW_*` names (which clap
+/// already merges into the `Cli`). An empty value is treated as unset so an
+/// injected-but-blank var never shadows the config file. This lets a disposable
+/// runner be driven by either the `CLW_*` or the CoreLink-wide `CORELINK_*`
+/// namespace (server D-9 dispatch-time env injection).
+fn corelink_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1169,95 @@ cache_dir = "~/.clw/cache"
         .unwrap();
         let resolved = ResolvedConfig::resolve(&cli_ok).unwrap();
         assert_eq!(resolved.clw_config.tenant, "acme");
+    }
+
+    // -----------------------------------------------------------------------
+    // CORELINK_* env aliases (runner readiness — D-9 dispatch-time injection)
+    // -----------------------------------------------------------------------
+
+    /// RAII guard that snapshots + restores an arbitrary set of env vars, so a
+    /// test can mutate the `CLW_*` / `CORELINK_*` namespace without leaking into
+    /// sibling tests (hold [`ENV_LOCK`] for the whole test).
+    struct VarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl VarGuard {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                saved: names.iter().map(|n| (*n, std::env::var_os(n))).collect(),
+            }
+        }
+    }
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            for (n, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_corelink_aliases_and_clw_wins() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = HomeEnvGuard::new();
+        let _vars = VarGuard::capture(&[
+            "CLW_ENDPOINT",
+            "CLW_TENANT",
+            "CLW_TOKEN",
+            "CORELINK_ENDPOINT",
+            "CORELINK_TENANT",
+            "CORELINK_TOKEN",
+        ]);
+        // Disposable-runner state: empty HOME (no config file), no CLW_* — only
+        // the CoreLink-wide CORELINK_* aliases injected at dispatch.
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        for v in [
+            "CLW_ENDPOINT",
+            "CLW_TENANT",
+            "CLW_TOKEN",
+            "CORELINK_ENDPOINT",
+            "CORELINK_TENANT",
+            "CORELINK_TOKEN",
+        ] {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("CORELINK_TENANT", "acme-runner");
+        std::env::set_var("CORELINK_TOKEN", "rtok");
+
+        let cli = crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap();
+        let resolved = ResolvedConfig::resolve(&cli).unwrap();
+        assert_eq!(
+            resolved.clw_config.tenant, "acme-runner",
+            "CORELINK_TENANT must be read when CLW_TENANT / --tenant / config are absent"
+        );
+        assert_eq!(
+            resolved.clw_config.token, "rtok",
+            "CORELINK_TOKEN must be read as a fallback"
+        );
+
+        // An empty CORELINK_* must be treated as unset (not shadow anything).
+        std::env::set_var("CORELINK_ENDPOINT", "");
+        let cli_e = crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap();
+        let resolved_e = ResolvedConfig::resolve(&cli_e).unwrap();
+        assert_eq!(
+            resolved_e.clw_config.endpoint, DEFAULT_ENDPOINT,
+            "an empty CORELINK_ENDPOINT must fall through to the default"
+        );
+
+        // CLW_* (clap) must take precedence over CORELINK_* when both are set.
+        std::env::set_var("CLW_TENANT", "acme-clw");
+        let cli2 = crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap();
+        let resolved2 = ResolvedConfig::resolve(&cli2).unwrap();
+        assert_eq!(
+            resolved2.clw_config.tenant, "acme-clw",
+            "CLW_TENANT (clap) must win over CORELINK_TENANT"
+        );
     }
 
     // -----------------------------------------------------------------------

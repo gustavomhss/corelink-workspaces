@@ -29,7 +29,7 @@ pub struct Cli {
         long,
         global = true,
         env = "CLW_ENDPOINT",
-        help = "Remote API endpoint URL (no trailing slash)"
+        help = "Remote API endpoint URL (no trailing slash). Env: CLW_ENDPOINT (or CORELINK_ENDPOINT)"
     )]
     pub endpoint: Option<String>,
 
@@ -38,7 +38,7 @@ pub struct Cli {
         long,
         global = true,
         env = "CLW_TENANT",
-        help = "Tenant ID (set via --tenant, CLW_TENANT env, or config)"
+        help = "Tenant ID (set via --tenant, CLW_TENANT/CORELINK_TENANT env, or config)"
     )]
     pub tenant: Option<String>,
 
@@ -47,7 +47,7 @@ pub struct Cli {
         long,
         global = true,
         env = "CLW_TOKEN",
-        help = "CoreLink personal access token. WARNING: visible in `ps`/shell history — prefer CLW_TOKEN env or ~/.clw/config.toml"
+        help = "CoreLink personal access token. WARNING: visible in `ps`/shell history — prefer CLW_TOKEN/CORELINK_TOKEN env or ~/.clw/config.toml"
     )]
     pub token: Option<String>,
 
