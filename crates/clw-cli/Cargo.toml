@@ -28,6 +28,23 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Windows-only Win32 FFI used to ACL-restrict the PAT-bearing ~/.clw/config.toml
+# (and ~/.clw dir) to the current owner — the Windows analogue of the unix
+# 0600/0700 hardening, which is a no-op there. Target-scoped to cfg(windows) so
+# it never enters the unix build/lock/`cargo deny` graph. MIT/Apache-2.0
+# (already in deny.toml [licenses].allow + about.toml accepted). Feature modules
+# below are the minimal set for: current-process token + user-SID lookup
+# (Threading), ACL build (Security), the named-object DACL apply (Authorization),
+# local heap alloc for the SID buffer (Memory), and shared Win32 types (Foundation).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 # Pre-added by the lead (wave-0) so W14-e2e never edits this file (conflict defusal).
 assert_cmd = { workspace = true }
