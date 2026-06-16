@@ -206,9 +206,9 @@ nature of the Processing and the information available to the Processor.
 4.7. **Deletion or return.** At the Customer's choice, delete or return all
 Customer Personal Data at the end of the provision of services, and delete
 existing copies, unless Union or Member State law requires storage — as set out in
-§9, **subject to §10.2 and effected by the interim operator-side process in §10.3**
-until roadmap item M6.4 lands, and subject to the credential carve-out in §9.4 (the
-PAT is destroyed, not returned).
+§9, **effected by the self-service capability in §10.2 or the operator-assisted
+process in §10.3**, and subject to the credential carve-out in §9.4 (the PAT is
+destroyed, not returned).
 
 4.8. **Records & demonstration of compliance.** Maintain records of Processing
 activities to the extent required by GDPR Art. 30(2), and make available to the
@@ -415,12 +415,12 @@ copies within 30 days (with a further export window of 30 days during which the
 Customer may retrieve its data, and deletion propagated to backups and replicas
 within 35 days), unless
 Union or Member State law requires continued storage, in which case the Processor
-shall protect the data and Process it only as required by that law. Because the
-content-addressed (CAS) blobs cannot yet be erased by self-service means (§10.2),
-deletion of server-side Customer Data — including the "delete existing copies"
-obligation in this §9.2 — is performed by, and subject to, the interim
-operator-side process and SLA in §10.3 until roadmap item M6.4 lands. The PAT is
-handled under the credential carve-out in §9.4, not "returned".
+shall protect the data and Process it only as required by that law. Deletion of
+server-side Customer Data — including the "delete existing copies" obligation in
+this §9.2 — including the content-addressed (CAS) blobs, may be performed by the
+Customer self-service via `clw erase` (§10.2) or by the operator-assisted process
+and SLA in §10.3. The PAT is handled under the credential carve-out in §9.4, not
+"returned".
 
 9.4. **Credential carve-out (PAT).** Notwithstanding §4.7 and §9.2, the tenant PAT
 is a security credential, not substantive Customer content. On termination or on a
@@ -438,40 +438,34 @@ local artifacts.
 
 ---
 
-## 10. Right to erasure (GDPR Art. 17) — commitment and current limitation
+## 10. Right to erasure (GDPR Art. 17)
 
-10.1. **Commitment.** The service is being built so that a tenant can delete all of
-its stored Customer Data, and the Processor will give effect to Data Subject and
-Customer erasure requests in accordance with §8 and Data Protection Law. Until the
-self-service capability in §10.2 is complete, the Processor effects erasure of all
-stored Customer Data — including the content-addressed (CAS) blobs — through the
-interim operator-side process and SLA in §10.3. The Processor does not represent
-that fully automated, verifiable self-service erasure of CAS content is available
-before M6.4 lands (§10.4).
+10.1. **Commitment.** A tenant can delete all of its stored Customer Data, and the
+Processor gives effect to Data Subject and Customer erasure requests in accordance
+with §8 and Data Protection Law. Both the self-service capability (§10.2) and an
+operator-assisted alternative (§10.3) are available.
 
-10.2. **Disclosed current limitation.** As of the Effective Date, the client `clw
-rm` operation deletes only the reference (AC) pointer and **cannot
-garbage-collect the underlying content-addressed (CAS) blobs**; consequently a
-tenant cannot yet fully and verifiably erase all uploaded content through
-self-service alone. Full self-service erasure requires client `prune` / CAS
-garbage-collection together with server reference-enumeration LIST (dependency
-D-7) and server CAS DELETE / LIST (dependency D-8), tracked as go-live-blocking
-roadmap item **M6.4** (`docs/ROADMAP-go-live.md`).
+10.2. **Self-service erasure (available).** As of the Effective Date, the client
+`clw erase` operation **irreversibly deletes all of a tenant's stored Customer Data
+— every reference (AC) pointer and every underlying content-addressed (CAS) blob**.
+It relies on server reference-enumeration LIST (dependency D-7) and server CAS
+DELETE / LIST (dependency D-8), which are **deployed and live** (roadmap item M6.4,
+closed; verified by the live conformance suite). The complementary `clw prune`
+operation garbage-collects unreferenced CAS blobs. Because these operations cannot
+be undone, they carry safety rails (dry-run by default; `clw erase` additionally
+requires explicit confirmation and a typed tenant identifier).
 
-10.3. **Interim erasure process.** Until M6.4 lands, the Processor shall, on a
-Customer's verified written erasure request to the contact in §15, effect deletion
-of the affected Customer Data — **including the underlying CAS blobs** — by an
-operator-side process, and confirm completion **without undue delay and in any
-event within 30 days**. This erasure is operator-assisted pending roadmap item M6.4
-(server-side D-7/D-8 reference-enumeration and CAS DELETE/LIST); the Processor does
-not represent that fully automated, instant self-service CAS erasure is available
-before M6.4 lands. This interim
-operator-side process is the means by which the deletion-or-return obligations in
-§4.7 and §9.2 are performed for server-side Customer Data until M6.4 lands.
+10.3. **Operator-assisted erasure (alternative).** Where a Customer prefers, or
+cannot run the client, the Processor shall, on a Customer's verified written
+erasure request to the contact in §15, effect deletion of the affected Customer
+Data — **including the underlying CAS blobs** — and confirm completion **without
+undue delay and in any event within 30 days**. This process is one means by which
+the deletion-or-return obligations in §4.7 and §9.2 are performed for server-side
+Customer Data.
 
-10.4. **No misrepresentation.** This DPA does not represent that fully automated,
-self-service erasure of CAS content is available before M6.4 lands. The Processor
-shall update §10 upon closure of M6.4.
+10.4. **Accuracy.** This DPA accurately reflects that fully automated, verifiable
+self-service erasure of CAS content is available as of the Effective Date. The
+Processor shall update §10 if the mechanism materially changes.
 
 ---
 

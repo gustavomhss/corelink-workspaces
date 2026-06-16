@@ -316,21 +316,23 @@ server operational/security/audit logs are retained for **90 days**, after which
 are deleted or aggregated/anonymized.
 
 **Right to erasure (GDPR Art. 17; LGPD Art. 18).** We honor erasure requests as
-described here and in §10. The mechanics differ between the self-service client operation and the full erasure
-of stored content, and we describe both honestly:
+described here and in §10. Full self-service erasure of your stored content is
+**available today** through the client:
 
-- **Reference deletion (self-service, available today).** The client `clw rm` operation
-  removes the reference (cache pointer) to a snapshot. This makes the snapshot
-  unreachable through normal use.
-- **Full content erasure (operator-assisted today; self-service on a stated timeline).**
-  As of the effective date above, `clw rm` deletes only the reference pointer and does
-  **not** by itself garbage-collect the underlying content-addressed (CAS) blobs.
-  Consequently, full self-service erasure of all uploaded content is **not yet** available
-  through the client alone. Until that capability ships (a roadmap item tracked as M6.4 in
-  `docs/ROADMAP-go-live.md`), we effect full erasure of your stored Customer Content
-  through an **operator-assisted process** on a verified written request to the contact in
-  §15, within **30 days** of the request. When self-service CAS erasure ships, we will
-  update this section.
+- **Reference deletion (self-service).** The client `clw rm` operation removes the
+  reference (cache pointer) to a single snapshot, making it unreachable through
+  normal use.
+- **Full content erasure (self-service).** The client `clw erase` operation
+  **irreversibly deletes all of your tenant's data** — every reference and every
+  underlying content-addressed (CAS) blob — directly through the client (it is the
+  GDPR Art. 17 path; the server-side reference-enumeration and CAS delete/list
+  capabilities it relies on are deployed and live). `clw prune` additionally
+  garbage-collects unreferenced CAS blobs. These operations carry safety rails
+  (dry-run by default; `clw erase` also requires explicit `--yes` and a typed
+  tenant confirmation) because they cannot be undone.
+- **Operator-assisted erasure (alternative).** If you prefer, or cannot run the
+  client, we will effect full erasure of your stored Customer Content on a verified
+  written request to the contact in §15, within **30 days** of the request.
 
 On account closure, and on a valid erasure request, we delete the affected Customer
 Content through the process above and we delete Account & Operational Data subject to the
@@ -364,10 +366,10 @@ it directly.
   you (Art. 15).
 - **Rectification** — have inaccurate or incomplete data corrected (Art. 16).
 - **Erasure ("right to be forgotten")** — have your data deleted (Art. 17). We honor this
-  right through the mechanism described in §9: reference deletion is available
-  self-service today, and full erasure of stored content is, until roadmap item M6.4
-  ships, carried out by an operator-assisted process on verified request. See §9 for the
-  mechanism and §10.3 for timelines.
+  right through the mechanism described in §9: both reference deletion (`clw rm`) and
+  full self-service erasure of all stored content (`clw erase`) are available today
+  through the client, with an operator-assisted process available as an alternative on
+  verified request. See §9 for the mechanism and §10.3 for timelines.
 - **Restriction** — restrict processing in certain circumstances (Art. 18).
 - **Portability** — receive the data you provided in a structured, commonly used,
   machine-readable format, and have it transmitted to another controller where
