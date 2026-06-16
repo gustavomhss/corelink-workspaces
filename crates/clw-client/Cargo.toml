@@ -19,3 +19,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true }
+# Property-based robustness tests (list-envelope JSON parsers never panic on
+# arbitrary bytes). Already a workspace dev-dep; no new external crate.
+proptest = { workspace = true }

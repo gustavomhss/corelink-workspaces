@@ -55,3 +55,6 @@ tokio = { workspace = true }
 # fakes (e.g. erase.rs's eventually-consistent transport). Already a workspace
 # dependency (license-approved, in the lockfile); used here only by tests.
 async-trait = { workspace = true }
+# Property-based robustness tests (config-line parser never panics on arbitrary
+# input). Already a workspace dev-dep; no new external crate enters the graph.
+proptest = { workspace = true }

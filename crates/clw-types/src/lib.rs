@@ -767,6 +767,108 @@ mod tests {
         assert!(dbg.contains("corelink-api.humangr.com"));
     }
 
+    // -----------------------------------------------------------------------
+    // PART A — proptest fuzz-robustness (runs in the ordinary gate).
+    //
+    // The invariant for every parser: on ARBITRARY input it returns Ok or Err —
+    // it NEVER panics, hangs, or OOMs. A panic = test failure (non-vacuous by
+    // construction). Modest case counts keep the gate fast.
+    // -----------------------------------------------------------------------
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// `Manifest::from_bytes` on ARBITRARY bytes never panics — only
+            /// `Ok`/`Err`. Covers the serde_json + validate_canonical parse path
+            /// against hostile/garbage blobs.
+            #[test]
+            fn manifest_from_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = Manifest::from_bytes(&bytes);
+            }
+
+            /// `RefRecord::from_bytes` (clw-types:312) on ARBITRARY bytes never
+            /// panics — only `Ok`/`Err`.
+            #[test]
+            fn refrecord_from_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = RefRecord::from_bytes(&bytes);
+            }
+
+            /// `Digest::from_hex` on an ARBITRARY string never panics — only
+            /// `Ok`/`Err` (non-hex, wrong-length, unicode all yield `Err`).
+            #[test]
+            fn digest_from_hex_never_panics(s in ".*") {
+                let _ = Digest::from_hex(&s);
+            }
+        }
+
+        // Strategy: a SAFE relative path (the canonical-manifest invariant) — one
+        // or more '/'-joined components drawn from a closed alphabet that excludes
+        // '/', '.', ':', '\\' and empties, so validate_rel_path always accepts it.
+        // This keeps the round-trip property NON-VACUOUS: canonical_bytes succeeds
+        // for these, so the property actually exercises the serialize→parse path.
+        fn safe_component() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_-]{1,8}"
+        }
+        fn safe_rel_path() -> impl Strategy<Value = String> {
+            proptest::collection::vec(safe_component(), 1..4).prop_map(|c| c.join("/"))
+        }
+
+        // Strategy: an arbitrary Entry with a safe path/target (so the canonical
+        // round-trip is exercised, not short-circuited by a validation Err).
+        fn arb_entry() -> impl Strategy<Value = Entry> {
+            prop_oneof![
+                (safe_rel_path(), any::<u32>(), any::<u64>()).prop_map(|(path, mode, size)| {
+                    Entry::File {
+                        path,
+                        mode,
+                        size,
+                        chunks: vec![],
+                    }
+                }),
+                (safe_rel_path(), safe_rel_path())
+                    .prop_map(|(path, target)| Entry::Symlink { path, target }),
+                safe_rel_path().prop_map(|path| Entry::Dir { path }),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Canonical round-trip: build an ARBITRARY `Manifest`, sort+dedup its
+            /// entries by path (the canonical-form precondition), then assert
+            /// `from_bytes(canonical_bytes())` round-trips to an EQUAL manifest.
+            /// Proves canonical_bytes is the one legal serialization the parser
+            /// accepts and reproduces exactly.
+            #[test]
+            fn manifest_canonical_roundtrip(
+                mut entries in proptest::collection::vec(arb_entry(), 0..16),
+                total_size in any::<u64>(),
+            ) {
+                // Canonical precondition: entries STRICTLY ascending by path. Sort,
+                // then dedup duplicate paths (canonical_bytes rejects both unsorted
+                // AND duplicate paths), so canonical_bytes does not error first.
+                entries.sort_by(|a, b| a.path().cmp(b.path()));
+                entries.dedup_by(|a, b| a.path() == b.path());
+
+                let manifest = Manifest {
+                    version: MANIFEST_VERSION,
+                    total_size,
+                    entries,
+                };
+                // With safe paths + sorted/deduped entries, canonical_bytes succeeds.
+                let bytes = manifest
+                    .canonical_bytes()
+                    .expect("sorted/deduped safe-path manifest must canonicalize");
+                let parsed = Manifest::from_bytes(&bytes)
+                    .expect("canonical bytes must round-trip back through from_bytes");
+                prop_assert_eq!(parsed, manifest);
+            }
+        }
+    }
+
     #[test]
     fn validate_symlink_target_rejects_escape_and_accepts_clean() {
         assert!(validate_symlink_target("a.txt").is_ok());
