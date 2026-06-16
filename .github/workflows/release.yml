@@ -288,6 +288,9 @@ jobs:
           # 1. Import the Developer ID .p12 into an ephemeral keychain.
           KEYCHAIN="$RUNNER_TEMP/clw-signing.keychain-db"
           KEYCHAIN_PASS="$(uuidgen)"
+          # Cleanup on ANY exit (incl. a mid-step failure under set -e): never leave
+          # the ephemeral keychain or the p12/p8 key material on the runner.
+          trap 'security delete-keychain "$KEYCHAIN" 2>/dev/null || true; rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"' EXIT
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 900 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
@@ -378,6 +381,7 @@ jobs:
           # Real minisign detached signature -> dist/${ASSET}.minisig.
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
+          trap 'rm -f minisign.key' EXIT   # remove the key even if signing aborts under set -e
           echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "dist/${ASSET}"
           rm -f minisign.key   # leave NO key material on the runner
           # Self-verify against the committed public key (the trust-root) when present.
@@ -514,6 +518,7 @@ jobs:
           # signed-checksum guarantee the roadmap demands).
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
+          trap 'rm -f ../minisign.key' EXIT   # remove the key even if signing aborts under set -e
           echo "$MINISIGN_PASSWORD" | minisign -S -s ../minisign.key -m SHA256SUMS
           rm -f ../minisign.key   # leave NO key material on the runner
           echo "---- SHA256SUMS.minisig ----"
