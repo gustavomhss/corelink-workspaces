@@ -51,3 +51,7 @@ assert_cmd = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
+# Test-only: implement the AcTransport/CasTransport async traits for in-crate
+# fakes (e.g. erase.rs's eventually-consistent transport). Already a workspace
+# dependency (license-approved, in the lockfile); used here only by tests.
+async-trait = { workspace = true }

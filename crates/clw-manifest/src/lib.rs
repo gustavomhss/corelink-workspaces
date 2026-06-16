@@ -137,9 +137,20 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
                     ))
                 })?
                 .replace(std::path::MAIN_SEPARATOR, "/");
+            // FIX 3: validate the entry's OWN rel path too (not just the target),
+            // so an unrepresentable symlink path fails fast at walk time.
+            clw_types::validate_rel_path(&rel)?;
             clw_types::validate_symlink_target(&target)?;
             entries.push(WalkedEntry::Symlink { rel, target });
         } else if file_type.is_dir() {
+            // FIX 3: validate Dir entry paths at walk time — the SAME point symlink
+            // targets are validated — so a path `validate_rel_path` will reject
+            // (e.g. a filename containing a backslash, legal on unix) fails FAST
+            // with a clear per-entry error, instead of surviving until
+            // `manifest.canonical_bytes()` AFTER every chunk has been uploaded.
+            // `validate_rel_path` is the authority; this only moves the check
+            // earlier — it does not change what is accepted or rejected.
+            clw_types::validate_rel_path(&rel)?;
             // Record as a candidate empty dir; we'll filter after collecting all entries.
             candidate_dirs.push((rel, abs));
         } else if file_type.is_file() {
@@ -158,6 +169,10 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
             #[cfg(windows)]
             let mode = 0o644;
             let size = meta.len();
+            // FIX 3: validate the File entry's rel path at walk time (see the Dir
+            // branch above) so a path canonical_bytes() would later reject fails
+            // FAST — BEFORE this file is chunked and uploaded — naming the file.
+            clw_types::validate_rel_path(&rel)?;
             entries.push(WalkedEntry::File(WalkedFile {
                 abs,
                 rel,
@@ -231,16 +246,28 @@ fn entries_changed(old: &Entry, new: &Entry) -> bool {
     match (old, new) {
         (
             Entry::File {
+                mode: old_mode,
                 size: old_size,
                 chunks: old_chunks,
                 ..
             },
             Entry::File {
+                mode: new_mode,
                 size: new_size,
                 chunks: new_chunks,
                 ..
             },
-        ) => old_size != new_size || old_chunks != new_chunks,
+        ) =>
+        // Mode is part of the manifest (masked `& 0o777` at walk time, the SAME
+        // way both the remote snapshot and the local re-walk mask it), so a
+        // mode-only change — `chmod +x` with identical content — DOES change the
+        // manifest. `status` must not claim CLEAN when a re-snapshot would
+        // differ, so the mode is compared here alongside size/chunks. The values
+        // are already masked identically on both sides, so the comparison agrees
+        // with what `snapshot` would produce.
+        {
+            old_mode != new_mode || old_size != new_size || old_chunks != new_chunks
+        }
         (
             Entry::Symlink {
                 target: old_target, ..
@@ -467,6 +494,34 @@ mod tests {
         );
     }
 
+    // FIX 3 (unix) — a file whose name contains a backslash (legal on unix, but
+    // rejected by `validate_rel_path` for portability) must fail at WALK time,
+    // BEFORE any chunk is uploaded, with an error that names the offending path.
+    #[cfg(unix)]
+    #[test]
+    fn walk_rejects_backslash_named_file_at_walk_time() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // `a\b.txt` — a single unix filename literally containing a backslash.
+        let bad_name = "a\\b.txt";
+        fs::write(root.join(bad_name), b"data").unwrap();
+
+        let err = walk(root).expect_err("walk must reject a backslash-named file");
+        match err {
+            ClwError::InvalidManifest(msg) => {
+                assert!(
+                    msg.contains("backslash"),
+                    "error should explain the backslash rejection, got: {msg}"
+                );
+                assert!(
+                    msg.contains(bad_name),
+                    "error should name the offending file, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidManifest, got: {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn walk_mode_captured() {
@@ -589,6 +644,95 @@ mod tests {
         }]);
         let d = diff(&old, &new);
         assert_eq!(d.changed, vec!["a.txt"]);
+    }
+
+    // FIX 2 — a MODE-ONLY change (identical content/size/chunks, different mode)
+    // must be reported as `changed`: the mode is in the manifest, so a re-snapshot
+    // would produce a different manifest and `status` must not claim CLEAN.
+    #[test]
+    fn diff_changed_mode_only() {
+        let chunks = vec![ChunkRef {
+            digest: Digest::of_bytes(b"same"),
+            size: 5,
+        }];
+        let old = make_manifest(vec![Entry::File {
+            path: "exec.sh".to_string(),
+            mode: 0o644,
+            size: 5,
+            chunks: chunks.clone(),
+        }]);
+        // Only the mode differs (chmod +x); content/size/chunks identical.
+        let new = make_manifest(vec![Entry::File {
+            path: "exec.sh".to_string(),
+            mode: 0o755,
+            size: 5,
+            chunks,
+        }]);
+        let d = diff(&old, &new);
+        assert_eq!(
+            d.changed,
+            vec!["exec.sh"],
+            "a mode-only change must be reported as changed"
+        );
+        assert!(d.added.is_empty());
+        assert!(d.removed.is_empty());
+    }
+
+    // FIX 2 (unix) — end to end through `walk`: a tracked file whose MODE changed
+    // (content byte-identical) yields a manifest that diffs as `changed` against
+    // the pre-chmod manifest. This proves status & snapshot agree on mode masking.
+    #[cfg(unix)]
+    #[test]
+    fn walk_mode_change_is_reported_as_changed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Build a manifest from a walk of `root` (File entries only; no chunking —
+        // diff compares size+chunks+mode and content is unchanged so chunks stay
+        // identical, but to keep this manifest-only we synthesize chunks from rel).
+        fn manifest_from_walk(root: &Path) -> Manifest {
+            let entries: Vec<Entry> = walk(root)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e {
+                    WalkedEntry::File(f) => Some(Entry::File {
+                        path: f.rel.clone(),
+                        mode: f.mode,
+                        size: f.size,
+                        // Content is identical across the chmod, so a content-derived
+                        // digest is identical too — isolating MODE as the only delta.
+                        chunks: vec![ChunkRef {
+                            digest: Digest::of_bytes(f.rel.as_bytes()),
+                            size: f.size,
+                        }],
+                    }),
+                    _ => None,
+                })
+                .collect();
+            make_manifest(entries)
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let path = root.join("exec.sh");
+        fs::write(&path, b"#!/bin/sh\n").unwrap();
+
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+        let before = manifest_from_walk(root);
+
+        // chmod +x — content byte-identical, only the mode changes.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        let after = manifest_from_walk(root);
+
+        let d = diff(&before, &after);
+        assert_eq!(
+            d.changed,
+            vec!["exec.sh"],
+            "a tracked file whose mode changed (content identical) must be reported as changed"
+        );
     }
 
     #[test]

@@ -108,47 +108,14 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         blobs.len()
     );
 
-    // Execute WITH VERIFICATION. Delete every REF first, then every blob
-    // (refs-first keeps the store consistent on a partial failure — a crash after
-    // the ref loop leaves only UNREFERENCED orphan blobs, reclaimable by `prune`
-    // or an idempotent re-run, never a live ref pointing at deleted content).
-    // Then RE-ENUMERATE and repeat: a GDPR Art.17 claim MUST NOT report success
-    // until enumeration confirms the tenant is actually empty — a single pass can
-    // miss data written concurrently or carried by a late pagination page.
-    // Bounded passes prevent an unbounded loop against a misbehaving server.
-    const MAX_PASSES: usize = 3;
-    let mut refs_deleted = 0usize;
-    let mut blobs_deleted = 0usize;
-    let mut pending_refs = ref_keys;
-    let mut pending_blobs = blobs;
-    let mut pass = 0usize;
-    let (remaining_refs, remaining_blobs) = loop {
-        pass += 1;
-        for k in &pending_refs {
-            AcTransport::delete(&client, k)
-                .await
-                .map_err(map_auth_error)?;
-            refs_deleted += 1;
-        }
-        for d in &pending_blobs {
-            CasTransport::delete(&client, d)
-                .await
-                .map_err(map_auth_error)?;
-            blobs_deleted += 1;
-        }
-        // Verify: re-enumerate to confirm nothing remains.
-        let r = AcTransport::list_refs(&client)
-            .await
-            .map_err(map_auth_error)?;
-        let b = CasTransport::list_blobs(&client)
-            .await
-            .map_err(map_auth_error)?;
-        if (r.is_empty() && b.is_empty()) || pass >= MAX_PASSES {
-            break (r.len(), b.len());
-        }
-        pending_refs = r;
-        pending_blobs = b;
-    };
+    // Execute WITH VERIFICATION (see `erase_with_verification`).
+    let EraseOutcome {
+        refs_deleted,
+        blobs_deleted,
+        remaining_refs,
+        remaining_blobs,
+        passes: pass,
+    } = erase_with_verification(&client, ref_keys, blobs).await?;
 
     // Truthful Art.17 outcome: only claim success when enumeration confirms the
     // tenant is empty. Otherwise FAIL loud (non-zero exit) so a caller never
@@ -190,6 +157,85 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         );
     }
     Ok(())
+}
+
+/// Result of the verified-erase loop. `refs_deleted`/`blobs_deleted` are the
+/// counts of DISTINCT objects erased (the GDPR Art.17 audit numbers), NOT the
+/// number of delete calls. `remaining_*` are what enumeration still saw on the
+/// final pass; `passes` is how many passes ran.
+struct EraseOutcome {
+    refs_deleted: usize,
+    blobs_deleted: usize,
+    remaining_refs: usize,
+    remaining_blobs: usize,
+    passes: usize,
+}
+
+/// Delete every ref then every blob, RE-ENUMERATE, and repeat until empty or
+/// `MAX_PASSES`. Refs-first keeps the store consistent on a partial failure — a
+/// crash after the ref loop leaves only UNREFERENCED orphan blobs, reclaimable
+/// by `prune` or an idempotent re-run, never a live ref pointing at deleted
+/// content. The verify loop exists because a GDPR Art.17 claim MUST NOT report
+/// success until enumeration confirms the tenant is actually empty — a single
+/// pass can miss data written concurrently or carried by a late pagination page.
+/// Bounded passes prevent an unbounded loop against a misbehaving server.
+///
+/// COUNT DISTINCT objects erased, NOT delete CALLS: DELETE is idempotent
+/// (404→Ok), so an eventually-consistent server can re-return a just-deleted key
+/// on the next enumeration. Re-DELETEing it must NOT inflate the reported total —
+/// that total is the audit number and must be truthful. We accumulate the
+/// keys/hashes we issued a delete for into HashSets, so the distinct count holds
+/// regardless of re-listing.
+async fn erase_with_verification<C>(
+    client: &C,
+    ref_keys: Vec<clw_types::Digest>,
+    blobs: Vec<clw_types::Digest>,
+) -> Result<EraseOutcome, ClwError>
+where
+    C: AcTransport + CasTransport,
+{
+    const MAX_PASSES: usize = 3;
+    let mut deleted_refs: std::collections::HashSet<clw_types::Digest> =
+        std::collections::HashSet::new();
+    let mut deleted_blobs: std::collections::HashSet<clw_types::Digest> =
+        std::collections::HashSet::new();
+    let mut pending_refs = ref_keys;
+    let mut pending_blobs = blobs;
+    let mut pass = 0usize;
+    let (remaining_refs, remaining_blobs) = loop {
+        pass += 1;
+        for k in &pending_refs {
+            AcTransport::delete(client, k)
+                .await
+                .map_err(map_auth_error)?;
+            deleted_refs.insert(*k);
+        }
+        for d in &pending_blobs {
+            CasTransport::delete(client, d)
+                .await
+                .map_err(map_auth_error)?;
+            deleted_blobs.insert(*d);
+        }
+        // Verify: re-enumerate to confirm nothing remains.
+        let r = AcTransport::list_refs(client)
+            .await
+            .map_err(map_auth_error)?;
+        let b = CasTransport::list_blobs(client)
+            .await
+            .map_err(map_auth_error)?;
+        if (r.is_empty() && b.is_empty()) || pass >= MAX_PASSES {
+            break (r.len(), b.len());
+        }
+        pending_refs = r;
+        pending_blobs = b;
+    };
+    Ok(EraseOutcome {
+        refs_deleted: deleted_refs.len(),
+        blobs_deleted: deleted_blobs.len(),
+        remaining_refs,
+        remaining_blobs,
+        passes: pass,
+    })
 }
 
 /// Rail 3 — typed-tenant confirmation. With `--confirm-tenant` we compare the
@@ -258,6 +304,124 @@ fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clw_types::{Digest, Result as ClwResult};
+    use std::sync::Mutex;
+
+    // FIX 1 — a fake transport whose enumeration is EVENTUALLY CONSISTENT: on the
+    // SECOND `list_refs`/`list_blobs` call it re-returns one already-deleted key,
+    // then reports empty thereafter. This reproduces the double-count: pass 2
+    // re-DELETEs the re-listed key, and a call-counting implementation would
+    // inflate the audit number. The distinct-set count must NOT inflate.
+    struct EventuallyConsistentTransport {
+        // The single ref/blob that gets re-listed once after being deleted.
+        ghost_ref: Digest,
+        ghost_blob: Digest,
+        ref_list_calls: Mutex<usize>,
+        blob_list_calls: Mutex<usize>,
+        ref_deletes: Mutex<usize>,
+        blob_deletes: Mutex<usize>,
+    }
+
+    impl EventuallyConsistentTransport {
+        fn new() -> Self {
+            Self {
+                ghost_ref: Digest::of_bytes(b"ghost-ref"),
+                ghost_blob: Digest::of_bytes(b"ghost-blob"),
+                ref_list_calls: Mutex::new(0),
+                blob_list_calls: Mutex::new(0),
+                ref_deletes: Mutex::new(0),
+                blob_deletes: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for EventuallyConsistentTransport {
+        async fn get(&self, _key: &Digest) -> ClwResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &Digest, _value: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &Digest) -> ClwResult<()> {
+            *self.ref_deletes.lock().unwrap() += 1;
+            Ok(()) // idempotent — re-deleting the ghost is Ok, like a real 404→Ok.
+        }
+        async fn list_refs(&self) -> ClwResult<Vec<Digest>> {
+            let mut n = self.ref_list_calls.lock().unwrap();
+            *n += 1;
+            // 1st verify (after pass 1) STILL sees the just-deleted ghost; from
+            // the 2nd verify on, it's gone.
+            if *n == 1 {
+                Ok(vec![self.ghost_ref])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for EventuallyConsistentTransport {
+        async fn exists(&self, _digest: &Digest) -> ClwResult<bool> {
+            Ok(false)
+        }
+        async fn get(&self, digest: &Digest) -> ClwResult<Vec<u8>> {
+            Err(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, _digest: &Digest, _bytes: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _digest: &Digest) -> ClwResult<()> {
+            *self.blob_deletes.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn list_blobs(&self) -> ClwResult<Vec<Digest>> {
+            let mut n = self.blob_list_calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Ok(vec![self.ghost_blob])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn erase_counts_distinct_objects_not_delete_calls() {
+        let client = EventuallyConsistentTransport::new();
+        // Initial enumeration found exactly one ref + one blob (the ghosts).
+        let ref_keys = vec![client.ghost_ref];
+        let blobs = vec![client.ghost_blob];
+
+        let outcome = erase_with_verification(&client, ref_keys, blobs)
+            .await
+            .unwrap();
+
+        // Two passes ran (pass 1 deletes; the re-list forces pass 2 which
+        // re-deletes the ghost), so the DELETE CALL count is 2 each…
+        assert_eq!(
+            *client.ref_deletes.lock().unwrap(),
+            2,
+            "the ghost ref was DELETEd twice (idempotently)"
+        );
+        assert_eq!(*client.blob_deletes.lock().unwrap(), 2);
+
+        // …but the AUDIT number is the DISTINCT count: exactly ONE ref + ONE blob.
+        assert_eq!(
+            outcome.refs_deleted, 1,
+            "must report DISTINCT refs erased, not delete calls"
+        );
+        assert_eq!(
+            outcome.blobs_deleted, 1,
+            "must report DISTINCT blobs erased, not delete calls"
+        );
+
+        // Erasure correctness is unchanged: the loop still gated on emptiness and
+        // the tenant ended up verified empty.
+        assert_eq!(outcome.remaining_refs, 0);
+        assert_eq!(outcome.remaining_blobs, 0);
+        assert_eq!(outcome.passes, 2);
+    }
 
     #[test]
     fn confirm_tenant_flag_must_match_exactly() {
