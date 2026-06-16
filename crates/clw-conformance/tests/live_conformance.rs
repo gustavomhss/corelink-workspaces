@@ -14,10 +14,11 @@
 //!
 //! A silent skip-as-pass is safe for everyday CI but DANGEROUS as a release
 //! pre-tag gate: a release run that forgot the credentials — or hit an endpoint
-//! that regressed to not-deployed — would report GREEN having asserted nothing.
-//! Set `CLW_CONFORMANCE_REQUIRE=1` (only in the pre-tag release gate) to make
-//! EVERY skip a hard failure: missing creds and not-yet-deployed endpoints then
-//! PANIC instead of passing. With the variable unset, behaviour is identical to
+//! that regressed to a 405/501-unavailable state — would report GREEN having
+//! asserted nothing. Set `CLW_CONFORMANCE_REQUIRE=1` (only in the pre-tag
+//! release gate) to make EVERY skip a hard failure: missing creds and
+//! 405/501-unavailable endpoints then PANIC instead of passing. With the
+//! variable unset, behaviour is identical to
 //! before (skips pass) — so this change is invisible to the normal lane.
 //!
 //! Run with:
@@ -83,7 +84,7 @@ fn require_live() -> bool {
 
 /// Emit a skip notice to stderr — or PANIC when running under the require gate
 /// (`CLW_CONFORMANCE_REQUIRE=1`). This is what closes the skip-equals-pass
-/// false-green: in the release gate a missing credential or a not-yet-deployed
+/// false-green: in the release gate a missing credential or a 405/501-unavailable
 /// endpoint fails loudly instead of reporting a green that asserted nothing.
 fn skip_or_fail(reason: &str) {
     if require_live() {
@@ -107,12 +108,12 @@ fn run_suffix() -> String {
     format!("{:08x}{:08x}", pid, nanos)
 }
 
-/// True if `err` is the optimistic "endpoint not yet deployed" signal (the
-/// client maps 405/501 to a `Transport` error whose message says so). Live tests
-/// SKIP rather than fail during the ratified-but-not-yet-deployed window
-/// (corelink-server PR #269).
-fn is_not_deployed(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+/// True if `err` is the server-regression signal: the capability is LIVE but the
+/// server returned 405/501 (the client maps 405/501 to a `Transport` error
+/// carrying the `405/501` token). Live tests SKIP rather than fail when a LIVE
+/// capability is transiently unavailable.
+fn is_capability_unavailable(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
 }
 
 // ---------------------------------------------------------------------------
@@ -262,8 +263,8 @@ async fn auth_rejected() {
 /// D-1: PUT a ref → confirm present → `AcTransport::delete` → confirm gone.
 ///
 /// Exercises the real client `delete` impl (the server chose `204`-for-both,
-/// idempotent). During the ratified-but-not-yet-deployed window the client maps
-/// 405/501 to a "not yet deployed" error → the test SKIPS, never fails.
+/// idempotent). DELETE /v1/ac is LIVE (D-1); if a LIVE endpoint returns 405/501
+/// the client maps it to a `405/501` server-regression error → the test SKIPS.
 #[tokio::test]
 async fn ref_delete_roundtrip() {
     let Some((client, _tenant)) = try_client() else {
@@ -293,8 +294,8 @@ async fn ref_delete_roundtrip() {
     // DELETE via the real client impl (D-1).
     match AcTransport::delete(&client, &key).await {
         Ok(()) => {}
-        Err(e) if is_not_deployed(&e) => {
-            skip_or_fail("DELETE /v1/ac (D-1) not yet deployed; ref-delete round-trip pending");
+        Err(e) if is_capability_unavailable(&e) => {
+            skip_or_fail("DELETE /v1/ac (D-1) returned 405/501 — capability unavailable; ref-delete round-trip skipped");
             return;
         }
         Err(e) => panic!("ac delete failed: {e}"),
@@ -317,7 +318,7 @@ async fn ref_delete_roundtrip() {
 // ---------------------------------------------------------------------------
 
 /// D-7: PUT a ref → `list_refs` must include its key → best-effort cleanup.
-/// SKIPS while `GET /v1/ac/{tenant}` is not yet deployed.
+/// SKIPS if `GET /v1/ac/{tenant}` (LIVE) returns a 405/501-unavailable state.
 #[tokio::test]
 async fn ref_list_roundtrip() {
     let Some((client, _tenant)) = try_client() else {
@@ -334,8 +335,8 @@ async fn ref_list_roundtrip() {
 
     let refs = match AcTransport::list_refs(&client).await {
         Ok(r) => r,
-        Err(e) if is_not_deployed(&e) => {
-            skip_or_fail("GET /v1/ac (D-7) not yet deployed; ref-list round-trip pending");
+        Err(e) if is_capability_unavailable(&e) => {
+            skip_or_fail("GET /v1/ac (D-7) returned 405/501 — capability unavailable; ref-list round-trip skipped");
             return;
         }
         Err(e) => panic!("list_refs failed: {e}"),
@@ -345,7 +346,7 @@ async fn ref_list_roundtrip() {
         "list_refs must include the just-put ref key"
     );
 
-    // Best-effort cleanup (ignore not-deployed / transient errors).
+    // Best-effort cleanup (ignore 405/501-unavailable / transient errors).
     let _ = AcTransport::delete(&client, &key).await;
 }
 
@@ -354,7 +355,7 @@ async fn ref_list_roundtrip() {
 // ---------------------------------------------------------------------------
 
 /// D-8: PUT a blob → exists true → `CasTransport::delete` → exists false.
-/// SKIPS while `DELETE /v1/cas/{tenant}/{hash}` is not yet deployed.
+/// SKIPS if `DELETE /v1/cas/{tenant}/{hash}` (LIVE) returns 405/501-unavailable.
 #[tokio::test]
 async fn cas_delete_roundtrip() {
     let Some((client, _tenant)) = try_client() else {
@@ -377,8 +378,8 @@ async fn cas_delete_roundtrip() {
 
     match CasTransport::delete(&client, &digest).await {
         Ok(()) => {}
-        Err(e) if is_not_deployed(&e) => {
-            skip_or_fail("DELETE /v1/cas (D-8) not yet deployed; cas-delete round-trip pending");
+        Err(e) if is_capability_unavailable(&e) => {
+            skip_or_fail("DELETE /v1/cas (D-8) returned 405/501 — capability unavailable; cas-delete round-trip skipped");
             return;
         }
         Err(e) => panic!("cas delete failed: {e}"),
@@ -395,7 +396,7 @@ async fn cas_delete_roundtrip() {
 // ---------------------------------------------------------------------------
 
 /// D-8: PUT a blob → `list_blobs` must include its hash → best-effort cleanup.
-/// SKIPS while `GET /v1/cas/{tenant}` is not yet deployed.
+/// SKIPS if `GET /v1/cas/{tenant}` (LIVE) returns a 405/501-unavailable state.
 #[tokio::test]
 async fn cas_list_roundtrip() {
     let Some((client, _tenant)) = try_client() else {
@@ -412,8 +413,8 @@ async fn cas_list_roundtrip() {
 
     let blobs = match CasTransport::list_blobs(&client).await {
         Ok(b) => b,
-        Err(e) if is_not_deployed(&e) => {
-            skip_or_fail("GET /v1/cas (D-8) not yet deployed; cas-list round-trip pending");
+        Err(e) if is_capability_unavailable(&e) => {
+            skip_or_fail("GET /v1/cas (D-8) returned 405/501 — capability unavailable; cas-list round-trip skipped");
             return;
         }
         Err(e) => panic!("list_blobs failed: {e}"),

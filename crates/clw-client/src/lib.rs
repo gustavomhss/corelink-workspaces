@@ -349,12 +349,13 @@ impl HttpClient {
     /// follows a non-null `next_cursor` internally via `?cursor=<opaque>` (URL-
     /// encoded) until the server returns `null`. Each page GET rides the SAME
     /// [`with_retry`](Self::with_retry) / [`Governor`] / `User-Agent` path as every
-    /// other request. Until corelink-server PR #269 deploys, a 405|501 is surfaced
-    /// as `ClwError::Transport(not_deployed_msg)`, distinct per caller (D-7/D-8).
+    /// other request. The GET listing capability is LIVE (D-7/D-8, conformance-
+    /// green), so a 405|501 is a server-side regression and is surfaced as
+    /// `ClwError::Transport(unavailable_msg)`, distinct per caller (D-7/D-8).
     async fn list_digests<P: ListPage + Send>(
         &self,
         base_url: &str,
-        not_deployed_msg: &str,
+        unavailable_msg: &str,
     ) -> Result<Vec<Digest>> {
         let auth = self.auth_header();
         let client = &self.inner;
@@ -374,7 +375,7 @@ impl HttpClient {
                     let base_url = base_url.to_string();
                     let auth = auth.clone();
                     let cursor = cursor.clone();
-                    let not_deployed_msg = not_deployed_msg.to_string();
+                    let unavailable_msg = unavailable_msg.to_string();
                     async move {
                         // `?limit=1000` always; the opaque cursor is appended
                         // (reqwest URL-encodes it) only when continuing.
@@ -401,8 +402,8 @@ impl HttpClient {
                                 })
                             }
                             401 => Err(ClwError::Auth),
-                            // OPTIMISTIC-pending: ratified+implemented, not yet deployed.
-                            405 | 501 => Err(ClwError::Transport(not_deployed_msg)),
+                            // Defensive: capability is LIVE (D-7/D-8) — a 405/501 here means a server-side regression.
+                            405 | 501 => Err(ClwError::Transport(unavailable_msg)),
                             429 => {
                                 record_retry_after(&retry_slot, &resp);
                                 Err(ClwError::Http {
@@ -835,9 +836,9 @@ impl CasTransport for HttpClient {
     }
 
     /// DELETE a blob by its hash (`DELETE /v1/cas/{tenant}/{hash}`). Idempotent:
-    /// 200|202|204|404 all return Ok(()). OPTIMISTIC: 405|501 surface a clear
-    /// "CAS delete not yet deployed (D-8)" error until corelink-server ships the
-    /// handler — see docs/REQUESTS-to-other-TLs.md D-8.
+    /// 200|202|204|404 all return Ok(()). The DELETE /v1/cas capability is LIVE
+    /// (D-8, conformance-green), so a 405|501 is a server-side regression and is
+    /// surfaced as a clear server-regression error — see docs/RELAY-server-D1-D7-D8.md.
     async fn delete(&self, digest: &Digest) -> Result<()> {
         let url = self.config.cas_url(digest);
         let auth = self.auth_header();
@@ -860,9 +861,7 @@ impl CasTransport for HttpClient {
                     200 | 202 | 204 | 404 => Ok(()),
                     401 => Err(ClwError::Auth),
                     405 | 501 => Err(ClwError::Transport(format!(
-                        "CAS delete not yet deployed (D-8) — ratified & implemented in \
-                         corelink-server (PR #269), pending deploy; see \
-                         docs/RELAY-server-D1-D7-D8.md ({url})"
+                        "CAS delete failed: server returned 405/501 for {url} — the DELETE /v1/cas capability is LIVE (D-8, conformance-green), so this indicates a server-side regression, not an expected state; see docs/RELAY-server-D1-D7-D8.md"
                     ))),
                     429 => {
                         record_retry_after(&retry_slot, &resp);
@@ -883,8 +882,8 @@ impl CasTransport for HttpClient {
 
     /// List the tenant's CAS blob hashes (`GET /v1/cas/{tenant}`), paginating
     /// internally into a flat `Vec` per the ratified D-8 envelope
-    /// `{"blobs":[{"hash":…}],"next_cursor"}`. Until corelink-server PR #269
-    /// deploys, 405|501 surface a clear "CAS listing not yet deployed (D-8)" error.
+    /// `{"blobs":[{"hash":…}],"next_cursor"}`. The GET /v1/cas capability is LIVE
+    /// (D-8, conformance-green), so 405|501 surface a clear server-regression error.
     async fn list_blobs(&self) -> Result<Vec<Digest>> {
         let base_url = format!(
             "{}/v1/cas/{}",
@@ -893,8 +892,7 @@ impl CasTransport for HttpClient {
         );
         self.list_digests::<CasListPage>(
             &base_url,
-            "CAS listing not yet deployed (D-8) — ratified & implemented in \
-             corelink-server (PR #269), pending deploy; see docs/RELAY-server-D1-D7-D8.md",
+            "CAS listing failed: server returned 405/501 — the GET /v1/cas capability is LIVE (D-8, conformance-green), so this indicates a server-side regression, not an expected state; see docs/RELAY-server-D1-D7-D8.md",
         )
         .await
     }
@@ -1009,12 +1007,9 @@ impl AcTransport for HttpClient {
                     // Idempotent: an absent key (404) is a successful delete.
                     200 | 202 | 204 | 404 => Ok(()),
                     401 => Err(ClwError::Auth),
-                    // Optimistic-pending case: the server has no DELETE handler yet
-                    // (this branch is HELD until corelink-server ships D-1).
+                    // Defensive: DELETE /v1/ac is LIVE (D-1) — a 405/501 here means a server-side regression.
                     405 | 501 => Err(ClwError::Transport(format!(
-                        "ref deletion not yet deployed (D-1) — ratified & implemented in \
-                         corelink-server (PR #269), pending deploy; see \
-                         docs/RELAY-server-D1-D7-D8.md ({url})"
+                        "ref deletion failed: server returned 405/501 for DELETE {url} — the DELETE /v1/ac capability is LIVE (D-1, conformance-green), so this indicates a server-side regression or misroute, not an expected state; see docs/RELAY-server-D1-D7-D8.md"
                     ))),
                     429 => {
                         record_retry_after(&retry_slot, &resp);
@@ -1037,8 +1032,8 @@ impl AcTransport for HttpClient {
     /// into a flat `Vec` per the ratified D-7 envelope
     /// `{"refs":[{"ref_key":…}],"next_cursor"}`. Needed because
     /// `ref_key = BLAKE3(domain‖name)` is one-way and the client keeps no
-    /// name→key index. Until corelink-server PR #269 deploys, 405|501 surface a
-    /// clear "ref listing not yet deployed (D-7)" error.
+    /// name→key index. The GET /v1/ac capability is LIVE (D-7, conformance-green),
+    /// so 405|501 surface a clear server-regression error.
     async fn list_refs(&self) -> Result<Vec<Digest>> {
         let base_url = format!(
             "{}/v1/ac/{}",
@@ -1047,8 +1042,7 @@ impl AcTransport for HttpClient {
         );
         self.list_digests::<AcListPage>(
             &base_url,
-            "ref listing not yet deployed (D-7) — ratified & implemented in \
-             corelink-server (PR #269), pending deploy; see docs/RELAY-server-D1-D7-D8.md",
+            "ref listing failed: server returned 405/501 — the GET /v1/ac capability is LIVE (D-7, conformance-green), so this indicates a server-side regression, not an expected state; see docs/RELAY-server-D1-D7-D8.md",
         )
         .await
     }
@@ -1622,7 +1616,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AC delete — status mappings (optimistic; server DELETE pending)
+    // AC delete — status mappings (LIVE D-1; 405/501 → server-regression)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1677,12 +1671,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_delete_405_surfaces_not_deployed_error() {
+    async fn ac_delete_405_surfaces_unavailable_error() {
         let server = MockServer::start().await;
         let (key, _) = digest_and_bytes();
         let path_str = format!("/v1/ac/test-tenant/{}", key);
 
-        // The optimistic-pending case: corelink-server has no DELETE handler yet.
+        // The server-regression case: a LIVE capability returns 405/501.
         Mock::given(method("DELETE"))
             .and(path(&path_str))
             .respond_with(ResponseTemplate::new(405))
@@ -1693,15 +1687,15 @@ mod tests {
         let err = AcTransport::delete(&client, &key).await.unwrap_err();
         match err {
             ClwError::Transport(msg) => assert!(
-                msg.contains("not yet deployed"),
-                "405 must surface the not-deployed message, got: {msg}"
+                msg.contains("405/501"),
+                "405 must surface the server-regression message, got: {msg}"
             ),
-            other => panic!("expected Transport not-deployed error, got {other:?}"),
+            other => panic!("expected Transport server-regression error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn ac_delete_501_surfaces_not_deployed_error() {
+    async fn ac_delete_501_surfaces_unavailable_error() {
         let server = MockServer::start().await;
         let (key, _) = digest_and_bytes();
         let path_str = format!("/v1/ac/test-tenant/{}", key);
@@ -1715,8 +1709,8 @@ mod tests {
         let client = make_client(server.uri());
         let err = AcTransport::delete(&client, &key).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed")),
-            "501 must surface the not-deployed message"
+            matches!(err, ClwError::Transport(msg) if msg.contains("405/501")),
+            "501 must surface the server-regression message"
         );
     }
 
@@ -1738,7 +1732,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AC list_refs — array / cursor pagination / not-deployed (D-7)
+    // AC list_refs — array / cursor pagination / server-regression (D-7)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1796,7 +1790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac_list_refs_405_surfaces_not_deployed_d7() {
+    async fn ac_list_refs_405_surfaces_unavailable_d7() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/ac/test-tenant"))
@@ -1808,15 +1802,15 @@ mod tests {
         let err = AcTransport::list_refs(&client).await.unwrap_err();
         match err {
             ClwError::Transport(msg) => {
-                assert!(msg.contains("not yet deployed"), "got: {msg}");
+                assert!(msg.contains("405/501"), "got: {msg}");
                 assert!(msg.contains("D-7"), "must cite D-7, got: {msg}");
             }
-            other => panic!("expected Transport not-deployed error, got {other:?}"),
+            other => panic!("expected Transport server-regression error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn ac_list_refs_501_surfaces_not_deployed_d7() {
+    async fn ac_list_refs_501_surfaces_unavailable_d7() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/ac/test-tenant"))
@@ -1827,12 +1821,12 @@ mod tests {
         let client = make_client(server.uri());
         let err = AcTransport::list_refs(&client).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-7"))
+            matches!(err, ClwError::Transport(msg) if msg.contains("405/501") && msg.contains("D-7"))
         );
     }
 
     // -------------------------------------------------------------------------
-    // CAS delete — idempotent (D-8); 204/404 → Ok, 405|501 → not-deployed
+    // CAS delete — idempotent (D-8); 204/404 → Ok, 405|501 → server-regression
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1887,7 +1881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_delete_405_surfaces_not_deployed_d8() {
+    async fn cas_delete_405_surfaces_unavailable_d8() {
         let server = MockServer::start().await;
         let (digest, _) = digest_and_bytes();
         let path_str = format!("/v1/cas/test-tenant/{}", digest);
@@ -1902,15 +1896,15 @@ mod tests {
         let err = CasTransport::delete(&client, &digest).await.unwrap_err();
         match err {
             ClwError::Transport(msg) => {
-                assert!(msg.contains("not yet deployed"), "got: {msg}");
+                assert!(msg.contains("405/501"), "got: {msg}");
                 assert!(msg.contains("D-8"), "must cite D-8, got: {msg}");
             }
-            other => panic!("expected Transport not-deployed error, got {other:?}"),
+            other => panic!("expected Transport server-regression error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn cas_delete_501_surfaces_not_deployed_d8() {
+    async fn cas_delete_501_surfaces_unavailable_d8() {
         let server = MockServer::start().await;
         let (digest, _) = digest_and_bytes();
         let path_str = format!("/v1/cas/test-tenant/{}", digest);
@@ -1924,12 +1918,12 @@ mod tests {
         let client = make_client(server.uri());
         let err = CasTransport::delete(&client, &digest).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+            matches!(err, ClwError::Transport(msg) if msg.contains("405/501") && msg.contains("D-8"))
         );
     }
 
     // -------------------------------------------------------------------------
-    // CAS list_blobs — array / cursor pagination / not-deployed (D-8)
+    // CAS list_blobs — array / cursor pagination / server-regression (D-8)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1985,7 +1979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cas_list_blobs_405_surfaces_not_deployed_d8() {
+    async fn cas_list_blobs_405_surfaces_unavailable_d8() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/cas/test-tenant"))
@@ -1996,12 +1990,12 @@ mod tests {
         let client = make_client(server.uri());
         let err = CasTransport::list_blobs(&client).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+            matches!(err, ClwError::Transport(msg) if msg.contains("405/501") && msg.contains("D-8"))
         );
     }
 
     #[tokio::test]
-    async fn cas_list_blobs_501_surfaces_not_deployed_d8() {
+    async fn cas_list_blobs_501_surfaces_unavailable_d8() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/cas/test-tenant"))
@@ -2012,7 +2006,7 @@ mod tests {
         let client = make_client(server.uri());
         let err = CasTransport::list_blobs(&client).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed") && msg.contains("D-8"))
+            matches!(err, ClwError::Transport(msg) if msg.contains("405/501") && msg.contains("D-8"))
         );
     }
 

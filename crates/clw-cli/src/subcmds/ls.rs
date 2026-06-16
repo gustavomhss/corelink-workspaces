@@ -1,10 +1,11 @@
 //! `clw ls --name <NAME>` — list ref info for one workspace.
 //! `clw ls --all`         — enumerate every ref in the tenant.
 //!
-//! `--all` is OPTIMISTIC against a frozen contract: the corelink-server ref
-//! enumeration capability is pending ratification (docs/REQUESTS-to-other-TLs.md
-//! D-7). Until it deploys the real transport surfaces the 405/501 not-deployed
-//! case as an actionable error rather than a silent empty list.
+//! `--all` uses the corelink-server ref enumeration capability, which is LIVE
+//! (D-7, conformance-green). The 405/501 branch is a defensive guard: a LIVE
+//! capability returning 405/501 is a server-side regression, so the transport
+//! surfaces it as an actionable server-regression error rather than a silent
+//! empty list.
 
 use clap::Args;
 use clw_client::HttpClient;
@@ -109,7 +110,9 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
 
     let keys = match AcTransport::list_refs(&client).await {
         Ok(keys) => keys,
-        Err(e) if is_not_deployed(&e) => return not_deployed_err(json, "ref enumeration", "D-7"),
+        Err(e) if is_capability_unavailable(&e) => {
+            return capability_unavailable(json, "ref enumeration", "D-7")
+        }
         Err(e) => return Err(map_auth_error(e)),
     };
 
@@ -158,21 +161,24 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     Ok(())
 }
 
-/// True if the error is the optimistic-pending "server capability not deployed"
-/// case (the client maps 405/501 to a `Transport` error naming the gap).
-fn is_not_deployed(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+/// True if the error is the server-regression case (the client maps 405/501 to a
+/// `Transport` error carrying the `405/501` token for a LIVE capability).
+fn is_capability_unavailable(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
 }
 
-/// Render the optimistic-pending case. ALWAYS fails (non-zero exit) so a script
-/// never mistakes "endpoint not deployed" for "tenant has no refs" — in `--json`
+/// Render the server-regression case. ALWAYS fails (non-zero exit) so a script
+/// never mistakes a server regression for "tenant has no refs" — in `--json`
 /// mode the structured note is printed first, then the error propagates.
-fn not_deployed_err(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
     let msg = format!(
-        "{capability} requires a corelink-server capability not yet deployed — tracked ({dep}; see docs/RELAY-server-D1-D7-D8.md)"
+        "{capability} failed: corelink-server capability {dep} is LIVE but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)"
     );
     if json {
-        println!("{}", json!({ "error": "not-deployed", "note": msg }));
+        println!(
+            "{}",
+            json!({ "error": "capability-unavailable", "note": msg })
+        );
     }
     Err(ClwError::Transport(msg))
 }
@@ -233,21 +239,22 @@ mod tests {
     }
 
     #[test]
-    fn not_deployed_detects_pending_capability_message() {
+    fn capability_unavailable_detects_405_501_message() {
         let err = ClwError::Transport(
-            "ref enumeration requires a corelink-server capability not yet deployed (D-7)"
-                .to_string(),
+            "ref enumeration failed: server returned 405/501 (D-7)".to_string(),
         );
-        assert!(is_not_deployed(&err));
-        assert!(!is_not_deployed(&ClwError::Transport("unrelated".into())));
-        assert!(!is_not_deployed(&ClwError::Auth));
+        assert!(is_capability_unavailable(&err));
+        assert!(!is_capability_unavailable(&ClwError::Transport(
+            "unrelated".into()
+        )));
+        assert!(!is_capability_unavailable(&ClwError::Auth));
     }
 
     #[test]
-    fn not_deployed_err_fails_in_both_modes() {
+    fn capability_unavailable_fails_in_both_modes() {
         // Both modes return an error (non-zero exit) so a script never mistakes
-        // "endpoint not deployed" for "tenant has no refs".
-        assert!(not_deployed_err(true, "ref enumeration", "D-7").is_err());
-        assert!(not_deployed_err(false, "ref enumeration", "D-7").is_err());
+        // a server regression for "tenant has no refs".
+        assert!(capability_unavailable(true, "ref enumeration", "D-7").is_err());
+        assert!(capability_unavailable(false, "ref enumeration", "D-7").is_err());
     }
 }
