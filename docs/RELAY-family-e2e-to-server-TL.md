@@ -26,10 +26,18 @@ The 6 tiers (`crates/corelink-tier-selection/src/tier.rs`) gate different axes i
 storage bytes + monthly requests at the edge Worker (`worker/src/lib/quota.ts:84-93`), RPS ladder
 (`corelink-ratelimit/src/tier.rs`), retention TTL (`corelink-eviction/src/tier.rs`), runner concurrency
 (`runners_entitlement` — a **separate** axis). The container quota/byte-accounting/PAT gates return
-`None`/fail-open in dev/CI without D1. **Ask:** for a per-tier LIVE test, provide a way to provision
-test tenants on **non-free** tiers (signup hardcodes `free` + region `enam`) — seeded
-`tier_selections` / `runners_entitlement` / `tenant_quota` rows with the D1 gates ACTIVE. Otherwise a
-per-tier test exercises no-ops. clw asserts its side (correct handling of 429/402/409/410/413).
+`None`/fail-open in dev/CI without D1. **Ask (concrete):** you own the D1 schema — please provide a
+**per-tier seed script** + a **D1-active test env** (clw never touches the server DB, by design, so we
+can't seed it). For each tier under test, the seed must set the *authoritative* rows my recon found:
+- `tier_selections` — `tier=<tier>`, `subscription_state='active'` (this is what `getTierForTenant`
+  reads first, `worker/src/lib/quota.ts:135-189`), OR `tenant.tier=<tier>` as the fallback.
+- `runners_entitlement` (`migrations/d1/0070`) — the runner-concurrency cap (separate axis from cache tier).
+- `tenant_quota` (`0066`) — a non-zero $ budget so the quota gate isn't a flat 402.
+- region as needed (immutable post-insert, `0028`).
+
+Exact columns/values are yours (your schema, not mine to prescribe). A 6-row fixture (one tenant per
+tier) is ideal. With that + gates active, clw runs the per-tier matrix and asserts its side (correct
+handling of 429/402/409/410/413).
 
 ## 3. The rustup-nuke is STILL recurring on the shared CI host
 `RELAY-server-ci-fuzz-nukes-rustup.md` reported this fixed ("remediation on main"); it recurred again
