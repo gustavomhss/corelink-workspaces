@@ -6,6 +6,13 @@
 //! The mock server maintains two in-memory `Arc<Mutex<HashMap>>` stores — one
 //! for CAS (`/v1/cas/:tenant/:hash`) and one for AC (`/v1/ac/:tenant/:key`).
 //! Every route requires `Authorization: Bearer test-pat`; anything else → 401.
+//!
+//! UNIX-ONLY: the fixtures use unix symlinks + `chmod` and assert unix file modes
+//! (`exec.sh` 0o755), so this suite is gated to unix. Windows integration coverage
+//! lands with the M2.4 cross-platform CI lane. `#![cfg(unix)]` makes the crate
+//! compile to nothing on Windows so a future `cargo test --target *-windows-*`
+//! build does not break on the unix imports.
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;

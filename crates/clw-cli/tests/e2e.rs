@@ -7,6 +7,14 @@
 //!
 //! Test isolation: each test creates its own `TempDir` trees and unique
 //! workspace names, so tests can run in parallel safely.
+//!
+//! UNIX-ONLY: this binary-level suite builds its fixtures with unix symlinks +
+//! `chmod` and asserts unix file modes (0o600/0o755), so it is gated to unix.
+//! Windows binary-level e2e coverage lands with the M2.4 cross-platform CI lane
+//! (it needs Windows symlink/ACL-aware fixtures, not just a compile fix). The
+//! `#![cfg(unix)]` makes the crate compile to nothing on Windows so a future
+//! `cargo test --target *-windows-*` build does not break on the unix imports.
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
