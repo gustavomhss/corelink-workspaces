@@ -157,9 +157,11 @@ and, where applicable data-protection law confers a right to erasure (including
 Article 17 of the GDPR and Article 18 of Brazil's LGPD (Lei nº 13.709/2018)), you
 may request deletion of all Customer Data stored for your Tenant, in each case as
 described in, and subject to the limitations and processes set out in, the Privacy
-Policy and the DPA. Erasure is currently operator-assisted, pending roadmap M6.4
-(server-side D-7/D-8), and HumanGR will give effect to a valid erasure request
-within thirty (30) days; deletion is subject to a reasonable processing period and
+Policy and the DPA. Full erasure is available self-service through the client
+(`clw erase` deletes every reference and CAS blob for your Tenant; the server-side
+capabilities it relies on are deployed and live); an operator-assisted process is
+also available, under which HumanGR will give effect to a valid erasure request
+within thirty (30) days. Deletion is subject to a reasonable processing period and
 to retention HumanGR is required by law to maintain.
 
 5.6 **CCPA/CPRA service-provider status.** To the extent Customer Data includes
