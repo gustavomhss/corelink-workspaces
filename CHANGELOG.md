@@ -7,10 +7,19 @@
 > that follows is retained for the record.
 
 ### Added
-- **`clw rm --name <ws>`** — delete a workspace ref (AC erasure). **Optimistic / pending:** the
-  client sends the request, but it depends on a server `DELETE /v1/ac` endpoint that is not yet
-  deployed. Until the server ships that endpoint, the command prints a clear **"not yet deployed"**
-  message and is a no-op against live data. (M1.4, server dependency D-1)
+- **`clw rm --name <ws>`** — delete a workspace ref (AC erasure). **LIVE:** the server `DELETE /v1/ac`
+  endpoint (D-1) is deployed and conformance-green, so this performs a **real, idempotent** ref delete
+  against production. Destructive-command rails: a y/N confirmation unless `--yes`, and a refusal to
+  delete non-interactively / with `--json` without `--yes` (it never silently deletes in a pipeline).
+  Removes only the ref, not the underlying CAS blobs. (M1.4, server dependency D-1)
+- **`clw prune`** — live CAS garbage collection: a mark-and-sweep over the manifest roots reachable
+  from refs that deletes unreferenced blobs. **Dry-run by default**; `--yes` to actually delete. Has a
+  safety floor that refuses to wipe a non-empty CAS when the live set is empty (a likely stale ref
+  index). (gated on D-7/D-8, now LIVE)
+- **`clw erase`** — live GDPR Art.17 full-tenant erasure: irreversibly deletes **every ref and every
+  CAS blob** for the tenant. Three rails: **dry-run by default**, `--yes` to execute, and a
+  typed-tenant confirmation (interactive prompt, or `--confirm-tenant <TENANT>` for non-interactive /
+  `--json`). (M6.4, gated on D-7/D-8, now LIVE)
 - **`clw uninstall`** — remove the local `clw` footprint: the `~/.clw` config (including the stored
   PAT) and the local cache. Prompts for confirmation by default; `--yes` skips the prompt and
   `--dry-run` previews exactly what would be removed without deleting anything. It cannot delete its
@@ -21,8 +30,9 @@
   `login` (persist resolved endpoint/tenant/token to `~/.clw/config.toml`, forced `0600`),
   `logout` (drop the `token` key; `--all` clears the whole file, with a confirm unless `--yes`),
   `whoami` (print the resolved identity, token shown as `<set>`/`<unset>` only).
-  `rotate` is a stub — not yet supported pending a server token-rotation endpoint
-  (use `auth login` with a new `--token` to replace the stored token). (M6.6)
+  In v1, `rotate` directs you to re-authenticate — run `auth login` with the new `--token` to
+  atomically replace the stored credential; a dedicated one-step rotate (mint-new + revoke-old) is a
+  post-launch nicety that needs a server endpoint. (M6.6)
 - **`clw doctor`** — support-ready, **redacted** diagnostics bundle (version, os/arch, config
   path/existence/mode, endpoint, tenant + token presence, cache dir); the token is never
   printed; `--json` supported; points at `SECURITY.md` for disclosure; always exits 0. (M5.5)
@@ -64,17 +74,22 @@
   `components = ["rustfmt", "clippy"]` so a clean machine builds correctly. (M2.0)
 
 ### Security
-- **Ref erasure is client-shipped but server-pending.** `clw rm --name <ws>` (AC-ref delete,
-  **M1.4**) now exists on the client, but its server dependency **D-1** (`DELETE /v1/ac`) is not yet
-  deployed — until it is, `clw rm` prints a "not yet deployed" message and is a no-op against live
-  data. CAS blob GC / right-to-erasure is **M6.4** (gated on D-7/D-8) and remains unshipped.
-  Documented as a tracked residual, not silently accepted.
+- **Erasure is LIVE and destructive.** The server dependencies **D-1** (`DELETE /v1/ac`), **D-7**
+  (ref enumeration), and **D-8** (CAS list/delete) are deployed and conformance-green, so the
+  erasure surfaces are live: `clw rm` (**M1.4**, AC-ref delete) performs a real idempotent delete with
+  confirm rails; `clw prune` (CAS GC) and `clw erase` (**M6.4**, GDPR Art.17 full-tenant erasure) are
+  live, dry-run-by-default, and guarded (`--yes`, and a typed-tenant confirmation for `erase`). These
+  commands delete real production data — the safety rails, not a server gap, are now what stand
+  between the operator and an irreversible delete.
 - Threat model updated to reflect the shipped Windows path validation and the erasure gap
   (see `docs/THREAT-MODEL.md`).
 
 ### CI
-- **`cargo-deny`** (advisories + licenses + bans + sources) + `cargo-audit` wired into the
-  gate and the release lane. (M4.1)
+- **`cargo-deny`** (advisories + licenses + bans + sources) wired into the local gate and the
+  release lane. The **`cargo-audit`** RustSec scan is **CI-provisioned / best-effort locally**: the
+  local gate runs it only if `cargo-audit` is installed, otherwise it prints "cargo-audit not
+  installed — CI provisions it; skipping locally" and continues — so the authoritative RustSec scan
+  runs in CI, not the local gate. (M4.1)
 - **Cross-platform CI matrix** — Linux blocking, Windows informational (to flip to required
   once green); release pipeline scaffold + distribution decisions; **`publish = false`** on all
   crates (proprietary-leak guard). (M2.4 / M3 / M4)

@@ -197,17 +197,21 @@ clw auth logout --all --yes
 env > config > default), so `clw --tenant t --token pat_… auth login` persists
 those values. `whoami` works with `--json` for scripting.
 
-**Rotation is not yet supported.** `clw auth rotate` is a stub pending a server
-token-rotation endpoint:
+**Rotating your token (v1).** In v1 you rotate by **re-authenticating**: run
+`clw auth login` with the new token to atomically replace the stored credential.
+`clw auth rotate` exists only to point you at that supported path (it exits 0 and
+changes nothing on its own); a dedicated one-step rotate (mint-new + revoke-old)
+is a post-launch nicety that needs a server endpoint.
 
 ```sh
 clw auth rotate
 # clw auth rotate: to rotate your token, run `clw auth login` with the new
 # token — this replaces the stored credential. (v1 has no one-step rotate;
 # a dedicated mint-and-revoke command is planned post-launch.)
-```
 
-To rotate today, run `clw auth login` with a fresh `--token`.
+# Rotate today:
+clw --token pat_newtoken auth login
+```
 
 ---
 
@@ -240,22 +244,96 @@ pasting diagnostics into a public issue.
 
 ---
 
-## `clw rm` — deleting a workspace ref (server-pending)
+## `clw rm` — deleting a workspace ref
 
-`clw rm --name <ws>` deletes a workspace ref (AC erasure). The client is shipped,
-but it depends on a server `DELETE /v1/ac` endpoint that is **not yet deployed**.
-Until that endpoint ships, `clw rm` is **optimistic**: it prints a clear "not yet
-deployed" message and does **not** touch live data.
+`clw rm --name <ws>` performs a **real, idempotent** `DELETE /v1/ac` against the
+live CoreLink server: it removes the named ref. Deleting a name that no longer
+exists succeeds quietly (idempotent).
+
+This is a destructive operation, so it is gated by a confirmation:
+
+- By default it prompts `delete ref '<ws>'? this cannot be undone [y/N]` and
+  proceeds only on `y`/`yes`.
+- `--yes` skips the prompt.
+- In non-interactive contexts (no TTY) and with `--json`, `clw rm` **refuses to
+  delete without `--yes`** — it never silently deletes in a pipeline.
 
 ```sh
 clw rm --name myapp-dev
-# clw rm: ref deletion is not yet deployed — tracked (server dependency).
+# delete ref 'myapp-dev'? this cannot be undone [y/N]: y
+# deleted ref 'myapp-dev'
+
+# Non-interactive / scripted:
+clw rm --name myapp-dev --yes
+# deleted ref 'myapp-dev'
 ```
 
-`clw rm` only removes the **ref** (the named pointer in the AC); it does not GC the
-underlying CAS blobs. CAS blob garbage-collection / right-to-erasure is a separate,
-also-unshipped track. When the server endpoint lands, this page will be updated
-with the live success/confirmation behavior.
+`clw rm` removes **only the ref** (the named pointer in the AC); it does **not**
+GC the underlying CAS blobs. To reclaim unreferenced blobs, use
+[`clw prune`](#clw-prune--garbage-collecting-unreferenced-cas-blobs); to
+irreversibly erase **all** of a tenant's data, use
+[`clw erase`](#clw-erase--gdpr-full-tenant-erasure).
+
+---
+
+## `clw prune` — garbage-collecting unreferenced CAS blobs
+
+`clw prune` runs a live **mark-and-sweep** garbage collection over the tenant's
+CAS: it computes the live set (every manifest root reachable from a ref, plus
+every chunk those manifests reference) and deletes CAS blobs outside it. It
+removes blobs, never refs.
+
+It is **dry-run by default** — without `--yes` it reports exactly what it *would*
+delete and changes nothing. Pass `--yes` to actually delete.
+
+```sh
+# Preview (default) — deletes nothing:
+clw prune
+# DRY RUN — would delete 3 orphaned blob(s) (128 live). Re-run with --yes to delete:
+#   1a2b3c…
+#   4d5e6f…
+#   7890ab…
+
+# Actually delete the orphans:
+clw prune --yes
+# pruned 3 orphaned blob(s) (128 live)
+```
+
+As a safety floor, `prune --yes` **refuses** to delete when the live set is empty
+but CAS is non-empty (that pattern usually means a transiently-empty/stale ref
+index, not a genuinely orphaned tenant). Verify with `clw ls --all`; if the
+tenant truly is empty, use `clw erase` (which requires typed-tenant confirmation).
+
+---
+
+## `clw erase` — GDPR full-tenant erasure
+
+`clw erase` is the GDPR Art.17 "right to erasure" path: it irreversibly deletes
+**every ref and every CAS blob** for the tenant. It is the single most destructive
+command in the CLI, with three independent safety rails:
+
+1. **Dry-run by default** — without `--yes` it only reports the blast radius
+   (ref + blob counts) and changes nothing.
+2. **`--yes`** — explicit intent to actually delete.
+3. **Typed-tenant confirmation** — you must reproduce the exact tenant id, either
+   at the interactive prompt or via `--confirm-tenant <TENANT>` for
+   non-interactive / `--json` use. A mismatch (or a non-TTY without the flag)
+   aborts and exits non-zero.
+
+```sh
+# Dry run (default) — reports the blast radius, deletes nothing:
+clw erase
+# DRY RUN — would IRREVERSIBLY erase tenant 'my-tenant': 12 ref(s) + 480 blob(s).
+# Re-run with --yes and confirm the tenant id to proceed.
+
+# Execute interactively (prompts for the tenant id):
+clw erase --yes
+# type the tenant id 'my-tenant' to IRREVERSIBLY erase it: my-tenant
+# erased tenant 'my-tenant': 12 ref(s) + 480 blob(s) deleted
+
+# Non-interactive / scripted (typed-tenant confirmation via flag):
+clw erase --yes --confirm-tenant my-tenant
+```
 
 ---
 

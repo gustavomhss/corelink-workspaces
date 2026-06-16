@@ -108,23 +108,69 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         blobs.len()
     );
 
-    // Execute: delete every REF first, then every blob. Refs-first keeps the store
-    // consistent on a partial failure — a failure after the ref loop leaves only
-    // UNREFERENCED blobs (orphans, reclaimable by `prune` or an idempotent re-run),
-    // never a live ref pointing at already-deleted content.
+    // Execute WITH VERIFICATION. Delete every REF first, then every blob
+    // (refs-first keeps the store consistent on a partial failure — a crash after
+    // the ref loop leaves only UNREFERENCED orphan blobs, reclaimable by `prune`
+    // or an idempotent re-run, never a live ref pointing at deleted content).
+    // Then RE-ENUMERATE and repeat: a GDPR Art.17 claim MUST NOT report success
+    // until enumeration confirms the tenant is actually empty — a single pass can
+    // miss data written concurrently or carried by a late pagination page.
+    // Bounded passes prevent an unbounded loop against a misbehaving server.
+    const MAX_PASSES: usize = 3;
     let mut refs_deleted = 0usize;
-    for k in &ref_keys {
-        AcTransport::delete(&client, k)
-            .await
-            .map_err(map_auth_error)?;
-        refs_deleted += 1;
-    }
     let mut blobs_deleted = 0usize;
-    for d in &blobs {
-        CasTransport::delete(&client, d)
+    let mut pending_refs = ref_keys;
+    let mut pending_blobs = blobs;
+    let mut pass = 0usize;
+    let (remaining_refs, remaining_blobs) = loop {
+        pass += 1;
+        for k in &pending_refs {
+            AcTransport::delete(&client, k)
+                .await
+                .map_err(map_auth_error)?;
+            refs_deleted += 1;
+        }
+        for d in &pending_blobs {
+            CasTransport::delete(&client, d)
+                .await
+                .map_err(map_auth_error)?;
+            blobs_deleted += 1;
+        }
+        // Verify: re-enumerate to confirm nothing remains.
+        let r = AcTransport::list_refs(&client)
             .await
             .map_err(map_auth_error)?;
-        blobs_deleted += 1;
+        let b = CasTransport::list_blobs(&client)
+            .await
+            .map_err(map_auth_error)?;
+        if (r.is_empty() && b.is_empty()) || pass >= MAX_PASSES {
+            break (r.len(), b.len());
+        }
+        pending_refs = r;
+        pending_blobs = b;
+    };
+
+    // Truthful Art.17 outcome: only claim success when enumeration confirms the
+    // tenant is empty. Otherwise FAIL loud (non-zero exit) so a caller never
+    // records a completed erasure while data — i.e. PII — still remains.
+    if remaining_refs > 0 || remaining_blobs > 0 {
+        if json {
+            println!(
+                "{}",
+                json!({
+                    "dry_run": false,
+                    "tenant": tenant,
+                    "refs_deleted": refs_deleted,
+                    "blobs_deleted": blobs_deleted,
+                    "remaining_refs": remaining_refs,
+                    "remaining_blobs": remaining_blobs,
+                    "complete": false,
+                })
+            );
+        }
+        return Err(ClwError::Transport(format!(
+            "erasure INCOMPLETE for tenant '{tenant}': deleted {refs_deleted} ref(s) + {blobs_deleted} blob(s), but {remaining_refs} ref(s) + {remaining_blobs} blob(s) still remain after {pass} pass(es) — likely concurrent writes or a server-side enumeration fault. Re-run `clw erase` or escalate; do NOT record this tenant as erased."
+        )));
     }
 
     if json {
@@ -135,11 +181,12 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
                 "tenant": tenant,
                 "refs_deleted": refs_deleted,
                 "blobs_deleted": blobs_deleted,
+                "complete": true,
             })
         );
     } else {
         println!(
-            "erased tenant '{tenant}': {refs_deleted} ref(s) + {blobs_deleted} blob(s) deleted"
+            "erased tenant '{tenant}': {refs_deleted} ref(s) + {blobs_deleted} blob(s) deleted; tenant verified empty"
         );
     }
     Ok(())

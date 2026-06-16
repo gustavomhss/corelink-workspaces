@@ -7,9 +7,9 @@ content-addressed store (CAS + AC), hydrates it anywhere in seconds, and memoize
 deterministic commands so they never re-run when the inputs have not changed.
 
 > **Pre-1.0.** The commands documented here (`init`, `snapshot`, `hydrate`,
-> `status`, `run`, `ls`, `doctor`, `auth`, `rm`, `uninstall`, `completions`) are
-> implemented and tested. `clw rm` is **server-pending** (see the table note). No
-> stability guarantee exists until 1.0.
+> `status`, `run`, `ls`, `doctor`, `auth`, `rm`, `prune`, `erase`, `uninstall`,
+> `completions`) are implemented and tested. No stability guarantee exists until
+> 1.0.
 
 ---
 
@@ -25,7 +25,9 @@ deterministic commands so they never re-run when the inputs have not changed.
 | `clw ls`       | Shows ref metadata (root digest, file count, byte count) for a workspace |
 | `clw doctor`   | Prints a support-ready, **redacted** diagnostics bundle (token never shown) |
 | `clw auth`     | Manages the locally-stored identity offline: `login` / `logout` / `whoami` (`rotate` is a server-dependent stub) |
-| `clw rm`       | Deletes a workspace ref (`--name`). **Server-pending:** prints "not yet deployed" until CoreLink ships `DELETE /v1/ac` |
+| `clw rm`       | Deletes a workspace ref (`--name`) via a real, idempotent `DELETE /v1/ac`; y/N confirm unless `--yes` (non-interactive / `--json` requires `--yes`). Removes only the ref, not CAS blobs |
+| `clw prune`    | Garbage-collects unreferenced CAS blobs (mark-and-sweep over reachable refs); **dry-run by default**, `--yes` to delete |
+| `clw erase`    | Irreversibly erases **all** of a tenant's data (every ref + every CAS blob; GDPR Art.17); **dry-run by default**, needs `--yes` + typed-tenant confirmation (`--confirm-tenant`) |
 | `clw uninstall`| Removes the local footprint (`~/.clw` config + PAT + cache); confirm / `--yes` / `--dry-run`; prints the binary path to remove |
 | `clw completions` | Prints a shell-completion script for `bash` / `zsh` / `fish` / `powershell` / `elvish` |
 
