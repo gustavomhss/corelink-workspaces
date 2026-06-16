@@ -434,6 +434,171 @@ async fn roundtrip_bit_identical() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 1b: runner_model_env_only_lifecycle_and_keyspace_isolation
+//
+// Proves `clw` works exactly as a disposable corelink-runner drives it: env-only,
+// NO config file (empty $HOME ⇒ ~/.clw/config.toml cannot exist), NO `--endpoint
+// /--tenant/--token` CLI flags, and a runner ref-keyspace selected purely via
+// `CLW_REF_DOMAIN=runner`. The lifecycle (snapshot → hydrate with a fresh cache,
+// so bytes come off the mock server) is asserted byte-identical, and the CORE
+// assertion is keyspace isolation: the same workspace name hydrated in the USER
+// domain (CLW_REF_DOMAIN omitted) is NOT FOUND, because the runner ref lives only
+// in `clw/ref/runner/v1/` — disjoint from the user keyspace `clw/ref/v1/`. This
+// black-boxes the disjoint keyspaces through the real binary.
+// ---------------------------------------------------------------------------
+
+/// Spawn `clw` like a disposable runner does: ONLY env vars, NO CLI identity
+/// flags, NO config file. `home` is an empty TempDir so `~/.clw/config.toml`
+/// cannot exist; any inherited `CLW_*`/`CORELINK_*` identity is stripped and then
+/// the runner's own vars are set explicitly. `ref_domain == None` ⇒ the var is NOT
+/// set (the user-keyspace default); `Some("runner")` selects the runner keyspace.
+fn clw_runner_cmd(
+    endpoint: &str,
+    home: &std::path::Path,
+    cache_dir: &std::path::Path,
+    ref_domain: Option<&str>,
+) -> Command {
+    let mut cmd = Command::cargo_bin("clw").unwrap();
+    cmd.env("HOME", home.to_str().unwrap())
+        // Strip any identity that could leak in from the parent env so the run is
+        // genuinely env-only — no inherited CLW_*/CORELINK_* config-file fallback.
+        .env_remove("CLW_ENDPOINT")
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env_remove("CLW_REF_DOMAIN")
+        .env_remove("CORELINK_ENDPOINT")
+        .env_remove("CORELINK_TENANT")
+        .env_remove("CORELINK_TOKEN")
+        // The runner's full identity, injected purely via env (no flags, no file).
+        .env("CLW_ENDPOINT", endpoint)
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache_dir.to_str().unwrap());
+    if let Some(domain) = ref_domain {
+        cmd.env("CLW_REF_DOMAIN", domain);
+    }
+    cmd
+}
+
+#[tokio::test]
+async fn runner_model_env_only_lifecycle_and_keyspace_isolation() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    // Empty HOME so ~/.clw/config.toml cannot exist for any of these invocations.
+    let home = TempDir::new().unwrap();
+
+    // Workspace fixture: a regular file with known bytes + an executable (0o755)
+    // + a symlink (mirrors the lifecycle fixture builder's file types).
+    let src_tmp = TempDir::new().unwrap();
+    std::fs::write(src_tmp.path().join("small.txt"), b"hello runner model").unwrap();
+    std::fs::write(src_tmp.path().join("exec.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+    let mut perms = std::fs::metadata(src_tmp.path().join("exec.sh"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(src_tmp.path().join("exec.sh"), perms).unwrap();
+    std::os::unix::fs::symlink("small.txt", src_tmp.path().join("link.txt")).unwrap();
+
+    // --- snapshot, env-only, runner keyspace, NO identity flags ---
+    let cache_snap = TempDir::new().unwrap();
+    clw_runner_cmd(
+        &server.uri(),
+        home.path(),
+        cache_snap.path(),
+        Some("runner"),
+    )
+    .args([
+        "snapshot",
+        src_tmp.path().to_str().unwrap(),
+        "--name",
+        "ws-runner",
+    ])
+    .assert()
+    .success();
+
+    // --- hydrate with a FRESH cache (bytes come from the mock server, not cache),
+    // env-only, runner keyspace ---
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    clw_runner_cmd(&server.uri(), home.path(), cache_hyd.path(), Some("runner"))
+        .args(["hydrate", dest.to_str().unwrap(), "--name", "ws-runner"])
+        .assert()
+        .success();
+
+    // Byte-identical file, executable mode, and preserved symlink.
+    assert_eq!(
+        std::fs::read(src_tmp.path().join("small.txt")).unwrap(),
+        std::fs::read(dest.join("small.txt")).unwrap(),
+        "small.txt must be byte-identical after a fresh-cache runner hydrate"
+    );
+    let exec_mode = std::fs::metadata(dest.join("exec.sh"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(exec_mode, 0o755, "exec.sh must hydrate with mode 0o755");
+    assert_eq!(
+        std::fs::read_link(dest.join("link.txt"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "small.txt",
+        "link.txt symlink target must be preserved"
+    );
+
+    // --- KEYSPACE ISOLATION: the same name in the USER domain is NOT FOUND ---
+    // CLW_REF_DOMAIN omitted ⇒ user keyspace `clw/ref/v1/`, disjoint from the
+    // runner keyspace `clw/ref/runner/v1/` the ref was written under.
+    let cache_user = TempDir::new().unwrap();
+    let dest_user_tmp = TempDir::new().unwrap();
+    let dest_user = dest_user_tmp.path().join("out");
+    let out_user = clw_runner_cmd(&server.uri(), home.path(), cache_user.path(), None)
+        .args([
+            "hydrate",
+            dest_user.to_str().unwrap(),
+            "--name",
+            "ws-runner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out_user.status.success(),
+        "user-keyspace hydrate of a runner-keyspace ref must FAIL (disjoint keyspaces), got: {:?}",
+        out_user.status.code()
+    );
+    let stderr_user = String::from_utf8_lossy(&out_user.stderr);
+    assert!(
+        stderr_user.contains("not found") || stderr_user.contains("ws-runner"),
+        "user-keyspace miss must be reported as not-found for 'ws-runner', got:\n{stderr_user}"
+    );
+    assert!(
+        !dest_user.exists(),
+        "a not-found hydrate must not materialize a destination tree"
+    );
+
+    // Re-hydrate WITH the runner keyspace → succeeds again (the ref is only there).
+    let cache_hyd2 = TempDir::new().unwrap();
+    let dest2_tmp = TempDir::new().unwrap();
+    let dest2 = dest2_tmp.path().join("out");
+    clw_runner_cmd(
+        &server.uri(),
+        home.path(),
+        cache_hyd2.path(),
+        Some("runner"),
+    )
+    .args(["hydrate", dest2.to_str().unwrap(), "--name", "ws-runner"])
+    .assert()
+    .success();
+    assert_eq!(
+        std::fs::read(src_tmp.path().join("small.txt")).unwrap(),
+        std::fs::read(dest2.join("small.txt")).unwrap(),
+        "runner-keyspace re-hydrate must again be byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 2: status_clean_dirty
 // ---------------------------------------------------------------------------
 
