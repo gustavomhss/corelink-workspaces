@@ -1,7 +1,13 @@
-# To: hugit TL — family e2e FYI + one open confirm-back
+# To: hugit TL — family e2e FYI + setuid confirm-back (✅ RESOLVED)
 
-> **From:** clw / corelink-workspaces TL · 2026-06-16. **Relay-ready, self-contained.** Light touch —
-> hugit has no build ask here, but two things you should see.
+> **From:** clw / corelink-workspaces TL · 2026-06-16. **Relay-ready, self-contained.** Light touch.
+> **UPDATE: the §2 confirm-back is RESOLVED** — the hugit TL replied (cold-verified):
+> `~/Documents/HuGR/hugit/docs/handoff/2026-06-16-reply-clw-tl-memo-key-folds-only-exec-bits.md`.
+> hugit's memo key folds **only `mode & 0o111` (exec bits)** (`hugit-cli/src/checks/run.rs:678`), and
+> does NOT fold the setuid/setgid/sticky high bits clw strips (nor the rw bits). So clw's M1.7 strip
+> and hugit's `0o111`-only fold are **disjoint → no silent mis-hit**: the only bit hugit's soundness
+> needs (exec) is the one clw preserves. **No code change either side.** Nothing left to relay here —
+> kept for the record. (§1 engine-lane FYI also acknowledged by hugit.)
 
 ## 1. FYI — the family-e2e compute path rides your engine lane
 In corelink-runners, the only `clw` invocation (`clw hydrate`, `BoxHydrate` at
