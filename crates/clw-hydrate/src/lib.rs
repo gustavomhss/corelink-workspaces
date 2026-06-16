@@ -17,7 +17,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use clw_cache::LocalCache;
-use clw_types::{AcTransport, CasTransport, ClwError, Digest, Entry, Manifest, RefRecord, Result};
+use clw_types::{
+    AcTransport, CasTransport, ClwError, Digest, Entry, Manifest, RefDomain, RefRecord, Result,
+};
 
 // ---------------------------------------------------------------------------
 // Resource-safety / abuse bounds (M1.6)
@@ -152,6 +154,8 @@ const MAX_SYMLINK_ENTRIES: usize = 100_000;
 pub struct HydrateOptions {
     pub workspace_name: String,
     pub concurrency: usize,
+    /// Ref keyspace the ref is looked up in (default [`RefDomain::User`]).
+    pub ref_domain: RefDomain,
 }
 
 impl HydrateOptions {
@@ -160,7 +164,15 @@ impl HydrateOptions {
         Self {
             workspace_name: name.into(),
             concurrency: 8,
+            ref_domain: RefDomain::User,
         }
+    }
+
+    /// Select the ref keyspace (e.g. [`RefDomain::Runner`] for runner-produced refs).
+    #[must_use]
+    pub fn with_ref_domain(mut self, ref_domain: RefDomain) -> Self {
+        self.ref_domain = ref_domain;
+        self
     }
 }
 
@@ -223,7 +235,7 @@ where
     // ------------------------------------------------------------------
     // 2a. Fetch RefRecord from AC.
     // ------------------------------------------------------------------
-    let ref_key = clw_types::ref_key(&opts.workspace_name);
+    let ref_key = clw_types::ref_key_in(opts.ref_domain, &opts.workspace_name);
     let ref_bytes = AcTransport::get(client, &ref_key)
         .await?
         .ok_or(ClwError::NotFound(ref_key))?;

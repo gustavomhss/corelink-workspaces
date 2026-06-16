@@ -43,6 +43,7 @@ pub async fn run(
     let client = HttpClient::with_concurrency(cfg.clw_config, concurrency)?;
     let mut opts = SnapshotOptions::new(&args.name);
     opts.concurrency = concurrency;
+    opts.ref_domain = cfg.ref_domain;
 
     // Progress feedback on a long, otherwise-silent op: tell an interactive user
     // work has started so a slow snapshot isn't mistaken for a hung one. stderr

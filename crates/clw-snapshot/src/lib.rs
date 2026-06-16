@@ -14,8 +14,8 @@ use clw_cache::LocalCache;
 use clw_chunk::{chunk_bytes, chunk_stream, to_chunk_refs};
 use clw_manifest::{walk, WalkedEntry};
 use clw_types::{
-    ref_key, AcTransport, CasTransport, ChunkRef, ClwError, Digest, Entry, Manifest, RefRecord,
-    Result, CAS_BLOB_CAP_BYTES, MANIFEST_VERSION,
+    ref_key_in, AcTransport, CasTransport, ChunkRef, ClwError, Digest, Entry, Manifest, RefDomain,
+    RefRecord, Result, CAS_BLOB_CAP_BYTES, MANIFEST_VERSION,
 };
 use futures::stream::{self, StreamExt};
 
@@ -27,6 +27,8 @@ use futures::stream::{self, StreamExt};
 pub struct SnapshotOptions {
     pub workspace_name: String,
     pub concurrency: usize,
+    /// Ref keyspace the snapshot's ref is written under (default [`RefDomain::User`]).
+    pub ref_domain: RefDomain,
 }
 
 impl SnapshotOptions {
@@ -35,7 +37,15 @@ impl SnapshotOptions {
         Self {
             workspace_name: name.into(),
             concurrency: 8,
+            ref_domain: RefDomain::User,
         }
+    }
+
+    /// Select the ref keyspace (e.g. [`RefDomain::Runner`] for runner-produced refs).
+    #[must_use]
+    pub fn with_ref_domain(mut self, ref_domain: RefDomain) -> Self {
+        self.ref_domain = ref_domain;
+        self
     }
 }
 
@@ -389,7 +399,7 @@ where
     }
 
     // --- 6. Read existing ref for parent lineage ----------------------------
-    let rk = ref_key(&opts.workspace_name);
+    let rk = ref_key_in(opts.ref_domain, &opts.workspace_name);
     let parent: Option<Digest> = match AcTransport::get(client, &rk).await? {
         Some(bytes) => match RefRecord::from_bytes(&bytes) {
             Ok(rec) => Some(rec.root),
@@ -433,7 +443,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clw_types::{AcTransport, CasTransport, ClwError, Digest, Result};
+    use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Digest, Result};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;

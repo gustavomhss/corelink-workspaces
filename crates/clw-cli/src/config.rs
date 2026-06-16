@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use clw_types::{validate_tenant, ClwError, Config};
+use clw_types::{validate_tenant, ClwError, Config, RefDomain};
 
 use crate::Cli;
 
@@ -30,6 +30,8 @@ const DEFAULT_CACHE_DIR: &str = "~/.clw/cache";
 /// Fully resolved configuration ready to hand off to subcommands.
 pub struct ResolvedConfig {
     pub clw_config: Config,
+    /// Ref keyspace selector (`CLW_REF_DOMAIN`): user (default) or runner.
+    pub ref_domain: RefDomain,
 }
 
 impl ResolvedConfig {
@@ -87,6 +89,12 @@ impl ResolvedConfig {
 
         let cache_dir = expand_tilde(&cache_dir_str);
 
+        let ref_domain = parse_ref_domain(
+            cli.ref_domain
+                .as_deref()
+                .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
+        )?;
+
         Ok(ResolvedConfig {
             clw_config: Config {
                 endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -94,6 +102,7 @@ impl ResolvedConfig {
                 token,
                 cache_dir,
             },
+            ref_domain,
         })
     }
 
@@ -147,6 +156,14 @@ impl ResolvedConfig {
                 token,
                 cache_dir: expand_tilde(&cache_dir_str),
             },
+            // Local-only commands don't touch refs; a bad value here must not
+            // error the diagnostic path, so fall back to the default keyspace.
+            ref_domain: parse_ref_domain(
+                cli.ref_domain
+                    .as_deref()
+                    .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
+            )
+            .unwrap_or(RefDomain::User),
         }
     }
 
@@ -179,6 +196,20 @@ impl ResolvedConfig {
 /// namespace (server D-9 dispatch-time env injection).
 fn corelink_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Parse the ref-domain selector (`--ref-domain` / `CLW_REF_DOMAIN` / config
+/// `ref_domain`). `user` (default) and `runner` select disjoint ref keyspaces;
+/// any other value is a hard config error (exit 2).
+fn parse_ref_domain(raw: Option<&str>) -> Result<RefDomain, ClwError> {
+    match raw {
+        None | Some("") | Some("user") => Ok(RefDomain::User),
+        Some("runner") => Ok(RefDomain::Runner),
+        Some(other) => Err(ClwError::Config(format!(
+            "invalid ref domain '{other}': expected 'user' or 'runner' \
+             (set via --ref-domain or CLW_REF_DOMAIN)"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1289,78 @@ cache_dir = "~/.clw/cache"
             resolved2.clw_config.tenant, "acme-clw",
             "CLW_TENANT (clap) must win over CORELINK_TENANT"
         );
+    }
+
+    #[test]
+    fn resolve_ref_domain_selector() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = HomeEnvGuard::new();
+        let _vars = VarGuard::capture(&["CLW_REF_DOMAIN"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        std::env::remove_var("CLW_REF_DOMAIN");
+
+        // Default (no selector) => the user keyspace.
+        let cli = crate::Cli::try_parse_from([
+            "clw", "--tenant", "acme", "--token", "k", "ls", "--name", "ws",
+        ])
+        .unwrap();
+        assert_eq!(
+            ResolvedConfig::resolve(&cli).unwrap().ref_domain,
+            RefDomain::User
+        );
+
+        // --ref-domain runner => the runner keyspace.
+        let cli_r = crate::Cli::try_parse_from([
+            "clw",
+            "--tenant",
+            "acme",
+            "--token",
+            "k",
+            "--ref-domain",
+            "runner",
+            "ls",
+            "--name",
+            "ws",
+        ])
+        .unwrap();
+        assert_eq!(
+            ResolvedConfig::resolve(&cli_r).unwrap().ref_domain,
+            RefDomain::Runner
+        );
+
+        // CLW_REF_DOMAIN=runner (clap env) => the runner keyspace.
+        std::env::set_var("CLW_REF_DOMAIN", "runner");
+        let cli_e = crate::Cli::try_parse_from([
+            "clw", "--tenant", "acme", "--token", "k", "ls", "--name", "ws",
+        ])
+        .unwrap();
+        assert_eq!(
+            ResolvedConfig::resolve(&cli_e).unwrap().ref_domain,
+            RefDomain::Runner
+        );
+        std::env::remove_var("CLW_REF_DOMAIN");
+
+        // An invalid selector is a hard config error (exit 2), never a silent default.
+        let cli_bad = crate::Cli::try_parse_from([
+            "clw",
+            "--tenant",
+            "acme",
+            "--token",
+            "k",
+            "--ref-domain",
+            "bogus",
+            "ls",
+            "--name",
+            "ws",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ResolvedConfig::resolve(&cli_bad),
+            Err(ClwError::Config(_))
+        ));
     }
 
     // -----------------------------------------------------------------------

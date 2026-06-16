@@ -7,7 +7,7 @@
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_types::{ref_key, AcTransport, ClwError};
+use clw_types::{ref_key_in, AcTransport, ClwError};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -44,7 +44,7 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
     }
 
     let client = HttpClient::new(cfg.clw_config)?;
-    let rk = ref_key(&args.name);
+    let rk = ref_key_in(cfg.ref_domain, &args.name);
 
     match AcTransport::delete(&client, &rk).await {
         Ok(()) => {

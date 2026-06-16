@@ -9,7 +9,7 @@
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
+use clw_types::{ref_key_in, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -50,7 +50,7 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
     let client = HttpClient::new(cfg.clw_config)?;
 
     // Fetch ref record from AC.
-    let rk = ref_key(name);
+    let rk = ref_key_in(cfg.ref_domain, name);
     let ref_bytes = AcTransport::get(&client, &rk)
         .await
         .map_err(map_auth_error)?
