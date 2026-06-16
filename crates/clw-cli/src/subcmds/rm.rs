@@ -1,9 +1,9 @@
 //! `clw rm --name <NAME>` — delete a workspace ref.
 //!
-//! OPTIMISTIC against a frozen contract: the corelink-server `DELETE /v1/ac`
-//! capability is pending ratification (docs/REQUESTS-to-other-TLs.md D-1). Until
-//! it deploys, the real transport surfaces the 405/501 not-deployed case as an
-//! actionable error rather than a silent success.
+//! The corelink-server `DELETE /v1/ac` capability is LIVE (D-1, conformance-
+//! green). The 405/501 branch is a defensive guard: a LIVE capability returning
+//! 405/501 is a server-side regression, so the transport surfaces it as an
+//! actionable server-regression error rather than a silent success.
 
 use clap::Args;
 use clw_client::HttpClient;
@@ -61,35 +61,36 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
             }
             Ok(())
         }
-        // Optimistic-pending: the server lacks the DELETE handler. ALWAYS fails
-        // (non-zero exit) in BOTH modes — a destructive command that deleted
-        // nothing must never report success. In `--json` the structured note is
-        // printed first, then the same error propagates (mirrors ls/prune/erase).
-        Err(e) if is_not_deployed(&e) => not_deployed(json),
+        // Defensive: DELETE /v1/ac is LIVE (D-1) — a 405/501 means a server-side
+        // regression. ALWAYS fails (non-zero exit) in BOTH modes — a destructive
+        // command that deleted nothing must never report success. In `--json` the
+        // structured note is printed first, then the same error propagates
+        // (mirrors ls/prune/erase).
+        Err(e) if is_capability_unavailable(&e) => capability_unavailable(json),
         Err(e) => Err(map_auth_error(e)),
     }
 }
 
-/// Render the optimistic-pending case. ALWAYS returns `Err` so the process exits
+/// Render the server-regression case. ALWAYS returns `Err` so the process exits
 /// non-zero regardless of `--json`; in JSON mode the structured note is emitted
 /// to stdout first. Identical exit-code contract to `ls`/`prune`/`erase` — the
 /// brutal-audit (2026-06-15) caught `rm` as the lone outlier that PR #34 missed.
-fn not_deployed(json: bool) -> Result<(), ClwError> {
-    let msg = "ref deletion requires a corelink-server capability not yet deployed — tracked (DELETE /v1/ac; see docs/REQUESTS-to-other-TLs.md D-1)".to_string();
+fn capability_unavailable(json: bool) -> Result<(), ClwError> {
+    let msg = "ref deletion failed: the corelink-server DELETE /v1/ac capability is LIVE (D-1) but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)".to_string();
     if json {
         println!(
             "{}",
-            json!({ "deleted": false, "error": "not-deployed", "note": msg })
+            json!({ "deleted": false, "error": "capability-unavailable", "note": msg })
         );
     }
     Err(ClwError::Transport(msg))
 }
 
-/// True if the error is the optimistic-pending "server delete not deployed" case
-/// (the client maps 405/501 to a `Transport` error whose message names the
-/// pending capability).
-fn is_not_deployed(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+/// True if the error is the server-regression case (the client maps 405/501 to a
+/// `Transport` error whose message carries the `405/501` token for a LIVE
+/// capability).
+fn is_capability_unavailable(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
 }
 
 /// Rewrite a raw `Auth` error into an actionable transport message (mirrors
@@ -129,28 +130,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn not_deployed_detects_pending_capability_message() {
+    fn capability_unavailable_detects_405_501_message() {
         let err = ClwError::Transport(
-            "ref deletion requires a corelink-server capability not yet deployed (DELETE /v1/ac)"
-                .to_string(),
+            "ref deletion failed: server returned 405/501 for DELETE /v1/ac".to_string(),
         );
-        assert!(is_not_deployed(&err));
+        assert!(is_capability_unavailable(&err));
     }
 
     #[test]
-    fn not_deployed_ignores_other_transport_errors() {
+    fn capability_unavailable_ignores_other_transport_errors() {
         let err = ClwError::Transport("some unrelated transport issue".to_string());
-        assert!(!is_not_deployed(&err));
-        assert!(!is_not_deployed(&ClwError::Auth));
+        assert!(!is_capability_unavailable(&err));
+        assert!(!is_capability_unavailable(&ClwError::Auth));
     }
 
     #[test]
-    fn not_deployed_fails_in_both_modes() {
+    fn capability_unavailable_fails_in_both_modes() {
         // A destructive delete that did nothing must NEVER report success — both
         // JSON and human mode return an error (non-zero exit). Regression for the
         // brutal-audit CRIT/HIGH: rm was the sibling PR #34 missed.
-        assert!(not_deployed(true).is_err());
-        assert!(not_deployed(false).is_err());
+        assert!(capability_unavailable(true).is_err());
+        assert!(capability_unavailable(false).is_err());
     }
 
     #[test]

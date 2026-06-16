@@ -11,10 +11,10 @@
 //!      non-interactive/`--json` use. A mismatch aborts. This makes erasing the
 //!      wrong tenant a deliberate two-factor act, not a fat-fingered flag.
 //!
-//! OPTIMISTIC against a frozen contract: ref enumeration (D-7) and CAS
-//! list/delete (D-8) are pending corelink-server ratification
-//! (docs/REQUESTS-to-other-TLs.md). Until they deploy, the real transport
-//! surfaces the 405/501 not-deployed case as an actionable error.
+//! Ref enumeration (D-7) and CAS list/delete (D-8) are LIVE corelink-server
+//! capabilities (conformance-green). The 405/501 branch is a defensive guard: a
+//! LIVE capability returning 405/501 is a server-side regression, so the real
+//! transport surfaces it as an actionable server-regression error.
 
 use clap::Args;
 use clw_client::HttpClient;
@@ -57,12 +57,16 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
     // Enumerate the targets up front (also drives the dry-run report).
     let ref_keys = match AcTransport::list_refs(&client).await {
         Ok(k) => k,
-        Err(e) if is_not_deployed(&e) => return not_deployed(json, "erase", "D-7"),
+        Err(e) if is_capability_unavailable(&e) => {
+            return capability_unavailable(json, "erase", "D-7")
+        }
         Err(e) => return Err(map_auth_error(e)),
     };
     let blobs = match CasTransport::list_blobs(&client).await {
         Ok(b) => b,
-        Err(e) if is_not_deployed(&e) => return not_deployed(json, "erase", "D-8"),
+        Err(e) if is_capability_unavailable(&e) => {
+            return capability_unavailable(json, "erase", "D-8")
+        }
         Err(e) => return Err(map_auth_error(e)),
     };
 
@@ -177,22 +181,25 @@ fn abort(json: bool, tenant: &str) -> Result<(), ClwError> {
     )))
 }
 
-/// True if the error is the optimistic-pending "server capability not deployed"
-/// case (the client maps 405/501 to a `Transport` error naming the gap).
-fn is_not_deployed(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("not yet deployed"))
+/// True if the error is the server-regression case (the client maps 405/501 to a
+/// `Transport` error carrying the `405/501` token for a LIVE capability).
+fn is_capability_unavailable(err: &ClwError) -> bool {
+    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
 }
 
-/// Render the optimistic-pending case. ALWAYS fails (non-zero exit) so a
+/// Render the server-regression case. ALWAYS fails (non-zero exit) so a
 /// destructive command that did nothing never reports success — in `--json` mode
 /// the structured note is printed first, then the error propagates (same exit
 /// code as human mode).
-fn not_deployed(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
+fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
     let msg = format!(
-        "{capability} requires corelink-server capabilities not yet deployed — tracked ({dep}; see docs/RELAY-server-D1-D7-D8.md)"
+        "{capability} failed: corelink-server capability {dep} is LIVE but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)"
     );
     if json {
-        println!("{}", json!({ "error": "not-deployed", "note": msg }));
+        println!(
+            "{}",
+            json!({ "error": "capability-unavailable", "note": msg })
+        );
     }
     Err(ClwError::Transport(msg))
 }
@@ -214,21 +221,21 @@ mod tests {
     }
 
     #[test]
-    fn not_deployed_detects_pending_capability_message() {
-        let err = ClwError::Transport(
-            "erase requires a corelink-server capability not yet deployed (D-8)".to_string(),
-        );
-        assert!(is_not_deployed(&err));
-        assert!(!is_not_deployed(&ClwError::Transport("unrelated".into())));
-        assert!(!is_not_deployed(&ClwError::Auth));
+    fn capability_unavailable_detects_405_501_message() {
+        let err = ClwError::Transport("erase failed: server returned 405/501 (D-8)".to_string());
+        assert!(is_capability_unavailable(&err));
+        assert!(!is_capability_unavailable(&ClwError::Transport(
+            "unrelated".into()
+        )));
+        assert!(!is_capability_unavailable(&ClwError::Auth));
     }
 
     #[test]
-    fn not_deployed_fails_in_both_modes() {
+    fn capability_unavailable_fails_in_both_modes() {
         // A destructive command that did nothing must NEVER report success —
         // both JSON and human mode return an error (non-zero exit).
-        assert!(not_deployed(true, "erase", "D-7").is_err());
-        assert!(not_deployed(false, "erase", "D-7").is_err());
+        assert!(capability_unavailable(true, "erase", "D-7").is_err());
+        assert!(capability_unavailable(false, "erase", "D-7").is_err());
     }
 
     #[test]
