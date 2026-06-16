@@ -7,7 +7,8 @@
 |---|---|---|---|
 | **corelink-server TL** (+ CoreLink-API / Clerk) | [`REQUEST-server-TL-2026-06-16.md`](REQUEST-server-TL-2026-06-16.md) | Freeze **D-9** runner per-job PAT minting | family e2e (M7.5) |
 | **CoreLink runners TL** (M7.3, ownerless) | [`REQUEST-runners-TL-2026-06-16.md`](REQUEST-runners-TL-2026-06-16.md) | Freeze the runner ↔ clw contract (4 points) | family e2e (M7.5) |
-| **hugit / githugr TL** | [`REQUEST-hugit-githugr-TL-2026-06-16.md`](REQUEST-hugit-githugr-TL-2026-06-16.md) | Define the clw integration seam (design-first) | nothing (early) |
+| **hugit TL** | [`REQUEST-hugit-TL-2026-06-16.md`](REQUEST-hugit-TL-2026-06-16.md) | ✅ **RESOLVED** — seam 2 = hugit consumes `clw hydrate` (byte+mode identical); one setuid confirm-back open | nothing (early) |
+| **githugr TL** | [`REQUEST-githugr-TL-2026-06-16.md`](REQUEST-githugr-TL-2026-06-16.md) | Seam 1 (push→compute) — routed here by hugit TL; rides the runner seam | nothing (early) |
 
 ## What CLOSED since 2026-06-14 (recorded so nobody re-asks)
 
