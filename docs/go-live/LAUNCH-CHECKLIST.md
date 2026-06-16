@@ -1,0 +1,89 @@
+# clw go-live launch checklist — the turnkey path to `v0.1.0` GA
+
+> **Purpose.** The clw **code** is done: two full adversarial audit passes (71 findings fixed across
+> PRs #42–#55), gate-green, live-conformance-green, real e2e coverage for the destructive commands.
+> What remains for a GA tag is **owner/infra action**, not engineering. This checklist turns
+> "owner/infra-gated" from a vague status into a **sequenced, do-this-then-that** list: each of the 11
+> exit-gates, its current status, and the exact action + who owns it.
+>
+> Legend: ✅ done · ⏳ **owner action** (concrete, unblocked) · 🔒 infra/external (needs a key, a bill,
+> or a third party) · 🧪 verifiable-now-by-you (a script exists).
+
+---
+
+## At a glance
+
+| # | Exit gate | Status | Blocking action |
+|---|---|---|---|
+| 1 | Audit merged + defects fixed; zero open HIGH/MED | ✅ | — (done **twice** — pass-1 + pass-2) |
+| 2 | Compiles + tests green every platform incl. Windows | 🔒 / 🧪 | Windows **test lane** = M2.4 (billing). ACL **verifiable now** via the PowerShell script |
+| 3 | Every tracked deferral closed (or logged waiver) | ✅ | — (shipped code clean; only `best-effort` *design* comments remain) |
+| 4 | Signed reproducible binaries; install **and** uninstall verified | 🔒 | Provision signing secrets (below); run the matrix |
+| 5 | Supply chain clean + SBOM + **signed** checksums | ⏳ / 🔒 | `cargo-deny`/`publish=false` ✅; SBOM in CI ✅; signed checksums need the signing key |
+| 6 | Live conformance green as a pre-tag gate | ✅ | — (8/8 green vs prod; wired into `release.yml` conformance job) |
+| 7 | End-to-end **family** path proven across repos | 🔒 | M7 — needs server + runners + the other repos (cross-team) |
+| 8 | Region/residency correct + real right-to-erasure | ✅ / ⏳ | erasure ✅ (`clw erase`, audited); confirm the signup-worker region fix landed |
+| 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
+| 10 | Telemetry-off + key rotation runbook + support/EOL | ✅ | telemetry removed ✅; rotation runbook + EOL policy now published (this PR) |
+| 11 | CI not on a single founder machine | 🔒 | M2.4 — GitHub-hosted runners (billing) |
+
+**The critical path to GA:** unblock **M3 signing (gate 4/5)** + **M2.4 CI (gate 2/11)** + **legal sign-off (gate 9)**. Everything else is ✅ or follows from these.
+
+---
+
+## ⏳ Owner actions — do these (each is concrete + unblocked)
+
+### A. Provision the signing & release secrets (gates 4, 5)
+Decisions are already made in `docs/DISTRIBUTION.md`; you only provision the secrets the chosen options imply, then delete the dry-run guards in `.github/workflows/release.yml` (each is marked `TODO(OWNER)`).
+
+- **Windows code-signing — Azure Trusted Signing** (decision (b); exportable `.pfx` was rejected — no longer obtainable from a reputable CA). Provision as GitHub **secrets** (OIDC preferred over a client secret):
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE`.
+- **macOS — Developer ID + notarization** (decision (c): notarized **zip** for the bare-binary PATH install). Provision:
+  `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, plus the notarization creds (`AC_API_KEY_ID`, `AC_API_ISSUER_ID`, `AC_API_KEY_BASE64`).
+- **Linux — minisign** (sigstore documented as the alternative). Generate a minisign keypair; provision the secret key as `MINISIGN_SECRET_KEY` (+ passphrase); publish the **public** key in the repo + `docs/DISTRIBUTION.md` trust-root section.
+- **Download surface — R2 behind a CoreLink auth route** (decision (a), tracked as server dep **D-12**). Provision the R2 S3 creds (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`); the publish step uploads to `releases/clw/<version>/`. Coordinate D-12 (the authenticated download route) with the corelink-server team.
+
+→ See `docs/go-live/RUNBOOK-key-rotation-revocation.md` for how these keys are rotated/revoked once provisioned (gate 10).
+
+### B. Verify the Windows PAT-file ACL (gate 2, the security half) 🧪
+You do **not** need the M2.4 CI lane to close this. On any Windows machine (a VM, a friend's PC, a
+cloud box), run the script in **`docs/go-live/WINDOWS-ACL-VERIFICATION.md`** — it builds clw, runs
+`clw init`, and asserts the `config.toml` DACL is protected + owner-only. Report the three `PASS`
+lines and we mark the Windows ACL runtime-verified for v0.1.0.
+
+### C. Verify install **and** uninstall per platform (gate 4)
+After the signed binaries build: on each of macOS / Linux / Windows, run the authenticated install,
+confirm `clw doctor` is green, then run `clw uninstall --yes` and confirm `~/.clw` (config + PAT +
+cache) is gone and the binary-removal instruction is printed. (The uninstall **logic** is audited +
+e2e-tested; this is the per-platform packaging confirmation.)
+
+### D. Route the drafts to counsel (gate 9)
+The binding docs are written and self-consistent (`EULA.md` + `NOTICE` at the repo root;
+`docs/PRIVACY-POLICY.md`, `docs/TERMS-OF-SERVICE.md`, `docs/DPA-subprocessors.md`, `SECURITY.md`,
+and the export-control self-classification).
+They carry the "operative, full counsel review pending" framing. Get a lawyer's sign-off; that flips
+gate 9 from drafted → published.
+
+---
+
+## 🔒 Infra/external — needs a bill or a third party
+
+- **M2.4 — GitHub-hosted CI matrix (gates 2, 11).** Enable Actions billing / raise the spending limit,
+  then flip the Windows test lane from informational to required. This also delivers gate 11 (no
+  single founder machine). The cross-compile already proves Windows *compiles*; this proves it *runs*.
+- **M7 — family e2e (gate 7).** Needs corelink-server live + runners + the hugit/githugr repos. Cross-team;
+  schedule once M3 + M2.4 land. See `docs/HANDOFF-corelink-server-track.md`.
+
+---
+
+## When all ⏳ + 🔒 clear: cut the tag
+
+1. Confirm `main` is gate-green and live-conformance-green (the `release.yml` `conformance` job gates this).
+2. Tag `v0.1.0`. The pipeline runs: preflight → conformance gate → build+sign (5 targets) → **signed**
+   SHA-256 checksums + SBOM → publish to the R2 surface.
+3. Smoke-test the published, signed artifact on one machine per OS (download → verify signature →
+   `clw doctor`).
+4. Announce per the support policy in `docs/SUPPORT-AND-EOL.md`.
+
+**Pre-GA, a `v0.1.0-rc1` code-freeze tag can be cut at any time** — the code is frozen-ready; an RC
+marks "audited², release-engineering pending" without implying signed GA binaries.
