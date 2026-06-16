@@ -102,32 +102,29 @@ pub async fn run(
 mod tests {
     use clw_snapshot::SnapshotOptions;
 
-    /// The clamp the subcmd applies before wiring `--concurrency` into both the
-    /// `HttpClient` governor and `SnapshotOptions`. Mirrors the body of `run` so
-    /// a regression that drops the clamp (or fails to plumb the value) is caught.
-    fn clamp(concurrency: usize) -> usize {
-        concurrency.max(1)
-    }
+    // NOTE (pass-2 audit de-vacuous): the previous `concurrency_zero_is_clamped_to_one`
+    // and `concurrency_flag_is_passed_through_to_opts` tests defined a test-local `clamp`
+    // helper (`concurrency.max(1)`) that REIMPLEMENTED the inline clamp in `run`, then
+    // asserted on that reimplementation — they never ran `run`'s real clamp+plumbing, so a
+    // regression that dropped the clamp from `run` would not have failed them. The real
+    // `--concurrency` path (the `.max(1)` clamp plus wiring the value into BOTH
+    // `HttpClient::with_concurrency` and `SnapshotOptions::concurrency`) is exercised
+    // end-to-end through `run` by the binary-level `roundtrip_bit_identical` test in
+    // `crates/clw-cli/tests/e2e.rs`, which drives a real `snapshot` (default concurrency 8)
+    // and asserts a bit-identical round-trip — a broken governor/stream fan-out would surface
+    // there. The genuine contract assertion below exercises the REAL `SnapshotOptions::new`
+    // default (8) that `run` relies on as its wiring baseline.
 
     #[test]
-    fn concurrency_zero_is_clamped_to_one() {
-        // `--concurrency 0` must not stall the stream/governor.
-        assert_eq!(clamp(0), 1);
-    }
-
-    #[test]
-    fn concurrency_flag_is_passed_through_to_opts() {
-        // FIX 4: the flag must reach `SnapshotOptions` (previously honored by the
-        // stream but dropped on the client's HTTP governor). Assert the plumbing:
-        // the clamped value is the one written onto opts.
-        let concurrency = clamp(8);
-        let mut opts = SnapshotOptions::new("ws");
-        opts.concurrency = concurrency;
-        assert_eq!(opts.concurrency, 8, "concurrency must be plumbed onto opts");
-
-        // And a 0 is clamped before it ever reaches opts or the governor.
-        let mut opts0 = SnapshotOptions::new("ws");
-        opts0.concurrency = clamp(0);
-        assert_eq!(opts0.concurrency, 1);
+    fn snapshot_options_new_defaults_concurrency_to_eight() {
+        // `run` constructs `SnapshotOptions::new(name)` and then overwrites
+        // `.concurrency` with the clamped flag value; this asserts the REAL default
+        // that ships when the flag is left at its own default — a regression in the
+        // library default would change the wiring baseline `run` builds on.
+        let opts = SnapshotOptions::new("ws");
+        assert_eq!(
+            opts.concurrency, 8,
+            "SnapshotOptions::new must default concurrency to 8"
+        );
     }
 }

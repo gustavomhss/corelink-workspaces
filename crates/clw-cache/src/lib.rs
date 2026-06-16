@@ -512,23 +512,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Each blob below is 64 bytes; budget = 1 KiB so the steady state holds
         // ~16 blobs. Write enough to both exceed the budget AND trip the
-        // GC_CHECK_EVERY_PUTS gate at least once.
+        // GC_CHECK_EVERY_PUTS gate.
         let budget: u64 = 1024;
         let cache = LocalCache::with_budget(dir.path(), budget).unwrap();
 
-        let n_writes = GC_CHECK_EVERY_PUTS + 64;
-        for i in 0..n_writes {
-            // Distinct 64-byte payloads → distinct digests → distinct files.
-            let mut data = vec![0u8; 64];
-            data[..8].copy_from_slice(&i.to_le_bytes());
-            let d = Digest::of_bytes(&data);
-            cache.put(&d, &data).unwrap();
-        }
-
-        // After at least one gated sweep, the cache must be at/under budget.
-        let on_disk = cache.gc_to_budget().unwrap(); // also asserts gc itself is callable
-        let _ = on_disk;
-        let total: u64 = {
+        // Helper: total on-disk bytes across all 256 shards (the real footprint).
+        let on_disk_total = || -> u64 {
             let blobs_root = dir.path().join("blobs");
             let mut t = 0u64;
             for i in 0u16..=255 {
@@ -544,9 +533,36 @@ mod tests {
             }
             t
         };
+
+        // Pass-2 audit de-vacuous: the prior version called `cache.gc_to_budget()`
+        // IMMEDIATELY before measuring, so the assertion would pass even if eviction
+        // were NOT wired into `put` at all (the explicit gc masked a missing gate).
+        // We instead write EXACTLY `GC_CHECK_EVERY_PUTS` blobs so the per-put gate
+        // fires on the LAST put, then assert the cache is back under budget with NO
+        // explicit gc() call — proving the eviction is driven by the WIRED write path.
+        let n_writes = GC_CHECK_EVERY_PUTS; // gate fires precisely on the final put
+        for i in 0..n_writes {
+            // Distinct 64-byte payloads → distinct digests → distinct files.
+            let mut data = vec![0u8; 64];
+            data[..8].copy_from_slice(&i.to_le_bytes());
+            let d = Digest::of_bytes(&data);
+            cache.put(&d, &data).unwrap();
+        }
+        // Sanity: we genuinely overflowed the budget before the gate fired
+        // (GC_CHECK_EVERY_PUTS * 64 bytes ≫ 1 KiB), so eviction was actually needed.
+        assert!(
+            GC_CHECK_EVERY_PUTS * 64 > budget,
+            "test must write more than the budget for the assertion to be meaningful"
+        );
+
+        // The WIRED gate (inside `put`) must have evicted back under budget — with
+        // NO explicit gc_to_budget() call here. A regression that unwires eviction
+        // from the write path leaves the cache well over budget and FAILS this.
+        let total = on_disk_total();
         assert!(
             total <= budget,
-            "cache must be evicted back under budget ({budget}), got {total} bytes"
+            "the wired per-put eviction gate must bring the cache back under budget \
+             ({budget}) with no explicit gc call, got {total} bytes"
         );
     }
 
