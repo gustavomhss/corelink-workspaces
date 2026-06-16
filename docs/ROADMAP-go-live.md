@@ -60,7 +60,7 @@
    ships TLS+BLAKE3), DPA/sub-processor list. → new go-live-blocking milestone **M6**.
 7. **Family integration was under/mis-specified.** Runner auth conflates the client PAT path with the server-internal
    `x-corelink-tenant-id` header (clw never sends it); per-job PAT minting is undefined; the **CoreLink runners repo is a
-   third repo with no WP/owner**; the region-endpoint mechanism is an **open question** (clw may need no change); sccache C1
+   third repo with no WP/owner**; the region-endpoint mechanism is **resolved → (c): clw needs no change**; sccache C1
    is almost certainly **docs-only** (clw is not in the sccache data path).
 8. **Product-surface gaps:** credential/key lifecycle + signing-key rotation, telemetry consent, `clw uninstall`,
    cache-format migration, `clw doctor`/support, billing/quota-aware UX, output accessibility (NO_COLOR/`--json`),
@@ -154,7 +154,7 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 - **M4.2** **License posture:** replace invalid-SPDX `UNLICENSED` (note: `license-file` **cannot** be inherited via `.workspace=true` — keep `license` consistent, bind EULA via shipped files); add `publish = false` to **all** crates (proprietary leak guard); decide on `webpki-roots` **CDLA-Permissive-2.0**; scope down the workspace-wide `tokio` feature union (only `clw-run` needs `process`).
 - **M4.3** Per-release **CycloneDX SBOM**; attribution bundle (`cargo-about`) shipped **inside** the artifact (legal obligation → M3.1 DoD).
 - **M4.4** `SECURITY.md` + vuln disclosure + threat-model summary (from the audit). Enforce the secrets-backup rule (`SIGNUP_TOKEN_KEY` → **D-2**).
-- **M4.5** Promote the live conformance suite to a **pre-tag gate** (env-skip safe; fix the skip-equals-pass false-green). ✅ **false-green CLOSED (2026-06-15):** `CLW_CONFORMANCE_REQUIRE=1` makes every skip (absent creds **or** not-deployed) a hard failure; unset = prior skip-as-pass behaviour. Remaining M4.5 work (wiring the suite into `release.yml` with that env set) is **M3-gated** (no release pipeline yet).
+- **M4.5** Promote the live conformance suite to a **pre-tag gate** (env-skip safe; fix the skip-equals-pass false-green). ✅ **false-green CLOSED (2026-06-15):** `CLW_CONFORMANCE_REQUIRE=1` makes every skip (absent creds **or** not-deployed) a hard failure; unset = prior skip-as-pass behaviour. **Now wired (2026-06-16):** `release.yml` has a standalone `conformance` job that is a REQUIRED `needs:` predecessor of `build`/`sbom`/`publish` and runs `clw-conformance --features live`. It is **inert until `CLW_CI_TOKEN` is provisioned** (skip-not-fail by design); provisioning that one owner secret flips it to a true ship-blocking gate.
 
 ### M5 — Observability, ops & product surface  *(clw)*
 - **M5.1** Structured logging via `tracing` + PAT redaction; `-v/-q/--log-json`; replace ~35 ad-hoc `println/eprintln`.
@@ -175,9 +175,9 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 - **M6.7** **Disaster recovery / business continuity.** DR runbook for signing-key loss/compromise (re-key, re-sign, customer notification), loss of the download surface, CI/org continuity; document the cache as ephemeral/reconstructible and the R2 snapshot durability/backup guarantee (server-side commitment — schedule as a dep if a backup SLA is promised).
 
 ### M7 — HuGR family integration (CoreLink + runners + hugit/githugr)  *(coordinated, multi-repo)*
-- **M7.1 — Region/residency (corrected).** Two tracks: **(server)** D-3 signup-worker `enam` fix; **(clw)** *only if needed* — the region-endpoint mechanism is an **open question (a/b/c)**: (a) server redirects to a regional host and clw follows; (b) clw learns the tenant `primary_region` (needs a new lookup API → **D-10**) and maps region→host (a new `clw-types` contract); (c) the single global host region-routes internally → **clw needs no change** and the "clw resolves the regional endpoint" clause is deleted. **Confirm with the edge/server owner before scoping.**
-- **M7.2 — Runner ↔ clw contract (corrected + freeze).** **Auth two-layer model:** the runner authenticates with a (per-job, scoped) **tenant PAT** via `Authorization: Bearer` + tenant-in-URL-path, exactly like any client; `x-corelink-tenant-id` is **server-internal** and **never** set by clw/runner. Decide **library-link vs shell-out**; define the runner's **config-resolution** path (a disposable runner has no `~/.clw/config.toml`, an injected secret — conflicts with the H2 `$HOME`-config hardening); define the **snapshot-back ref-naming** convention/ownership. Freeze an **anchor contract** before any runner-side or e2e work.
-- **M7.3 — CoreLink runners repo (third repo, NEW track).** A runner-side WP to consume the frozen clw contract — **owner needed**; no WP exists today. Gates M7.5.
+- **M7.1 — Region/residency (corrected).** Two tracks: **(server)** D-3 signup-worker `enam` fix; **(clw)** *only if needed* — the region-endpoint mechanism is an **open question (a/b/c)**: (a) server redirects to a regional host and clw follows; (b) clw learns the tenant `primary_region` (needs a new lookup API → **D-10**) and maps region→host (a new `clw-types` contract); (c) the single global host region-routes internally → **clw needs no change** and the "clw resolves the regional endpoint" clause is deleted. **✅ RESOLVED (2026-06-16) → mechanism (c):** the single global host `corelink-api.humangr.com` region-routes internally, **clw needs no change**, the regional-endpoint clause is dropped, and **D-10 is superseded**. The **(server)** D-3 signup-worker fix shipped in #269.
+- **M7.2 — Runner ↔ clw contract (corrected + freeze).** ✅ **FROZEN (2026-06-16).** Runners TL ratified: **shell-out to a digest-pinned `clw` binary** (CLI contract `docs/CLI-CONTRACT.md`); **dispatch-time env injection** of a per-job scoped PAT (`CLW_*` env, no `~/.clw/config.toml` — clw already env-ready); **ref-naming** = clw reserves a runner ref-key domain `clw/ref/runner/v1/` via `CLW_REF_DOMAIN=runner` (collision-proof by construction); auth = `Bearer` + tenant-in-path, never `x-corelink-tenant-id`. Points 2+4 gate on D-9 (FROZEN). See `docs/REPLY-to-runners-TL-2026-06-16.md`.
+- **M7.3 — CoreLink runners repo (third repo).** ✅ **HAS A TL (2026-06-16)** — no longer ownerless; the runners TL responded + will add the `clw`-invocation step to the runner-lease path (mock-broker first) once D-9's mint route merges. Gates M7.5. **clw-side residual:** ship the `CLW_REF_DOMAIN` runner ref-key domain (bounded, gated change — frozen contract).
 - **M7.4 — Campaign #1 / CI-acceleration (server-gated).**
   - **S1 `R2KvStore`** (persistent KV, per-tenant prefix, no hash-verify) — closes turbo `TODO(v2)`; backs cargo+turbo. Keystone. **→ D-4.**
   - **S2 Native cargo route (Option A header-trust)** on S1 + mount + tests — mirror `bazel_v2`. **→ D-5.**
@@ -193,19 +193,19 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 |---|---|---|---|---|
 | ✅ D-1 | `DELETE /v1/ac/...` (idempotency + tenant-scope) — **LIVE** (#269 `f1199bdc`, conformance green) | audit L5 | M1.4 `clw rm` | corelink-server |
 | D-2 | Back up `SIGNUP_TOKEN_KEY` (write-only secret) | BUGREPORT §secrets | M4.4 | corelink-server |
-| D-3 | signup-worker region fix (`enam` hardcode + `regionFromColo` + no-op `configureTenant`) | HANDOFF-signup-region-hardcode | M7.1 | corelink-server (GAP-5) |
-| D-4 | `R2KvStore` (persistent KV behind turbo+cargo) | FINDING-sccache step 1 | M7.4 S2, C1 | corelink-server |
+| ✅ D-3 | signup-worker region fix (`enam` hardcode + `regionFromColo` + no-op `configureTenant`) — **LIVE** (residency #29 shipped in #269) | HANDOFF-signup-region-hardcode | M7.1 | corelink-server (GAP-5) |
+| ✅ D-4 | `R2KvStore` (persistent KV behind turbo+cargo) — **already exists** (merged server #206; no-hash-verify variant is a config of it) | FINDING-sccache step 1 | M7.4 S2, C1 | corelink-server |
 | D-5 | Native cargo route (Option A header-trust) | FINDING-sccache step 2 | M7.4 C1 | corelink-server |
 | D-6 | Per-tenant CAS write scaling (shard-DO **B** / bypass **C**) | FINDING-per-tenant-write-ceiling | M7.4 S3, M5.6 | corelink-server |
 | D-6a | `wrangler.toml max_instances=5` vs live `20` config drift | same finding | order before D-6 | corelink-server |
 | ✅ **D-7** | **Ref-enumeration LIST endpoint** (tenant's refs) — **LIVE** (#269 `f1199bdc`, conformance green) | M1.4/M6.4 briefs | `ls --all`, `prune`, **Art.17 erasure** | corelink-server |
 | ✅ **D-8** | **CAS DELETE + CAS LIST** (blob GC) — **LIVE** (#269 `f1199bdc`, conformance green) | M6.4 brief | `prune`, **Art.17 erasure** | corelink-server |
-| **D-9** | **Per-job runner PAT minting** (scope/TTL/trigger) | family-integration critic | M7.2, M7.5 | corelink-server / CoreLink API |
-| **D-10** | **Tenant `primary_region` lookup API** (only if M7.1 path (b)) | family-integration critic | M7.1 | corelink-server (conditional) |
+| **D-9** | **Per-job runner PAT minting** — **CONTRACT FROZEN (2026-06-16):** dispatcher mints via new `POST /internal/v1/runner/mint` (internal-auth, entitlement-checked, `cas:rw`, TTL-capped); dispatch-time env injection; clw **already env-injection-ready** (`CLW_TOKEN/ENDPOINT/TENANT`). Pending: server route merge (after cycle-2) + env-name confirm | family-integration critic | M7.2, M7.5 | corelink-server / CoreLink API |
+| ~~D-10~~ | **SUPERSEDED (2026-06-16)** — region resolved to mechanism (c); no `primary_region` lookup API needed | family-integration critic | M7.1 | — |
 | **D-11** | Distinct CAS-PUT status (created vs existed) for faithful accounting | M1.2 brief | accurate `chunks_uploaded` (optional) | corelink-server (low) |
 | **D-12** | Authenticated binary **download route** (if R2-behind-CoreLink) | M3.3 brief | M3.3 | corelink-server (conditional) |
-| CONFIRM | Clerk PAT **scope grants CAS+AC** (drifted single-`scope` enum) | FINDING-sccache blocker 2 | M7.5 e2e | Clerk/signup |
-| CONFIRM | Region-routing mechanism a/b/c | family-integration critic | M7.1 | edge/server |
+| ✅ CONFIRM | Clerk PAT **scope grants CAS+AC** — **RATIFIED + proven** (round-2 `read-write`; D-8 erasure passed on it) | FINDING-sccache blocker 2 | M7.5 e2e | Clerk/signup |
+| ✅ CONFIRM | Region-routing mechanism — **RESOLVED → (c)**, clw needs no change | family-integration critic | M7.1 | edge/server |
 
 **Already landed upstream:** AC-500 root cause (PR #139, empty `R2_AC_BUCKET`); wrangler@4 deploy fix.
 
