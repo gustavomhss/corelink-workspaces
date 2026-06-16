@@ -125,15 +125,30 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     };
 
     let mut rows = Vec::with_capacity(keys.len());
-    // Per-record skips (corrupt/unparseable records), carried so --json can report
-    // them structurally and human mode can summarize.
+    // Per-record skips, carried so --json can report them structurally and human
+    // mode can summarize. Covers BOTH a corrupt/unparseable record AND a transient
+    // per-record TRANSPORT error (a network blip fetching one record) — for a
+    // read-only listing, neither should be fatal to the whole command.
     let mut skipped: Vec<(String, String)> = Vec::new();
     for key in &keys {
-        // A ref deleted between enumeration and fetch simply drops out of the list.
-        let Some(bytes) = AcTransport::get(&client, key)
-            .await
-            .map_err(map_auth_error)?
-        else {
+        // Fetch this record. AUTH (401) is fatal — it means the WHOLE listing is
+        // unauthorized, so abort (map it to the actionable message first). Any
+        // OTHER per-record error (a transient transport blip) is TOLERATED the
+        // same way a corrupt record is: skip it, report it (named), and keep
+        // listing the rest. A ref deleted between enumeration and fetch (Ok(None))
+        // simply drops out of the list.
+        let fetched = match AcTransport::get(&client, key).await {
+            Ok(b) => b,
+            Err(ClwError::Auth) => return Err(map_auth_error(ClwError::Auth)),
+            Err(e) => {
+                let key_hex = key.to_hex();
+                tracing::warn!(ref_key = %key_hex, error = %e, "skipping ref record after a transport error");
+                eprintln!("warning: skipping ref record {key_hex} after a transport error: {e}");
+                skipped.push((key_hex, e.to_string()));
+                continue;
+            }
+        };
+        let Some(bytes) = fetched else {
             continue;
         };
         match RefRecord::from_bytes(&bytes) {
@@ -363,5 +378,80 @@ mod tests {
         assert_eq!(out["count"], 2);
         assert_eq!(out["skipped"], 1);
         assert_eq!(out["errors"][0]["ref_key"], bad_key.to_hex());
+    }
+
+    /// Exact mirror of `run_all`'s per-record fetch loop (FIX 4 logic): given each
+    /// key's fetch RESULT, AUTH aborts the whole listing; Ok(None) drops out;
+    /// Ok(Some(corrupt)) and any non-auth transport Err are both SKIPPED (collected
+    /// + named) and the loop keeps going. Returns Err only for the fatal auth case.
+    #[allow(clippy::type_complexity)]
+    fn collect_listing(
+        fetches: Vec<(Digest, Result<Option<Vec<u8>>, ClwError>)>,
+    ) -> Result<(Vec<RefRecord>, Vec<(String, String)>), ClwError> {
+        let mut rows = Vec::new();
+        let mut skipped = Vec::new();
+        for (key, fetched) in fetches {
+            let bytes = match fetched {
+                Ok(b) => b,
+                Err(ClwError::Auth) => return Err(map_auth_error(ClwError::Auth)),
+                Err(e) => {
+                    skipped.push((key.to_hex(), e.to_string()));
+                    continue;
+                }
+            };
+            let Some(bytes) = bytes else { continue };
+            match RefRecord::from_bytes(&bytes) {
+                Ok(r) => rows.push(r),
+                Err(e) => skipped.push((key.to_hex(), e.to_string())),
+            }
+        }
+        Ok((rows, skipped))
+    }
+
+    // FIX 4 — a per-record TRANSPORT error (a transient blip) is SKIPPED+reported
+    // just like a corrupt record; the rest of the listing still comes back.
+    #[test]
+    fn one_transport_error_still_lists_the_others() {
+        let blip_key = Digest::of_bytes(b"blip");
+        let fetches = vec![
+            (Digest::of_bytes(b"a"), Ok(Some(good_record("alpha")))),
+            (
+                blip_key,
+                Err(ClwError::Transport("connection reset by peer".into())),
+            ),
+            (Digest::of_bytes(b"b"), Ok(Some(good_record("bravo")))),
+        ];
+
+        let (rows, skipped) = collect_listing(fetches).expect("a transport blip must NOT be fatal");
+
+        // Both good refs survive — partial output beats no output.
+        assert_eq!(rows.len(), 2, "good records must still list");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"bravo"));
+
+        // The blipped record is skipped and named by its ref key.
+        assert_eq!(skipped.len(), 1, "exactly one record skipped");
+        assert_eq!(skipped[0].0, blip_key.to_hex(), "skip names the ref key");
+        assert!(
+            skipped[0].1.contains("connection reset"),
+            "skip carries the transport error text"
+        );
+    }
+
+    // FIX 4 — an AUTH (401) error fetching a record is STILL fatal: a 401 means the
+    // whole listing is unauthorized, so it must abort with the actionable message.
+    #[test]
+    fn auth_error_on_a_record_is_fatal() {
+        let fetches = vec![
+            (Digest::of_bytes(b"a"), Ok(Some(good_record("alpha")))),
+            (Digest::of_bytes(b"x"), Err(ClwError::Auth)),
+        ];
+        let err = collect_listing(fetches).expect_err("a 401 must abort the whole listing");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CLW_TOKEN") || msg.contains("config.toml"),
+            "auth abort must use the actionable message, got: {msg}"
+        );
     }
 }

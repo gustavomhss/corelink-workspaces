@@ -430,10 +430,17 @@ fn restrict_to_owner_windows(path: &std::path::Path) -> std::io::Result<()> {
         }
 
         // --- 2b. Fetch the TOKEN_USER (which embeds the user's SID) ---------
-        // Second call: a Vec<u8> backs the variable-length TOKEN_USER; the SID it
-        // points to lives INSIDE this buffer, so `buf` must outlive every use of
-        // `sid` below.
-        let mut buf: Vec<u8> = vec![0u8; needed as usize];
+        // Second call: an OVER-ALIGNED buffer backs the variable-length TOKEN_USER;
+        // the SID it points to lives INSIDE this buffer, so `buf` must outlive every
+        // use of `sid` below.
+        //
+        // FIX 5 (soundness): TOKEN_USER embeds a SID_AND_ATTRIBUTES whose `Sid`
+        // field is a POINTER (alignment 8), so the backing store must be 8-aligned.
+        // A plain `Vec<u8>` is align-1; casting it to `*const TOKEN_USER` and reading
+        // through it is UNDEFINED BEHAVIOR (misaligned read). Backing the buffer with
+        // a `Vec<u64>` (align 8) sized to ceil(needed/8) gives a correctly aligned
+        // allocation while keeping the exact byte size the API asked for.
+        let mut buf: Vec<u64> = vec![0u64; needed.div_ceil(8) as usize];
         if GetTokenInformation(
             token,
             TokenUser,
@@ -469,7 +476,13 @@ fn restrict_to_owner_windows(path: &std::path::Path) -> std::io::Result<()> {
         let acl_size = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
             - std::mem::size_of::<u32>()
             + sid_len as usize;
-        let mut acl_buf: Vec<u8> = vec![0u8; acl_size];
+        // FIX 5 (soundness): ACL and ACCESS_ALLOWED_ACE contain u32 fields (align 4),
+        // so writing/reading through this buffer as `*mut ACL` requires ≥4-byte
+        // alignment. A plain `Vec<u8>` is align-1, so the cast + InitializeAcl write
+        // would be UNDEFINED BEHAVIOR. Back it with a `Vec<u64>` (align 8, which
+        // covers the align-4 need) sized to ceil(acl_size/8) — same byte size, just
+        // an over-aligned allocation.
+        let mut acl_buf: Vec<u64> = vec![0u64; acl_size.div_ceil(8)];
         let acl = acl_buf.as_mut_ptr() as *mut ACL;
 
         // InitializeAcl lays down the ACL header in our buffer.
