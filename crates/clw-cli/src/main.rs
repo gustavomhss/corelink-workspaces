@@ -17,7 +17,11 @@ use config::ResolvedConfig;
 // ---------------------------------------------------------------------------
 
 /// `CoreLink` Workspaces client — snapshot, hydrate, and memoize your workspace.
-#[derive(Debug, Parser)]
+///
+/// `Debug` is hand-written (NOT derived) so the global `--token`/`CLW_TOKEN` PAT
+/// is redacted: the derived `Debug` would print `token: Some("<the PAT>")`. The
+/// hand-written route keeps clap parsing untouched (no newtype / `FromStr`).
+#[derive(Parser)]
 #[command(name = "clw", version, about, long_about = None)]
 pub struct Cli {
     /// Remote API endpoint (no trailing slash).
@@ -114,6 +118,32 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+// Manual Debug impl: redact the `--token`/`CLW_TOKEN` PAT (rendered as
+// `<redacted>`/`<unset>`) while showing every other field normally. The derived
+// Debug would print `token: Some("<the PAT>")`, leaking the secret into any
+// `{cli:?}` diagnostic.
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = if self.token.is_some() {
+            "<redacted>"
+        } else {
+            "<unset>"
+        };
+        f.debug_struct("Cli")
+            .field("endpoint", &self.endpoint)
+            .field("tenant", &self.tenant)
+            .field("token", &token)
+            .field("cache_dir", &self.cache_dir)
+            .field("json", &self.json)
+            .field("no_color", &self.no_color)
+            .field("concurrency", &self.concurrency)
+            .field("verbose", &self.verbose)
+            .field("quiet", &self.quiet)
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -717,6 +747,42 @@ mod tests {
         assert!(
             !help.to_lowercase().contains("token value"),
             "auth help must not surface a token value, got: {help}"
+        );
+    }
+
+    #[test]
+    fn cli_debug_redacts_token() {
+        // FIX 3: a `{cli:?}` diagnostic must never contain the PAT value.
+        let cli = Cli::try_parse_from([
+            "clw",
+            "--tenant",
+            "acme",
+            "--token",
+            "super-secret-pat-value",
+            "ls",
+            "--name",
+            "ws",
+        ])
+        .unwrap();
+        let dbg = format!("{cli:?}");
+        assert!(
+            !dbg.contains("super-secret-pat-value"),
+            "Cli Debug must NOT contain the token value, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Cli Debug must show '<redacted>' for a set token, got: {dbg}"
+        );
+        // Other fields are still shown.
+        assert!(dbg.contains("acme"));
+
+        // An unset token renders '<unset>', not '<redacted>'.
+        let cli_no_tok =
+            Cli::try_parse_from(["clw", "--tenant", "acme", "ls", "--name", "ws"]).unwrap();
+        let dbg2 = format!("{cli_no_tok:?}");
+        assert!(
+            dbg2.contains("<unset>"),
+            "Cli Debug must show '<unset>' when no token is set, got: {dbg2}"
         );
     }
 
