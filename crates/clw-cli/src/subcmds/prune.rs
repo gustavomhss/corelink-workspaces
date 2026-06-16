@@ -46,11 +46,20 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
     // not a candidate. The reverse order (mark, then list blobs) would sweep a
     // concurrently-pushed ref's blobs as orphans — live-data loss.
     //
-    // RESIDUAL (documented, not closed client-side): a push whose blobs were
-    // already in CAS before T0 but whose ref write lands AFTER the mark read can
-    // still have those blobs swept. The fully-correct fix is a server-side GC
-    // lease/epoch (a corelink-server item). Until then `prune` is dry-run-by-
-    // default; run it in a low-write window and review the dry-run first.
+    // RESIDUAL (documented, not closed client-side): two distinct skew cases can
+    // turn a live blob into a false orphan, both bounded by dry-run-by-default and
+    // the store's last-write-wins semantics:
+    //   1. A push whose blobs were already in CAS before T0 but whose ref write
+    //      lands AFTER the mark read can still have those blobs swept.
+    //   2. A ref whose record GETs 404 mid-mark (see `compute_live_set`) is
+    //      SKIPPED. That is usually a benign concurrent `rm`, but it can ALSO be
+    //      AC replica-lag / read-after-write skew (the ref exists but a lagging
+    //      replica answered 404). In that case the ref contributes nothing to the
+    //      live set and its blobs become false orphans, deletable under `--yes`.
+    // The fully-correct fix for both is a server-side GC lease/epoch (a
+    // corelink-server item). Until then `prune` is dry-run-by-default: run it in a
+    // low-write window, review the dry-run first, and rely on last-write-wins (a
+    // concurrent re-push restores any blob a prune raced) to bound the exposure.
     let all_blobs = match CasTransport::list_blobs(&client).await {
         Ok(b) => b,
         Err(e) if is_capability_unavailable(&e) => {
@@ -196,13 +205,22 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
 /// the live set is INCOMPLETE — proceeding would sweep that ref's live blobs as
 /// false orphans. We therefore ABORT the whole mark with a `live_set_incomplete`
 /// error that NAMES the offending ref, rather than returning a partial set. A ref
-/// that simply 404s mid-walk (a concurrent `rm`) is the one benign case: it now
-/// contributes nothing, so it is skipped, not treated as corruption.
+/// that 404s on its record GET mid-walk is SKIPPED (it contributes nothing), not
+/// treated as corruption — aborting on every concurrent `rm` would be too brittle.
+/// CAVEAT: that 404 is USUALLY a benign concurrent `rm`, but it can ALSO be AC
+/// replica-lag / read-after-write skew (the ref still exists; a lagging replica
+/// answered 404). In the skew case the ref's blobs become false orphans, so the
+/// skip is NOT unconditionally safe — the exposure is bounded by dry-run-by-default
+/// and the store's last-write-wins (a re-push restores a raced blob). See the
+/// RESIDUAL note in `run` for the full skew model.
 async fn compute_live_set(client: &HttpClient) -> Result<HashSet<Digest>, ClwError> {
     let mut live = HashSet::new();
 
     for key in AcTransport::list_refs(client).await? {
-        // A ref deleted mid-walk (404) simply contributes nothing — benign.
+        // A ref whose record GETs 404 mid-walk contributes nothing, so it is
+        // skipped. USUALLY a benign concurrent `rm`; can also be AC replica-lag
+        // (read-after-write skew), in which case its blobs become false orphans —
+        // bounded by dry-run-default + last-write-wins (see the RESIDUAL note in `run`).
         let Some(bytes) = AcTransport::get(client, &key).await? else {
             continue;
         };

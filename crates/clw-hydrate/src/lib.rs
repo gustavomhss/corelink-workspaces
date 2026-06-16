@@ -284,6 +284,15 @@ where
     // a manifest-integrity error — the two views of "how big is this snapshot" must
     // be consistent, and a divergence is the exact signature of the disk-fill
     // bypass (tiny declared total, huge real chunks). Reject before any FS work.
+    //
+    // V1 (audit pass-2): the STRICT equality is correct and must NOT be relaxed.
+    // By construction in the producer (clw-snapshot `build_manifest_local` /
+    // `snapshot`), `total_size` is `Σ File.size` over File entries only, and each
+    // File's `size` equals the sum of its chunk sizes because the chunks tile that
+    // file's content byte-for-byte (chunk_bytes / chunk_stream). Symlink and Dir
+    // entries contribute nothing to either side (they have no chunks AND are not
+    // added to total_size). Hence `total_size == Σ ChunkRef.size` exactly for any
+    // legitimate manifest, so `!=` can never spuriously reject a well-formed one.
     if manifest.total_size != real_total_bytes {
         return Err(ClwError::InvalidManifest(format!(
             "manifest total_size ({}) disagrees with the sum of its chunk sizes ({real_total_bytes}); \
@@ -473,6 +482,24 @@ where
         let mut f = std::fs::File::create(&tmp_path)?;
         for chunk in chunks {
             let (data, from_cache) = fetch_chunk(chunk.digest, client, cache).await?;
+            // FIX F1 (integrity): the per-chunk digest is already re-verified in
+            // fetch_chunk, but a chunk's ACTUAL byte length is never checked against
+            // its DECLARED `ChunkRef.size`. The disk-fill budget (pass 2c) sums the
+            // declared sizes, so a transport returning more/fewer bytes than declared
+            // would defeat that budget and/or write a file that disagrees with the
+            // manifest. Reject any length mismatch as an integrity error naming the
+            // chunk. (Digest verification alone does NOT make this redundant: it
+            // proves the bytes hash to `chunk.digest`, but the manifest's own
+            // `ChunkRef.size` can still disagree with those bytes' length.)
+            if data.len() as u64 != chunk.size {
+                return Err(ClwError::InvalidManifest(format!(
+                    "chunk {} for file {rel_path:?} returned {} byte(s) but the manifest \
+                     declares {} byte(s); refusing to hydrate a length-mismatched chunk",
+                    chunk.digest.to_hex(),
+                    data.len(),
+                    chunk.size
+                )));
+            }
             if from_cache {
                 bytes_from_cache += chunk.size;
             } else {
@@ -1158,6 +1185,57 @@ mod tests {
             "corrupt file must not be written"
         );
         assert!(!cache.has(&digest), "corrupt chunk must not be cached");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5b (FIX F1): a fetched chunk whose ACTUAL byte length disagrees with
+    // its DECLARED `ChunkRef.size` must be rejected as an integrity error, even
+    // when its digest verifies. We seed CAS with the REAL bytes (so the digest
+    // check passes) but declare a `ChunkRef.size` that does NOT match those
+    // bytes' length — the length guard must fire and no file must be written.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chunk_length_mismatch_returns_integrity_error() {
+        let real = b"the-honest-chunk-bytes";
+        let (digest, bytes) = make_chunk(real);
+
+        // Declared sizes deliberately LIE: total_size and the ChunkRef.size both
+        // claim a length different from the real bytes. They agree with each
+        // other (so the pass-2c declared-vs-summed check passes), but disagree
+        // with the bytes actually returned for the chunk.
+        let declared_len = real.len() as u64 + 7;
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: declared_len,
+            entries: vec![Entry::File {
+                path: "f.bin".into(),
+                mode: 0o644,
+                size: declared_len,
+                chunks: vec![ChunkRef {
+                    digest,
+                    size: declared_len,
+                }],
+            }],
+        };
+
+        // Seed CAS with the REAL bytes under the (correct) digest, so the digest
+        // re-verification in fetch_chunk passes and the LENGTH guard is what fires.
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(digest, bytes)]);
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("length-mismatched")),
+            "expected InvalidManifest about a length-mismatched chunk, got: {err}"
+        );
+        assert!(
+            !dest.join("f.bin").exists(),
+            "a length-mismatched chunk must not produce a file"
+        );
     }
 
     // -----------------------------------------------------------------------

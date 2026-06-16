@@ -147,6 +147,21 @@ are ignored — they do not affect the cache key.
 pipeline. Only successful runs (exit 0) are memoized; failed runs are never
 cached and always re-execute.
 
+### Caveat: ignored files are invisible to the cache key
+
+When an `--input` is a directory, `clw run` walks it the same way `snapshot`
+does — **respecting `.gitignore` and `.clwignore`**. A file inside an input
+directory that is ignored by those rules is therefore invisible to BOTH the
+snapshot and the cache key. If your command depends on such a file (a local
+`.env`, a generated config, a secret excluded from version control), changing it
+will **not** invalidate the cache, and a run can replay a stale result.
+
+To make an ignored file part of the key, either pass it as an explicit
+`--input <FILE>` (a directly-named file is digested regardless of ignore rules)
+or un-ignore it. This is by design — `clw` respects ignore files so build
+artifacts and caches do not pollute the key — but it is a sharp edge worth
+knowing.
+
 ---
 
 ## Conformance suite
