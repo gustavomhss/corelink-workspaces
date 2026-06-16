@@ -42,7 +42,12 @@ clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole clien
 ## Auth + exit semantics
 - `Authorization: Bearer <PAT>` + tenant-in-URL-path. Never `x-corelink-tenant-id` (server-internal).
 - An expired/invalid PAT → a **non-retryable** auth error (clw does **not** self-re-mint; the
-  dispatcher re-mints per D-9). Exit code is non-zero; config/usage errors exit `2`.
+  dispatcher re-mints per D-9). Exit code is non-zero; config/usage/transport/auth errors exit `2`.
+- **`clw run` is exit-code-transparent** (load-bearing for a CI runner): it **propagates the wrapped
+  command's exit code** (`std::process::exit(child_code)`), with a signal-killed child mapped to
+  `128 + signal` (POSIX; SIGTERM → 143), never -1/255. So `2` always means *clw itself* errored; any
+  other non-zero code is the *job's own* result, flowing through faithfully. A non-zero run is **not**
+  memoized — a failing job never poisons the cache.
 
 ## JSON output
 The family-relevant verbs support `--json` for machine parsing (content-address root, cache
