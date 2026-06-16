@@ -21,7 +21,7 @@
 | 4 | Signed reproducible binaries; install **and** uninstall verified | 🔒 | Provision signing secrets (below); run the matrix |
 | 5 | Supply chain clean + SBOM + **signed** checksums | ⏳ / 🔒 | `cargo-deny`/`publish=false` ✅; SBOM in CI ✅; signed checksums need the signing key |
 | 6 | Live conformance green as a pre-tag gate | ✅ / ⏳ | 8/8 green vs prod; the `release.yml` `conformance` job is wired as a REQUIRED predecessor but is **inert until `CLW_CI_TOKEN` is provisioned** (skip-not-fail) — provision that one secret to make it ship-blocking |
-| 7 | End-to-end **family** path proven across repos | 🔒 | M7 — needs server + runners + the other repos (cross-team) |
+| 7 | End-to-end **family** path proven across repos | 🔒 / ⏳ | **clw half DONE** (runner-model #64 + per-tier #66 + solo-live #67 suites merged); **server D-9 mint SHIPPED** (#305) + per-tier seed delivered (#303); remaining = runner's clw-invocation build + a D1 test env + per-tenant PATs — all TL-routed |
 | 8 | Region/residency correct + real right-to-erasure | ✅ / ⏳ | erasure ✅ (`clw erase`, audited); confirm the signup-worker region fix landed |
 | 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
 | 10 | Telemetry-off + key rotation runbook + support/EOL | ✅ | telemetry removed ✅; rotation runbook + EOL policy now published (this PR) |
