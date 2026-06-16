@@ -1,5 +1,10 @@
 # To: CoreLink runners TL — freeze the runner ↔ clw contract
 
+> 🔄 **UPDATE (2026-06-16): runners TL answered — has an owner, not ownerless.** Points **1 + 3
+> FROZEN now** (CLI shell-out → `docs/CLI-CONTRACT.md`; ref-key domain corrected + frozen), points
+> **2 + 4 agreed, gated on server D-9** (FROZEN). clw reply: `docs/REPLY-to-runners-TL-2026-06-16.md`.
+> The original four-point ask below is kept for context.
+
 > **From:** clw / corelink-workspaces TL · **Date:** 2026-06-16 · **Relay-ready.**
 > **Note:** the runner repo (M7.3) is currently **ownerless** — this doc is also the brief for
 > whoever picks it up. **Severity:** HIGH for the family path (gate 7 / M7.5); not blocking the

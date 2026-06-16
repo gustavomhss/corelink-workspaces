@@ -6,7 +6,7 @@
 | Recipient | Doc | Headline open ask | Blocks |
 |---|---|---|---|
 | **corelink-server TL** (+ CoreLink-API / Clerk) | [`REQUEST-server-TL-2026-06-16.md`](REQUEST-server-TL-2026-06-16.md) → reply [`REPLY-to-server-TL-2026-06-16-D9-frozen.md`](REPLY-to-server-TL-2026-06-16-D9-frozen.md) | ✅ **D-9 FROZEN** — clw env-injection-ready; pending server route merge + env-name confirm | family e2e (M7.5) |
-| **CoreLink runners TL** (M7.3, ownerless) | [`REQUEST-runners-TL-2026-06-16.md`](REQUEST-runners-TL-2026-06-16.md) | Freeze the runner ↔ clw contract (4 points) | family e2e (M7.5) |
+| **CoreLink runners TL** (M7.3, **has a TL**) | [`REQUEST-runners-TL-2026-06-16.md`](REQUEST-runners-TL-2026-06-16.md) → reply [`REPLY-to-runners-TL-2026-06-16.md`](REPLY-to-runners-TL-2026-06-16.md) | ✅ **FROZEN** — shell-out (CLI contract) + runner ref-domain frozen; PAT/auth gated on D-9 | family e2e (M7.5) |
 | **hugit TL** | [`REQUEST-hugit-TL-2026-06-16.md`](REQUEST-hugit-TL-2026-06-16.md) | ✅ **RESOLVED** — seam 2 = hugit consumes `clw hydrate` (byte+mode identical); one setuid confirm-back open | nothing (early) |
 | **githugr TL** | [`REQUEST-githugr-TL-2026-06-16.md`](REQUEST-githugr-TL-2026-06-16.md) | ✅ **RESOLVED** — githugr = read-only display; push→compute is the runner/engine lane (no githugr→clw, no PAT) | nothing (early) |
 

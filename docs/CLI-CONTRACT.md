@@ -1,0 +1,58 @@
+# clw CLI contract — the stable surface consumers may pin against (v0.1.0)
+
+> **Audience:** the corelink-runners fabric (shell-out, digest-pinned binary) and any engine/CI
+> consumer. **Promise:** the surface below is the **stable contract** for the `v0.1.0` line. Additive
+> changes (new verbs/flags/JSON fields) are minor; removing or changing the meaning of anything here
+> is a **breaking change** (major bump) and will be announced per `docs/SUPPORT-AND-EOL.md`.
+> **Authoritative detail:** `clw --help` / `clw <verb> --help` and `docs/usage.md`.
+
+## Invocation model
+Consumers **shell out** to the `clw` binary (`clw <verb> …`) and **pin it by digest** (bake it into
+the consumer image). No library/ABI coupling. This is the model the runners TL ratified
+(`corelink-runners` runner-contract response, 2026-06-16).
+
+## Stable verbs (the family-path subset in **bold**)
+| Verb | Purpose |
+|---|---|
+| **`snapshot [PATH] --name <NAME>`** | snapshot a workspace dir → content-addressed ref |
+| **`hydrate <NAME> <DEST>`** | materialize a ref into DEST — byte+mode+symlink identical |
+| **`run …`** | content-addressed, memoized execution (cache miss→hit) |
+| `ls [--all]` | list refs (`--all` enumerates the tenant) |
+| `rm <NAME> --yes` | delete a ref (idempotent) |
+| `prune` | CAS GC (mark-and-sweep; fail-safe on incomplete live set) |
+| `erase --yes` | GDPR Art.17 — wipe the tenant, verify-empty |
+| `doctor` / `status` | environment + auth health |
+| `auth` / `init` / `completions` / `uninstall` | setup / lifecycle |
+
+## Configuration contract — **env-var driven (no config file required)**
+A disposable runner needs **no `~/.clw/config.toml`**; every value falls back to an env var (clap),
+and `Config::resolve()` succeeds from env alone:
+
+| Env var | Meaning | Source |
+|---|---|---|
+| `CLW_ENDPOINT` | API base URL | `crates/clw-cli/src/main.rs:31` |
+| `CLW_TENANT` | tenant id (carried in the URL path) | `:40` |
+| `CLW_TOKEN` | PAT (`Authorization: Bearer`) — redacted in all logs/Debug | `:49` |
+| `CLW_CACHE_DIR` | local cache dir | `:58` |
+| `CLW_REF_DOMAIN` | **(PROPOSED, see below)** ref keyspace selector: `user` (default) or `runner` | — |
+
+The per-job, short-TTL, CAS+AC-scoped PAT is **injected at dispatch time** (server **D-9**, FROZEN).
+clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole client tenant authority.
+
+## Auth + exit semantics
+- `Authorization: Bearer <PAT>` + tenant-in-URL-path. Never `x-corelink-tenant-id` (server-internal).
+- An expired/invalid PAT → a **non-retryable** auth error (clw does **not** self-re-mint; the
+  dispatcher re-mints per D-9). Exit code is non-zero; config/usage errors exit `2`.
+
+## JSON output
+The family-relevant verbs support `--json` for machine parsing (content-address root, cache
+hit/miss, byte counts). Pin against the documented fields in `docs/usage.md`; fields are additive
+within the `v0.1.0` line.
+
+## ⚠️ Ref namespacing — PROPOSED contract (see `docs/REPLY-to-runners-TL-2026-06-16.md`)
+clw's ref key is `BLAKE3(REF_KEY_DOMAIN ‖ name)` with a **single fixed** `REF_KEY_DOMAIN =
+"clw/ref/v1/"` (a protocol-version separator, **not** a per-producer field). To give runner refs a
+**collision-proof-by-construction** namespace, clw will reserve a second domain
+`"clw/ref/runner/v1/"`, selected via `CLW_REF_DOMAIN=runner`. A consumer without that selector can
+never produce a runner-domain key regardless of `name`. **Frozen contract; implementation lands as a
+gated change.**
