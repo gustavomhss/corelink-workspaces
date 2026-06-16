@@ -254,6 +254,61 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
 }
 
 // ---------------------------------------------------------------------------
+// FIX 3: bounded child-output capture
+// ---------------------------------------------------------------------------
+
+/// Error from [`read_capped`]: either the stream exceeded the cap (carrying the
+/// projected size that tripped it) or an underlying I/O error.
+enum CapErr {
+    TooLarge(u64),
+    Io(std::io::Error),
+}
+
+impl CapErr {
+    fn into_clw(self) -> ClwError {
+        match self {
+            // A TooLarge here is handled by the caller before this is reached, but
+            // keep a faithful mapping so the conversion is total.
+            CapErr::TooLarge(size) => ClwError::TooLarge {
+                size,
+                cap: CAS_BLOB_CAP_BYTES as u64,
+            },
+            CapErr::Io(e) => ClwError::Io(e),
+        }
+    }
+}
+
+/// Read an optional async pipe into a `Vec` with a HARD running ceiling. Reads in
+/// fixed-size blocks and aborts with [`CapErr::TooLarge`] the moment the buffer
+/// would exceed `cap`, so we never retain more than ~`cap` + one block of bytes.
+/// A `None` pipe (stream not captured) yields an empty buffer.
+async fn read_capped<R>(reader: Option<R>, cap: usize) -> std::result::Result<Vec<u8>, CapErr>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let Some(mut reader) = reader else {
+        return Ok(Vec::new());
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut block).await.map_err(CapErr::Io)?;
+        if n == 0 {
+            break;
+        }
+        let projected = buf.len() as u64 + n as u64;
+        if projected > cap as u64 {
+            // Stop reading immediately; the caller will kill the child. We do NOT
+            // keep extending `buf`, so memory stays bounded at ~cap + one block.
+            return Err(CapErr::TooLarge(projected));
+        }
+        buf.extend_from_slice(&block[..n]);
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -298,22 +353,50 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // --- MISS: execute the command ---
     // Diagnostic channel (M5.1): cache miss + key on stderr.
     tracing::debug!(key = %key.to_hex(), hit = false, "run cache miss; executing");
-    let child = tokio::process::Command::new(&opts.command[0])
+    let mut child = tokio::process::Command::new(&opts.command[0])
         .args(&opts.command[1..])
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    let output = child.wait_with_output().await?;
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = output.stdout;
-    let stderr = output.stderr;
+    // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
+    // child output first. `wait_with_output` reads ALL of stdout/stderr into memory
+    // before any size check runs, so a command emitting gigabytes OOMs the process
+    // before the cap is consulted. Instead we read each stream with a running
+    // ceiling (CAS_BLOB_CAP_BYTES) and KILL the child the moment either exceeds it.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_fut = read_capped(stdout_pipe, CAS_BLOB_CAP_BYTES);
+    let stderr_fut = read_capped(stderr_pipe, CAS_BLOB_CAP_BYTES);
+    let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
 
-    // --- Memoize only on success + within size cap ---
-    let within_cap = stdout.len() <= CAS_BLOB_CAP_BYTES && stderr.len() <= CAS_BLOB_CAP_BYTES;
+    // If either stream blew the cap, kill the child and fail fast — we never retain
+    // more than ~cap bytes per stream.
+    let cap_blown = matches!(&stdout_res, Err(CapErr::TooLarge(_)))
+        || matches!(&stderr_res, Err(CapErr::TooLarge(_)));
+    if cap_blown {
+        // Best-effort kill + reap so we don't leave a runaway child.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let size = match (&stdout_res, &stderr_res) {
+            (Err(CapErr::TooLarge(n)), _) | (_, Err(CapErr::TooLarge(n))) => *n,
+            _ => CAS_BLOB_CAP_BYTES as u64 + 1,
+        };
+        return Err(ClwError::TooLarge {
+            size,
+            cap: CAS_BLOB_CAP_BYTES as u64,
+        });
+    }
+    let stdout = stdout_res.map_err(CapErr::into_clw)?;
+    let stderr = stderr_res.map_err(CapErr::into_clw)?;
 
-    if exit_code == 0 && within_cap {
+    // Both streams drained; now wait for the process to exit.
+    let status = child.wait().await?;
+    let exit_code = status.code().unwrap_or(-1);
+
+    // --- Memoize only on success (output is already within cap by construction) ---
+    if exit_code == 0 {
         let stdout_digest = Digest::of_bytes(&stdout);
         let stderr_digest = Digest::of_bytes(&stderr);
 
@@ -820,6 +903,75 @@ mod tests {
             matches!(err, ClwError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "missing input must return Io(NotFound), got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 3: a cache-miss command emitting MORE than the size cap is aborted with
+    // TooLarge WHILE capturing — not buffered whole and then checked. We emit well
+    // over CAS_BLOB_CAP_BYTES (5 MiB) of stdout; the read_capped ceiling must trip,
+    // the child is killed, and nothing is memoized (the AC stays empty for the key).
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // uses /bin/sh + `yes`/`head` (Windows port: M2)
+    #[tokio::test]
+    async fn oversized_child_output_aborts_with_too_large() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+
+        let store = FakeStore::default();
+
+        // Emit ~6 MiB of stdout (> 5 MiB cap): 6 * 1024 * 1024 bytes of 'A' + newline.
+        // `head -c` bounds the producer so the test terminates promptly even though
+        // our reader aborts early.
+        let bytes = 6 * 1024 * 1024;
+        let cmd = format!("yes A | head -c {bytes}");
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
+            env_keys: vec![],
+        };
+
+        let err = run_memoized(cwd, &store, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == CAS_BLOB_CAP_BYTES as u64),
+            "oversized child output must abort as TooLarge, got: {err:?}"
+        );
+
+        // The key was computed but nothing must have been memoized.
+        let key = compute_key(cwd, &opts).await.unwrap();
+        let stored = AcTransport::get(&store, &key).await.unwrap();
+        assert!(stored.is_none(), "aborted run must not be memoized");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 3 regression: output exactly AT the cap is still captured and memoized.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_output_within_cap_is_captured() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // 1 KiB of output — well under the cap.
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "yes A | head -c 1024".to_string(),
+            ],
+            env_keys: vec![],
+        };
+        let outcome = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout.len(), 1024, "stdout captured in full");
+        // Memoized on success.
+        let stored = AcTransport::get(&store, &outcome.key).await.unwrap();
+        assert!(stored.is_some(), "within-cap success must be memoized");
     }
 
     // -----------------------------------------------------------------------

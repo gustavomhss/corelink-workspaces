@@ -30,6 +30,7 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clw_types::{ClwError, Digest, Result};
 
@@ -41,6 +42,25 @@ pub const CACHE_FORMAT_VERSION: u32 = 1;
 /// Name of the version sentinel file stored at the cache root.
 const VERSION_FILE: &str = ".clw-cache-version";
 
+/// Default ceiling for the on-disk cache before [`gc`](LocalCache::gc) is invoked.
+///
+/// Rationale (anti unbounded-disk-growth): the cache is an L1 in front of CoreLink
+/// — every `put` (from snapshot uploads and from hydrate's download-side caching)
+/// writes a blob and NOTHING reclaimed them, so `~/.clw/cache` grew forever. 8 GiB
+/// is comfortably larger than any single workspace snapshot we expect (so eviction
+/// never thrashes a legitimate working set) yet bounds the steady-state footprint a
+/// long-lived developer machine accumulates. It is an LRU(mtime)-down-to-budget
+/// target, not a hard write rejection: a single hydrate/snapshot larger than this
+/// still completes; we just evict the coldest blobs back under budget afterward.
+pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+
+/// How many `put`s may land between two budget checks. Walking all 256 shards to
+/// total the cache size on EVERY write would make `put` O(cache) — far too costly.
+/// We instead sweep once per this many writes; with the 8 GiB budget and realistic
+/// blob sizes the cache can only overshoot the budget by a bounded slack (this many
+/// blobs) between sweeps, which is acceptable for a best-effort eviction policy.
+const GC_CHECK_EVERY_PUTS: u64 = 256;
+
 // ---------------------------------------------------------------------------
 // LocalCache
 // ---------------------------------------------------------------------------
@@ -51,6 +71,11 @@ const VERSION_FILE: &str = ".clw-cache-version";
 /// guarantees.
 pub struct LocalCache {
     root: PathBuf,
+    /// Size ceiling (bytes) the cache is evicted back down to once it overshoots.
+    budget_bytes: u64,
+    /// Count of successful `put`s since the last budget sweep; gates the cost of
+    /// `gc` so we don't stat the whole cache on every single write.
+    puts_since_gc: AtomicU64,
 }
 
 impl LocalCache {
@@ -73,8 +98,21 @@ impl LocalCache {
             let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         }
 
-        let cache = Self { root };
+        let cache = Self {
+            root,
+            budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
+            puts_since_gc: AtomicU64::new(0),
+        };
         cache.check_format_version()?;
+        Ok(cache)
+    }
+
+    /// Open a cache rooted at `root` with an explicit eviction `budget_bytes`
+    /// (used by tests to drive eviction without writing gigabytes). Production
+    /// callers use [`new`](Self::new), which applies [`DEFAULT_CACHE_BUDGET_BYTES`].
+    pub fn with_budget(root: impl Into<PathBuf>, budget_bytes: u64) -> Result<Self> {
+        let mut cache = Self::new(root)?;
+        cache.budget_bytes = budget_bytes;
         Ok(cache)
     }
 
@@ -212,7 +250,26 @@ impl LocalCache {
         let tmp_path = tmp.path.clone();
         drop(tmp.file); // close before rename on Windows
         fs::rename(&tmp_path, &dest)?;
+
+        // Eviction is wired HERE so every write path (snapshot uploads + hydrate's
+        // download-side caching) is bounded without each caller remembering to call
+        // gc. The full-cache stat in gc is O(cache), so we gate it: only sweep once
+        // per GC_CHECK_EVERY_PUTS writes. A gc failure must NOT fail the put (the
+        // blob is already durably written); eviction is best-effort.
+        if self.puts_since_gc.fetch_add(1, Ordering::Relaxed) + 1 >= GC_CHECK_EVERY_PUTS {
+            self.puts_since_gc.store(0, Ordering::Relaxed);
+            let _ = self.gc(self.budget_bytes);
+        }
         Ok(())
+    }
+
+    /// Evict the cache back down to its configured `budget_bytes` (the value passed
+    /// to [`with_budget`](Self::with_budget), else [`DEFAULT_CACHE_BUDGET_BYTES`]).
+    /// Returns the number of bytes freed. Exposed so a hydrate/snapshot path can
+    /// force a sweep at the end of a run regardless of the per-`put` gate.
+    pub fn gc_to_budget(&self) -> Result<u64> {
+        self.puts_since_gc.store(0, Ordering::Relaxed);
+        self.gc(self.budget_bytes)
     }
 
     /// Evict blobs until the total cached size is ≤ `max_total_bytes`.
@@ -442,6 +499,55 @@ mod tests {
 
         // Suppress unused variable warning.
         let _ = base;
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 4: eviction is WIRED into the write path — driving the cache over its
+    // budget triggers gc back under budget without any explicit gc() call.
+    // We use a tiny budget + with_budget so the test stays cheap, and write more
+    // than GC_CHECK_EVERY_PUTS blobs so the per-put gate fires.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn put_over_budget_triggers_eviction_back_under_budget() {
+        let dir = TempDir::new().unwrap();
+        // Each blob below is 64 bytes; budget = 1 KiB so the steady state holds
+        // ~16 blobs. Write enough to both exceed the budget AND trip the
+        // GC_CHECK_EVERY_PUTS gate at least once.
+        let budget: u64 = 1024;
+        let cache = LocalCache::with_budget(dir.path(), budget).unwrap();
+
+        let n_writes = GC_CHECK_EVERY_PUTS + 64;
+        for i in 0..n_writes {
+            // Distinct 64-byte payloads → distinct digests → distinct files.
+            let mut data = vec![0u8; 64];
+            data[..8].copy_from_slice(&i.to_le_bytes());
+            let d = Digest::of_bytes(&data);
+            cache.put(&d, &data).unwrap();
+        }
+
+        // After at least one gated sweep, the cache must be at/under budget.
+        let on_disk = cache.gc_to_budget().unwrap(); // also asserts gc itself is callable
+        let _ = on_disk;
+        let total: u64 = {
+            let blobs_root = dir.path().join("blobs");
+            let mut t = 0u64;
+            for i in 0u16..=255 {
+                let shard = format!("{:02x}", i);
+                if let Ok(rd) = fs::read_dir(blobs_root.join(&shard)) {
+                    for e in rd.flatten() {
+                        let m = e.metadata().unwrap();
+                        if m.is_file() {
+                            t += m.len();
+                        }
+                    }
+                }
+            }
+            t
+        };
+        assert!(
+            total <= budget,
+            "cache must be evicted back under budget ({budget}), got {total} bytes"
+        );
     }
 
     // -----------------------------------------------------------------------

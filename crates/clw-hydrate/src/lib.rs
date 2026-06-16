@@ -54,15 +54,42 @@ const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// as a normal `ClwError::Io`).
 const MAX_HYDRATE_TOTAL_BYTES: u64 = 1 << 40; // 1 TiB
 
+/// Maximum total number of `ChunkRef`s across the whole manifest (summed over
+/// every `File` entry).
+///
+/// Rationale (anti-OOM): `MAX_MANIFEST_ENTRIES` bounds the entry COUNT but NOT the
+/// chunk list WITHIN one entry — a single `File` entry with a billion-element
+/// `chunks` Vec defeats the per-entry allocation bound (every `ChunkRef` is cloned
+/// into the in-memory file-entry vector before materialisation). With the snapshot
+/// chunker's minimum chunk size, 1 TiB of content (`MAX_HYDRATE_TOTAL_BYTES`) is on
+/// the order of tens of millions of chunks; 64M is generously above any legitimate
+/// manifest yet finite. Enforced up-front, before the file-entry vector is built.
+const MAX_TOTAL_CHUNKS: u64 = 64_000_000;
+
+/// Maximum number of `ChunkRef`s a SINGLE `File` entry may declare. Bounds the
+/// per-file `chunks` clone independently of the manifest-wide `MAX_TOTAL_CHUNKS`,
+/// so a 1-entry manifest cannot smuggle an enormous chunk list past the entry cap.
+/// A file at the 1 TiB ceiling is far below this in realistic chunkings; 16M is a
+/// generous per-file headroom that still bounds a hostile single entry.
+const MAX_CHUNKS_PER_FILE: usize = 16_000_000;
+
 /// Enforce the M1.6 abuse caps on an untrusted manifest's declared size and
 /// symlink count. Pure (takes counts, not the `Manifest`) so it is testable at
 /// the boundary without building a million-entry manifest. Run before any
 /// allocation or FS work so a pathological manifest never produces a partial
 /// destination.
+///
+/// `real_total_bytes` is the AUTHORITATIVE size — the sum of every `ChunkRef.size`
+/// across every `File` entry — NOT the attacker-controlled declared `total_size`.
+/// The declared figure is checked for AGREEMENT separately (see
+/// `summed_chunk_bytes` / the integrity check in `hydrate`); the disk-fill budget
+/// is enforced against the real number so a manifest declaring `total_size = 0`
+/// while its chunks sum to gigabytes cannot bypass the guard.
 fn enforce_resource_bounds(
     entry_count: usize,
-    total_size: u64,
+    real_total_bytes: u64,
     symlink_count: usize,
+    total_chunks: u64,
 ) -> Result<()> {
     if entry_count > MAX_MANIFEST_ENTRIES {
         return Err(ClwError::InvalidManifest(format!(
@@ -70,9 +97,9 @@ fn enforce_resource_bounds(
              {MAX_MANIFEST_ENTRIES} (anti-OOM/enumeration-bomb guard); refusing to hydrate"
         )));
     }
-    if total_size > MAX_HYDRATE_TOTAL_BYTES {
+    if real_total_bytes > MAX_HYDRATE_TOTAL_BYTES {
         return Err(ClwError::InvalidManifest(format!(
-            "manifest declares total_size {total_size} bytes, exceeding the hydrate cap of \
+            "manifest's chunks sum to {real_total_bytes} bytes, exceeding the hydrate cap of \
              {MAX_HYDRATE_TOTAL_BYTES} bytes (anti disk-fill guard); refusing to hydrate"
         )));
     }
@@ -80,6 +107,25 @@ fn enforce_resource_bounds(
         return Err(ClwError::InvalidManifest(format!(
             "manifest declares {symlink_count} symlinks, exceeding the hydrate cap of \
              {MAX_SYMLINK_ENTRIES} (anti fan-out/count guard); refusing to hydrate"
+        )));
+    }
+    if total_chunks > MAX_TOTAL_CHUNKS {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest declares {total_chunks} chunks total, exceeding the hydrate cap of \
+             {MAX_TOTAL_CHUNKS} (anti-OOM chunk-count guard); refusing to hydrate"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a single `File` entry whose `chunks` list exceeds [`MAX_CHUNKS_PER_FILE`]
+/// (FIX 6). Pure (takes the count, not the Vec) so it is testable at the boundary
+/// without allocating a 16M-element chunk list.
+fn enforce_per_file_chunk_cap(path: &str, chunk_count: usize) -> Result<()> {
+    if chunk_count > MAX_CHUNKS_PER_FILE {
+        return Err(ClwError::InvalidManifest(format!(
+            "file entry {path:?} declares {chunk_count} chunks, exceeding the per-file cap of \
+             {MAX_CHUNKS_PER_FILE} (anti-OOM chunk-count guard); refusing to hydrate"
         )));
     }
     Ok(())
@@ -213,7 +259,45 @@ where
         .iter()
         .filter(|e| matches!(e, Entry::Symlink { .. }))
         .count();
-    enforce_resource_bounds(manifest.entries.len(), manifest.total_size, symlink_count)?;
+
+    // FIX 1 + FIX 6: derive the AUTHORITATIVE figures from the chunk lists, not
+    // from the attacker-controlled `total_size`. The real number of bytes we will
+    // actually write is the sum of every ChunkRef.size; the real number of chunk
+    // allocations is the total chunk count. A malicious manifest can declare
+    // `total_size = 0` while its chunks sum to gigabytes, so we MUST budget against
+    // the summed figure. We also bound the per-file chunk count so a single entry
+    // cannot smuggle an enormous `chunks` Vec past the entry cap. Saturating adds
+    // keep a hostile manifest from wrapping the running total to a small value.
+    let mut real_total_bytes: u64 = 0;
+    let mut total_chunks: u64 = 0;
+    for entry in &manifest.entries {
+        if let Entry::File { path, chunks, .. } = entry {
+            enforce_per_file_chunk_cap(path, chunks.len())?;
+            total_chunks = total_chunks.saturating_add(chunks.len() as u64);
+            for c in chunks {
+                real_total_bytes = real_total_bytes.saturating_add(c.size);
+            }
+        }
+    }
+
+    // FIX 1: a declared `total_size` that disagrees with the summed chunk sizes is
+    // a manifest-integrity error — the two views of "how big is this snapshot" must
+    // be consistent, and a divergence is the exact signature of the disk-fill
+    // bypass (tiny declared total, huge real chunks). Reject before any FS work.
+    if manifest.total_size != real_total_bytes {
+        return Err(ClwError::InvalidManifest(format!(
+            "manifest total_size ({}) disagrees with the sum of its chunk sizes ({real_total_bytes}); \
+             refusing to hydrate an internally inconsistent manifest",
+            manifest.total_size
+        )));
+    }
+
+    enforce_resource_bounds(
+        manifest.entries.len(),
+        real_total_bytes,
+        symlink_count,
+        total_chunks,
+    )?;
 
     // ------------------------------------------------------------------
     // 3. Ensure dest exists.
@@ -326,6 +410,12 @@ where
             materialize_symlink_as_copy(dest, path, target, &abs)?;
         }
     }
+
+    // FIX 4: a hydrate caches every downloaded chunk; over many hydrates the cache
+    // would grow without bound. Force one eviction sweep down to the cache budget
+    // at the end of the run. Best-effort: a gc failure must not fail an otherwise
+    // successful hydrate (the materialised destination is already complete).
+    let _ = cache.gc_to_budget();
 
     Ok(HydrateReport {
         root: record.root,
@@ -1182,8 +1272,8 @@ mod tests {
         // The cap is a pure guard — exercise it at the boundary directly instead
         // of building a million-entry manifest (which made this test ~minute-long
         // via canonical_bytes serialization). The guard runs before any FS work.
-        assert!(enforce_resource_bounds(MAX_MANIFEST_ENTRIES, 0, 0).is_ok());
-        let err = enforce_resource_bounds(MAX_MANIFEST_ENTRIES + 1, 0, 0).unwrap_err();
+        assert!(enforce_resource_bounds(MAX_MANIFEST_ENTRIES, 0, 0, 0).is_ok());
+        let err = enforce_resource_bounds(MAX_MANIFEST_ENTRIES + 1, 0, 0, 0).unwrap_err();
         assert!(
             matches!(err, ClwError::InvalidManifest(ref m) if m.contains("entries")),
             "expected InvalidManifest about entry count, got: {err}"
@@ -1197,8 +1287,8 @@ mod tests {
 
     #[test]
     fn oversized_symlink_count_rejected() {
-        assert!(enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES).is_ok());
-        let err = enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES + 1).unwrap_err();
+        assert!(enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES, 0).is_ok());
+        let err = enforce_resource_bounds(0, 0, MAX_SYMLINK_ENTRIES + 1, 0).unwrap_err();
         assert!(
             matches!(err, ClwError::InvalidManifest(ref m) if m.contains("symlink")),
             "expected InvalidManifest about symlinks, got: {err}"
@@ -1206,34 +1296,184 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 9 (M1.6): a manifest whose declared total_size exceeds
-    // MAX_HYDRATE_TOTAL_BYTES is rejected up-front with InvalidManifest.
+    // Test 9 (M1.6 / FIX 1): a manifest whose REAL size (summed chunk sizes)
+    // exceeds MAX_HYDRATE_TOTAL_BYTES is rejected up-front with InvalidManifest.
+    // CHANGED from the original (which used a bare Dir + an inflated declared
+    // total_size): the budget is now enforced against the summed chunk sizes, so
+    // the guard is exercised with a File whose ChunkRef.size is over the cap and a
+    // declared total_size that AGREES (so the FIX-1 agreement check passes and the
+    // disk-fill budget guard is what fires).
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn oversized_total_bytes_rejected() {
-        // One tiny entry, but a malicious declared total of (cap + 1) bytes.
+        // A file declaring a single chunk whose size is (cap + 1) bytes. We never
+        // actually fetch the chunk — the budget guard fires before any FS work.
+        let fake_digest = Digest::of_bytes(b"never-fetched");
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             total_size: MAX_HYDRATE_TOTAL_BYTES + 1,
-            entries: vec![Entry::Dir {
-                path: "only-dir".into(),
+            entries: vec![Entry::File {
+                path: "huge.bin".into(),
+                mode: 0o644,
+                size: MAX_HYDRATE_TOTAL_BYTES + 1,
+                chunks: vec![ChunkRef {
+                    digest: fake_digest,
+                    size: MAX_HYDRATE_TOTAL_BYTES + 1,
+                }],
             }],
         };
 
-        let (store, _cache_dir, cache) = setup_store(&manifest, &[]);
+        // setup_store would try to find the chunk bytes; build the store inline.
+        let store = FakeStore::new();
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let manifest_digest = Digest::of_bytes(&manifest_bytes);
+        store.cas_put_raw(manifest_digest, manifest_bytes.clone());
+        let record = RefRecord {
+            name: "test-ws".into(),
+            root: manifest_digest,
+            manifest_size: manifest_bytes.len() as u64,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "0.1.0".into(),
+        };
+        store.ac_put_raw(clw_types::ref_key("test-ws"), record.to_bytes().unwrap());
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+
         let dest_dir = TempDir::new().unwrap();
         let dest = dest_dir.path().join("out");
 
         let opts = HydrateOptions::new("test-ws");
         let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
         assert!(
-            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("total_size")),
-            "expected InvalidManifest about total_size, got: {err}"
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("chunks sum")),
+            "expected InvalidManifest about summed chunk bytes, got: {err}"
         );
         assert!(
-            !dest.join("only-dir").exists(),
-            "guard must fire before any directory is created"
+            !dest.join("huge.bin").exists(),
+            "guard must fire before any file is created"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10 (FIX 1): the disk-fill guard is enforced against the REAL summed
+    // chunk sizes, NOT the attacker-declared total_size. A manifest declaring a
+    // tiny (or zero) total_size while its chunks sum huge must be REJECTED before
+    // any write — both as an integrity disagreement and (had they agreed) as an
+    // over-budget request. Here the declared total is deliberately tiny, so the
+    // agreement check catches the bypass.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn declared_total_size_disagreeing_with_chunks_is_rejected() {
+        // Two real chunks summing to a known size, but total_size declared as 0 —
+        // the classic disk-fill bypass. We seed the chunks so this would otherwise
+        // hydrate; the guard must abort BEFORE writing.
+        let (d1, b1) = make_chunk(b"chunk-aaaa");
+        let (d2, b2) = make_chunk(b"chunk-bbbbbb");
+        let real = (b1.len() + b2.len()) as u64;
+
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0, // LIE: real chunks sum to `real` bytes.
+            entries: vec![Entry::File {
+                path: "f.bin".into(),
+                mode: 0o644,
+                size: real,
+                chunks: vec![
+                    ChunkRef {
+                        digest: d1,
+                        size: b1.len() as u64,
+                    },
+                    ChunkRef {
+                        digest: d2,
+                        size: b2.len() as u64,
+                    },
+                ],
+            }],
+        };
+
+        let (store, _cache_dir, cache) =
+            setup_store(&manifest, &[(d1, b1.clone()), (d2, b2.clone())]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("disagrees")),
+            "expected InvalidManifest about declared/real disagreement, got: {err}"
+        );
+        assert!(
+            !dest.join("f.bin").exists(),
+            "disk-fill bypass must abort before any file is written"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11 (FIX 6): the per-file and manifest-wide chunk-count caps reject a
+    // chunk Vec larger than the bound. The caps are pure guards (they take counts)
+    // so we exercise them at the boundary directly — building 16M/64M ChunkRefs in
+    // a unit test is infeasible, and the guards run on the count before any FS work.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oversized_chunk_counts_rejected() {
+        // Per-file cap.
+        assert!(enforce_per_file_chunk_cap("f.bin", MAX_CHUNKS_PER_FILE).is_ok());
+        let err = enforce_per_file_chunk_cap("f.bin", MAX_CHUNKS_PER_FILE + 1).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("per-file cap")),
+            "expected InvalidManifest about per-file chunk count, got: {err}"
+        );
+
+        // Manifest-wide total-chunk cap.
+        assert!(enforce_resource_bounds(1, 0, 0, MAX_TOTAL_CHUNKS).is_ok());
+        let err = enforce_resource_bounds(1, 0, 0, MAX_TOTAL_CHUNKS + 1).unwrap_err();
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("chunks total")),
+            "expected InvalidManifest about total chunk count, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11b (FIX 6 regression): a LEGITIMATE multi-chunk file (well under both
+    // caps) must still hydrate — the new guards don't reject honest input.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn legitimate_multichunk_file_still_hydrates_under_new_caps() {
+        let (d1, b1) = make_chunk(b"part-one-");
+        let (d2, b2) = make_chunk(b"part-two!");
+        let real = (b1.len() + b2.len()) as u64;
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: real,
+            entries: vec![Entry::File {
+                path: "multi.bin".into(),
+                mode: 0o644,
+                size: real,
+                chunks: vec![
+                    ChunkRef {
+                        digest: d1,
+                        size: b1.len() as u64,
+                    },
+                    ChunkRef {
+                        digest: d2,
+                        size: b2.len() as u64,
+                    },
+                ],
+            }],
+        };
+        let (store, _cache_dir, cache) =
+            setup_store(&manifest, &[(d1, b1.clone()), (d2, b2.clone())]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+        let opts = HydrateOptions::new("test-ws");
+        hydrate(&dest, &store, &cache, &opts).await.unwrap();
+        let mut expected = b1.clone();
+        expected.extend_from_slice(&b2);
+        assert_eq!(std::fs::read(dest.join("multi.bin")).unwrap(), expected);
     }
 }

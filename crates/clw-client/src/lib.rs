@@ -223,6 +223,14 @@ impl HttpClient {
         let inner = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
+            // SECURITY (FIX 5): never follow redirects. We talk to ONE fixed,
+            // pre-validated API origin (is_safe_https / is_loopback_http above);
+            // reqwest's default follows up to 10 redirects, which a hostile or buggy
+            // server could use to redirect us at internal hosts (SSRF amplifier) or
+            // to a different host carrying the bearer PAT. For a single-origin client
+            // a 30x has no legitimate meaning, so surfacing it as a non-success
+            // transport error is strictly safer than chasing the Location.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ClwError::Transport(e.to_string()))?;
         Ok(Self {
@@ -360,6 +368,20 @@ impl HttpClient {
         base_url: &str,
         unavailable_msg: &str,
     ) -> Result<Vec<Digest>> {
+        self.list_digests_capped::<P>(base_url, unavailable_msg, MAX_TOTAL_DIGESTS)
+            .await
+    }
+
+    /// Inner paginator with an explicit total-entry ceiling so the FIX-2 abort can
+    /// be exercised with a small cap in tests (driving a real 10M-entry server is
+    /// infeasible). Production callers go through [`list_digests`](Self::list_digests),
+    /// which passes [`MAX_TOTAL_DIGESTS`].
+    async fn list_digests_capped<P: ListPage + Send>(
+        &self,
+        base_url: &str,
+        unavailable_msg: &str,
+        max_total: u64,
+    ) -> Result<Vec<Digest>> {
         let auth = self.auth_header();
         let client = &self.inner;
         let mut out: Vec<Digest> = Vec::new();
@@ -425,6 +447,16 @@ impl HttpClient {
 
             let (keys, next) = page.into_parts();
             out.extend(keys);
+
+            // Total-entry ceiling (FIX 2): abort before the accumulated digests can
+            // grow without bound, independent of the page cap. A server that keeps
+            // returning full pages cannot OOM us.
+            if out.len() as u64 > max_total {
+                return Err(ClwError::TooLarge {
+                    size: out.len() as u64,
+                    cap: max_total,
+                });
+            }
 
             pages += 1;
             if pages > MAX_PAGES {
@@ -560,6 +592,15 @@ fn is_safe_https(ep: &str) -> bool {
 /// page, so 16 MiB is orders of magnitude above any legitimate page while still
 /// bounding a hostile/buggy server's response.
 const LIST_PAGE_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// Total-ENTRY ceiling for a paginated listing (FIX 2). `MAX_PAGES` bounds the
+/// number of pages, but at `limit=1000`/page a hostile server paginating forever
+/// with FULL pages would still grow the flattened `Vec` toward ~10^9 digests
+/// (~32 GiB at 32 bytes each) and OOM the client. 10_000_000 ref/blob keys is far
+/// above any legitimate tenant (~320 MiB in the flat Vec — already generous
+/// headroom) yet finite, so an unbounded server is aborted with `TooLarge` instead
+/// of exhausting memory.
+const MAX_TOTAL_DIGESTS: u64 = 10_000_000;
 
 /// Read a response body into memory with a HARD size ceiling, so a hostile or
 /// buggy server cannot OOM the client by answering a small request with a
@@ -2273,6 +2314,100 @@ mod tests {
                 "genuine loopback {ep:?} must be accepted"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // FIX 2: the total-ENTRY ceiling aborts a server that paginates forever with
+    // full pages, independent of the page cap. Driving 10M real entries is
+    // infeasible, so we exercise the inner paginator with a tiny max_total: the
+    // server always returns a one-entry page with a fresh, strictly-advancing
+    // cursor (so neither MAX_PAGES nor the repeated-cursor guard fires first), and
+    // the accumulation must abort with TooLarge once it exceeds the cap.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_aborts_when_total_entries_exceed_cap() {
+        let server = MockServer::start().await;
+
+        // Each call returns a distinct blob hash + a distinct next_cursor, so the
+        // server "paginates forever". A shared counter makes every page unique.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.store(0, Ordering::SeqCst);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(|_: &wiremock::Request| {
+                let n = SEQ.fetch_add(1, Ordering::SeqCst);
+                // A unique, valid blob hash per page and a unique advancing cursor
+                // so the liveness guards never trip before the entry cap does.
+                let d = Digest::of_bytes(format!("blob-{n}").as_bytes());
+                ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"blobs":[{{"hash":"{d}"}}],"next_cursor":"cur-{}"}}"#,
+                    n + 1
+                ))
+            })
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let base_url = format!("{}/v1/cas/test-tenant", server.uri());
+        // Cap at 3 entries: the 4th accumulated entry must trip the abort.
+        let err = client
+            .list_digests_capped::<CasListPage>(&base_url, "unused", 3)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == 3),
+            "exceeding the total-entry cap must abort with TooLarge, got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // FIX 5: the client must NOT follow redirects. A 302 to ANOTHER host is left
+    // unfollowed: the redirect target receives no request (so the bearer PAT is
+    // never sent there), and the 302 surfaces as a non-success Http error rather
+    // than the leaked 200 body.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn redirect_is_not_followed_and_pat_not_leaked() {
+        let target = MockServer::start().await;
+        // The redirect TARGET: if the client wrongly followed the 302, this 200
+        // would be returned (and would have carried the Authorization header).
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"leaked".to_vec()))
+            .mount(&target)
+            .await;
+
+        let origin = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+        // The origin answers the CAS GET with a 302 → the OTHER host.
+        Mock::given(method("GET"))
+            .and(path(&path_str))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", target.uri().as_str()),
+            )
+            .mount(&origin)
+            .await;
+
+        let client = make_client(origin.uri());
+        let err = CasTransport::get(&client, &digest).await.unwrap_err();
+        // A 302 is NOT a success: with redirects disabled it surfaces as an Http
+        // error (the catch-all arm), never as the leaked 200 body.
+        assert!(
+            matches!(err, ClwError::Http { status: 302, .. }),
+            "302 must surface as a non-success Http error, got: {err:?}"
+        );
+
+        // The crux: the redirect target received ZERO requests — the PAT was never
+        // sent to another host.
+        let target_hits = target.received_requests().await.unwrap();
+        assert_eq!(
+            target_hits.len(),
+            0,
+            "redirect target must receive no request (PAT must not be sent there)"
+        );
     }
 }
 
