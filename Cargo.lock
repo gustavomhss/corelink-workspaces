@@ -367,8 +367,13 @@ dependencies = [
 name = "clw-conformance"
 version = "0.1.0"
 dependencies = [
+ "clw-cache",
  "clw-client",
+ "clw-hydrate",
+ "clw-run",
+ "clw-snapshot",
  "clw-types",
+ "tempfile",
  "tokio",
 ]
 
