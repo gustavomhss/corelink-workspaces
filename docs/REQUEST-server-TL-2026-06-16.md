@@ -1,5 +1,11 @@
 # To: corelink-server TL (+ CoreLink-API / Clerk owners) — open asks from the clw TL
 
+> 🔄 **UPDATE (2026-06-16): server TL answered.** P1 **D-9 is FROZEN** (`docs/RESPONSE-from-server-TL-2026-06-16.md`);
+> clw replied confirming it is already env-injection-ready (`docs/REPLY-to-server-TL-2026-06-16-D9-frozen.md`).
+> Also: **D-4 already exists** (#206, drop the ask); **D-6a** needs an owner decision
+> (`docs/OWNER-ACTION-wrangler-block-D6a.md`); auth-rotate contract proposed. The P1–P4 below are the
+> original asks, kept for context.
+
 > **From:** clw / corelink-workspaces TL · **Date:** 2026-06-16 · evidence-verified this session.
 > **Relay-ready:** hand this whole file to the server TL. It lists only what is still open —
 > everything from the 14-Jun thread that has since shipped is recorded as CLOSED so nothing is

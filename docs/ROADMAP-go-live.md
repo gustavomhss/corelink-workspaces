@@ -194,13 +194,13 @@ M3 tool-in-key, M4-hydrate streaming, M5 jitter, + LOWs. **But the fresh audit f
 | ✅ D-1 | `DELETE /v1/ac/...` (idempotency + tenant-scope) — **LIVE** (#269 `f1199bdc`, conformance green) | audit L5 | M1.4 `clw rm` | corelink-server |
 | D-2 | Back up `SIGNUP_TOKEN_KEY` (write-only secret) | BUGREPORT §secrets | M4.4 | corelink-server |
 | ✅ D-3 | signup-worker region fix (`enam` hardcode + `regionFromColo` + no-op `configureTenant`) — **LIVE** (residency #29 shipped in #269) | HANDOFF-signup-region-hardcode | M7.1 | corelink-server (GAP-5) |
-| D-4 | `R2KvStore` (persistent KV behind turbo+cargo) | FINDING-sccache step 1 | M7.4 S2, C1 | corelink-server |
+| ✅ D-4 | `R2KvStore` (persistent KV behind turbo+cargo) — **already exists** (merged server #206; no-hash-verify variant is a config of it) | FINDING-sccache step 1 | M7.4 S2, C1 | corelink-server |
 | D-5 | Native cargo route (Option A header-trust) | FINDING-sccache step 2 | M7.4 C1 | corelink-server |
 | D-6 | Per-tenant CAS write scaling (shard-DO **B** / bypass **C**) | FINDING-per-tenant-write-ceiling | M7.4 S3, M5.6 | corelink-server |
 | D-6a | `wrangler.toml max_instances=5` vs live `20` config drift | same finding | order before D-6 | corelink-server |
 | ✅ **D-7** | **Ref-enumeration LIST endpoint** (tenant's refs) — **LIVE** (#269 `f1199bdc`, conformance green) | M1.4/M6.4 briefs | `ls --all`, `prune`, **Art.17 erasure** | corelink-server |
 | ✅ **D-8** | **CAS DELETE + CAS LIST** (blob GC) — **LIVE** (#269 `f1199bdc`, conformance green) | M6.4 brief | `prune`, **Art.17 erasure** | corelink-server |
-| **D-9** | **Per-job runner PAT minting** (who-mints/TTL/trigger/revoke) — CAS+AC scope question **RESOLVED** (round-2 cred) | family-integration critic | M7.2, M7.5 | corelink-server / CoreLink API |
+| **D-9** | **Per-job runner PAT minting** — **CONTRACT FROZEN (2026-06-16):** dispatcher mints via new `POST /internal/v1/runner/mint` (internal-auth, entitlement-checked, `cas:rw`, TTL-capped); dispatch-time env injection; clw **already env-injection-ready** (`CLW_TOKEN/ENDPOINT/TENANT`). Pending: server route merge (after cycle-2) + env-name confirm | family-integration critic | M7.2, M7.5 | corelink-server / CoreLink API |
 | ~~D-10~~ | **SUPERSEDED (2026-06-16)** — region resolved to mechanism (c); no `primary_region` lookup API needed | family-integration critic | M7.1 | — |
 | **D-11** | Distinct CAS-PUT status (created vs existed) for faithful accounting | M1.2 brief | accurate `chunks_uploaded` (optional) | corelink-server (low) |
 | **D-12** | Authenticated binary **download route** (if R2-behind-CoreLink) | M3.3 brief | M3.3 | corelink-server (conditional) |
