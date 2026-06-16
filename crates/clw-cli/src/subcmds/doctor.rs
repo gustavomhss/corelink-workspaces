@@ -211,6 +211,7 @@ mod tests {
                 token: token.to_string(),
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
+            ref_domain: clw_types::RefDomain::User,
         }
     }
 
@@ -320,6 +321,7 @@ mod tests {
                 token: String::new(),
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
+            ref_domain: clw_types::RefDomain::User,
         }
     }
 
@@ -351,6 +353,7 @@ mod tests {
                 token: "tok".to_string(),
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
+            ref_domain: clw_types::RefDomain::User,
         };
         let problems = config_problems(&cfg);
         assert!(

@@ -9,7 +9,7 @@ use clap::Args;
 use clw_client::HttpClient;
 use clw_manifest::diff;
 use clw_snapshot::build_manifest_local;
-use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Digest, Manifest, RefRecord};
+use clw_types::{ref_key_in, AcTransport, CasTransport, ClwError, Digest, Manifest, RefRecord};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -36,7 +36,7 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
     let client = HttpClient::new(cfg.clw_config)?;
 
     // --- Fetch remote ref + manifest ---
-    let rk = ref_key(&args.name);
+    let rk = ref_key_in(cfg.ref_domain, &args.name);
     let ref_bytes = AcTransport::get(&client, &rk)
         .await
         .map_err(map_auth_error)?

@@ -60,6 +60,19 @@ pub struct Cli {
     )]
     pub cache_dir: Option<String>,
 
+    /// Ref keyspace selector — `user` (default) or `runner`.
+    ///
+    /// `runner` writes/reads refs under a reserved, collision-proof keyspace
+    /// (`clw/ref/runner/v1/`), disjoint from user refs by construction. Set by
+    /// the corelink-runners fabric at dispatch time; users never need it.
+    #[arg(
+        long,
+        global = true,
+        env = "CLW_REF_DOMAIN",
+        help = "Ref keyspace: 'user' (default) or 'runner' (runner-produced refs)"
+    )]
+    pub ref_domain: Option<String>,
+
     /// Emit machine-readable JSON to stdout.
     #[arg(
         long,
@@ -136,6 +149,7 @@ impl std::fmt::Debug for Cli {
             .field("tenant", &self.tenant)
             .field("token", &token)
             .field("cache_dir", &self.cache_dir)
+            .field("ref_domain", &self.ref_domain)
             .field("json", &self.json)
             .field("no_color", &self.no_color)
             .field("concurrency", &self.concurrency)

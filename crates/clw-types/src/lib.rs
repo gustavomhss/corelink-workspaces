@@ -36,6 +36,14 @@ const _: () = assert!(CHUNK_MAX_BYTES < CAS_BLOB_CAP_BYTES);
 /// Domain separator for workspace ref keys in the AC namespace.
 pub const REF_KEY_DOMAIN: &str = "clw/ref/v1/";
 
+/// Domain separator for RUNNER-produced workspace ref keys. Disjoint from
+/// [`REF_KEY_DOMAIN`] **by construction**: [`ref_key_in`] folds the domain into
+/// the BLAKE3 pre-image, so no name in the user keyspace can ever collide with a
+/// name in the runner keyspace. A client without `CLW_REF_DOMAIN=runner` can
+/// never produce a runner-domain key, for any name. Frozen contract with the
+/// corelink-runners TL (2026-06-16).
+pub const REF_KEY_DOMAIN_RUNNER: &str = "clw/ref/runner/v1/";
+
 // ---------------------------------------------------------------------------
 // Digest (BLAKE3-256)
 // ---------------------------------------------------------------------------
@@ -314,10 +322,41 @@ impl RefRecord {
     }
 }
 
-/// AC key for a workspace name: BLAKE3(REF_KEY_DOMAIN || name).
+/// Which ref keyspace a workspace name resolves into. `User` (the default) and
+/// `Runner` are **disjoint** keyspaces by construction — see
+/// [`REF_KEY_DOMAIN_RUNNER`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefDomain {
+    /// User-facing refs — the default for every interactive `clw` invocation.
+    #[default]
+    User,
+    /// Runner-produced refs — selected by `CLW_REF_DOMAIN=runner`.
+    Runner,
+}
+
+impl RefDomain {
+    /// The BLAKE3 domain separator string for this keyspace.
+    #[must_use]
+    pub fn separator(self) -> &'static str {
+        match self {
+            RefDomain::User => REF_KEY_DOMAIN,
+            RefDomain::Runner => REF_KEY_DOMAIN_RUNNER,
+        }
+    }
+}
+
+/// AC key for a workspace name in the default (user) domain:
+/// BLAKE3(REF_KEY_DOMAIN || name).
 pub fn ref_key(name: &str) -> Digest {
+    ref_key_in(RefDomain::User, name)
+}
+
+/// AC key for a workspace name in an explicit ref [`RefDomain`]:
+/// BLAKE3(domain.separator() || name). Folding the domain into the pre-image is
+/// what makes the user and runner keyspaces disjoint by construction.
+pub fn ref_key_in(domain: RefDomain, name: &str) -> Digest {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(REF_KEY_DOMAIN.as_bytes());
+    hasher.update(domain.separator().as_bytes());
     hasher.update(name.as_bytes());
     Digest(*hasher.finalize().as_bytes())
 }
@@ -540,6 +579,31 @@ mod tests {
         assert_ne!(ref_key("x"), Digest::of_bytes(b"x"));
         assert_ne!(ref_key("a"), ref_key("b"));
         assert_eq!(ref_key("a"), ref_key("a"));
+    }
+
+    #[test]
+    fn ref_domains_are_disjoint_keyspaces() {
+        // Same name, different domain => different key: collision-proof by
+        // construction (a user can never reach the runner keyspace, any name).
+        assert_ne!(
+            ref_key_in(RefDomain::User, "ws"),
+            ref_key_in(RefDomain::Runner, "ws")
+        );
+        // `ref_key(name)` is exactly the user domain (back-compat).
+        assert_eq!(ref_key("ws"), ref_key_in(RefDomain::User, "ws"));
+        // Stable + injective within the runner domain.
+        assert_eq!(
+            ref_key_in(RefDomain::Runner, "a"),
+            ref_key_in(RefDomain::Runner, "a")
+        );
+        assert_ne!(
+            ref_key_in(RefDomain::Runner, "a"),
+            ref_key_in(RefDomain::Runner, "b")
+        );
+        // The frozen contract strings + default.
+        assert_eq!(RefDomain::Runner.separator(), "clw/ref/runner/v1/");
+        assert_eq!(RefDomain::User.separator(), "clw/ref/v1/");
+        assert_eq!(RefDomain::default(), RefDomain::User);
     }
 
     #[test]
