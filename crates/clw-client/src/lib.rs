@@ -1132,6 +1132,39 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // PART A — proptest: the LIST-envelope JSON parsers (AcListPage /
+    // CasListPage, both pub(crate)) must never panic on arbitrary bytes — only
+    // Ok/Err. These are the prune/ls live-set parsers fed straight from a
+    // possibly-hostile server body. A panic = test failure (non-vacuous).
+    // -----------------------------------------------------------------------
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// `serde_json::from_slice::<AcListPage>` on ARBITRARY bytes never
+            /// panics — only Ok/Err.
+            #[test]
+            fn ac_list_page_from_slice_never_panics(
+                bytes in proptest::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                let _: std::result::Result<AcListPage, _> = serde_json::from_slice(&bytes);
+            }
+
+            /// `serde_json::from_slice::<CasListPage>` on ARBITRARY bytes never
+            /// panics — only Ok/Err.
+            #[test]
+            fn cas_list_page_from_slice_never_panics(
+                bytes in proptest::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                let _: std::result::Result<CasListPage, _> = serde_json::from_slice(&bytes);
+            }
+        }
+    }
+
     fn make_client(endpoint: String) -> HttpClient {
         HttpClient::new(test_config(endpoint)).unwrap()
     }

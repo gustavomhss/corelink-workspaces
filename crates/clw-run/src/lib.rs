@@ -532,6 +532,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    // -----------------------------------------------------------------------
+    // PART A — proptest: the cache-hit-path `RunRecord` parse
+    // (serde_json::from_slice in the replay path) must never panic on arbitrary
+    // bytes — only Ok/Err. RunRecord is private; this in-crate test sees it via
+    // `use super::*`. A panic = test failure (non-vacuous).
+    // -----------------------------------------------------------------------
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// `serde_json::from_slice::<RunRecord>` on ARBITRARY bytes never
+            /// panics — only Ok/Err (the cache-hit replay decode path).
+            #[test]
+            fn run_record_from_slice_never_panics(
+                bytes in proptest::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                let _: std::result::Result<RunRecord, _> = serde_json::from_slice(&bytes);
+            }
+        }
+    }
+
     #[test]
     fn looks_like_path_detects_paths_cross_platform() {
         // Bare names are PATH lookups (false); anything with a separator or an

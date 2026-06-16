@@ -388,44 +388,111 @@ pub fn clw_config_path() -> Option<PathBuf> {
 // `init` and `auth` share ONE implementation instead of duplicating it.
 // ---------------------------------------------------------------------------
 
-/// Write `content` to `path`, truncating any existing file and forcing
-/// owner-only permissions: `0600` on Unix, and (on Windows) an explicit
-/// owner-only DACL via [`restrict_to_owner_windows`]. The file contains the
-/// plaintext PAT, so it must never be readable by other users.
+/// Atomically write `content` to `path` with owner-only permissions: `0600` on
+/// Unix, and (on Windows) an explicit owner-only DACL via
+/// [`restrict_to_owner_windows`]. The file contains the plaintext PAT, so it must
+/// never be readable by other users — and a crash mid-write must never leave a
+/// truncated/partial config holding a half-written PAT (or an empty file that
+/// blanks a working identity).
 ///
-/// `OpenOptions::mode(0o600)` only applies when the file is **created**; if the
-/// file already exists (e.g. `clw init --force` over a prior `0644` config) the
-/// open does NOT change its mode. We therefore `set_permissions(0o600)`
-/// explicitly after writing so a pre-existing loose mode is always tightened.
+/// B1 (crash-consistency): the write is ATOMIC. We write the full `content` to a
+/// temp file IN THE SAME DIRECTORY as `path` (so the final `fs::rename` is an
+/// atomic same-filesystem rename on POSIX; on Windows the temp handle is closed
+/// before the rename), fsync the temp file's data to disk, then rename it into
+/// place. A crash at any point leaves EITHER the old config intact OR the new one
+/// complete — never a half-written file. Mirrors the proven
+/// tempfile_in + flush + rename pattern in `clw-cache`.
 ///
-/// On Windows the unix mode bits are a no-op, so after writing we apply a
-/// PROTECTED (inheritance-disabled) DACL granting full control to ONLY the
-/// current process user. A failed ACL apply WARNS (the PAT may be readable by
-/// other users) but does NOT fail the write — losing the ability to save config
-/// because hardening failed would be the worse outcome.
+/// PAT-leak ordering: the temp file is created 0600 (unix) / owner-only DACL
+/// (windows) BEFORE any byte of `content` (which carries the PAT) is written, so
+/// the secret is never momentarily more world-readable in the temp file than in
+/// the final file.
+///
+/// On Windows a failed ACL apply WARNS (the PAT may be readable by other users)
+/// but does NOT fail the write — losing the ability to save config because
+/// hardening failed would be the worse outcome. The parent dir is already
+/// hardened to an owner-only PROTECTED DACL by `ensure_config_parent_0700`
+/// (called before this), so the temp file inherits owner-only from creation.
 pub(crate) fn write_config_file_0600(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+
+    // Temp file in the SAME directory as the final path so the rename is atomic
+    // (a cross-directory rename is NOT atomic / may be a copy). Fall back to the
+    // path itself if it somehow has no parent.
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_path = config_tmp_path(dir);
+
+    // Create the temp file owner-only BEFORE writing the PAT-bearing content, so
+    // the secret is never written into a momentarily-loose file. `create_new`
+    // refuses to clobber a stray collision (the name is process+time unique).
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut file = opts.open(path)?;
-    file.write_all(content.as_bytes())?;
-    // `mode()` above only applies on CREATION; force 0600 on an already-existing
-    // file too (the file holds the plaintext PAT).
+    let mut file = opts.open(&tmp_path)?;
+
+    // On Windows, mode() is a no-op; restrict the temp file's DACL to the owner
+    // BEFORE writing the PAT (warn-not-fail, see fn doc). This closes the window
+    // where the PAT could be world-readable in the temp file.
+    #[cfg(windows)]
+    warn_if_windows_acl_failed(&tmp_path);
+
+    // Write the full content, flush the buffer, and fsync the bytes to durable
+    // storage before the rename — so a crash after the rename never exposes a
+    // file whose data never reached disk. A write failure removes the temp file.
+    if let Err(e) = (|| -> std::io::Result<()> {
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })() {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // `mode()` only applies on CREATION; force 0600 on the temp file explicitly
+    // in case the open path did not (defense-in-depth; cheap and idempotent).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
     }
-    // Windows analogue of the 0600 above: restrict the DACL to the owner. Warn,
-    // never fail, on error (see fn doc).
+
+    // Close the handle before renaming (required on Windows; harmless on unix).
+    drop(file);
+
+    // Atomic publish: rename the complete temp file over the final path. On a
+    // failure, clean up the temp file so no stray partial is left behind.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Windows analogue of the 0600 above on the FINAL path: restrict the DACL to
+    // the owner. Warn, never fail, on error (see fn doc). On unix the renamed file
+    // already carries the temp file's 0600 mode.
     #[cfg(windows)]
     warn_if_windows_acl_failed(path);
     Ok(())
+}
+
+/// Build a unique temp-file path in `dir` for the atomic config write. Combines
+/// the process id, thread id, and subsecond nanos so concurrent writers (and a
+/// leftover from a prior crashed run) never collide. The name is dotfile-prefixed
+/// so it is visually distinct from the real `config.toml`.
+fn config_tmp_path(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let tid = std::thread::current().id();
+    dir.join(format!(".config.toml.tmp-{pid}-{tid:?}-{nanos}"))
 }
 
 /// Tighten a directory to owner-only: `0700` on Unix, and (on Windows) an
@@ -775,6 +842,99 @@ cache_dir = "~/.clw/cache"
     }
 
     // -----------------------------------------------------------------------
+    // B1 — atomic config write: complete + 0600 + NO leftover temp file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn atomic_write_leaves_complete_0600_config_and_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let content = "# clw configuration\ntoken = \"super-secret-pat\"\ntenant = \"acme\"\n";
+
+        write_config_file_0600(&path, content).unwrap();
+
+        // The config is COMPLETE (the full content reached disk, not a truncated
+        // partial — a crash mid-write under the old non-atomic path could leave a
+        // half-written PAT here).
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, content, "config must be written completely");
+
+        // 0600 guarantee preserved (the file holds the plaintext PAT).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "config must be owner-only 0600");
+        }
+
+        // On SUCCESS, NO temp file is left behind in the directory — the rename
+        // consumed it. Scan the dir for any `.config.toml.tmp-*` stray.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".config.toml.tmp-"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a successful atomic write must leave no temp file, found: {strays:?}"
+        );
+
+        // The directory holds exactly the one final config file.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["config.toml".to_string()],
+            "only the final config.toml must remain"
+        );
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_and_tightens_loose_mode() {
+        // Overwriting a PRE-EXISTING (possibly loose-mode) config must end at 0600
+        // with the new content complete — the atomic rename replaces it wholesale.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Seed a pre-existing world-readable config (the classic restored-0644).
+        std::fs::write(&path, "token = \"old\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let new_content = "token = \"new-secret\"\ntenant = \"acme\"\n";
+        write_config_file_0600(&path, new_content).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new_content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "overwriting a 0644 config must end at 0600"
+            );
+        }
+        // No leftover temp.
+        let strays = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.toml.tmp-")
+            });
+        assert!(!strays, "overwrite must leave no temp file");
+    }
+
+    // -----------------------------------------------------------------------
     // Config precedence: flag > env > file
     // -----------------------------------------------------------------------
 
@@ -1094,6 +1254,43 @@ cache_dir = "~/.clw/cache"
             "# just a comment\n",
             &empty
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // PART A — proptest: parse_config_lines never panics / never loops on
+    // arbitrary text (embedded quotes, backslashes, newlines, unbalanced
+    // escapes, invalid-byte-boundary Strings). A panic/hang = test failure.
+    // -----------------------------------------------------------------------
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// `parse_config_lines` on ARBITRARY text never panics and always
+            /// terminates — only mutates the map. The `.*` regex covers embedded
+            /// quotes, backslashes, '=', '#', and multi-line content; `\PC*`
+            /// adds non-printable/control-laden inputs.
+            #[test]
+            fn parse_config_lines_never_panics(content in ".*") {
+                let mut map = HashMap::new();
+                parse_config_lines(&content, &mut map);
+            }
+
+            /// Same invariant against multi-line, control-char, and escape-heavy
+            /// strings — exercises the quoted-value escape loop (`\\` / `\"`) so a
+            /// trailing/unbalanced backslash can never run the char iterator past
+            /// its end or loop forever.
+            #[test]
+            fn parse_config_lines_never_panics_multiline(
+                content in proptest::collection::vec("[\\\\\"#=a-z\\n\\t ]{0,40}", 0..20)
+                    .prop_map(|v| v.join("\n"))
+            ) {
+                let mut map = HashMap::new();
+                parse_config_lines(&content, &mut map);
+            }
+        }
     }
 
     #[test]

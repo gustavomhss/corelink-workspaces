@@ -16,6 +16,9 @@ hex = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Property-based robustness tests (parsers never panic on arbitrary input).
+# Already a workspace dev-dep; no new external crate enters the graph.
+proptest = { workspace = true }
 
 [[bench]]
 name = "manifest_digest"

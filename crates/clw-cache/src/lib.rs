@@ -653,6 +653,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // B2 (crash-consistency): a leftover/partial temp file from a crashed `put`
+    // is NEVER read as a real blob and does not corrupt a subsequent get/put.
+    //
+    // The cache writes via tempfile_in + rename, so a crash between the write and
+    // the rename leaves a stray `.tmp-*` file in the shard directory. Because the
+    // real blob path is the 64-hex digest name (never a `.tmp-*` name), `get`
+    // addresses the digest path directly and the stray is simply not on that
+    // path — it is ignored. This test simulates that crash and proves the
+    // invariant: the real key still reads back, and the stray never masquerades
+    // as content.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn stray_partial_temp_file_is_never_read_as_a_blob() {
+        let (_dir, cache) = make_cache();
+        let data = b"real blob content";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        // Simulate a crashed put: drop a partial temp file in the SAME shard dir
+        // as the real blob, named like the cache's own temp files (.tmp-*). Its
+        // bytes are garbage that does NOT hash to any requested digest.
+        let shard = cache.shard_dir(&d);
+        let stray = shard.join(".tmp-Crashed-12345");
+        fs::write(&stray, b"half-written-garbage-from-a-crash").unwrap();
+        assert!(stray.exists(), "precondition: the stray temp file exists");
+
+        // The real key still reads back intact — the stray does not interfere.
+        let got = cache.get(&d).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(data.as_slice()),
+            "the real blob must still read back with a stray temp file present"
+        );
+
+        // A digest computed from the STRAY's bytes is not addressable as a blob:
+        // its on-disk name is `.tmp-*`, not the 64-hex digest, so `get` of that
+        // digest finds nothing (the stray is never mistaken for content).
+        let stray_digest = Digest::of_bytes(b"half-written-garbage-from-a-crash");
+        assert!(
+            cache.get(&stray_digest).unwrap().is_none(),
+            "a stray temp file must never be readable as a real blob"
+        );
+
+        // A subsequent put of a NEW key still succeeds and is unaffected.
+        let data2 = b"a second blob after the crash";
+        let d2 = Digest::of_bytes(data2);
+        cache.put(&d2, data2).unwrap();
+        assert_eq!(cache.get(&d2).unwrap().as_deref(), Some(data2.as_slice()));
+
+        // The stray is still sitting there inert (the cache never touched it),
+        // confirming it is simply ignored rather than consumed or corrupting state.
+        assert!(
+            stray.exists(),
+            "the inert stray is left untouched, not consumed"
+        );
+    }
+
+    #[test]
+    fn successful_put_leaves_no_temp_file_behind() {
+        // The temp+rename write must consume its temp file: after a successful
+        // put, NO `.tmp-*` file remains in the shard directory (the rename moved
+        // it to the final digest path). A regression that leaks temp files would
+        // slowly fill the cache with un-evictable junk.
+        let (_dir, cache) = make_cache();
+        let data = b"leaves no temp behind";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        let shard = cache.shard_dir(&d);
+        let leftover_tmp: Vec<_> = fs::read_dir(&shard)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "a successful put must leave no temp file, found: {leftover_tmp:?}"
+        );
+
+        // Exactly the one final blob (named by its 64-hex digest) is present.
+        let blobs: Vec<_> = fs::read_dir(&shard)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(blobs, vec![d.to_hex()], "only the final blob must remain");
+    }
+
+    // -----------------------------------------------------------------------
     // gc: under-cap store frees 0
     // -----------------------------------------------------------------------
     #[test]
