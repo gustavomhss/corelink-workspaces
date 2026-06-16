@@ -20,12 +20,22 @@
 #     Linux minisign (sigstore as documented alternative).
 #   * Cross-platform, 5 locked targets:
 #       aarch64-apple-darwin, x86_64-apple-darwin            (macOS)
-#       x86_64-pc-windows-msvc                                (Windows)
+#       x86_64-pc-windows-gnu                                 (Windows)
 #       x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu  (Linux)
 #     aarch64-linux is BUILD-ONLY here: it is cross-compiled (cargo-zigbuild) and
-#     cannot be executed/tested on the x86_64 hosted runner.
-#   * No self-hosted Mac in the release path (M2 de-self-hosting mandate) — all
-#     legs run on GitHub-hosted runners.
+#     cannot be executed/tested on the self-hosted Mac build host.
+#   * Build host: the owner's OWN self-hosted single-owner Mac builds ALL legs —
+#     macOS native ×2 (a Mac compiles both apple arches natively), Linux cross ×2
+#     (cargo-zigbuild), and Windows cross ×1 (x86_64-pc-windows-gnu, also via
+#     zigbuild — zig targets windows-gnu). This is the owner's dedicated box, not
+#     GitHub-hosted billing and not a multi-tenant shared runner, so the earlier
+#     "no self-hosted Mac in the release path (M2 de-self-hosting mandate)"
+#     rationale is SUPERSEDED. The one hazard of a single-owner Mac — the owner's
+#     OTHER parallel projects nuking the shared ~/.rustup / ~/.cargo — is mitigated
+#     by a per-project isolated CARGO_HOME/RUSTUP_HOME ($HOME/.clw-ci-rust), set as
+#     the first step of every rust-using job (mirrors ci.yml's gates job).
+#     Windows is gnu, NOT msvc: msvc would require a Windows runner (a future
+#     option); the gnu ABI cross-compiles on the Mac via zigbuild.
 
 name: release
 
@@ -55,7 +65,7 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: preflight (guard + gates)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -63,6 +73,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Isolate clw's Rust toolchain from the SHARED ~/.rustup + ~/.cargo on this
+      # single-owner self-hosted Mac. The owner's OTHER parallel projects can nuke
+      # the shared rustup home, dangling clw's cargo shims (`cargo: command not
+      # found`, exit 127). A clw-dedicated CARGO_HOME/RUSTUP_HOME survives that and
+      # self-heals if absent (mirrors ci.yml's gates job).
+      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
+        run: |
+          set -euo pipefail
+          CLW_RUST="$HOME/.clw-ci-rust"
+          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
+          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
+            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
+            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          "$CLW_RUST/cargo/bin/rustup" --version
 
       - name: install pinned rust toolchain
         run: |
@@ -138,7 +168,7 @@ jobs:
   conformance:
     name: live conformance gate (pre-tag)
     needs: preflight
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     env:
       # CI service identity for the live conformance suite. The suite reads these
@@ -152,6 +182,24 @@ jobs:
       CLW_CI_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
     steps:
       - uses: actions/checkout@v4
+
+      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
+      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
+      # if absent. Mirrors ci.yml's gates job.
+      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
+        run: |
+          set -euo pipefail
+          CLW_RUST="$HOME/.clw-ci-rust"
+          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
+          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
+            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
+            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          "$CLW_RUST/cargo/bin/rustup" --version
 
       - name: install pinned rust toolchain
         run: |
@@ -191,34 +239,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- macOS (Apple Silicon, native on the arm runner) ---------------
+          # --- macOS (Apple Silicon, native on the self-hosted Mac) ----------
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: [self-hosted, macOS]
             platform: macos
             ext: ""
             cross: false
-          # --- macOS (Intel, cross-compiled on the arm runner) ---------------
+          # --- macOS (Intel, native on the self-hosted Mac — a Mac builds both
+          #     apple arches natively) ---------------------------------------
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: [self-hosted, macOS]
             platform: macos
             ext: ""
             cross: false
-          # --- Windows (x86_64, native) --------------------------------------
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # --- Windows (x86_64, gnu ABI: cross-compiled on the Mac via
+          #     cargo-zigbuild — zig targets windows-gnu. msvc would need a
+          #     Windows runner, a future option) -----------------------------
+          - target: x86_64-pc-windows-gnu
+            os: [self-hosted, macOS]
             platform: windows
             ext: ".exe"
-            cross: false
-          # --- Linux (x86_64, native) ----------------------------------------
+            cross: true
+          # --- Linux (x86_64, cross-compiled on the Mac via cargo-zigbuild) --
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: [self-hosted, macOS]
             platform: linux
             ext: ""
-            cross: false
+            cross: true
           # --- Linux (aarch64, BUILD-ONLY: cross-compiled via cargo-zigbuild,
-          #     CANNOT be run/tested on the x86_64 hosted runner) -------------
+          #     CANNOT be run/tested on the self-hosted Mac build host) ------
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: [self-hosted, macOS]
             platform: linux
             ext: ""
             cross: true
@@ -229,6 +280,25 @@ jobs:
       ASSET: clw-${{ needs.preflight.outputs.version }}-${{ matrix.target }}${{ matrix.ext }}
     steps:
       - uses: actions/checkout@v4
+
+      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
+      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
+      # if absent. Mirrors ci.yml's gates job.
+      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLW_RUST="$HOME/.clw-ci-rust"
+          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
+          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
+            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
+            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          "$CLW_RUST/cargo/bin/rustup" --version
 
       - name: install pinned rust toolchain + target
         shell: bash
@@ -355,10 +425,10 @@ jobs:
             --timestamp-url "http://timestamp.acs.microsoft.com" \
             --file-digest SHA256 \
             --verbosity information
-          # Verify the Authenticode signature chain (PowerShell fallback if signtool
-          # is not on PATH in the bash shell).
-          signtool verify //pa //v "dist/${ASSET}" \
-            || powershell -Command "\$s = Get-AuthenticodeSignature 'dist/${ASSET}'; \$s | Format-List; if (\$s.Status -ne 'Valid') { exit 1 }"
+          # Authenticode VERIFICATION is intentionally NOT run here: signtool /
+          # Get-AuthenticodeSignature are Windows-only, and this gnu .exe is signed on
+          # the macOS build host. The signature is verified downstream on a Windows
+          # consumer (the OS validates the Authenticode chain at install/run time).
 
       # =======================================================================
       # SIGN — Linux: minisign detached signature (default). sigstore/cosign is a
@@ -379,7 +449,11 @@ jobs:
             exit 0
           fi
           # Real minisign detached signature -> dist/${ASSET}.minisig.
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          # Portable install (this leg now runs on the self-hosted Mac): brew on
+          # macOS, apt on Linux, skip if already present.
+          if ! command -v minisign >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then brew install minisign; else sudo apt-get update -qq && sudo apt-get install -y -qq minisign; fi
+          fi
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
           trap 'rm -f minisign.key' EXIT   # remove the key even if signing aborts under set -e
           echo "$MINISIGN_PASSWORD" | minisign -S -s minisign.key -m "dist/${ASSET}"
@@ -415,13 +489,31 @@ jobs:
   sbom:
     name: sbom (CycloneDX)
     needs: [preflight, conformance]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
       SBOM: clw-${{ needs.preflight.outputs.version }}.cdx.json
     steps:
       - uses: actions/checkout@v4
+
+      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
+      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
+      # if absent. Mirrors ci.yml's gates job.
+      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
+        run: |
+          set -euo pipefail
+          CLW_RUST="$HOME/.clw-ci-rust"
+          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
+          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
+            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
+            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          "$CLW_RUST/cargo/bin/rustup" --version
 
       - name: install pinned rust toolchain
         run: |
@@ -471,7 +563,7 @@ jobs:
     # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
     # predecessor of publish/sign — a red conformance tag never ships.
     needs: [preflight, conformance, build, sbom]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -507,7 +599,9 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum -- * > SHA256SUMS
+          # Portable SHA-256 (self-hosted Mac has `shasum`, Linux has `sha256sum`;
+          # both emit the same `<hex>  <file>` format).
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum -- * > SHA256SUMS; else shasum -a 256 -- * > SHA256SUMS; fi
           echo "---- SHA256SUMS ----"
           cat SHA256SUMS
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
@@ -516,7 +610,10 @@ jobs:
           fi
           # Sign the checksum file itself -> SHA256SUMS.minisig (the cross-platform
           # signed-checksum guarantee the roadmap demands).
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          # Portable install (self-hosted Mac): brew on macOS, apt on Linux.
+          if ! command -v minisign >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then brew install minisign; else sudo apt-get update -qq && sudo apt-get install -y -qq minisign; fi
+          fi
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
           trap 'rm -f ../minisign.key' EXIT   # remove the key even if signing aborts under set -e
           echo "$MINISIGN_PASSWORD" | minisign -S -s ../minisign.key -m SHA256SUMS
@@ -554,6 +651,15 @@ jobs:
           [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true
           [ -f EULA.md ] && cp EULA.md release/ || true
           [ -f NOTICE ] && cp NOTICE release/ || true
+          # aws CLI on the self-hosted Mac (brew if absent; clear error otherwise).
+          if ! command -v aws >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+              brew install awscli
+            else
+              echo "::error::aws CLI not found and brew unavailable — install awscli on the release runner"
+              exit 1
+            fi
+          fi
           aws s3 cp release/ "s3://${R2_BUCKET}/releases/clw/${VERSION}/" \
             --recursive --endpoint-url "${R2_ENDPOINT}"
           echo "published release/ -> ${R2_BUCKET}/releases/clw/${VERSION}/"

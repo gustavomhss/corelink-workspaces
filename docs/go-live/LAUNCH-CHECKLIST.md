@@ -16,7 +16,7 @@
 | # | Exit gate | Status | Blocking action |
 |---|---|---|---|
 | 1 | Audit merged + defects fixed; zero open HIGH/MED | ✅ | — (done **twice** — pass-1 + pass-2) |
-| 2 | Compiles + tests green every platform incl. Windows | 🔒 / 🧪 | Windows **test lane** = M2.4 (billing). ACL **verifiable now** via the PowerShell script |
+| 2 | Compiles + tests green every platform incl. Windows | ✅ / 🧪 | gates run on the **self-hosted Mac** (incl. the windows-gnu cross-compile check); a Windows **runtime** test needs a Windows machine (a future self-hosted Windows runner) — **not** billing. ACL **verifiable now** via the PowerShell script |
 | 3 | Every tracked deferral closed (or logged waiver) | ✅ | — (shipped code clean; only `best-effort` *design* comments remain) |
 | 4 | Signed reproducible binaries; install **and** uninstall verified | 🔒 | Provision signing secrets (below); run the matrix |
 | 5 | Supply chain clean + SBOM + **signed** checksums | ⏳ / 🔒 | `cargo-deny`/`publish=false` ✅; SBOM in CI ✅; signed checksums need the signing key |
@@ -25,9 +25,9 @@
 | 8 | Region/residency correct + real right-to-erasure | ✅ / ⏳ | erasure ✅ (`clw erase`, audited); confirm the signup-worker region fix landed |
 | 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
 | 10 | Telemetry-off + key rotation runbook + support/EOL | ✅ | telemetry removed ✅; rotation runbook + EOL policy now published (this PR) |
-| 11 | CI not on a single founder machine | 🔒 | M2.4 — GitHub-hosted runners (billing) |
+| 11 | CI not on a single founder machine | ☑️ **owner-accepted** | self-hosted single-owner **dedicated** Mac is the chosen model (not GitHub billing). Owner accepts the single-machine risk (CI/release pause if the Mac is down); per-project toolchain isolation (#68) mitigates the cross-project rustup-nuke |
 
-**The critical path to GA:** unblock **M3 signing (gate 4/5)** + **M2.4 CI (gate 2/11)** + **legal sign-off (gate 9)**. Everything else is ✅ or follows from these.
+**The critical path to GA:** provision **signing secrets (gate 4/5)** + **legal sign-off (gate 9)** + prove the **family e2e (gate 7)**. CI + release are **self-hosted** (gate 2/11 owner-accepted, the `release.yml` runs on the dedicated Mac); everything else is ✅ or follows from these.
 
 ---
 
@@ -68,11 +68,15 @@ gate 9 from drafted → published.
 
 ## 🔒 Infra/external — needs a bill or a third party
 
-- **M2.4 — GitHub-hosted CI matrix (gates 2, 11).** Enable Actions billing / raise the spending limit,
-  then flip the Windows test lane from informational to required. This also delivers gate 11 (no
-  single founder machine). The cross-compile already proves Windows *compiles*; this proves it *runs*.
-- **M7 — family e2e (gate 7).** Needs corelink-server live + runners + the hugit/githugr repos. Cross-team;
-  schedule once M3 + M2.4 land. See `docs/HANDOFF-corelink-server-track.md`.
+- **~~M2.4 — GitHub-hosted CI matrix~~ → SELF-HOSTED (owner decision, gates 2, 11).** GitHub-hosted
+  billing is **not** the model — CI (`ci.yml`) and the release (`release.yml`) run on the owner's
+  **dedicated single-owner Mac** (macOS native, Linux + Windows-**gnu** cross via `cargo-zigbuild`),
+  with per-project `CARGO_HOME`/`RUSTUP_HOME` isolation (#68) against the cross-project rustup-nuke.
+  Gate 11 is **owner-accepted** (single-machine risk). A Windows **runtime** test (not just compile)
+  remains a future self-hosted Windows runner — optional, not billing-gated.
+- **M7 — family e2e (gate 7).** Needs corelink-server (D-9 mint **SHIPPED** #305 + seed #303) + the
+  runner's clw-invocation build + a D1 test env. Cross-team, all TL-routed. See
+  `docs/FAMILY-E2E-integration-plan-2026-06-16.md`.
 
 ---
 
