@@ -33,7 +33,11 @@ use crate::config::ResolvedConfig;
                   so an ignored file inside an input dir (e.g. a local .env) is NOT part of the \
                   key — changing it will not invalidate the cache and a run may replay a stale \
                   result. Pass such a file as an explicit --input <FILE> (named files are digested \
-                  regardless of ignore rules) or un-ignore it."
+                  regardless of ignore rules) or un-ignore it.\n\n\
+                  The global --json and --concurrency flags DO NOT APPLY to `run`: it proxies the \
+                  child's stdout/stderr verbatim (so there is no clw JSON payload to emit) and runs \
+                  the single wrapped command (so there is nothing to parallelize). Passing --json \
+                  with `run` prints a one-line note on stderr and is otherwise ignored."
 )]
 pub struct RunArgs {
     /// Input paths (files or directories) that key the memoization.
@@ -62,7 +66,20 @@ pub struct RunArgs {
     pub cmd: Vec<String>,
 }
 
-pub async fn run(args: RunArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
+/// P6: the one-line note printed (to STDERR, never stdout — that belongs to the
+/// child) when `--json` is passed with `run`, which has no JSON form. Extracted as
+/// a pure seam so the wording can be asserted without driving the child process.
+const JSON_NOT_APPLICABLE_HINT: &str =
+    "[clw] note: --json does not apply to `run` (it proxies the child's stdout/stderr); ignoring it";
+
+pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+    // P6: `run` has no JSON form — it proxies the child's stdout/stderr verbatim,
+    // so a global `--json` would be silently ignored. Emit a one-line stderr hint
+    // (never stdout — that belongs to the child) so the user is not left guessing.
+    if json {
+        eprintln!("{JSON_NOT_APPLICABLE_HINT}");
+    }
+
     let client = HttpClient::new(cfg.clw_config)?;
     let cwd = std::env::current_dir()?;
 
@@ -86,4 +103,47 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig) -> Result<(), ClwError> {
 
     // Propagate child exit code.
     std::process::exit(outcome.exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // P6 — the --json-with-run hint is actionable and clarifies why it's ignored.
+    #[test]
+    fn json_hint_explains_run_has_no_json_form() {
+        assert!(JSON_NOT_APPLICABLE_HINT.contains("--json"));
+        assert!(
+            JSON_NOT_APPLICABLE_HINT.contains("does not apply"),
+            "hint must say --json doesn't apply"
+        );
+        assert!(
+            JSON_NOT_APPLICABLE_HINT.contains("proxies"),
+            "hint must explain it proxies the child's streams"
+        );
+    }
+
+    // P6 — `run --help` documents that --json/--concurrency don't apply.
+    #[test]
+    fn run_help_documents_json_and_concurrency_dont_apply() {
+        use clap::Args as _;
+
+        // Augment a bare command with RunArgs' derived surface (incl. the
+        // long_about) and render its long help.
+        let cmd = RunArgs::augment_args(clap::Command::new("run"));
+        let long = cmd.clone().render_long_help().to_string();
+        assert!(long.contains("--json"), "run --help must mention --json");
+        assert!(
+            long.contains("--concurrency"),
+            "run --help must mention --concurrency"
+        );
+        assert!(
+            long.contains("DO NOT APPLY") || long.contains("do not apply"),
+            "run --help must state they don't apply, got:\n{long}"
+        );
+    }
 }

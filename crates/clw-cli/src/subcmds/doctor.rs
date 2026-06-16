@@ -5,7 +5,7 @@
 //! reported as `<set>`/`<unset>`. Always exits 0.
 
 use clap::Args;
-use clw_types::ClwError;
+use clw_types::{validate_tenant, ClwError};
 use serde_json::json;
 
 use crate::config::{clw_config_path, ResolvedConfig};
@@ -57,6 +57,9 @@ fn build_report_json(cfg: &ResolvedConfig) -> String {
         "token": redact_present(&c.token),
         "cache_dir": c.cache_dir.display().to_string(),
         "cache_exists": c.cache_dir.exists(),
+        // P1: missing/invalid tenant/token/endpoint reported as diagnostics,
+        // never a hard error (doctor still exits 0).
+        "problems": config_problems(cfg),
     });
     format!("{out}\n")
 }
@@ -104,6 +107,19 @@ fn build_report(cfg: &ResolvedConfig) -> String {
     out.push_str(&format!("cache dir:      {}\n", c.cache_dir.display()));
     out.push_str(&format!("cache exists:   {}\n", c.cache_dir.exists()));
 
+    // --- problems (P1) -----------------------------------------------------
+    // Report a missing/invalid tenant/token/endpoint as advisories instead of
+    // failing — `doctor` is the command you run to DIAGNOSE a broken config.
+    let problems = config_problems(cfg);
+    if problems.is_empty() {
+        out.push_str("problems:       none\n");
+    } else {
+        out.push_str(&format!("problems:       {}\n", problems.len()));
+        for p in &problems {
+            out.push_str(&format!("  - {p}\n"));
+        }
+    }
+
     // --- reporting note ----------------------------------------------------
     out.push_str("-----------------------------------\n");
     out.push_str(
@@ -113,6 +129,36 @@ fn build_report(cfg: &ResolvedConfig) -> String {
     );
 
     out
+}
+
+/// Collect config PROBLEMS as human-readable diagnostic lines (P1).
+///
+/// `doctor` runs on a LENIENTLY-resolved config (missing tenant/token => empty),
+/// so the exact broken state a user invokes `doctor` to diagnose is reported here
+/// as advisories rather than a hard error — `doctor` still exits 0. Pure over its
+/// inputs so the diagnosis is unit-testable. Returns an empty vec when nothing is
+/// wrong (a fully-configured, valid config).
+fn config_problems(cfg: &ResolvedConfig) -> Vec<String> {
+    let c = &cfg.clw_config;
+    let mut problems = Vec::new();
+    if c.tenant.is_empty() {
+        problems.push(
+            "tenant is not set — set --tenant, CLW_TENANT, or add tenant to ~/.clw/config.toml"
+                .to_string(),
+        );
+    } else if let Err(e) = validate_tenant(&c.tenant) {
+        problems.push(format!("tenant is invalid: {e}"));
+    }
+    if c.token.is_empty() {
+        problems.push(
+            "token is not set — set --token, CLW_TOKEN, or add token to ~/.clw/config.toml"
+                .to_string(),
+        );
+    }
+    if c.endpoint.is_empty() {
+        problems.push("endpoint is empty — set --endpoint or CLW_ENDPOINT".to_string());
+    }
+    problems
 }
 
 /// Map a possibly-empty secret/identifier to a presence sentinel.
@@ -257,6 +303,87 @@ mod tests {
         let cfg = cfg_with_token("");
         let report = build_report_json(&cfg);
         let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(v["token"], "<unset>");
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 — doctor runs on a broken config: missing tenant+token are reported
+    // as PROBLEMS (diagnostic lines), never a hard error.
+    // -----------------------------------------------------------------------
+
+    /// A leniently-resolved, half-configured config: empty tenant + empty token.
+    fn cfg_broken() -> ResolvedConfig {
+        ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://example.com".to_string(),
+                tenant: String::new(),
+                token: String::new(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+        }
+    }
+
+    #[test]
+    fn config_problems_reports_missing_tenant_and_token() {
+        let problems = config_problems(&cfg_broken());
+        assert_eq!(problems.len(), 2, "missing tenant + token = 2 problems");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("tenant") && p.contains("not set")),
+            "must flag the missing tenant, got: {problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("token") && p.contains("not set")),
+            "must flag the missing token, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn config_problems_flags_invalid_tenant() {
+        let cfg = ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://example.com".to_string(),
+                // A path-injection tenant: present but invalid.
+                tenant: "../other".to_string(),
+                token: "tok".to_string(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+        };
+        let problems = config_problems(&cfg);
+        assert!(
+            problems.iter().any(|p| p.contains("tenant is invalid")),
+            "an invalid present tenant must be a reported problem, got: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn config_problems_empty_for_valid_config() {
+        assert!(
+            config_problems(&cfg_with_token("tok")).is_empty(),
+            "a fully-configured valid config has no problems"
+        );
+    }
+
+    #[test]
+    fn report_on_broken_config_lists_problems_and_does_not_error() {
+        // build_report is the exact value `run` prints; on a broken config it must
+        // render the problems section (so doctor can still exit 0 and diagnose).
+        let report = build_report(&cfg_broken());
+        assert!(report.contains("problems:"), "must have a problems section");
+        assert!(report.contains("tenant"), "must mention the missing tenant");
+        assert!(report.contains("token"), "must mention the missing token");
+    }
+
+    #[test]
+    fn json_report_on_broken_config_carries_problems_array() {
+        let report = build_report_json(&cfg_broken());
+        let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        let problems = v["problems"].as_array().expect("problems must be an array");
+        assert_eq!(problems.len(), 2, "missing tenant + token");
+        assert_eq!(v["tenant"], "<unset>");
         assert_eq!(v["token"], "<unset>");
     }
 }

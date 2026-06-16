@@ -13,7 +13,7 @@ use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Manifest, RefRecor
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
-use crate::subcmds::status::map_auth_error;
+use crate::subcmds::status::{map_auth_error, map_missing_manifest};
 
 #[derive(Debug, Args)]
 #[command(about = "List ref info for a workspace name, or every ref with --all")]
@@ -61,10 +61,13 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
         })?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
 
-    // Fetch manifest to count files and total size.
+    // Fetch manifest to count files and total size. The ref exists but its
+    // manifest blob may be missing (pruned / lost / replica-lag): surface a
+    // workspace-NAMED error rather than a bare 64-hex `NotFound(<digest>)`.
     let manifest_bytes = CasTransport::get(&client, &record.root)
         .await
-        .map_err(map_auth_error)?;
+        .map_err(map_auth_error)
+        .map_err(|e| map_missing_manifest(e, name, &tenant, &record.root))?;
     let manifest = Manifest::from_bytes(&manifest_bytes)?;
 
     let file_count = manifest

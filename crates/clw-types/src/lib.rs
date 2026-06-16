@@ -482,6 +482,11 @@ pub enum ClwError {
     InvalidManifest(String),
     #[error("invalid tenant: {0}")]
     InvalidTenant(String),
+    /// A CONFIGURATION problem (e.g. a missing tenant/token) — distinct from a
+    /// network/transport failure. Carries an actionable message naming the
+    /// flag/env/config key the user should set.
+    #[error("configuration error: {0}")]
+    Config(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error(transparent)]

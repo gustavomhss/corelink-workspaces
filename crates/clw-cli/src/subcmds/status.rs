@@ -9,7 +9,7 @@ use clap::Args;
 use clw_client::HttpClient;
 use clw_manifest::diff;
 use clw_snapshot::build_manifest_local;
-use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
+use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Digest, Manifest, RefRecord};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -48,10 +48,13 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
         })?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
 
-    // Fetch manifest blob from CAS.
+    // Fetch manifest blob from CAS. The ref resolved but its manifest blob may be
+    // missing (pruned / lost / replica-lag): surface a workspace-NAMED error
+    // rather than a bare 64-hex `NotFound(<digest>)`.
     let manifest_bytes = CasTransport::get(&client, &record.root)
         .await
-        .map_err(map_auth_error)?;
+        .map_err(map_auth_error)
+        .map_err(|e| map_missing_manifest(e, &args.name, &tenant, &record.root))?;
     let remote_manifest = Manifest::from_bytes(&manifest_bytes)?;
 
     // --- Build local manifest ---
@@ -108,6 +111,23 @@ pub fn map_auth_error(err: ClwError) -> ClwError {
         )
     } else {
         err
+    }
+}
+
+/// Map a `NotFound(<manifest root>)` while fetching a workspace's manifest blob
+/// to a workspace-NAMED, actionable message — mirroring the ref-not-found
+/// contextualization in [`run`]/`ls::run_one`. The ref RESOLVED, but its manifest
+/// `record.root` blob is missing/unreachable (pruned, lost, or replica-lag), so a
+/// bare 64-hex `NotFound(<digest>)` would name nothing the user recognizes.
+/// Non-`NotFound` errors (and a `NotFound` on a different digest) pass through.
+pub fn map_missing_manifest(err: ClwError, name: &str, tenant: &str, root: &Digest) -> ClwError {
+    match &err {
+        ClwError::NotFound(d) if d == root => ClwError::Transport(format!(
+            "workspace '{name}' (tenant '{tenant}') is missing its manifest blob {root} — the ref \
+             resolves but its manifest is unreachable (pruned, lost, or replica lag); re-run \
+             'clw snapshot --name {name}' to repair it"
+        )),
+        _ => err,
     }
 }
 
@@ -173,6 +193,44 @@ mod tests {
             out["added"].as_array().is_some(),
             "'added' must be an array"
         );
+    }
+
+    // P3 — a NotFound on the manifest root maps to a workspace-NAMED error, not a
+    // bare 64-hex digest.
+    #[test]
+    fn missing_manifest_maps_to_workspace_named_error() {
+        let root = Digest::of_bytes(b"manifest-root");
+        let mapped = map_missing_manifest(ClwError::NotFound(root), "my-ws", "acme", &root);
+        let msg = mapped.to_string();
+        assert!(
+            !matches!(mapped, ClwError::NotFound(_)),
+            "a missing manifest must be re-mapped away from the bare NotFound digest"
+        );
+        assert!(msg.contains("my-ws"), "must NAME the workspace, got: {msg}");
+        assert!(msg.contains("acme"), "must name the tenant, got: {msg}");
+        assert!(
+            msg.contains("manifest"),
+            "must say the manifest is missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("clw snapshot"),
+            "must suggest re-snapshotting to repair, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_manifest_passes_through_unrelated_errors() {
+        let root = Digest::of_bytes(b"root");
+        // A NotFound on a DIFFERENT digest is not the manifest root — pass through.
+        let other = Digest::of_bytes(b"other");
+        let mapped = map_missing_manifest(ClwError::NotFound(other), "ws", "t", &root);
+        assert!(
+            matches!(mapped, ClwError::NotFound(d) if d == other),
+            "a NotFound on a different digest must pass through unchanged"
+        );
+        // A non-NotFound error passes through verbatim.
+        let mapped2 = map_missing_manifest(ClwError::Transport("blip".into()), "ws", "t", &root);
+        assert!(matches!(mapped2, ClwError::Transport(m) if m == "blip"));
     }
 
     #[test]
