@@ -46,7 +46,7 @@ impl ResolvedConfig {
             .clone()
             .or_else(|| file_cfg.get("tenant").cloned())
             .ok_or_else(|| {
-                ClwError::Transport(
+                ClwError::Config(
                     "missing tenant: set --tenant, CLW_TENANT, or add tenant to ~/.clw/config.toml"
                         .to_string(),
                 )
@@ -64,7 +64,7 @@ impl ResolvedConfig {
             .clone()
             .or_else(|| file_cfg.get("token").cloned())
             .ok_or_else(|| {
-                ClwError::Transport(
+                ClwError::Config(
                     "missing token: set --token, CLW_TOKEN, or add token to ~/.clw/config.toml"
                         .to_string(),
                 )
@@ -86,6 +86,56 @@ impl ResolvedConfig {
                 cache_dir,
             },
         })
+    }
+
+    /// Resolve config LENIENTLY for LOCAL-ONLY subcommands that operate on
+    /// whatever is configured and make NO network call (`doctor`, `auth logout`,
+    /// `auth whoami`).
+    ///
+    /// Applies the same flag > env > file > default precedence as [`resolve`], but
+    /// a MISSING tenant/token yields an empty string rather than an error — so a
+    /// half-configured state can still be diagnosed (`doctor`) or repaired
+    /// (`logout`). The tenant, when PRESENT, is still validated (a path-injection
+    /// value is reported, not silently accepted); an invalid present tenant is
+    /// surfaced to the caller as a diagnostic line rather than blanked.
+    #[must_use]
+    pub fn resolve_lenient(cli: &Cli) -> Self {
+        let file_cfg = read_config_file();
+
+        let endpoint = cli
+            .endpoint
+            .clone()
+            .or_else(|| file_cfg.get("endpoint").cloned())
+            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+
+        // Missing tenant/token => empty string (reported as <unset> by the
+        // local-only commands), never an error.
+        let tenant = cli
+            .tenant
+            .clone()
+            .or_else(|| file_cfg.get("tenant").cloned())
+            .unwrap_or_default();
+
+        let token = cli
+            .token
+            .clone()
+            .or_else(|| file_cfg.get("token").cloned())
+            .unwrap_or_default();
+
+        let cache_dir_str = cli
+            .cache_dir
+            .clone()
+            .or_else(|| file_cfg.get("cache_dir").cloned())
+            .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
+
+        ResolvedConfig {
+            clw_config: Config {
+                endpoint: endpoint.trim_end_matches('/').to_string(),
+                tenant,
+                token,
+                cache_dir: expand_tilde(&cache_dir_str),
+            },
+        }
     }
 
     /// Resolve ONLY the cache directory, tolerating a missing tenant/token.
@@ -138,6 +188,14 @@ fn read_config_file() -> HashMap<String, String> {
             #[cfg(unix)]
             warn_if_perms_overbroad(&path);
             parse_config_lines(&content, &mut map);
+            // P4: the file was READABLE but parsing yielded NO recognized key —
+            // a typo'd / malformed config silently falling back to defaults. Warn
+            // (do not fail) so the user learns their config was ignored. Kept
+            // conservative: only warns when the file has real content yet not one
+            // usable key, so a legitimately minimal/empty config never false-warns.
+            if config_is_readable_but_unusable(&content, &map) {
+                warn_config_unusable(&path.display().to_string());
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Absent config file — defaults apply silently (the happy path for a
@@ -190,6 +248,49 @@ fn warn_config_unreadable(path: &str, reason: &str) {
     );
     eprintln!(
         "warning: config file {path} exists but could not be read ({reason}); using defaults"
+    );
+}
+
+/// The config keys clw actually understands. A readable file that parses to NONE
+/// of these (after stripping blank/comment lines) is "readable but unusable".
+const KNOWN_CONFIG_KEYS: [&str; 4] = ["endpoint", "tenant", "token", "cache_dir"];
+
+/// P4 predicate: decide whether a readable `config.toml` is MALFORMED — it has
+/// real (non-blank, non-comment) content yet [`parse_config_lines`] recovered NO
+/// recognized key. Pure over its inputs so the "readable but yielded nothing
+/// usable" seam is unit-testable without touching the filesystem.
+///
+/// Conservative by design: returns `false` for an empty / comment-only / fully
+/// blank file (a legitimately minimal config must NOT warn), and `false` as soon
+/// as ANY known key was parsed (a config with one good key plus a junk line is
+/// usable, not malformed).
+pub(crate) fn config_is_readable_but_unusable(
+    content: &str,
+    parsed: &HashMap<String, String>,
+) -> bool {
+    // Any recognized key present => usable, never warn.
+    if KNOWN_CONFIG_KEYS.iter().any(|k| parsed.contains_key(*k)) {
+        return false;
+    }
+    // No known key. Only warn if the file actually has substantive content —
+    // a non-blank line that is not a whole-line comment (so empty/comment-only
+    // configs stay silent).
+    content
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// P4: emit the readable-but-unusable advisory. Split out as a seam (mirroring
+/// [`warn_config_unreadable`]) so the malformed-config signal can be tested
+/// without a real malformed file.
+fn warn_config_unusable(path: &str) {
+    tracing::warn!(
+        path = %path,
+        "config.toml was read but no valid settings were parsed; using defaults"
+    );
+    eprintln!(
+        "warning: config file {path} was read but no valid settings were parsed (check for typos); using defaults"
     );
 }
 
@@ -883,6 +984,116 @@ cache_dir = "~/.clw/cache"
         .unwrap();
         let resolved = ResolvedConfig::resolve(&cli_ok).unwrap();
         assert_eq!(resolved.clw_config.tenant, "acme");
+    }
+
+    // -----------------------------------------------------------------------
+    // P7 — a missing tenant/token is a CONFIG error, not a Transport error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_missing_tenant_is_config_error() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = HomeEnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        // No --tenant, no --token, no config file: the FIRST missing field
+        // (tenant) must surface as a CONFIG-class error carrying the actionable
+        // set-tenant guidance — NOT a Transport (network) error.
+        let cli = crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap();
+        match ResolvedConfig::resolve(&cli) {
+            Err(ClwError::Config(msg)) => {
+                assert!(msg.contains("tenant"), "must name the tenant, got: {msg}");
+                assert!(
+                    msg.contains("CLW_TENANT") || msg.contains("--tenant"),
+                    "must stay actionable, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected ClwError::Config for a missing tenant, got: {other:?}"),
+            Ok(_) => panic!("expected resolve to error on a missing tenant"),
+        }
+    }
+
+    #[test]
+    fn resolve_missing_token_is_config_error() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = HomeEnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        // Tenant present (so we pass the tenant gate) but no token => the token
+        // gate must ALSO be a CONFIG error.
+        let cli =
+            crate::Cli::try_parse_from(["clw", "--tenant", "acme", "ls", "--name", "ws"]).unwrap();
+        match ResolvedConfig::resolve(&cli) {
+            Err(ClwError::Config(msg)) => {
+                assert!(msg.contains("token"), "must name the token, got: {msg}");
+            }
+            Err(other) => panic!("expected ClwError::Config for a missing token, got: {other:?}"),
+            Ok(_) => panic!("expected resolve to error on a missing token"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P1/P2 — lenient resolution tolerates a missing tenant+token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_lenient_tolerates_missing_tenant_and_token() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = HomeEnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        // No tenant, no token, no config file: lenient resolution must NOT error;
+        // missing identity fields come back as empty strings (reported <unset>).
+        let cli = crate::Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        let resolved = ResolvedConfig::resolve_lenient(&cli);
+        assert!(
+            resolved.clw_config.tenant.is_empty(),
+            "missing tenant => empty"
+        );
+        assert!(
+            resolved.clw_config.token.is_empty(),
+            "missing token => empty"
+        );
+        // Endpoint still falls back to the default.
+        assert_eq!(resolved.clw_config.endpoint, DEFAULT_ENDPOINT);
+    }
+
+    // -----------------------------------------------------------------------
+    // P4 — readable-but-malformed config warns; minimal/empty stays silent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_unusable_predicate_flags_only_real_junk() {
+        // Junk content that parses to NO known key => unusable (warn).
+        let mut junk = HashMap::new();
+        parse_config_lines("this is not valid toml at all\n[some-table]\n", &mut junk);
+        assert!(
+            config_is_readable_but_unusable("this is not valid toml at all\n[some-table]\n", &junk),
+            "a readable file with content but no recognized key must be flagged unusable"
+        );
+
+        // A config with at least one KNOWN key is usable, even with a junk line.
+        let mut ok = HashMap::new();
+        parse_config_lines("tenant = \"acme\"\njunk line here\n", &mut ok);
+        assert!(
+            !config_is_readable_but_unusable("tenant = \"acme\"\njunk line here\n", &ok),
+            "one good key makes the config usable — must NOT warn"
+        );
+
+        // An empty or comment-only file is a legitimately minimal config: silent.
+        let empty = HashMap::new();
+        assert!(!config_is_readable_but_unusable("", &empty));
+        assert!(!config_is_readable_but_unusable("\n\n  \n", &empty));
+        assert!(!config_is_readable_but_unusable(
+            "# just a comment\n",
+            &empty
+        ));
     }
 
     #[test]

@@ -291,6 +291,24 @@ pub fn actionable_error(err: &ClwError) -> String {
     }
 }
 
+/// Whether `cmd` is a LOCAL-ONLY command that must run even on a broken/
+/// half-configured config (missing tenant/token), resolving leniently instead of
+/// erroring out. Covers `doctor` (diagnostics — documented to always exit 0) and
+/// the offline `auth logout`/`auth whoami` (which repair/report local creds).
+///
+/// `auth login`/`auth rotate` are deliberately EXCLUDED: `login` persists the
+/// resolved identity, so it should still require a resolvable token+tenant.
+/// `uninstall` has its own dedicated lenient path above and is handled before
+/// this gate is consulted.
+fn command_runs_on_broken_config(cmd: &Commands) -> bool {
+    use subcmds::auth::AuthCommand;
+    match cmd {
+        Commands::Doctor(_) => true,
+        Commands::Auth(a) => matches!(a.command, AuthCommand::Logout(_) | AuthCommand::Whoami),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -314,9 +332,14 @@ async fn main() {
         return;
     }
 
-    // Resolve config from flags, env, and file. `uninstall` must work even when
-    // no token/tenant has ever been set (it is the cleanup path), so it resolves
-    // ONLY the cache dir leniently rather than failing on a missing token.
+    // Resolve config from flags, env, and file. A handful of LOCAL-ONLY commands
+    // must work even when no token/tenant has ever been set:
+    //   - `uninstall` is the cleanup path — it resolves ONLY the cache dir
+    //     leniently rather than failing on a missing token.
+    //   - `doctor`/`auth logout`/`auth whoami` operate on whatever is configured
+    //     and make NO network call; they must run on the exact broken/half-
+    //     configured config a user invokes them to diagnose or repair, resolving
+    //     missing tenant/token to `<unset>` rather than erroring out.
     let resolved = match ResolvedConfig::resolve(&cli) {
         Ok(c) => c,
         Err(e) => {
@@ -331,7 +354,14 @@ async fn main() {
                 }
                 return;
             }
-            exit_err(&e);
+            // `doctor` and the local-only `auth logout`/`whoami` fall back to a
+            // LENIENT resolution (missing tenant/token => empty) so they run on a
+            // broken config instead of erroring before they can diagnose/repair it.
+            if command_runs_on_broken_config(&cli.command) {
+                ResolvedConfig::resolve_lenient(&cli)
+            } else {
+                exit_err(&e);
+            }
         }
     };
 
@@ -359,8 +389,10 @@ async fn dispatch(
         Commands::Status(args) => subcmds::status::run(args, cfg, json).await,
         // `run` streams the child's stdout/stderr verbatim and propagates its
         // exit code, so there is no clw-level payload to render — it has no
-        // `--json` form by design (the wrapped command owns stdout).
-        Commands::Run(args) => subcmds::run::run(args, cfg).await,
+        // `--json` form by design (the wrapped command owns stdout), and it does
+        // not honor the global `--concurrency`. `json` is threaded in only so it
+        // can emit a one-line stderr hint when `--json` is passed (P6).
+        Commands::Run(args) => subcmds::run::run(args, cfg, json).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
         Commands::Rm(args) => subcmds::rm::run(args, cfg, json).await,
         Commands::Prune(args) => subcmds::prune::run(args, cfg, json).await,
@@ -873,6 +905,47 @@ mod tests {
     fn stderr_color_disabled_by_flag() {
         // --no-color always disables ANSI on the diagnostic (stderr) channel.
         assert!(!stderr_color_enabled(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // P1/P2 — which commands run on a broken/half-configured config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn doctor_and_local_auth_run_on_broken_config() {
+        // doctor (P1) and the offline auth logout/whoami (P2) must fall back to a
+        // lenient resolution so they run on a config missing tenant/token.
+        let doctor = Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        assert!(command_runs_on_broken_config(&doctor.command));
+
+        let logout = Cli::try_parse_from(["clw", "auth", "logout"]).unwrap();
+        assert!(
+            command_runs_on_broken_config(&logout.command),
+            "auth logout must run on a half-configured config"
+        );
+
+        let whoami = Cli::try_parse_from(["clw", "auth", "whoami"]).unwrap();
+        assert!(
+            command_runs_on_broken_config(&whoami.command),
+            "auth whoami must run on a half-configured config"
+        );
+    }
+
+    #[test]
+    fn network_and_persisting_commands_still_require_full_config() {
+        // auth login PERSISTS the resolved identity, so it keeps the strict gate;
+        // rotate and network commands likewise are NOT lenient.
+        let login = Cli::try_parse_from(["clw", "auth", "login"]).unwrap();
+        assert!(!command_runs_on_broken_config(&login.command));
+
+        let rotate = Cli::try_parse_from(["clw", "auth", "rotate"]).unwrap();
+        assert!(!command_runs_on_broken_config(&rotate.command));
+
+        let ls = Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap();
+        assert!(!command_runs_on_broken_config(&ls.command));
+
+        let snap = Cli::try_parse_from(["clw", "snapshot", "--name", "ws"]).unwrap();
+        assert!(!command_runs_on_broken_config(&snap.command));
     }
 
     #[test]

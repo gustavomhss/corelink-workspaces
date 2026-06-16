@@ -10,6 +10,14 @@
 //! INVARIANT: the personal access token is NEVER printed to stdout/stderr.
 //! Presence is reported as `<set>`/`<unset>` only. The config file is the only
 //! place the plaintext token is written, and it is forced owner-only (0600).
+//!
+//! STDOUT/STDERR CONTRACT (P5, shared across the CLI): a machine-readable RESULT
+//! — the `--json` payload, OR a query RESULT like `whoami`'s identity report
+//! (mirroring `doctor`/`ls`) — goes to STDOUT. Human action NOTICES/progress/
+//! advisories (`login`'s "logged in", `logout`'s "removed", `rotate`'s guidance,
+//! the "nothing to remove" notes) go to STDERR, so piping stdout to a file or a
+//! `jq` never captures chatter. The `--json` payload itself always stays on
+//! stdout regardless.
 
 use clap::{Args, Subcommand};
 use clw_types::ClwError;
@@ -284,14 +292,30 @@ fn build_whoami_json(cfg: &ResolvedConfig) -> serde_json::Value {
     })
 }
 
+/// Render a present identifier verbatim, or `<not configured>` when it is empty.
+/// P2: `whoami` reports what is PRESENT and clearly flags what is missing, so it
+/// is useful on a half-configured config rather than printing a blank line.
+fn or_not_configured(value: &str) -> &str {
+    if value.is_empty() {
+        "<not configured>"
+    } else {
+        value
+    }
+}
+
 /// `clw auth whoami` — print the resolved identity (redacted, offline).
+///
+/// P2: resolves LENIENTLY (no required token+tenant), so it runs on a
+/// half-configured config — reporting present fields and `<not configured>` /
+/// `<unset>` for missing ones. This is a query RESULT (like `doctor`/`ls`), so its
+/// human form goes to STDOUT per the stdout/stderr contract.
 fn whoami(cfg: &ResolvedConfig, json: bool) {
     let c = &cfg.clw_config;
     if json {
         println!("{}", build_whoami_json(cfg));
     } else {
-        println!("endpoint: {}", c.endpoint);
-        println!("tenant:   {}", c.tenant);
+        println!("endpoint: {}", or_not_configured(&c.endpoint));
+        println!("tenant:   {}", or_not_configured(&c.tenant));
         println!("token:    {}", redact_present(&c.token));
     }
 }
@@ -343,6 +367,31 @@ mod tests {
     fn redact_present_maps_correctly() {
         assert_eq!(redact_present(""), "<unset>");
         assert_eq!(redact_present("x"), "<set>");
+    }
+
+    // P2 — whoami on a half-configured config: a missing (empty) tenant/endpoint
+    // renders "<not configured>" rather than a blank line.
+    #[test]
+    fn or_not_configured_flags_missing_fields() {
+        assert_eq!(or_not_configured(""), "<not configured>");
+        assert_eq!(or_not_configured("acme"), "acme");
+    }
+
+    // P2 — whoami's JSON shape still round-trips when tenant is empty (logout/
+    // whoami must succeed on a config missing tenant, not error).
+    #[test]
+    fn whoami_json_on_missing_tenant_does_not_error() {
+        let cfg = ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://example.com".to_string(),
+                tenant: String::new(),
+                token: String::new(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+        };
+        let out = build_whoami_json(&cfg);
+        assert_eq!(out["tenant"], "", "missing tenant => empty in JSON");
+        assert_eq!(out["token"], "<unset>", "missing token => <unset>");
     }
 
     // whoami output must never leak the token value — asserted on the REAL pure
