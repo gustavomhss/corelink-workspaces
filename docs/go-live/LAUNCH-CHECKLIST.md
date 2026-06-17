@@ -23,11 +23,11 @@
 | 6 | Live conformance green as a pre-tag gate | ✅ / ⏳ | 8/8 green vs prod; the `release.yml` `conformance` job is wired as a REQUIRED predecessor but is **inert until `CLW_CI_TOKEN` is provisioned** (skip-not-fail) — provision that one secret to make it ship-blocking |
 | 7 | End-to-end **family** path proven across repos | 🔒 / ⏳ | **clw half DONE** (runner-model #64 + per-tier #66 + solo-live #67 suites merged); **server D-9 mint SHIPPED** (#305) + per-tier seed delivered (#303); remaining = runner's clw-invocation build + a D1 test env + per-tenant PATs — all TL-routed |
 | 8 | Region/residency correct + real right-to-erasure | ✅ | erasure ✅ (`clw erase`, audited); signup-worker region fix **LIVE** (D-3 #269 — `regionFromColo` derives `primary_region`). **Verify:** create a tenant from a non-NA colo (e.g. `LHR`) and assert its D1 row shows `primary_region = 'weur'` (not the old `enam` hardcode): `wrangler d1 execute <DB> --command "SELECT primary_region FROM tenants WHERE id='<new>'"` |
-| 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
+| 9 | Legal/compliance published | ✅ beta · ⏳ GA | Docs **operative for the open beta** (drafted ✅; none claims counsel-reviewed; DPA carries the beta→counsel banner). **NOT an open-beta blocker.** Counsel sign-off **deferred to post-open-beta / pre-GA by owner waiver (2026-06-17)** — see `docs/ROADMAP-go-live.md`. |
 | 10 | Telemetry-off + key rotation runbook + support/EOL | ✅ | telemetry removed ✅; rotation runbook + EOL policy now published (this PR) |
 | 11 | CI not on a single founder machine | ☑️ **owner-accepted** | self-hosted single-owner **dedicated** Mac is the chosen model (not GitHub billing). Owner accepts the single-machine risk (CI/release pause if the Mac is down); per-project toolchain isolation (#68) mitigates the cross-project rustup-nuke |
 
-**The critical path to GA:** provision **signing secrets (gate 4/5)** + **legal sign-off (gate 9)** + prove the **family e2e (gate 7)**. CI + release are **self-hosted** (gate 2/11 owner-accepted, the `release.yml` runs on the dedicated Mac); everything else is ✅ or follows from these.
+**The critical path to GA:** provision **signing secrets (gate 4/5)** + **legal sign-off (gate 9 — deferred to post-open-beta by owner waiver 2026-06-17)** + prove the **family e2e (gate 7)**. **For the OPEN BETA, gate 9 is satisfied** (docs operative; counsel engaged after beta, before GA). CI + release are **self-hosted** (gate 2/11 owner-accepted, the `release.yml` runs on the dedicated Mac); everything else is ✅ or follows from these.
 
 ---
 
@@ -61,8 +61,10 @@ e2e-tested; this is the per-platform packaging confirmation.)
 The binding docs are written and self-consistent (`EULA.md` + `NOTICE` at the repo root;
 `docs/PRIVACY-POLICY.md`, `docs/TERMS-OF-SERVICE.md`, `docs/DPA-subprocessors.md`, `SECURITY.md`,
 and the export-control self-classification).
-They carry the "operative, full counsel review pending" framing. Get a lawyer's sign-off; that flips
-gate 9 from drafted → published.
+They carry the "operative, full counsel review pending" framing. **Owner decision (2026-06-17): no
+counsel for now — the open beta launches on these operative docs, and counsel is engaged AFTER the
+open beta, before GA** (logged as a waiver in `docs/ROADMAP-go-live.md`). The eventual sign-off flips
+gate 9 from operative-for-beta → published.
 
 ---
 
