@@ -15,6 +15,14 @@ organization.
 
 If you do not agree to these Terms, you must not access or use the Service.
 
+> **Status — operative for the open beta; full counsel review tracked before GA.**
+> These Terms are operative and in effect for the current open-beta /
+> incubation period. A full review by external counsel has **not** yet been
+> completed and is a tracked obligation to close **before general availability** —
+> a known, time-limited gap, consistent with the EU/UK Article 27 representative
+> note in the Privacy Policy. Any material revisions from that review will be
+> published here.
+
 ## 1. Definitions
 
 1.1 "**Service**" means the hosted CoreLink Workspaces backend made available by

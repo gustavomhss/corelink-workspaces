@@ -21,6 +21,13 @@ vs. "consumer"), we use them interchangeably.
 This policy covers the Service only. It does not cover third-party products you may
 connect to, your own customers' data-handling practices, or websites we link to.
 
+> **Status — operative for the open beta; full counsel review tracked before GA.**
+> This Privacy Policy is operative and in effect for the current open-beta /
+> incubation period. A full review by external counsel has **not** yet been
+> completed and is a tracked obligation to close **before general availability** —
+> a known, time-limited gap, consistent with the EU/UK Article 27 representative
+> note below. Any material revisions from that review will be published here.
+
 ---
 
 ## 1. Roles: who is the controller and who is the processor

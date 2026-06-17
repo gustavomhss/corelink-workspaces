@@ -28,6 +28,14 @@ LICENSEE IS ENTERING INTO THIS AGREEMENT ON BEHALF OF AN ENTITY, LICENSEE
 REPRESENTS THAT IT HAS THE AUTHORITY TO BIND THAT ENTITY, AND "LICENSEE" REFERS
 TO THAT ENTITY.**
 
+> **Status — operative for the open beta; full counsel review tracked before GA.**
+> This Agreement is operative and in effect for the current open-beta /
+> incubation period. A full review by external counsel has **not** yet been
+> completed and is a tracked obligation to close **before general availability** —
+> a known, time-limited gap, consistent with the EU/UK Article 27 representative
+> note in the Privacy Policy. Any material revisions from that review will be
+> published here.
+
 ## 1. Definitions
 
 1.1 "**Documentation**" means the user and technical documentation that Licensor
