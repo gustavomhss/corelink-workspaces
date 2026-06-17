@@ -106,15 +106,17 @@ fn skip_or_fail(reason: &str) {
 }
 
 /// A unique, per-run suffix that avoids key collisions between test invocations.
-/// Derived from `std::process::id()` folded with `SystemTime` nanos so it
-/// changes each run even within the same process.
+/// Concatenates `std::process::id()` (8 hex) with the FULL epoch nanos
+/// (`as_nanos()`, 16 hex) so it changes on every call. NOTE: `subsec_nanos()`
+/// would be a bug — it wraps every second, so two runs at the same sub-second
+/// offset could collide (same fix as live_conformance.rs).
 fn run_suffix() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}{:08x}", pid, nanos)
+        .as_nanos() as u64;
+    format!("{pid:08x}{nanos:016x}")
 }
 
 /// True if `err` is the server-regression signal: the capability is LIVE but the

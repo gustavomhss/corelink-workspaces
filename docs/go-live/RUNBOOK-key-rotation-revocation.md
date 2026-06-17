@@ -2,7 +2,7 @@
 
 > Satisfies exit-gate #10 ("signing keys have a documented rotation+revocation runbook"). Covers every
 > long-lived secret clw's release + operation depends on: the code-signing keys, the Linux release
-> key, the R2 download credentials, and the CI conformance PAT. Written to be runnable by whoever
+> key, the release-mirror + Homebrew-tap push tokens, and the CI conformance PAT. Written to be runnable by whoever
 > holds the owner role — key-agnostic (it documents the *procedure*, valid before and after the keys
 > exist).
 >
@@ -20,7 +20,8 @@
 | macOS Developer ID cert (`.p12`) | macOS codesign | GitHub secret (base64) | 12 mo or on staff change | Apple Developer → revoke certificate |
 | App Store Connect API key | macOS notarization | GitHub secret | 12 mo | App Store Connect → revoke key |
 | minisign secret key | Linux artifact signature | GitHub secret `MINISIGN_SECRET_KEY` (passphrase as `MINISIGN_PASSWORD`) | 24 mo or on compromise | publish new pubkey + revocation notice |
-| R2 access keys | Download-surface upload | GitHub secrets | 6 mo | Cloudflare → roll the access key |
+| `CLW_RELEASES_TOKEN` | Publish the GitHub Release on the public mirror `clw-releases` | GitHub secret (deploy-key / fine-grained PAT, scoped to that repo, contents:write) | 6 mo or on compromise | regenerate the deploy key / PAT on `clw-releases` |
+| `HOMEBREW_TAP_TOKEN` | Push the formula bump to the tap `homebrew-clw` | GitHub secret (deploy-key / fine-grained PAT, scoped to that repo, contents:write) | 6 mo or on compromise | regenerate the deploy key / PAT on `homebrew-clw` |
 | `CLW_CI_TOKEN` (conformance PAT) | pre-tag conformance gate | GitHub secret | 90 days | corelink-server → revoke the PAT |
 | `CLW_CI_TENANT` (conformance tenant id) | pre-tag conformance gate (identifies the CI tenant the PAT is scoped to) | GitHub secret | with `CLW_CI_TOKEN` (90 days) | corelink-server → retire the CI tenant / re-scope the PAT |
 | `CLW_CI_ENDPOINT` (conformance API endpoint) | pre-tag conformance gate (target host) | GitHub secret | on endpoint/region change | update to the new host; no consumer trust-root |
@@ -54,9 +55,10 @@ publish:
 3. Update the `MINISIGN_SECRET_KEY` secret; sign the next release with the new key.
 4. Keep verifying-instructions for BOTH keys in `DISTRIBUTION.md` for one release cycle.
 
-### R2 / conformance PAT
-Roll in place: create the new credential, update the GitHub secret, confirm one pipeline run, delete
-the old credential. No consumer-facing trust-root, so no hand-off note needed.
+### Release-mirror / tap tokens / conformance PAT
+Roll in place: create the new credential (regenerate the deploy key / fine-grained PAT for
+`clw-releases` or `homebrew-clw`, or the conformance PAT), update the GitHub secret, confirm one
+pipeline run, delete the old credential. No consumer-facing trust-root, so no hand-off note needed.
 
 ---
 
@@ -68,10 +70,11 @@ signed artifact is reported.
 Execute in this order — **revoke first, explain second:**
 
 1. **Revoke the key at the source NOW** (the "Revoke via" column): Azure cert profile, Apple cert,
-   minisign pubkey retraction, Cloudflare key roll, corelink-server PAT revoke. This invalidates the
-   attacker's ability to sign *new* artifacts.
-2. **Pull the affected artifacts** from the R2 surface (`releases/clw/<version>/`) so nobody downloads
-   a suspect binary.
+   minisign pubkey retraction, regenerate the release-mirror / tap push tokens, corelink-server PAT
+   revoke. This invalidates the attacker's ability to sign *new* artifacts or push a malicious formula.
+2. **Pull the affected artifacts:** draft/delete the bad GitHub Release on the public mirror
+   `clw-releases` and revert the formula bump on `homebrew-clw` so nobody downloads a suspect binary
+   (see *Bad-release rollback* below).
 3. **Publish a security advisory** per `SECURITY.md`: which version(s)/checksums are affected, the
    compromised key fingerprint, and the new trust-root. For minisign, publish a `REVOKED.txt` listing
    the retired public key so a verifier can hard-fail it.
@@ -98,3 +101,24 @@ A consumer must be able to tell a legitimate rotation from an attack:
 
 If any of these fail on a freshly-downloaded artifact, treat it as a potential compromise and follow
 the emergency path.
+
+---
+
+## Bad-release rollback (Homebrew tap + public mirror)
+
+A published release asset is **immutable by URL** and the Homebrew formula may already be bumped + users
+may have cached the (now-bad) `sha256` in `~/Library/Caches/Homebrew`. **Never reuse a tag or asset URL**
+to "fix" a bad release — a different binary at the same URL is a `sha256` mismatch for everyone who cached
+it. Procedure:
+
+1. **Stop the bleed.** On `humangr-labs/clw-releases`, mark the bad GitHub Release as a **draft** (or
+   delete it) so new `brew install`s can't fetch it. `gh release edit vX.Y.Z --repo humangr-labs/clw-releases --draft`.
+2. **Yank the formula.** On `humangr-labs/homebrew-clw`, **revert** the formula-bump commit (point
+   `Formula/clw.rb` back at the last-good `vX.Y.(Z-1)`). `brew update` then serves the good version again.
+3. **Re-release forward.** Fix the defect, **bump to a NEW patch** `vX.Y.(Z+1)` (never re-cut the bad
+   tag), tag → the pipeline publishes the new Release + re-bumps the formula. Users get the fix via
+   `brew upgrade clw`.
+4. **Caches.** Users who already installed the bad version recover with `brew update && brew upgrade clw`;
+   a `sha256` mismatch on the *withdrawn* version is expected and harmless once the formula points forward.
+5. **If the cause is key/credential compromise** (signing key, `CLW_RELEASES_TOKEN`, `HOMEBREW_TAP_TOKEN`),
+   ALSO run the rotation/revocation path above before re-releasing.
