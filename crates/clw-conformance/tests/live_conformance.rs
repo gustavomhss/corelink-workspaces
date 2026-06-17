@@ -263,25 +263,19 @@ async fn ac_missing() {
 /// `ClwError::Auth` (HTTP 401) from the server on any authenticated call.
 #[tokio::test]
 async fn auth_rejected() {
-    // We need CLW_TENANT to build a valid URL, but we deliberately use an
-    // invalid token. If CLW_TENANT is absent we skip normally.
-    let tenant = match std::env::var("CLW_TENANT") {
-        Ok(t) => t,
-        Err(_) => {
-            skip_or_fail("set CLW_TOKEN + CLW_TENANT to run live conformance");
-            return;
-        }
+    // Reuse the credential resolver for endpoint + tenant — it skips when creds are
+    // absent (including the empty-string-env dry-run case, where an absent CI secret
+    // surfaces as "") — then swap in a deliberately invalid token so the server must
+    // reject the call with 401. (Reading CLW_TENANT/CLW_ENDPOINT inline here would
+    // re-introduce the empty-vs-unset bug and panic in the no-PAT dry-run.)
+    let Some(cfg) = try_config() else {
+        return;
     };
 
-    let endpoint = std::env::var("CLW_ENDPOINT")
-        .unwrap_or_else(|_| "https://corelink-api.humangr.com".to_string());
-
     let bad_cfg = Config {
-        endpoint,
-        tenant,
         // Intentionally invalid PAT; server must reject it with 401.
         token: "corelink_pat_invalid.invalid.invalid".to_string(),
-        cache_dir: PathBuf::from("/tmp/clw-conformance-cache"),
+        ..cfg
     };
     let bad_client = HttpClient::new(bad_cfg).expect("failed to build bad HttpClient");
 
