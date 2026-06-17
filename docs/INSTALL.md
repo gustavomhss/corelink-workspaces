@@ -1,77 +1,133 @@
 # Installing and verifying `clw`
 
 This is the consumer-facing install + verification runbook for the `clw` client. It
-covers the five supported targets, how to verify a signature/checksum on each
-platform, where to put the binary on `$PATH`, and how to upgrade or uninstall.
+covers the supported targets, the preferred install path (Homebrew), the `curl`
+fallback, the direct Windows download, how to verify a signature/checksum on each
+platform, and how to upgrade, pin, or uninstall.
 
-`clw` is **proprietary**, commercial-licensed software (see `EULA.md`). It is **not**
-published to a public GitHub Release, crates.io, Homebrew, or any package manager.
-Binaries ship from an **authenticated download surface** (Cloudflare R2 behind a
-CoreLink auth route — `docs/DISTRIBUTION.md` decision (a)). You must present a
-download credential to fetch them; see [Authenticated download](#authenticated-download).
+`clw` is **proprietary**, commercial-licensed software (see `EULA.md`) — but it is
+**publicly downloadable**: binaries are published as GitHub Release assets on the
+public mirror repo **`humangr-labs/clw-releases`**, and macOS/Linux install via a
+public Homebrew tap. The license governs *use*; the download itself needs no
+credential. (See `docs/DISTRIBUTION.md`.)
 
 > Verifying the signature is **not optional**. `clw` carries a tenant Personal Access
 > Token and snapshots your workspace — run only a binary whose signature and checksum
-> you have verified against the published trust root.
+> you have verified against the published trust root. Homebrew verifies the per-asset
+> SHA-256 for you; for the `curl` and Windows paths, verify per
+> [§4](#4-verify-the-download-per-platform).
 
 ---
 
-## 1. Supported targets (the install matrix)
+## 1. Quick start
+
+### macOS / Linux — Homebrew (preferred)
+
+```sh
+brew install humangr-labs/clw/clw
+clw --version
+```
+
+That's it — brew resolves the right binary for your OS/arch, verifies its SHA-256,
+and (on macOS) installs a **formula** binary that is **not** Gatekeeper-quarantined,
+so it runs with no "unidentified developer" prompt. **Prefer brew on macOS** for
+exactly this reason (the `curl` path below downloads a quarantined binary and has to
+strip the attribute itself).
+
+### macOS / Linux — `curl` one-liner (fallback)
+
+Use this only where Homebrew is unavailable. `CLW_VERSION` is required (the mirror has
+no `latest` alias):
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  "https://raw.githubusercontent.com/humangr-labs/clw-releases/main/install.sh" \
+  | CLW_VERSION=<version> sh
+```
+
+`install.sh` downloads the binary + the signed `SHA256SUMS` (+ `.minisig`) +
+`minisign.pub`, verifies the minisign signature over the checksum manifest, then the
+binary's SHA-256 (**never skippable**), strips the macOS quarantine attribute, and
+installs to `$HOME/.local/bin/clw`. See the
+[macOS quarantine note](#3-macos-quarantine-curl-path-only).
+
+### Windows — direct `.exe` download
+
+There is no Homebrew on Windows; download the `.exe` directly from the mirror release
+and verify it (see [§4d](#4d-windows--authenticode)):
+
+```powershell
+$ver = "<version>"
+$base = "https://github.com/humangr-labs/clw-releases/releases/download/v$ver"
+Invoke-WebRequest "$base/clw-$ver-x86_64-pc-windows-gnu.exe" -OutFile "clw.exe"
+Invoke-WebRequest "$base/SHA256SUMS"          -OutFile "SHA256SUMS"
+Invoke-WebRequest "$base/SHA256SUMS.minisig"  -OutFile "SHA256SUMS.minisig"
+Invoke-WebRequest "$base/minisign.pub"        -OutFile "minisign.pub"
+```
+
+Then install it on `PATH` per [§5 Windows](#windows-powershell-1).
+
+---
+
+## 2. Supported targets (the install matrix)
 
 | OS | Arch | Target triple | Asset name | Signing / verify |
 |----|------|---------------|------------|------------------|
-| macOS (Apple Silicon) | arm64 | `aarch64-apple-darwin` | `clw-<version>-aarch64-apple-darwin.zip` | Developer ID + notarized zip → `spctl` |
-| macOS (Intel) | x86_64 | `x86_64-apple-darwin` | `clw-<version>-x86_64-apple-darwin.zip` | Developer ID + notarized zip → `spctl` |
+| macOS (Apple Silicon) | arm64 | `aarch64-apple-darwin` | `clw-<version>-aarch64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
+| macOS (Intel) | x86_64 | `x86_64-apple-darwin` | `clw-<version>-x86_64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
 | Windows | x86_64 | `x86_64-pc-windows-gnu` | `clw-<version>-x86_64-pc-windows-gnu.exe` | Azure Trusted Signing (Authenticode) → `Get-AuthenticodeSignature` |
-| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `clw-<version>-x86_64-unknown-linux-gnu` | minisign detached sig → `minisign -V` |
-| Linux | arm64 | `aarch64-unknown-linux-gnu` | `clw-<version>-aarch64-unknown-linux-gnu` | minisign detached sig → `minisign -V` |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `clw-<version>-x86_64-unknown-linux-gnu` | minisign over `SHA256SUMS` |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` | `clw-<version>-aarch64-unknown-linux-gnu` | minisign over `SHA256SUMS` |
+
+All assets live at:
+
+```
+https://github.com/humangr-labs/clw-releases/releases/download/v<version>/<asset>
+```
 
 Notes:
 - The Windows and both Linux legs are **cross-compiled on the macOS build host** via
   `cargo-zigbuild`; the `aarch64-unknown-linux-gnu` leg is build-only on that host
   (it cannot be runtime-tested there). See `docs/DISTRIBUTION.md`.
-- macOS ships a **notarized `.zip`** (a bare Mach-O CLI cannot have a notarization
-  ticket stapled). Windows and Linux ship the bare binary plus a detached signature.
-- Every release also publishes a single **signed checksum manifest**: `SHA256SUMS`
-  and its minisign signature `SHA256SUMS.minisig`, covering all assets.
+- Every release publishes a single **signed checksum manifest** — `SHA256SUMS` and its
+  minisign signature `SHA256SUMS.minisig` — plus the trust-root key `minisign.pub`,
+  covering all assets. (A `gh attestation` provenance statement rides along too.)
+- The macOS and Linux binaries ship as bare binaries (no `.zip`); Homebrew is the
+  recommended way to get them on macOS/Linux.
 
 ---
 
-## 2. Authenticated download
+## 3. macOS quarantine (curl path only)
 
-The download surface is private. Obtain a **`CLW_INSTALL_TOKEN`** from the
-signup/dashboard flow (a narrowly-scoped, download-only token — `docs/DISTRIBUTION.md`
-decision (e)), then fetch the asset for your target plus its signature and the
-checksum manifest. Replace `<version>` and `<target>` from the matrix above:
+A binary fetched with `curl`/`wget`/a browser is tagged `com.apple.quarantine` by
+macOS, so Gatekeeper blocks it on first run. **A Homebrew *formula* install is not
+quarantined** — which is why `brew install humangr-labs/clw/clw` is the preferred
+macOS path and needs no extra step.
+
+The `curl` `install.sh` handles this for you: after verifying the download it runs
+`xattr -d com.apple.quarantine` on the binary. If you download a macOS binary manually
+(not via brew, not via `install.sh`), strip it yourself before running:
 
 ```sh
-export CLW_INSTALL_TOKEN=...   # from the dashboard / signup flow
-
-BASE="https://<authenticated-download-host>/releases/clw/<version>"
-ASSET="clw-<version>-<target>"          # add .zip for macOS, .exe for Windows
-
-# Download the artifact, its signature, and the signed checksum manifest:
-curl -fSL -H "Authorization: Bearer $CLW_INSTALL_TOKEN" -o "$ASSET"            "$BASE/$ASSET"
-curl -fSL -H "Authorization: Bearer $CLW_INSTALL_TOKEN" -o "SHA256SUMS"        "$BASE/SHA256SUMS"
-curl -fSL -H "Authorization: Bearer $CLW_INSTALL_TOKEN" -o "SHA256SUMS.minisig" "$BASE/SHA256SUMS.minisig"
-# Linux only also fetch the per-asset minisign signature:
-curl -fSL -H "Authorization: Bearer $CLW_INSTALL_TOKEN" -o "$ASSET.minisig"    "$BASE/$ASSET.minisig"
+xattr -d com.apple.quarantine ./clw 2>/dev/null || true
 ```
 
-> The concrete download host is filled in once the R2-behind-CoreLink route (server
-> dependency **D-12**) is provisioned; see `docs/go-live/LAUNCH-CHECKLIST.md` §A.
+(Full Developer-ID signing/notarization, which closes this gap for manual downloads
+too, is near-term — see `docs/DISTRIBUTION.md`.)
 
 ---
 
-## 3. Verify the download (per platform)
+## 4. Verify the download (per platform)
 
-Always verify **both** the platform signature **and** the checksum manifest.
+Homebrew already verifies the per-asset SHA-256 from the formula, and `install.sh`
+verifies automatically. For the **Windows** and any **manual** download, verify both
+the checksum manifest **and**, where applicable, the platform signature.
 
-### 3a. The minisign public key (Linux + the checksum manifest)
+### 4a. The minisign public key (trust root)
 
-The Linux signatures and the `SHA256SUMS` manifest are signed with **minisign**. The
-public key is published as `docs/minisign.pub` in the source tree and alongside every
-release on the download surface. Pin its fingerprint out of band:
+`SHA256SUMS` is signed with **minisign**. The public key is published as
+`docs/minisign.pub` in the source tree **and** alongside every release on the public
+mirror (`.../v<version>/minisign.pub`). Pin its fingerprint out of band:
 
 ```sh
 # Inspect the published key; compare its fingerprint to the one in this repo / README
@@ -80,12 +136,12 @@ cat minisign.pub
 ```
 
 > **Trust-root fingerprint:** _(filled in when the owner provisions the minisign key —
-> `docs/go-live/LAUNCH-CHECKLIST.md` §A and `docs/DISTRIBUTION.md` decision (d). Until
-> then `docs/minisign.pub` is not yet committed.)_ On key rotation, the old and new
-> public keys are dual-published for one release cycle; see
+> `docs/go-live/LAUNCH-CHECKLIST.md` §A and `docs/DISTRIBUTION.md`. Until then
+> `docs/minisign.pub` is not yet committed.)_ On key rotation, the old and new public
+> keys are dual-published for one release cycle; see
 > `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
 
-### 3b. Verify the signed checksum manifest (all platforms)
+### 4b. Verify the signed checksum manifest (all platforms)
 
 ```sh
 # 1. Verify the manifest signature against the published public key:
@@ -93,60 +149,68 @@ minisign -V -p minisign.pub -m SHA256SUMS
 
 # 2. Verify your asset's checksum is the one the signed manifest attests:
 #    (Linux: sha256sum; macOS: shasum -a 256)
-sha256sum --ignore-missing -c SHA256SUMS    # Linux
-shasum -a 256 -c SHA256SUMS                 # macOS (drop entries you didn't download)
+sha256sum --ignore-missing -c SHA256SUMS      # Linux
+shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
 ```
 
 A failure on either step means **do not run the binary** — treat it as a potential
 compromise and follow `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
 
-### 3c. macOS — notarization
+> Optional supply-chain check (any platform, needs the `gh` CLI): verify the build
+> provenance attestation published with the release:
+>
+> ```sh
+> gh attestation verify clw-<version>-<target> --repo humangr-labs/clw-releases
+> ```
+
+### 4c. macOS — Gatekeeper / signature
+
+Once Developer-ID signing is live you can assess the binary with Gatekeeper:
 
 ```sh
-unzip "clw-<version>-<target>.zip"
-# Gatekeeper assessment (online, first-run). 'accepted'/'Notarized Developer ID' = good:
-spctl -a -t open --context context:primary-signature -vv "clw-<version>-<target>"
-codesign --verify --deep --strict --verbose=2 "clw-<version>-<target>"
+spctl -a -t open --context context:primary-signature -vv ./clw   # 'accepted' when signed
+codesign --verify --deep --strict --verbose=2 ./clw
 ```
 
-### 3d. Windows — Authenticode
+Until then the macOS binaries are verified via minisign-over-`SHA256SUMS` (§4b); the
+brew path runs them unquarantined, and the `curl`/manual path strips quarantine (§3).
+
+### 4d. Windows — Authenticode
 
 ```powershell
 # 'Valid' status, signed via the Azure Trusted Signing certificate, is required:
-Get-AuthenticodeSignature .\clw-<version>-x86_64-pc-windows-gnu.exe | Format-List
+Get-AuthenticodeSignature .\clw.exe | Format-List
 ```
 
-### 3e. Linux — minisign detached signature
+Also verify the checksum manifest (PowerShell):
 
-```sh
-# Verify the binary itself against the published public key:
-minisign -V -p minisign.pub -m "clw-<version>-<target>"
+```powershell
+(Get-FileHash .\clw.exe -Algorithm SHA256).Hash.ToLower()
+# compare against the clw-<version>-x86_64-pc-windows-gnu.exe line in SHA256SUMS
 ```
 
 ---
 
-## 4. Install on `$PATH`
+## 5. Install on `$PATH` (manual / Windows)
 
-`clw` is a single self-contained binary. Put it on `$PATH` and make it executable.
+Homebrew and `install.sh` put `clw` on `PATH` for you. For a manual download:
 
 ### macOS / Linux
 
 ```sh
 chmod +x "clw-<version>-<target>"
-sudo install -m 0755 "clw-<version>-<target>" /usr/local/bin/clw
-# Or, no sudo (per-user) — ensure ~/.local/bin is on PATH:
-install -m 0755 "clw-<version>-<target>" "$HOME/.local/bin/clw"
+# macOS manual download only — strip quarantine first (see §3):
+xattr -d com.apple.quarantine "clw-<version>-<target>" 2>/dev/null || true
+install -m 0755 "clw-<version>-<target>" "$HOME/.local/bin/clw"   # no sudo
+# or system-wide: sudo install -m 0755 "clw-<version>-<target>" /usr/local/bin/clw
 ```
 
-Make the per-user dir persistent on `$PATH`, per shell:
+Make `~/.local/bin` persistent on `$PATH`, per shell:
 
 ```sh
-# bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-# zsh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-# fish
-fish_add_path "$HOME/.local/bin"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc    # zsh
+fish_add_path "$HOME/.local/bin"                           # fish
 ```
 
 Then restart the shell (or `source` the rc file).
@@ -156,7 +220,7 @@ Then restart the shell (or `source` the rc file).
 ```powershell
 $dest = "$env:LOCALAPPDATA\Programs\clw"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item .\clw-<version>-x86_64-pc-windows-gnu.exe "$dest\clw.exe"
+Copy-Item .\clw.exe "$dest\clw.exe"
 # Add to the per-user PATH (persists across sessions):
 [Environment]::SetEnvironmentVariable(
   "Path", [Environment]::GetEnvironmentVariable("Path","User") + ";$dest", "User")
@@ -179,59 +243,68 @@ clw auth login        # configure the tenant PAT (see docs/usage.md)
 
 ---
 
-## 5. Upgrade
+## 6. Upgrade, pin, and uninstall (Homebrew)
 
-Upgrading is "verify the new asset, then replace the binary in place" — there is no
-in-binary self-update. Repeat sections 2–3 for the new `<version>`, then overwrite the
-installed binary:
+### Upgrade
 
 ```sh
-# macOS / Linux
-sudo install -m 0755 "clw-<new-version>-<target>" /usr/local/bin/clw
-clw --version    # confirm the new version
+brew update
+brew upgrade clw
+clw --version
+```
+
+### Install / pin a specific version
+
+The tap publishes versioned formulae, so you can install or pin an exact version:
+
+```sh
+brew install humangr-labs/clw/clw@<version>   # e.g. clw@0.1.0
+# stop a future `brew upgrade` from moving it:
+brew pin clw                                   # `brew unpin clw` to allow upgrades again
+```
+
+To move from a pinned/old version to the latest:
+
+```sh
+brew unpin clw 2>/dev/null || true
+brew uninstall clw
+brew install humangr-labs/clw/clw
+```
+
+### Uninstall
+
+```sh
+brew uninstall clw
+```
+
+For the `curl`/manual install, remove the binary directly:
+
+```sh
+rm ~/.local/bin/clw        # or: sudo rm /usr/local/bin/clw
 ```
 
 ```powershell
-# Windows
-Copy-Item .\clw-<new-version>-x86_64-pc-windows-gnu.exe "$env:LOCALAPPDATA\Programs\clw\clw.exe" -Force
+Remove-Item "$env:LOCALAPPDATA\Programs\clw\clw.exe"   # Windows
 ```
 
-Your `~/.clw` config + PAT + cache are preserved across an upgrade.
+### Manual / non-brew upgrade
 
----
+Re-run `brew upgrade`, or for the `curl` path re-run `install.sh` with the new
+`CLW_VERSION` (it verifies and replaces the binary in place). There is no in-binary
+self-update.
 
-## 6. Uninstall
-
-`clw` removes its own local footprint, then tells you where the binary is so you can
-delete it (a running process cannot delete its own executable):
-
-```sh
-clw uninstall            # interactive; or --yes to skip the prompt, --dry-run to preview
-```
-
-This deletes the `~/.clw` directory (config + PAT + cache) and prints the binary path
-to remove manually. See `docs/usage.md` (`clw uninstall`) and the DPA's local-client-data
-clause (`docs/DPA-subprocessors.md` §9.3). Then remove the binary:
-
-```sh
-# macOS / Linux
-sudo rm /usr/local/bin/clw      # or: rm ~/.local/bin/clw
-```
-
-```powershell
-# Windows
-Remove-Item "$env:LOCALAPPDATA\Programs\clw\clw.exe"
-```
-
-To erase your **server-side** data (GDPR Art. 17 / LGPD Art. 18), run `clw erase`
-**before** uninstalling — uninstall removes only the local footprint, not stored
-Customer Data. See `docs/usage.md` (`clw erase`).
+> Removing the binary leaves your local `~/.clw` config + PAT + cache in place. To
+> clear the **local** footprint, run `clw uninstall` first (deletes `~/.clw`; see
+> `docs/usage.md` and the DPA local-client-data clause, `docs/DPA-subprocessors.md`
+> §9.3). To erase **server-side** data (GDPR Art. 17 / LGPD Art. 18), run `clw erase`
+> **before** uninstalling — uninstall removes only the local footprint, not stored
+> Customer Data.
 
 ---
 
 ## 7. Build from source (internal / development only)
 
-If you have authenticated access to the source tree you can build directly instead of
+If you have access to the (private) source tree you can build directly instead of
 downloading a signed artifact:
 
 ```sh
@@ -241,5 +314,5 @@ cargo build --release -p clw-cli
 
 The toolchain is pinned in `rust-toolchain.toml` (rustfmt + clippy components install
 automatically on first build). Source builds are **unsigned** and intended for
-development only — production installs should use the signed, verified release assets
-above. See the README "Building from source" section for details.
+development only — production installs should use Homebrew or the signed, verified
+release assets above. See the README "Building from source" section for details.
