@@ -97,15 +97,20 @@ fn skip_or_fail(reason: &str) {
 }
 
 /// A unique, per-run suffix that avoids key collisions between test invocations.
-/// Derived from `std::process::id()` XOR-folded with `SystemTime` nanos so it
-/// changes each run even within the same process.
+/// Concatenates `std::process::id()` (8 hex) with the FULL epoch nanos
+/// (`as_nanos()`, 16 hex) so it changes on every call — even for two tests
+/// running within the same wall-clock second in the same process.
+///
+/// Note: using `subsec_nanos()` here would be a bug — it wraps every second,
+/// so two tests crossing a second boundary at the same sub-second offset could
+/// produce identical suffixes and collide AC/CAS keys on the live server.
 fn run_suffix() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}{:08x}", pid, nanos)
+        .as_nanos() as u64;
+    format!("{pid:08x}{nanos:016x}")
 }
 
 /// True if `err` is the server-regression signal: the capability is LIVE but the
@@ -210,6 +215,36 @@ async fn ac_roundtrip() {
         fetched,
         Some(value),
         "ac get must return exactly the bytes that were put"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ac_missing
+// ---------------------------------------------------------------------------
+
+/// GET of an AC key that was never stored must return `Ok(None)` — directly,
+/// not merely as a post-delete side-effect. A server that returned `Some([])`
+/// (or any non-`None`) for an absent key would otherwise go undetected: the
+/// only other place `get → None` is asserted is after an explicit delete, which
+/// does not catch an "empty-but-present" absent-key response. The key is unique
+/// per run (`run_suffix`) so it cannot accidentally exist.
+#[tokio::test]
+async fn ac_missing() {
+    let Some((client, _tenant)) = try_client() else {
+        return;
+    };
+
+    let suffix = run_suffix();
+    let key_input = format!("clw/ref/v1/conformance-never-stored-{suffix}");
+    let key = Digest::of_bytes(key_input.as_bytes());
+
+    let fetched = AcTransport::get(&client, &key)
+        .await
+        .expect("ac get of a never-stored key should succeed");
+
+    assert_eq!(
+        fetched, None,
+        "ac get of a never-stored key must return None, got: {fetched:?}"
     );
 }
 
