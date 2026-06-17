@@ -68,6 +68,10 @@ does not exist.
   failure; when the wrapped command runs, its exit code (whatever it is, including a coincidental 2)
   passes through transparently. So `2` from clw means "clw-internal", and any other propagated code
   is the child's. **Confirmed, consistent with `clw-run-response §4`.**
+  > **SUPERSEDED (2026-06-17, #100):** the exit-`2` ambiguity flagged here was then resolved — `clw run`
+  > now exits the reserved **`125`** on a clw-internal failure where the child never ran (a child can
+  > legitimately return `2`, so `2` was not a safe discriminator). Authoritative: `docs/CLI-SURFACE-EXIT-FREEZE.md`
+  > + `docs/REPLY-runner-TL-cli-exit-freeze-2026-06-17.md`.
 
 ---
 
