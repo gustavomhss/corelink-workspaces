@@ -101,8 +101,11 @@ termination solely as set out in Section 9.
 by the EULA. Summarized for convenience and without modifying the EULA: the Client
 license is non-exclusive, non-transferable, and revocable, is limited to executable
 binary form for use with a valid Tenant, and does not permit public
-redistribution. The Client is distributed only through an authenticated download
-surface and not via any public repository or package registry.
+redistribution. The Client binary is made publicly available for download (for
+example through HumanGR's public Homebrew tap or its public release mirror). Public
+availability of the binary does not waive any restriction in the EULA, grant any
+license beyond it, or make the Client's source code public: the source code and
+internals of the Client remain proprietary and confidential.
 
 3.3 **No other rights.** All rights not expressly granted are reserved by HumanGR
 and its licensors. Nothing in these Terms transfers any ownership of, or
@@ -197,8 +200,8 @@ mandatory law expressly permits despite this restriction.
 
 6.2 **Redistribute or resell.** Redistribute, resell, sublicense, publish, host, or
 make available the Client or the Service (in whole or in part) to any third party,
-or circumvent the authenticated download surface or any signing, checksum, or
-integrity-verification mechanism.
+or circumvent any signing, checksum, or integrity-verification mechanism applied to
+the Client or its distribution.
 
 6.3 **Attack or abuse the Service.** Exceed published rate or quota limits other
 than via the Client's built-in adaptive backoff (which honors `Retry-After`);
