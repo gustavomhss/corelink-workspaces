@@ -461,11 +461,10 @@ Contracts for the International Sale of Goods.
 jurisdiction and venue of the courts of the Judicial District (Comarca) of São
 Paulo, State of São Paulo, Brazil, for any dispute arising out of or relating to
 these Terms. The parties do not agree to mandatory arbitration or a class-action
-waiver. Any arbitration agreement or class-action waiver
-inserted in this Section 14.2 applies only to Customers that are not consumers under
-applicable mandatory consumer-protection law; it does not apply to, and does not
-deprive any consumer of, any non-waivable forum, collective-redress, or remedy that
-such law confers (see Section 2.5).
+waiver; disputes are resolved in the courts named above. Nothing in these Terms
+deprives a consumer, under applicable mandatory consumer-protection law, of any
+non-waivable forum, collective-redress, or remedy that such law confers (see
+Section 2.5).
 
 ## 15. General
 

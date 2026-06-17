@@ -411,9 +411,9 @@ addresses, and request metadata for 90 days; and billing records for 5 years
 
 9.2. On termination or expiry of the Agreement, the Processor shall, at the
 Customer's choice, delete or return all Customer Personal Data and delete existing
-copies within 30 days (with a further export window of 30 days during which the
-Customer may retrieve its data, and deletion propagated to backups and replicas
-within 35 days), unless
+copies within 30 days of the end of a 30-day post-termination export window (during
+which the Customer may retrieve its data), with deletion propagated to backups and
+replicas within 35 days, unless
 Union or Member State law requires continued storage, in which case the Processor
 shall protect the data and Process it only as required by that law. Deletion of
 server-side Customer Data — including the "delete existing copies" obligation in
@@ -683,4 +683,4 @@ Agreement constitutes acceptance of this DPA.
 |---|---|
 | Name: Gustavo Schneiter | Name: ____________________ |
 | Title: Head of Engineering / CEO | Title: ____________________ |
-| Date: ____________________ | Date: ____________________ |
+| Date: June 14, 2026 | Date: ____________________ |
