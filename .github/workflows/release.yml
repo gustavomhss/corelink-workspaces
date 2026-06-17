@@ -220,7 +220,27 @@ jobs:
       # GREEN; with the PAT provisioned a red service FAILS this job and (via the
       # `needs:` edges) blocks build/sign/publish.
       - name: live conformance suite (clw-conformance --features live)
-        run: cargo test -p clw-conformance --features live
+        env:
+          # CRITICAL: the suite reads CLW_TOKEN/CLW_TENANT/CLW_ENDPOINT
+          # (clw-conformance/tests/live_conformance.rs::try_config), NOT the
+          # CLW_CI_* names. Map the CI service-identity secrets onto the names the
+          # suite actually reads — without this mapping every live case skips even
+          # when the PAT is provisioned, leaving the gate a permanent false-green.
+          CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+          CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
+          CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          # When the PAT is provisioned, REQUIRE every live case to actually run:
+          # CLW_CONFORMANCE_REQUIRE=1 turns a skip (missing cred OR a 405/501
+          # unavailable endpoint) into a hard failure, so a red/unreachable service
+          # blocks the tag. Absent the PAT, leave REQUIRE unset so the suite skips
+          # GREEN (the intentional dry-run on forks / before secrets exist).
+          if [ -n "${CLW_TOKEN:-}" ]; then
+            echo "PAT present — requiring live conformance (skip => hard fail)."
+            export CLW_CONFORMANCE_REQUIRE=1
+          fi
+          cargo test -p clw-conformance --features live
 
   # ---------------------------------------------------------------------------
   # STAGE 2 + 3 — BUILD MATRIX (+ SIGN folded into each leg)
@@ -313,8 +333,15 @@ jobs:
         if: matrix.cross
         shell: bash
         run: |
+          set -euo pipefail
+          # Resolve a pip: macOS ships python3 (pip3) but often no bare `pip`, so a
+          # plain `pip install` dies with command-not-found on a fresh runner.
+          if command -v pip >/dev/null 2>&1; then PIP=pip
+          elif command -v pip3 >/dev/null 2>&1; then PIP=pip3
+          elif command -v brew >/dev/null 2>&1; then brew install python >/dev/null && PIP=pip3
+          else echo "::error::no pip/pip3 and no brew on the release runner — install python3 to build the cross (zigbuild) legs"; exit 1; fi
           # Pinned for a reproducible cross toolchain (M2.2). Bump deliberately.
-          pip install "ziglang==0.16.0"
+          "$PIP" install "ziglang==0.16.0"
           cargo install --locked cargo-zigbuild --version 0.23.0
 
       - name: build release binary
@@ -570,6 +597,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Clean slate: this job runs on a PERSISTENT self-hosted Mac, so a prior
+      # tag's `artifacts/` and `release/` (stale binaries + an old SHA256SUMS /
+      # .minisig) survive between runs and would be re-checksummed and re-published
+      # under the new version. Remove them before the download repopulates.
+      - name: clean stale release workspace (persistent self-hosted runner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release artifacts
+
       # Downloads EVERY uploaded artifact (per-target binaries AND the M4.3
       # `clw-sbom` CycloneDX SBOM) — no `name:` filter, so the SBOM rides along.
       - name: download all signed artifacts + SBOM
@@ -585,6 +622,13 @@ jobs:
           # Flatten per-target artifact dirs (binaries, signatures, SBOM) into one
           # release/ dir so the SBOM is checksummed + published with the binaries.
           find artifacts -type f -exec cp {} release/ \;
+          # Ship the trust-root (minisign pubkey) + license notices WITH the
+          # binaries — and stage them HERE, before the checksum step, so they are
+          # covered by SHA256SUMS (previously copied in the publish step, after
+          # checksumming, so they shipped unverifiable).
+          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true
+          [ -f EULA.md ] && cp EULA.md release/ || true
+          [ -f NOTICE ] && cp NOTICE release/ || true
           ls -la release/
 
       # SHA-256 over every published binary + signature file, then SIGN the
@@ -620,6 +664,16 @@ jobs:
           rm -f ../minisign.key   # leave NO key material on the runner
           echo "---- SHA256SUMS.minisig ----"
           cat SHA256SUMS.minisig
+          # Verify the just-produced signature against the COMMITTED trust-root
+          # pubkey. Fails loudly if docs/minisign.pub does not correspond to the
+          # signing key — otherwise we would publish a trust root that rejects our
+          # own signatures. (cwd is release/, so the committed key is ../docs/.)
+          if [ -f ../docs/minisign.pub ]; then
+            minisign -V -p ../docs/minisign.pub -m SHA256SUMS
+            echo "SHA256SUMS verified against committed docs/minisign.pub"
+          else
+            echo "::warning::docs/minisign.pub absent — cannot verify the signature against the published trust root; commit the minisign public key alongside the secret."
+          fi
 
       # Publish to the authenticated proprietary surface. Default per the brief:
       # Cloudflare R2 behind a versioned prefix. The EXACT surface is an OWNER
@@ -642,15 +696,19 @@ jobs:
             ls -la release/
             exit 0
           fi
+          # The access key alone is not enough: fail early with a clear message if
+          # any of the other three R2 vars is missing, rather than letting
+          # `aws s3 cp` fail late with an empty --endpoint-url / s3:// target.
+          : "${R2_SECRET_ACCESS_KEY:?R2_ACCESS_KEY_ID is set but R2_SECRET_ACCESS_KEY is missing}"
+          : "${R2_ENDPOINT:?R2_ACCESS_KEY_ID is set but R2_ENDPOINT is missing}"
+          : "${R2_BUCKET:?R2_ACCESS_KEY_ID is set but R2_BUCKET is missing}"
           # Real upload to the R2 (S3-compatible) surface under a versioned prefix.
           # R2 creds map onto the standard AWS env the aws CLI reads.
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"   # R2 ignores region but the CLI requires one
-          # Ship the trust-root (minisign pubkey) + license notices with the binaries.
-          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true
-          [ -f EULA.md ] && cp EULA.md release/ || true
-          [ -f NOTICE ] && cp NOTICE release/ || true
+          # (trust-root + license notices were staged into release/ in the collect
+          # step, so they are covered by SHA256SUMS — not re-copied here.)
           # aws CLI on the self-hosted Mac (brew if absent; clear error otherwise).
           if ! command -v aws >/dev/null 2>&1; then
             if command -v brew >/dev/null 2>&1; then
