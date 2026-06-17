@@ -341,7 +341,8 @@ impl HttpClient {
         // On exhaustion, rewrite a final 429's context so the message
         // distinguishes a transient backpressure throttle from a plan/quota
         // ceiling, using the last raw Retry-After observed (M5.6).
-        let last_err = last_err.unwrap();
+        let last_err = last_err
+            .expect("exhausted retry loop with at least one attempt; last_err is always Some here");
         if let ClwError::Http { status: 429, .. } = &last_err {
             let retry_after = (last_retry_after_secs > 0).then_some(last_retry_after_secs);
             return Err(ClwError::Http {

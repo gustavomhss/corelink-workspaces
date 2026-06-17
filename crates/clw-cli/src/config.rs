@@ -323,7 +323,7 @@ fn warn_config_unreadable(path: &str, reason: &str) {
 
 /// The config keys clw actually understands. A readable file that parses to NONE
 /// of these (after stripping blank/comment lines) is "readable but unusable".
-const KNOWN_CONFIG_KEYS: [&str; 4] = ["endpoint", "tenant", "token", "cache_dir"];
+const KNOWN_CONFIG_KEYS: [&str; 5] = ["endpoint", "tenant", "token", "cache_dir", "ref_domain"];
 
 /// P4 predicate: decide whether a readable `config.toml` is MALFORMED — it has
 /// real (non-blank, non-comment) content yet [`parse_config_lines`] recovered NO

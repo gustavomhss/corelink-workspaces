@@ -79,8 +79,7 @@ fn redact_present(value: &str) -> &'static str {
     }
 }
 
-// All subcommand entry points are async to satisfy the uniform dispatch
-// signature; these handlers do no async work (auth is fully offline).
+// async to satisfy the uniform await-able subcommand dispatch signature (no async work here).
 #[allow(clippy::unused_async)]
 pub async fn run(args: AuthArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     match args.command {

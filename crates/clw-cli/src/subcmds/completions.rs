@@ -70,8 +70,7 @@ fn install_hint(shell: Shell) -> String {
     common.to_string()
 }
 
-// The handler does no async work; the `async` keeps it uniform with the other
-// dispatch arms.
+// async to satisfy the uniform await-able subcommand dispatch signature (no async work here).
 #[allow(clippy::unused_async)]
 pub async fn run(args: CompletionsArgs) -> Result<(), ClwError> {
     let mut stdout = std::io::stdout();

@@ -175,6 +175,7 @@ fn current_exe_display() -> String {
         .unwrap_or_else(|_| "the clw binary".to_string())
 }
 
+// async to satisfy the uniform await-able subcommand dispatch signature (no async work here).
 #[allow(clippy::unused_async)]
 pub async fn run(
     args: UninstallArgs,

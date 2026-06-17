@@ -75,6 +75,7 @@ pub async fn run(
 
     if json {
         let out = json!({
+            "name": args.name,
             "root": report.root.to_hex(),
             "files": report.files,
             "bytes_total": report.bytes_total,

@@ -21,7 +21,7 @@ pub struct InitArgs {
     pub force: bool,
 }
 
-// All subcommand entry points are async to satisfy a uniform dispatch signature.
+// async to satisfy the uniform await-able subcommand dispatch signature (no async work here).
 #[allow(clippy::unused_async)]
 pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
