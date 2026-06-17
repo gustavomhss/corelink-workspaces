@@ -45,9 +45,13 @@ clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole clien
   dispatcher re-mints per D-9). Exit code is non-zero; config/usage/transport/auth errors exit `2`.
 - **`clw run` is exit-code-transparent** (load-bearing for a CI runner): it **propagates the wrapped
   command's exit code** (`std::process::exit(child_code)`), with a signal-killed child mapped to
-  `128 + signal` (POSIX; SIGTERM → 143), never -1/255. So `2` always means *clw itself* errored; any
-  other non-zero code is the *job's own* result, flowing through faithfully. A non-zero run is **not**
-  memoized — a failing job never poisons the cache.
+  `128 + signal` (POSIX; SIGTERM → 143), never -1/255. A **clw-internal failure where the child never
+  ran** (config / transport / hydrate / cache error) exits the **reserved code `125`** (the
+  docker / `env` / `timeout` "wrapper itself failed" convention) — distinct from any child passthrough —
+  so a runner classifies `125 → clw-failed`, any other code → the child's own result. (A clap *usage*
+  error on `clw run` — malformed args, child never ran — exits `2` per clap; the runner builds the argv,
+  so that is not expected in practice.) A non-zero run is **not** memoized — a failing job never poisons
+  the cache. **Full frozen surface + exit table: `docs/CLI-SURFACE-EXIT-FREEZE.md`.**
 
 ## JSON output
 The family-relevant verbs support `--json` for machine parsing (content-address root, cache

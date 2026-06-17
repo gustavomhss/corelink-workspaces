@@ -72,6 +72,13 @@ pub struct RunArgs {
 const JSON_NOT_APPLICABLE_HINT: &str =
     "[clw] note: --json does not apply to `run` (it proxies the child's stdout/stderr); ignoring it";
 
+/// Reserved exit code for a `clw run` clw-INTERNAL failure where the **child never
+/// ran** (substrate unreachable, bad config, hydrate/cache error). Distinct from the
+/// child's passed-through exit code so a caller (e.g. the CoreLink runner) can tell a
+/// clw failure from a child result, and never caches it. 125 is the docker / `env` /
+/// `timeout` "the wrapper itself failed" convention. FROZEN — see docs/CLI-CONTRACT.md.
+const CLW_RUN_INTERNAL_NOT_RUN: i32 = 125;
+
 pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // P6: `run` has no JSON form — it proxies the child's stdout/stderr verbatim,
     // so a global `--json` would be silently ignored. Emit a one-line stderr hint
@@ -80,16 +87,34 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
         eprintln!("{JSON_NOT_APPLICABLE_HINT}");
     }
 
-    let client = HttpClient::new(cfg.clw_config)?;
-    let cwd = std::env::current_dir()?;
-
     let opts = RunOptions {
         inputs: args.input,
         command: args.cmd,
         env_keys: args.env,
     };
 
-    let outcome = run_memoized(&cwd, &client, &opts).await?;
+    // EXIT-CODE CONTRACT (frozen — see docs/CLI-CONTRACT.md "exit-code convention"):
+    // `clw run` either runs the child (and passes the child's exit code through
+    // verbatim below) OR fails BEFORE the child ever runs — substrate unreachable,
+    // bad config, hydrate/cache error. That latter case is a clw-INTERNAL failure:
+    // the child never executed, so its result must NOT be mistaken for a child exit
+    // code and must NOT be cached. Signal it with the RESERVED exit code 125 — the
+    // docker / `env` / `timeout` "the wrapper itself failed" convention — which is
+    // distinct from the child passthrough. (A child SHOULD avoid emitting 125-127.)
+    let outcome = match async move {
+        let client = HttpClient::new(cfg.clw_config)?;
+        let cwd = std::env::current_dir()?;
+        run_memoized(&cwd, &client, &opts).await
+    }
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // clw-internal: child NOT run. Reserved code, NOT a child exit, NOT cached.
+            eprintln!("[clw] internal error — child not run: {e}");
+            std::process::exit(CLW_RUN_INTERNAL_NOT_RUN);
+        }
+    };
 
     if outcome.hit {
         eprintln!("[clw] cache hit");
@@ -144,6 +169,17 @@ mod tests {
         assert!(
             long.contains("DO NOT APPLY") || long.contains("do not apply"),
             "run --help must state they don't apply, got:\n{long}"
+        );
+    }
+
+    // CONTRACT TRIPWIRE: the CoreLink runner classifies a `clw run` exit of 125 as a
+    // clw-internal failure (child never ran) and never caches it — see
+    // docs/CLI-SURFACE-EXIT-FREEZE.md. Pin the value so it cannot drift silently.
+    #[test]
+    fn clw_run_internal_not_run_code_is_frozen_at_125() {
+        assert_eq!(
+            CLW_RUN_INTERNAL_NOT_RUN, 125,
+            "the runner contract pins clw-internal (child-not-run) at exit 125"
         );
     }
 }
