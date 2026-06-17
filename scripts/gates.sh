@@ -63,6 +63,16 @@ if [ "$SCOPE" = "full" ]; then
   cargo deny check
   if command -v cargo-audit >/dev/null 2>&1; then
     cargo audit
+  elif [ "${CI:-}" = "true" ]; then
+    # CI is the AUTHORITATIVE supply-chain gate: a missing cargo-audit here is a HARD
+    # FAILURE, never a silent skip — otherwise an advisory could ship unchecked. Try to
+    # provision it; if that fails, fail loudly with an ::error:: rather than skip.
+    echo "cargo-audit not installed in CI — installing (the advisory gate is mandatory here)"
+    if ! cargo install cargo-audit --locked; then
+      echo "::error::cargo-audit is unavailable in CI and could not be installed — refusing to skip the supply-chain advisory gate"
+      exit 1
+    fi
+    cargo audit
   else
     echo "cargo-audit not installed — CI provisions it; skipping locally"
   fi
