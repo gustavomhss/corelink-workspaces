@@ -51,13 +51,20 @@ fn try_client() -> Option<(HttpClient, String)> {
 /// when `CLW_TOKEN` or `CLW_TENANT` is absent. Used by tests that need the raw
 /// endpoint / token in addition to (or instead of) a built `HttpClient`.
 fn try_config() -> Option<Config> {
-    let token = std::env::var("CLW_TOKEN").ok();
-    let tenant = std::env::var("CLW_TENANT").ok();
+    // An ABSENT secret in CI surfaces as an env var set to the EMPTY STRING (not
+    // unset), so `var().ok()` returns `Some("")` — treat empty as absent. Otherwise
+    // the dry-run (no PAT provisioned) would take the credentials-present branch with
+    // an empty endpoint and panic in `HttpClient::new` ("refusing to send PAT over
+    // plaintext") instead of skipping the live cases. Empty == not provided.
+    let token = std::env::var("CLW_TOKEN").ok().filter(|s| !s.is_empty());
+    let tenant = std::env::var("CLW_TENANT").ok().filter(|s| !s.is_empty());
 
     match (token, tenant) {
         (Some(t), Some(tn)) => {
             let endpoint = std::env::var("CLW_ENDPOINT")
-                .unwrap_or_else(|_| "https://corelink-api.humangr.com".to_string());
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://corelink-api.humangr.com".to_string());
             Some(Config {
                 endpoint,
                 tenant: tn,
