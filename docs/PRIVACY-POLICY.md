@@ -177,32 +177,33 @@ your documented instructions under the Data Processing Agreement.
 
 ## 6. Data residency, storage location, and international transfers
 
-**Regional data residency.** Customer Content is stored in one of the regions we make
-available for your tenant. We do not move stored Customer Content out of the region in
-which it is stored except as necessary to provide the Service you requested or as you
-instruct.
+**Regional data residency.** At launch, Customer Content is stored **only in the United
+States** (Cloudflare's `enam` region). We do not move stored Customer Content out of that
+region except as necessary to provide the Service you requested or as you instruct.
 
-Customer-selectable region routing is being rolled out (a roadmap item tracked as M7.1 in
-`docs/ROADMAP-go-live.md`, consistent with `docs/DPA-subprocessors.md` §11). **Until that
-routing is live and verified end to end, the region(s) in which Customer Content is
-actually stored are those listed below, and a region you may indicate at sign-up does not
-yet, by itself, guarantee residency in that region.** The regions in which Customer
+Customer-selectable region routing is a roadmap item (tracked as M7.1 in
+`docs/ROADMAP-go-live.md`, consistent with `docs/DPA-subprocessors.md` §11) and is **not yet
+available**. **At launch there is no region selection: the US (`enam`) is the only region
+served, and a sign-up that resolves to any other region (including an EEA/UK location) is
+refused at provisioning rather than stored elsewhere.** The regions in which Customer
 Content is stored today, and the region(s) we make available, are:
 
-- **Today.** All Customer Content is stored in Cloudflare's **"enam" (Eastern North
-  America)** region. This is currently the only region in which Customer Content is
-  stored, regardless of any region you may indicate at sign-up.
-- **Customer-selectable regions (roadmap M7.1).** Customer-selectable regional
-  residency is being rolled out and is **not yet live**. Until it ships and is verified
-  end to end, indicating a region does not guarantee residency in that region. **EEA/UK
-  data *residency* is not available today** — all Customer Content is stored in `enam`
-  (US). EEA/UK data subjects **may** access the Service during the open beta, but an
-  EU/UK Article 27 representative has not yet been appointed — a known, time-limited
-  compliance gap (see the EU/UK representative note in §15 and the DPA).
+- **Today — United States only.** All Customer Content is stored in the **United States**, in
+  Cloudflare's **"enam" (Eastern North America)** region (CF colo `iad`). This is the **only**
+  region available at launch.
+- **Other regions (roadmap M7.1) — not yet served, fail-closed.** No serving infrastructure is
+  deployed outside the US region at launch. A sign-up whose region resolves to a region we do not
+  yet serve (currently every region except US `enam` — e.g. an EEA/UK location) is **refused at
+  provisioning** rather than silently stored in the US; the Service does **not** provision EEA/UK
+  tenants today. **EEA/UK in-region data residency is not available**, and an EU/UK Article 27
+  representative has not yet been appointed — a known, time-limited compliance gap (see the EU/UK
+  representative note in §15 and the DPA). Customer-selectable regional residency (roadmap M7.1)
+  will change this once it ships and is verified end to end.
 
 If you have a contractual or regulatory residency requirement (for example, EEA or UK
 residency under the GDPR), contact us at the address in §15 to confirm that the required
-region is available **before** you rely on residency for compliance purposes.
+region is available **before** you rely on residency for compliance purposes. **At launch only
+the US (`enam`) region is available; no EEA/UK in-region residency is offered.**
 
 **Sub-processors.** We use the third-party infrastructure and service providers listed
 in `docs/DPA-subprocessors.md`, namely:
@@ -242,10 +243,10 @@ These Chapter V safeguards apply to **both** categories of data: processor-side 
 Content** (covered by the Data Processing Agreement) and controller-side **Account &
 Operational Data** for which HumanGR is the controller (for example, billing identity,
 support correspondence, and request metadata including source IP, where these are handled
-by a provider located outside your jurisdiction). Because today Customer Content is stored
-in the region(s) identified above rather than necessarily in a region you select, EEA/UK
-Customer Content may currently be stored or processed outside the EEA/UK; where that is
-the case, the transfer safeguards in this paragraph apply. The sub-processor list above
+by a provider located outside your jurisdiction). Because Customer Content is stored **only
+in the United States** (`enam`) at launch, EEA/UK Customer Content **is** stored and
+processed outside the EEA/UK; the transfer safeguards in this paragraph (the Standard
+Contractual Clauses) apply. The sub-processor list above
 (once completed) identifies which providers receive controller-side personal data and the
 corresponding transfer mechanism.
 

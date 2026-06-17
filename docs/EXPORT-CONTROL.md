@@ -33,7 +33,7 @@ and Apple Silicon), Windows, and Linux (which the Company intends to code-sign a
 notarize), and because the Service is a multi-tenant hosted offering,
 export-control and sanctions law can be implicated by (a) the
 geographic location from which you download or use the Software, (b) the
-geographic location of the CoreLink data-residency region you select, (c) your
+geographic location of the CoreLink data-residency region (currently the United States; customer selection is not yet available), (c) your
 nationality or that of your personnel, and (d) the parties with whom and
 end-uses for which you use the Software or Service.
 
@@ -223,8 +223,8 @@ to re-assessment as the Company's target markets change.
 The Company may screen tenants, account registrations, and the download surface
 against applicable sanctions and restricted-party lists and may refuse, suspend,
 or terminate access where screening or other information indicates a violation or
-material risk of a violation of this Notice or applicable law. Where the Service
-honors a customer-selected data-residency region, the Company may also treat that
+material risk of a violation of this Notice or applicable law. If and when the Service
+offers a customer-selected data-residency region (roadmap M7.1), the Company may treat that
 selection as a screening signal. The current state of automated destination,
 denied-party, and residency-region screening at the download and registration
 surface is as follows: during the Company's incubation phase, automated

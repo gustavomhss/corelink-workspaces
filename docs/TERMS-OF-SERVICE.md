@@ -153,10 +153,10 @@ to provide, secure, maintain, and support the Service, and as further described 
 the Privacy Policy and DPA. HumanGR does not acquire any ownership of your Customer
 Data.
 
-5.4 **Data residency.** Customer Data is currently stored in the "enam" (Eastern
-North America) region via our infrastructure sub-processor, Cloudflare, Inc.
-Customer-selectable regional residency is on our roadmap (M7.1) but is not yet
-available, and an indicated region does not yet guarantee residency. Regional
+5.4 **Data residency.** At launch, Customer Data is stored **only in the United States**
+(the "enam" / Eastern North America region) via our infrastructure sub-processor,
+Cloudflare, Inc. Customer-selectable regional residency is on our roadmap (M7.1) but is
+not yet available; there is no region selection at launch and no EEA/UK in-region option. Regional
 residency, sub-processors, and the technical and organizational measures applicable
 to your Customer Data are described in the Privacy Policy and the DPA
 (`docs/DPA-subprocessors.md`).

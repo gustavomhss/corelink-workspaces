@@ -255,8 +255,9 @@ server-internal and never set by `clw`.
 fetch; manifests are canonical-JSON, Merkle-style. The client treats all
 server-returned manifests and chunks as untrusted and re-verifies them.
 
-(f) **Data residency.** Customer Data is stored in a Customer-selected region; see
-§11.
+(f) **Data residency.** At launch, Customer Data is stored in the **United States**
+(Cloudflare `enam`); customer-selectable regional residency is not yet available
+(roadmap M7.1). See §11.
 
 (g) **Access control, logging & monitoring.** Server-side access controls, audit
 logging, monitoring, and the personnel and operational controls comprising
@@ -471,9 +472,11 @@ Processor shall update §10 if the mechanism materially changes.
 
 ## 11. International data transfers
 
-11.1. **Residency.** Customer Data is stored in a Customer-selected region. Where
-the selected region keeps Customer Personal Data within the EEA or the UK as
-applicable, no transfer mechanism under this §11 is required for storage.
+11.1. **Residency.** At launch, Customer Data is stored in the **United States**
+(Cloudflare `enam`); customer-selectable regional residency is not yet available
+(roadmap M7.1), and there is **no EEA/UK in-region storage option**. Accordingly,
+storage of EEA/UK/Swiss Personal Data involves a transfer to the United States, for
+which the transfer mechanism in §11.2 (the Standard Contractual Clauses) applies.
 
 11.2. **Transfer mechanism.** To the extent the Processing involves a transfer of
 Customer Personal Data from the EEA, the UK, or Switzerland to a country not
@@ -568,8 +571,8 @@ Data:
 
 | Sub-Processor | Service provided | Data Processed | Location / residency |
 |---|---|---|---|
-| **Cloudflare, Inc. — R2** | Object storage backing the content-addressed store (CAS) — stores uploaded file **contents** (chunks) and manifests | File contents; file paths (within manifests) | Cloudflare global edge; currently configured to the **"enam"** (Eastern North America) region. Customer-selectable regional residency is on the roadmap (M7.1); an indicated region does **not** yet guarantee data residency |
-| **Cloudflare, Inc. — Durable Objects** | Coordination and per-tenant write-path control for the CoreLink API | Tenant-scoped coordination metadata; mediates CAS writes | Cloudflare network; currently configured to the **"enam"** region. As with R2, customer-selectable residency is roadmap M7.1 and an indicated region does not yet guarantee residency |
+| **Cloudflare, Inc. — R2** | Object storage backing the content-addressed store (CAS) — stores uploaded file **contents** (chunks) and manifests | File contents; file paths (within manifests) | Cloudflare global edge; configured to the **"enam"** (Eastern North America) region — the **only** region served at launch (United States). Customer-selectable regional residency is roadmap M7.1 and **not yet available**; there is no EEA/UK in-region option |
+| **Cloudflare, Inc. — Durable Objects** | Coordination and per-tenant write-path control for the CoreLink API | Tenant-scoped coordination metadata; mediates CAS writes | Cloudflare network; configured to the **"enam"** region (United States) — the only region served at launch. As with R2, customer-selectable residency is roadmap M7.1 and **not yet available** |
 | Payment processor | — | — | none — no payment sub-processor at v1 (billing not yet live) |
 | Billing / CRM / account-portal provider | — | — | none at v1 |
 | Transactional-email / notification provider | — | — | none — v1 ships no email backend; the §6.4 change-notice and §12 breach-notice are delivered via a published sub-processor page plus in-product / account-admin notice |
