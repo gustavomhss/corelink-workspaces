@@ -69,6 +69,12 @@ jobs:
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # rc-vs-real classification — computed ONCE here so downstream jobs never
+      # re-parse the tag (a loose re-parse keying on `-rc.` with the dot would
+      # mis-class `v0.1.0-rc6` as a real release). `prerelease` is the string
+      # "true" for ANY tag whose core carries an `-rc` suffix (rc.N or rcN),
+      # "false" for a real `vX.Y.Z`. The publish job consumes this verbatim.
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,6 +141,16 @@ jobs:
           fi
           # Strip the leading 'v' for downstream artifact naming.
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # Classify rc-vs-real ONCE, here, off the SAME validated tag (the regex
+          # above already accepted only `-rc.N` / `-rcN`). Any tag whose core
+          # carries an `-rc` suffix is a PRERELEASE; a bare vX.Y.Z is a real
+          # release. The publish job reuses this output verbatim — it never
+          # re-parses the tag (see preflight.outputs.prerelease).
+          if printf '%s' "$TAG" | grep -Eq -- '-rc\.?[0-9]+$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # The git tag must equal the workspace Cargo version — prevents shipping a
       # binary whose --version disagrees with the release tag.
@@ -648,9 +664,14 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # STAGE 4 — CHECKSUM + PUBLISH
-  # Collect every signed artifact, produce one signed SHA256SUMS, then publish to
-  # the AUTHENTICATED proprietary download surface (NOT a public GitHub Release).
+  # STAGE 4 — CHECKSUM + PUBLISH (REWORKED — public mirror + brew, WP-B/WP-C)
+  # Collect every signed artifact, produce one signed SHA256SUMS, then publish a
+  # PUBLIC GitHub Release on the dedicated mirror repo `humangr-labs/clw-releases`
+  # (the source repo `corelink-workspaces` is PRIVATE, so its own Release assets
+  # are not public — see DISTRIBUTION-REWORK-PLAN §8 B1). After a real upload,
+  # add SLSA build-provenance attestation, then bump the Homebrew formula in
+  # `humangr-labs/homebrew-clw` (real tags only). minisign stays the offline
+  # signature-of-record; attestation is the added provenance layer.
   # ---------------------------------------------------------------------------
   publish:
     name: checksum + publish
@@ -659,8 +680,20 @@ jobs:
     needs: [preflight, conformance, build, sbom]
     runs-on: [self-hosted, macOS]
     timeout-minutes: 20
+    # Provenance attestation needs to mint an OIDC token + write the attestation.
+    # `contents: write` is harmless here (the public Release is created on the
+    # MIRROR repo via a cross-repo token, not this repo's GITHUB_TOKEN) but is
+    # kept for the local attestation store. Least-privilege: nothing broader.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
+      # rc-vs-real, classified ONCE in preflight (never re-parsed here). "true"
+      # for an `-rc` tag (=> --prerelease + NO formula bump), "false" for a real
+      # vX.Y.Z (=> latest release + formula bump).
+      PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
 
@@ -742,49 +775,191 @@ jobs:
             echo "::warning::docs/minisign.pub absent — cannot verify the signature against the published trust root; commit the minisign public key alongside the secret."
           fi
 
-      # Publish to the authenticated proprietary surface. Default per the brief:
-      # Cloudflare R2 behind a versioned prefix. The EXACT surface is an OWNER
-      # DECISION — see docs/DISTRIBUTION.md decision (a). The step is guarded so
-      # the whole pipeline is dry-runnable without credentials.
-      - name: publish to authenticated download surface
+      # =======================================================================
+      # PUBLISH — create a PUBLIC GitHub Release on the MIRROR repo
+      # `humangr-labs/clw-releases`, uploading ALL of release/* as assets.
+      #
+      # WHY a cross-repo token: the source repo here is PRIVATE, so its own
+      # Release assets are not public. The default GITHUB_TOKEN is scoped to THIS
+      # repo and cannot write a Release on another repo — so we authenticate `gh`
+      # with a dedicated, repo-bound CLW_RELEASES_TOKEN (deploy key / fine-grained
+      # PAT scoped to clw-releases, contents:write).
+      #
+      # SECRET-GATED (mirrors the old R2 step's no-op): absent CLW_RELEASES_TOKEN
+      # => SKIP with a ::warning:: + an `ls release/` (dry-run, green). The rc
+      # dry-run therefore stays green until the owner provisions the token.
+      #
+      # rc-vs-real: a prerelease tag (PRERELEASE=="true", classified once in
+      # preflight) passes `--prerelease`; a real vX.Y.Z is published as latest.
+      # =======================================================================
+      - name: publish GitHub Release on the public mirror (humangr-labs/clw-releases)
+        id: mirror_release
         shell: bash
         env:
-          # TODO(OWNER): pick the surface (DISTRIBUTION.md (a)) and provision creds.
-          # Default = Cloudflare R2 (S3-compatible) behind CoreLink auth.
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          # TODO(OWNER): provision CLW_RELEASES_TOKEN — a deploy key / fine-grained
+          # PAT scoped to ONLY humangr-labs/clw-releases, contents:write. The
+          # default GITHUB_TOKEN cannot cross repos (confirmed, plan §8 B1).
+          GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${R2_ACCESS_KEY_ID:-}" ]; then
-            echo "::warning::download-surface credentials absent — SKIPPING publish (dry-run)."
-            echo "would publish release/ -> ${R2_BUCKET:-<bucket>}/releases/clw/${VERSION}/"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING public mirror Release (dry-run)."
+            echo "would create release v${VERSION} on humangr-labs/clw-releases (prerelease=${PRERELEASE}) with:"
             ls -la release/
+            echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # The access key alone is not enough: fail early with a clear message if
-          # any of the other three R2 vars is missing, rather than letting
-          # `aws s3 cp` fail late with an empty --endpoint-url / s3:// target.
-          : "${R2_SECRET_ACCESS_KEY:?R2_ACCESS_KEY_ID is set but R2_SECRET_ACCESS_KEY is missing}"
-          : "${R2_ENDPOINT:?R2_ACCESS_KEY_ID is set but R2_ENDPOINT is missing}"
-          : "${R2_BUCKET:?R2_ACCESS_KEY_ID is set but R2_BUCKET is missing}"
-          # Real upload to the R2 (S3-compatible) surface under a versioned prefix.
-          # R2 creds map onto the standard AWS env the aws CLI reads.
-          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-          export AWS_DEFAULT_REGION="auto"   # R2 ignores region but the CLI requires one
-          # (trust-root + license notices were staged into release/ in the collect
-          # step, so they are covered by SHA256SUMS — not re-copied here.)
-          # aws CLI on the self-hosted Mac (brew if absent; clear error otherwise).
-          if ! command -v aws >/dev/null 2>&1; then
-            if command -v brew >/dev/null 2>&1; then
-              brew install awscli
-            else
-              echo "::error::aws CLI not found and brew unavailable — install awscli on the release runner"
-              exit 1
-            fi
+          # rc => --prerelease (do NOT mark latest); real vX.Y.Z => latest.
+          PRERELEASE_FLAG=""
+          if [ "${PRERELEASE}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "rc tag — creating a PRERELEASE on the mirror (no formula bump)."
+          else
+            PRERELEASE_FLAG="--latest"
+            echo "real tag — creating a latest Release on the mirror (formula bump follows)."
           fi
-          aws s3 cp release/ "s3://${R2_BUCKET}/releases/clw/${VERSION}/" \
-            --recursive --endpoint-url "${R2_ENDPOINT}"
-          echo "published release/ -> ${R2_BUCKET}/releases/clw/${VERSION}/"
+          # Create the cross-repo Release and upload every assembled asset. If the
+          # release already exists (a re-run of the same tag), upload --clobber
+          # rather than fail — the tag is immutable but a re-run must be idempotent.
+          if gh release view "v${VERSION}" --repo humangr-labs/clw-releases >/dev/null 2>&1; then
+            echo "release v${VERSION} already exists on the mirror — uploading assets with --clobber."
+            gh release upload "v${VERSION}" release/* --repo humangr-labs/clw-releases --clobber
+          else
+            gh release create "v${VERSION}" release/* \
+              --repo humangr-labs/clw-releases \
+              --title "clw v${VERSION}" \
+              --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed." \
+              ${PRERELEASE_FLAG}
+          fi
+          echo "published release/ -> humangr-labs/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      # =======================================================================
+      # SLSA PROVENANCE — build-provenance attestation for the release binaries.
+      # Added provenance layer ON TOP OF minisign (which stays the offline
+      # signature-of-record). Runs ONLY after a real successful upload
+      # (mirror_release.outputs.published == 'true'); in the dry-run the upload
+      # step set published=false, so the `if:` guard makes this a clean no-op.
+      # Uses actions/attest-build-provenance (mints provenance via the OIDC token
+      # granted by `id-token: write` + `attestations: write` above).
+      # =======================================================================
+      - name: SLSA build-provenance attestation (real uploads only)
+        if: steps.mirror_release.outputs.published == 'true'
+        uses: actions/attest-build-provenance@v1
+        with:
+          # Attest the binaries (the artifacts a consumer runs). SHA256SUMS +
+          # .minisig already give offline integrity; provenance binds these
+          # subjects to this build.
+          subject-path: |
+            release/clw-${{ env.VERSION }}-*
+
+      # =======================================================================
+      # HOMEBREW FORMULA BUMP — REAL tags only (PRERELEASE=="false") AND only when
+      # HOMEBREW_TAP_TOKEN is present. Checks out humangr-labs/homebrew-clw, bumps
+      # `version` + each of the 4 brew platforms' url+sha256 (aarch64/x86_64 ×
+      # darwin/linux; Windows is not brew), then commits + pushes to the tap.
+      #
+      # sha256 SINGLE SOURCE OF TRUTH: parsed from the published SHA256SUMS — never
+      # recomputed (recompute => drift => a formula that rejects the binary, R4).
+      #
+      # SECRET-GATED + rc-gated: absent HOMEBREW_TAP_TOKEN OR a prerelease tag =>
+      # SKIP with a note (clean green). Runs only after the mirror Release
+      # actually published (so the formula never points at missing binaries, R5).
+      # =======================================================================
+      - name: bump Homebrew formula in the tap (real tags only)
+        if: steps.mirror_release.outputs.published == 'true' && needs.preflight.outputs.prerelease == 'false'
+        shell: bash
+        env:
+          # TODO(OWNER): provision HOMEBREW_TAP_TOKEN — deploy key / fine-grained
+          # PAT scoped to ONLY humangr-labs/homebrew-clw, contents:write (R3).
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN absent — SKIPPING Homebrew formula bump (dry-run)."
+            echo "would bump humangr-labs/homebrew-clw Formula/clw.rb to version ${VERSION} with url+sha256 from release/SHA256SUMS:"
+            grep -E "clw-${VERSION}-(aarch64|x86_64)-(apple-darwin|unknown-linux-gnu)$" release/SHA256SUMS || true
+            exit 0
+          fi
+          # Parse the sha256 for one asset out of the published SHA256SUMS (the
+          # single source of truth). SHA256SUMS lines are `<hex>  <filename>`.
+          sha_for() {
+            local asset="$1"
+            local line
+            line="$(grep -E "  ${asset}\$" release/SHA256SUMS || true)"
+            if [ -z "$line" ]; then
+              echo "::error::no SHA256SUMS entry for ${asset} — cannot bump formula" >&2
+              return 1
+            fi
+            printf '%s' "$line" | awk '{print $1}'
+          }
+          BASE_URL="https://github.com/humangr-labs/clw-releases/releases/download/v${VERSION}"
+          # The 4 brew platforms (Windows is NOT brew — excluded).
+          A_DARWIN="clw-${VERSION}-aarch64-apple-darwin"
+          X_DARWIN="clw-${VERSION}-x86_64-apple-darwin"
+          A_LINUX="clw-${VERSION}-aarch64-unknown-linux-gnu"
+          X_LINUX="clw-${VERSION}-x86_64-unknown-linux-gnu"
+          SHA_A_DARWIN="$(sha_for "$A_DARWIN")"
+          SHA_X_DARWIN="$(sha_for "$X_DARWIN")"
+          SHA_A_LINUX="$(sha_for "$A_LINUX")"
+          SHA_X_LINUX="$(sha_for "$X_LINUX")"
+
+          # Check out the tap with the scoped token and regenerate Formula/clw.rb.
+          TAP_DIR="$RUNNER_TEMP/homebrew-clw"
+          rm -rf "$TAP_DIR"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/humangr-labs/homebrew-clw.git" "$TAP_DIR"
+          mkdir -p "$TAP_DIR/Formula"
+          cat > "$TAP_DIR/Formula/clw.rb" <<EOF
+          # clw — CoreLink workspaces CLI. PROPRIETARY: the EULA governs use; the
+          # binary is publicly downloadable but the source is closed. This formula
+          # is AUTO-GENERATED by the release pipeline — do not hand-edit.
+          class Clw < Formula
+            desc "CoreLink workspaces CLI"
+            homepage "https://github.com/humangr-labs/clw-releases"
+            version "${VERSION}"
+            # Closed-source: brew has no SPDX expression for this. tap CI gates on
+            # \`brew style\` only (NOT \`brew audit --strict\`, which rejects this).
+            license :cannot_represent
+
+            on_macos do
+              on_arm do
+                url "${BASE_URL}/${A_DARWIN}"
+                sha256 "${SHA_A_DARWIN}"
+              end
+              on_intel do
+                url "${BASE_URL}/${X_DARWIN}"
+                sha256 "${SHA_X_DARWIN}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE_URL}/${A_LINUX}"
+                sha256 "${SHA_A_LINUX}"
+              end
+              on_intel do
+                url "${BASE_URL}/${X_LINUX}"
+                sha256 "${SHA_X_LINUX}"
+              end
+            end
+
+            def install
+              bin.install Dir["clw-*"].first => "clw"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/clw --version")
+            end
+          end
+          EOF
+          cd "$TAP_DIR"
+          git config user.name "clw-release-bot"
+          git config user.email "release-bot@humangr.com"
+          if git diff --quiet -- Formula/clw.rb; then
+            echo "Formula/clw.rb already at version ${VERSION} — nothing to bump."
+            exit 0
+          fi
+          git add Formula/clw.rb
+          git commit -m "clw ${VERSION} (auto-bump from clw-releases v${VERSION})"
+          git push origin HEAD
+          echo "bumped humangr-labs/homebrew-clw Formula/clw.rb -> ${VERSION}"
