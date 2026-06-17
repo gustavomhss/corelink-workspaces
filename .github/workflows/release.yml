@@ -94,6 +94,20 @@ jobs:
           fi
           "$CLW_RUST/cargo/bin/rustup" --version
 
+      # The RUST_TOOLCHAIN env (used to drive the rustup installs on every leg)
+      # duplicates `channel` in rust-toolchain.toml. They MUST agree — a silent
+      # divergence would build/gate the release on a different toolchain than the
+      # one the repo pins for local dev. Assert equality at the earliest gate so a
+      # drift fails the release here, not somewhere downstream.
+      - name: assert RUST_TOOLCHAIN matches rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          TOML_CHANNEL="$(grep -m1 '^channel = ' rust-toolchain.toml | sed -E 's/^channel = "([^"]+)".*/\1/')"
+          if [ "${RUST_TOOLCHAIN}" != "${TOML_CHANNEL}" ]; then
+            echo "::error::RUST_TOOLCHAIN env ('${RUST_TOOLCHAIN}') != rust-toolchain.toml channel ('${TOML_CHANNEL}') — reconcile the two before tagging"
+            exit 1
+          fi
+
       - name: install pinned rust toolchain
         run: |
           rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component rustfmt clippy
@@ -551,7 +565,10 @@ jobs:
       # Cargo.lock — no network egress and no signing secret, so this needs NO
       # owner-gated credential and runs fully in the scaffold.
       - name: install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx
+        # Pin the version (matches the cargo-zigbuild / ziglang discipline above):
+        # a breaking cargo-cyclonedx release must NOT silently change or break the
+        # SBOM at tag time. Bump deliberately after re-verifying the flags below.
+        run: cargo install --locked cargo-cyclonedx --version 0.5.9
 
       - name: generate CycloneDX SBOM (workspace, JSON)
         run: |
