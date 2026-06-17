@@ -56,13 +56,19 @@ fn try_client() -> Option<(HttpClient, String)> {
 /// Read runtime env into a `Config`. Returns `None` (and prints skip notice)
 /// when `CLW_TOKEN` or `CLW_TENANT` is absent.
 fn try_config() -> Option<Config> {
-    let token = std::env::var("CLW_TOKEN").ok();
-    let tenant = std::env::var("CLW_TENANT").ok();
+    // An ABSENT secret in CI surfaces as an env var set to the EMPTY STRING (not
+    // unset), so `var().ok()` returns `Some("")` — treat empty as absent, else the
+    // no-PAT dry-run takes the credentials-present branch with an empty endpoint and
+    // panics in `HttpClient::new` instead of skipping. (Same fix as live_conformance.rs.)
+    let token = std::env::var("CLW_TOKEN").ok().filter(|s| !s.is_empty());
+    let tenant = std::env::var("CLW_TENANT").ok().filter(|s| !s.is_empty());
 
     match (token, tenant) {
         (Some(t), Some(tn)) => {
             let endpoint = std::env::var("CLW_ENDPOINT")
-                .unwrap_or_else(|_| "https://corelink-api.humangr.com".to_string());
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://corelink-api.humangr.com".to_string());
             Some(Config {
                 endpoint,
                 tenant: tn,
