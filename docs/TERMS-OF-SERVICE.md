@@ -394,7 +394,7 @@ cryptography under ECCN 5D992.c (no ENC §740.17 license required; self-classifi
 and subject to counsel confirmation), as described in `docs/EXPORT-CONTROL.md`. You
 may not access, use, export, or re-export the Service or Client to any OFAC
 comprehensively-sanctioned destination, including Cuba, Iran, North Korea, Syria, or
-the Crimea, Donetsk, or Luhansk regions of Ukraine.
+the Crimea, Donetsk, Luhansk, Zaporizhzhia, and Kherson regions of Ukraine.
 
 ## 13. Indemnification
 
@@ -522,4 +522,4 @@ understandings on that subject.
 
 For questions about these Terms, contact legal@humangr.com.
 
-Copyright © 2026 Human Guardrail LTDA All rights reserved.
+Copyright © 2026 Human Guardrail LTDA. All rights reserved.

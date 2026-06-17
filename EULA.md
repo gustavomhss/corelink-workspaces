@@ -397,8 +397,8 @@ violation of this Section is void. Licensor may freely assign this Agreement.
 This Agreement binds and inures to the benefit of the parties' permitted
 successors and assigns.
 
-18.3 **Notices.** Legal notices to Licensor must be sent in writing to HumanGR
-Ltda., Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP:
+18.3 **Notices.** Legal notices to Licensor must be sent in writing to Human Guardrail
+LTDA, Avenida Rouxinol, 857, apt. 113, Moema, São Paulo – SP, Brazil (CEP:
 04516-001), with a copy to legal@humangr.com. Notices are deemed given upon
 receipt.
 
@@ -441,6 +441,6 @@ For licensing inquiries, contact sales@humangr.com.
 For privacy inquiries, contact the Data Protection Officer / privacy contact
 (LGPD Encarregado), Gustavo Schneiter, at privacy@humangr.com.
 
-Copyright © 2026 Human Guardrail LTDA All rights reserved.
+Copyright © 2026 Human Guardrail LTDA. All rights reserved.
 "CoreLink", "CoreLink Workspaces", "HumanGR", and `clw` are trademarks of
 Licensor.

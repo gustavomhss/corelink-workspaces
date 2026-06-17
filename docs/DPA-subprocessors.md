@@ -422,6 +422,10 @@ Customer self-service via `clw erase` (§10.2) or by the operator-assisted proce
 and SLA in §10.3. The PAT is handled under the credential carve-out in §9.4, not
 "returned".
 
+9.3. **Local client data.** The `clw` local cache is ephemeral and reconstructible;
+`clw uninstall` (roadmap M3.5) removes the binary, the PAT, the cache, and any
+local artifacts.
+
 9.4. **Credential carve-out (PAT).** Notwithstanding §4.7 and §9.2, the tenant PAT
 is a security credential, not substantive Customer content. On termination or on a
 verified deletion request, the Processor shall **destroy** (revoke and delete) the
@@ -431,10 +435,6 @@ salted hash or non-reversible derivative of the PAT, and associated security/aud
 logs, for as long as necessary for security, fraud-prevention, and audit purposes
 and as permitted or required by law; such retention is an express exception to the
 erasure and return obligations of this DPA.
-
-9.3. **Local client data.** The `clw` local cache is ephemeral and reconstructible;
-`clw uninstall` (roadmap M3.5) removes the binary, the PAT, the cache, and any
-local artifacts.
 
 ---
 

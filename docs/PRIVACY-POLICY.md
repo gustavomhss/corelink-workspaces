@@ -227,7 +227,7 @@ applies, or otherwise the European Commission's Standard Contractual Clauses (an
 UK International Data Transfer Addendum for UK transfers), together with any
 supplementary measures required following a transfer-impact assessment. For
 international transfers of personal data subject to Brazil's LGPD, we likewise rely on
-an appropriate transfer mechanism under LGPD Arts. 33–35 (such as standard contractual
+an appropriate transfer mechanism under LGPD Arts. 33–36 (such as standard contractual
 clauses or adequacy, as recognized by the ANPD). You may request a copy of the relevant
 safeguard via the contact in §15.
 
