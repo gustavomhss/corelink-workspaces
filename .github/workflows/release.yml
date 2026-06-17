@@ -375,14 +375,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Resolve a pip: macOS ships python3 (pip3) but often no bare `pip`, so a
-          # plain `pip install` dies with command-not-found on a fresh runner.
-          if command -v pip >/dev/null 2>&1; then PIP=pip
-          elif command -v pip3 >/dev/null 2>&1; then PIP=pip3
-          elif command -v brew >/dev/null 2>&1; then brew install python >/dev/null && PIP=pip3
-          else echo "::error::no pip/pip3 and no brew on the release runner — install python3 to build the cross (zigbuild) legs"; exit 1; fi
+          # ziglang ships as a pip package, but macOS' Homebrew Python is EXTERNALLY
+          # MANAGED (PEP 668) so `pip install` into it is REFUSED
+          # (error: externally-managed-environment). Install the pinned ziglang into a
+          # dedicated, ISOLATED venv (mirrors the isolated CARGO_HOME/RUSTUP_HOME
+          # pattern) and prepend it to PATH so cargo-zigbuild's `python3 -m ziglang`
+          # resolves to the venv python that has it — no system-python pollution.
+          ZIG_VENV="$HOME/.clw-ci-zigvenv"
+          if [ ! -x "$ZIG_VENV/bin/python3" ]; then
+            python3 -m venv "$ZIG_VENV"
+          fi
+          echo "$ZIG_VENV/bin" >> "$GITHUB_PATH"
           # Pinned for a reproducible cross toolchain (M2.2). Bump deliberately.
-          "$PIP" install "ziglang==0.16.0"
+          "$ZIG_VENV/bin/pip" install "ziglang==0.16.0"
           cargo install --locked cargo-zigbuild --version 0.23.0
 
       - name: build release binary
@@ -610,17 +615,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # `--all` covers every workspace member; JSON is the CycloneDX format the
-          # publish surface consumes. cargo-cyclonedx writes per-manifest files; we
-          # also request an aggregated workspace SBOM under a stable name.
+          # cargo-cyclonedx 0.5.x with --override-filename writes ONE FILE PER workspace
+          # member at <member-dir>/<name>.json — extension .json, NOT .cdx.json, and no
+          # aggregated root file (verified against 0.5.9). The shipped binary is clw-cli,
+          # whose SBOM carries the full transitive dep tree that actually ships, so that
+          # is the canonical release SBOM. Collect every member SBOM into dist/ as
+          # .cdx.json (they ARE CycloneDX JSON) and copy clw-cli's to the canonical name.
           cargo cyclonedx --all --format json --override-filename "clw-${VERSION}"
-          # Collect whatever cargo-cyclonedx produced (root + per-member) into dist/
-          # under the versioned release name. The aggregated/root file is the
-          # canonical release SBOM; per-member files ride along for completeness.
-          find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/ \; || true
-          # Ensure a canonical, predictably-named SBOM exists for the release.
-          if [ -f "clw-${VERSION}.cdx.json" ]; then
-            cp "clw-${VERSION}.cdx.json" "dist/${SBOM}"
+          found=0
+          while IFS= read -r f; do
+            crate="$(basename "$(dirname "$f")")"
+            cp "$f" "dist/${crate}.cdx.json"
+            found=1
+          done < <(find crates -name "clw-${VERSION}.json")
+          if [ -f "crates/clw-cli/clw-${VERSION}.json" ]; then
+            cp "crates/clw-cli/clw-${VERSION}.json" "dist/${SBOM}"
+            found=1
+          fi
+          if [ "$found" != "1" ]; then
+            echo "::error::cargo-cyclonedx produced no SBOM (expected crates/*/clw-${VERSION}.json) — its output naming may have changed; re-check the flags before bumping"
+            exit 1
           fi
           echo "---- SBOM files ----"
           ls -la dist/
