@@ -19,9 +19,11 @@
 | Azure Trusted Signing identity | Windows Authenticode | GitHub secrets (OIDC) | 12 mo (cert profile auto-rolls) | Azure portal → revoke cert profile |
 | macOS Developer ID cert (`.p12`) | macOS codesign | GitHub secret (base64) | 12 mo or on staff change | Apple Developer → revoke certificate |
 | App Store Connect API key | macOS notarization | GitHub secret | 12 mo | App Store Connect → revoke key |
-| minisign secret key | Linux artifact signature | GitHub secret (+ passphrase) | 24 mo or on compromise | publish new pubkey + revocation notice |
+| minisign secret key | Linux artifact signature | GitHub secret `MINISIGN_SECRET_KEY` (passphrase as `MINISIGN_PASSWORD`) | 24 mo or on compromise | publish new pubkey + revocation notice |
 | R2 access keys | Download-surface upload | GitHub secrets | 6 mo | Cloudflare → roll the access key |
 | `CLW_CI_TOKEN` (conformance PAT) | pre-tag conformance gate | GitHub secret | 90 days | corelink-server → revoke the PAT |
+| `CLW_CI_TENANT` (conformance tenant id) | pre-tag conformance gate (identifies the CI tenant the PAT is scoped to) | GitHub secret | with `CLW_CI_TOKEN` (90 days) | corelink-server → retire the CI tenant / re-scope the PAT |
+| `CLW_CI_ENDPOINT` (conformance API endpoint) | pre-tag conformance gate (target host) | GitHub secret | on endpoint/region change | update to the new host; no consumer trust-root |
 
 > The user **PAT** that an end user configures (`~/.clw/config.toml`) is NOT in this table — its
 > rotation is the user-facing `clw auth login` flow (see `docs/usage.md`); revocation is the

@@ -15,10 +15,10 @@ Locked context (from `docs/go-live/WP-BRIEFS.md`, M2.3 / M2.5):
 
 - Proprietary product: the download surface is **not** a public GitHub Release.
 - Five locked targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
-  `aarch64-unknown-linux-gnu` (the last is build-only on hosted runners).
+  `x86_64-pc-windows-gnu` (cross-compiled via `cargo-zigbuild` on the Mac host),
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (the Linux and Windows
+  legs are cross-compiled; `aarch64-unknown-linux-gnu` is build-only).
 - Signed releases with signed SHA-256 checksums.
-- No self-hosted Mac in the release path.
 
 ---
 

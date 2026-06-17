@@ -56,7 +56,7 @@ Data that the Processor Processes on behalf of the Customer under the Agreement.
 
 1.5. **"Customer Data"** means all data the Customer (or its users) uploads to or
 generates within the service via the `clw` client — principally file contents,
-file paths and tree structure, reference (AC) names, and the associated tenant
+file paths and tree structure, reference (Action Cache, "**AC**") names, and the associated tenant
 Personal Access Token (PAT). The PAT is a security **credential** and is subject to
 the credential carve-out in §1.10 and §9.4 rather than to the "return" mechanics
 applicable to substantive Customer content.
@@ -423,7 +423,7 @@ and SLA in §10.3. The PAT is handled under the credential carve-out in §9.4, n
 "returned".
 
 9.3. **Local client data.** The `clw` local cache is ephemeral and reconstructible;
-`clw uninstall` (roadmap M3.5) removes the binary, the PAT, the cache, and any
+`clw uninstall` removes the binary, the PAT, the cache, and any
 local artifacts.
 
 9.4. **Credential carve-out (PAT).** Notwithstanding §4.7 and §9.2, the tenant PAT

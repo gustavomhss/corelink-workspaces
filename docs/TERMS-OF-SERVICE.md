@@ -38,7 +38,8 @@ otherwise process through the Service.
 1.6 "**Documentation**" means the user and security documentation HumanGR makes
 available for the Service and the Client, including `SECURITY.md`, the Privacy
 Policy (`docs/PRIVACY-POLICY.md`), the Data Processing Addendum
-(`docs/DPA-subprocessors.md`), and the End-User License Agreement (`EULA.md`).
+(`docs/DPA-subprocessors.md`), the Export-Control and Sanctions Notice
+(`docs/EXPORT-CONTROL.md`), and the End-User License Agreement (`EULA.md`).
 
 ## 2. Agreement structure; relationship to the EULA, Privacy Policy and DPA
 

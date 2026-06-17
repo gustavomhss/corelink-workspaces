@@ -22,7 +22,7 @@
 | 5 | Supply chain clean + SBOM + **signed** checksums | ⏳ / 🔒 | `cargo-deny`/`publish=false` ✅; SBOM in CI ✅; signed checksums need the signing key |
 | 6 | Live conformance green as a pre-tag gate | ✅ / ⏳ | 8/8 green vs prod; the `release.yml` `conformance` job is wired as a REQUIRED predecessor but is **inert until `CLW_CI_TOKEN` is provisioned** (skip-not-fail) — provision that one secret to make it ship-blocking |
 | 7 | End-to-end **family** path proven across repos | 🔒 / ⏳ | **clw half DONE** (runner-model #64 + per-tier #66 + solo-live #67 suites merged); **server D-9 mint SHIPPED** (#305) + per-tier seed delivered (#303); remaining = runner's clw-invocation build + a D1 test env + per-tenant PATs — all TL-routed |
-| 8 | Region/residency correct + real right-to-erasure | ✅ / ⏳ | erasure ✅ (`clw erase`, audited); confirm the signup-worker region fix landed |
+| 8 | Region/residency correct + real right-to-erasure | ✅ | erasure ✅ (`clw erase`, audited); signup-worker region fix **LIVE** (D-3 #269 — `regionFromColo` derives `primary_region`). **Verify:** create a tenant from a non-NA colo (e.g. `LHR`) and assert its D1 row shows `primary_region = 'weur'` (not the old `enam` hardcode): `wrangler d1 execute <DB> --command "SELECT primary_region FROM tenants WHERE id='<new>'"` |
 | 9 | Legal/compliance published | ⏳ | EULA/Privacy/ToS/DPA/SECURITY drafted ✅ → **counsel sign-off** |
 | 10 | Telemetry-off + key rotation runbook + support/EOL | ✅ | telemetry removed ✅; rotation runbook + EOL policy now published (this PR) |
 | 11 | CI not on a single founder machine | ☑️ **owner-accepted** | self-hosted single-owner **dedicated** Mac is the chosen model (not GitHub billing). Owner accepts the single-machine risk (CI/release pause if the Mac is down); per-project toolchain isolation (#68) mitigates the cross-project rustup-nuke |
@@ -36,11 +36,11 @@
 ### A. Provision the signing & release secrets (gates 4, 5)
 Decisions are already made in `docs/DISTRIBUTION.md`, and the signing/publish **step bodies are now implemented** in `.github/workflows/release.yml` (macOS codesign+notarize, Windows Azure Trusted Signing via the `sign` CLI, Linux minisign, signed `SHA256SUMS`, R2 upload — each guarded by secret-presence, so it no-ops cleanly in dry-run and runs for real once the secret exists). You only **provision the secrets** the chosen options imply (each is flagged `TODO(OWNER)` in the step `env:` blocks); there are **no dry-run guards left to delete**. Caveat: the bodies are written to vendor spec but are first exercised end-to-end on your provisioning run (no signing infra exists to test against beforehand).
 
-- **Windows code-signing — Azure Trusted Signing** (decision (b); exportable `.pfx` was rejected — no longer obtainable from a reputable CA). Provision as GitHub **secrets** (OIDC preferred over a client secret):
-  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE`.
+- **Windows code-signing — Azure Trusted Signing** (decision (b); exportable `.pfx` was rejected — no longer obtainable from a reputable CA). Provision as GitHub **secrets**:
+  `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE`, `AZURE_ENDPOINT` (e.g. `https://eus.codesigning.azure.net`), and `AZURE_CLIENT_SECRET` (OIDC via `azure/login` is the **preferred** alternative to the client secret).
 - **macOS — Developer ID + notarization** (decision (c): notarized **zip** for the bare-binary PATH install). Provision:
-  `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, plus the notarization creds (`AC_API_KEY_ID`, `AC_API_ISSUER_ID`, `AC_API_KEY_BASE64`).
-- **Linux — minisign** (sigstore documented as the alternative). Generate a minisign keypair; provision the secret key as `MINISIGN_SECRET_KEY` (+ passphrase); publish the **public** key in the repo + `docs/DISTRIBUTION.md` trust-root section.
+  `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, plus the App Store Connect notarization creds (`MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER_ID`).
+- **Linux — minisign** (sigstore documented as the alternative). Generate a minisign keypair; provision the secret key as `MINISIGN_SECRET_KEY` and the passphrase as `MINISIGN_PASSWORD`; publish the **public** key in the repo + `docs/DISTRIBUTION.md` trust-root section.
 - **Download surface — R2 behind a CoreLink auth route** (decision (a), tracked as server dep **D-12**). Provision the R2 S3 creds (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`); the publish step uploads to `releases/clw/<version>/`. Coordinate D-12 (the authenticated download route) with the corelink-server team.
 
 → See `docs/go-live/RUNBOOK-key-rotation-revocation.md` for how these keys are rotated/revoked once provisioned (gate 10).

@@ -18,10 +18,10 @@
 > (3) the testing-cadence frequencies in Section 11 (the recommended minimums are
 > indicated inline); and (4) the sub-processor contingency / accepted-residual-risk
 > determination in Section 8.3. The compliance qualifications in Sections 5.2, 8.1, 8.2,
-> and 8.4 (regional-residency enforcement gated on roadmap M7.1, and full tenant erasure
-> gated on roadmap M6.4) must remain consistent with `docs/DPA-subprocessors.md`; if M6.4
-> or M7.1 is in production at the effective date, update the corresponding sections to
-> reflect that and remove the forward-looking qualifier.
+> and 8.4 (regional-residency enforcement gated on roadmap M7.1) must remain consistent
+> with `docs/DPA-subprocessors.md`; if M7.1 is in production at the effective date, update
+> the corresponding sections to reflect that and remove the forward-looking qualifier.
+> Full tenant erasure via `clw erase` is LIVE (M6.4 closed 2026-06-15) and §8.4 reflects that.
 
 ---
 
@@ -345,25 +345,26 @@ path in Section 8.2.
 
 The right to erasure under GDPR Article 17 (and, for the Brazilian controller, the
 corresponding right under Brazil's LGPD — Lei nº 13.709/2018, Art. 18) applies through and
-after recovery, subject to the current product limitation disclosed in
-`docs/DPA-subprocessors.md` §10 and mirrored here so this policy does not overstate the
-capability. The interim erasure SLA is 30 days, effected operator-assisted pending roadmap
-item M6.4 (server D-7/D-8); this is not instant erasure.
+after recovery, consistent with the erasure capability disclosed in
+`docs/DPA-subprocessors.md` §10 and mirrored here. Self-service erasure is **live**: the
+`clw erase` operation is the primary Article 17 path, with an operator-assisted alternative
+(30-day SLA) for Customers who prefer it or cannot run the client.
 
-- **Current limitation (until roadmap item M6.4).** As of the effective date, the client
-  `clw rm` operation deletes only the reference (AC) pointer and **cannot
-  garbage-collect the underlying content-addressed (CAS) blobs**; un-naming content does
-  not by itself reclaim the stored bytes. Full tenant erasure (CAS blob
-  garbage-collection, requiring server CAS DELETE/LIST and ref-enumeration) is delivered
-  by go-live-blocking roadmap item **M6.4**. Until M6.4 is in production, erasure of
-  affected Customer Data is effected by the operator-side interim process described in
-  the DPA, not by automated self-service deletion. This policy does not represent that
-  full, propagated-to-backup erasure is available before M6.4 lands.
+- **Self-service erasure (live).** As of the effective date, the client `clw erase`
+  operation **irreversibly deletes all of a tenant's stored Customer Data — every
+  reference (Action Cache / AC) pointer and every underlying content-addressed (CAS)
+  blob**. It relies on server reference-enumeration LIST (dependency D-7) and server CAS
+  DELETE/LIST (dependency D-8), which are **deployed and live** (roadmap item **M6.4**,
+  closed; verified by the live conformance suite). The complementary `clw prune` operation
+  garbage-collects unreferenced CAS blobs. These operations carry safety rails (dry-run by
+  default; `clw erase` additionally requires explicit confirmation and a typed tenant
+  identifier). An operator-assisted alternative (DPA §10.3, 30-day SLA) remains available
+  for Customers who prefer it or cannot run the client.
 - **Backward-looking commitment (in force once erasure executes).** When an erasure is
-  executed — whether by the interim operator-side process today or by the M6.4
-  self-service path once live — backups and replicas are not used to resurrect data a
-  tenant has erased; the erasure propagates to backups and replicas within 35 days and
-  superseded backup copies age out within their retention window.
+  executed — whether by the self-service `clw erase` path or by the operator-assisted
+  process — backups and replicas are not used to resurrect data a tenant has erased; the
+  erasure propagates to backups and replicas within 35 days and superseded backup copies
+  age out within their retention window.
 
 Any erasure request received during an incident is routed to the Data Protection Officer
 and tracked to completion under the DPA timelines; an active incident does not suspend
