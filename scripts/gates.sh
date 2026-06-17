@@ -5,11 +5,17 @@
 #   FULL   — main pushes, local runs, anything ambiguous: whole workspace.
 #   SCOPED — pull_request CI only: gate exactly the crates the diff touches.
 #            Docs-only diffs skip the Rust gates entirely (markdown can't break rustc).
-#            Any touch to clw-types (the contract), Cargo.toml/lock, scripts/ or
-#            .github/ escalates back to FULL.
+#            Any touch to clw-types (the contract), Cargo.toml/lock, deny.toml,
+#            scripts/ or .github/ escalates back to FULL.
 # Rationale: cargo's dependency graph guarantees a scoped `test -p <crate>` still
 # compiles everything that crate depends on; main is ALWAYS full-lane, so nothing
 # can merge-then-rot unnoticed.
+# Supply-chain invariant (made explicit so it is auditable): the FULL lane is the
+# ONLY lane that runs `cargo deny check` + `cargo audit`. Therefore the inputs
+# those gates read — Cargo.lock (the resolved dependency set) and deny.toml (the
+# license/advisory/bans policy) — MUST be in the full-lane escalation list below,
+# so a PR that edits either is re-checked against the supply-chain gates instead
+# of slipping through the SCOPED lane. main is always full-lane as the backstop.
 set -euo pipefail
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
@@ -35,7 +41,7 @@ if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
     echo "SCOPED lane: docs-only diff — Rust gates not applicable"
     echo "ALL GATES GREEN (docs-only)"
     exit 0
-  elif echo "$changed" | grep -qE '^(Cargo\.(toml|lock)|scripts/|\.github/|crates/clw-types/)'; then
+  elif echo "$changed" | grep -qE '^(Cargo\.(toml|lock)|deny\.toml|scripts/|\.github/|crates/clw-types/)'; then
     echo "diff touches contract/workspace/CI surface — full lane (fail-safe)"
   elif ! echo "$changed" | grep -qvE '^crates/'; then
     SCOPE="$(echo "$changed" | grep -oE '^crates/[^/]+' | sort -u | sed 's|crates/||' | tr '\n' ' ')"
@@ -51,6 +57,9 @@ if [ "$SCOPE" = "full" ]; then
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace
   # Supply-chain gates are a whole-workspace concern — full lane only.
+  # INVARIANT: this is the only lane that runs them, so their inputs (Cargo.lock,
+  # deny.toml) escalate to this lane in the SCOPED-lane gate above. Keep the two
+  # in lockstep: adding an input these gates read means adding it to that regex.
   cargo deny check
   if command -v cargo-audit >/dev/null 2>&1; then
     cargo audit
