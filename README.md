@@ -38,13 +38,21 @@ Backed by the live CoreLink API at `https://corelink-api.humangr.com` (`/v1/cas`
 
 ## Install
 
-`clw` is **proprietary** (commercial EULA — see [License](#license)). There is no
-public source repo or crates.io package, and pre-built binaries ship via an
-**authenticated download** surface, not a public release.
+`clw` is **proprietary** (commercial EULA — see [License](#license)), but it is
+**publicly downloadable**: the source stays closed, while the signed, pre-built
+binaries are distributed publicly. The two are independent — many proprietary CLIs
+are `brew install`-able without being open source.
 
-> **Authenticated download:** _(placeholder — the signed cross-platform binaries
-> and the install-token bootstrap are coming with the release pipeline; see
-> `docs/ROADMAP-go-live.md` M3.)_
+Primary install (macOS / Linux) — the public Homebrew tap:
+
+```sh
+brew install humangr-labs/clw/clw
+```
+
+Fallbacks: the `curl … | sh` one-liner (`scripts/install.sh`, anonymous public
+download) on any \*nix, and a direct `.exe` download from the public release mirror
+on Windows. See `docs/INSTALL.md` for the per-platform recipes and the minisign
+trust-root fingerprint.
 
 ### Building from source (internal / development only)
 

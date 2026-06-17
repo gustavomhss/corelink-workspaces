@@ -44,7 +44,7 @@ This policy covers two distinct continuity domains:
 - **Domain A — Release pipeline.** The systems that produce and distribute the signed
   `clw` binaries for macOS (Intel and Apple Silicon), Windows, and Linux: source
   control, the build/sign/notarize pipeline, the code-signing trust roots, and the
-  authenticated download surface.
+  public distribution channel (the public release mirror + Homebrew tap).
 - **Domain B — Hosted service and customer data.** The CoreLink API, its
   authentication subsystem (per-tenant Bearer Personal Access Tokens, "PATs"), the
   content-addressed store ("CAS") that holds snapshotted workspace content, and the
@@ -210,7 +210,7 @@ the following thresholds:
 - **SEV-1 (Critical):** suspected or confirmed compromise of a code-signing trust root;
   confirmed loss or unauthorized disclosure of customer data; full unavailability of the
   CoreLink API in a Region exceeding 1 hour of downtime.
-- **SEV-2 (Major):** loss of the authenticated download surface; partial CoreLink API
+- **SEV-2 (Major):** loss of the public distribution channel (release mirror / Homebrew tap); partial CoreLink API
   unavailability or degradation in a Region that persists but does not amount to full
   unavailability exceeding the SEV-1 1-hour downtime threshold; loss of CI /
   source-control org access.
@@ -227,8 +227,8 @@ regardless of severity rating.
 
 The release pipeline (`.github/workflows/release.yml`): tag → build all targets → sign
 (macOS Developer ID + notarization; Windows Authenticode via cloud/HSM signing; Linux
-minisign / sigstore) → produce signed SHA-256 checksums → publish to the authenticated
-download surface (`docs/DISTRIBUTION.md`).
+minisign / sigstore) → produce signed SHA-256 checksums → publish the GitHub Release on
+the public mirror and bump the public Homebrew tap (`docs/DISTRIBUTION.md`).
 
 ### 7.1 Loss or compromise of a signing key (SEV-1)
 
@@ -260,10 +260,10 @@ path without compromise-based revocation. Because artifacts signed with a lost k
 longer be re-issued under that key, re-sign all current releases under the new key and
 notify.
 
-### 7.2 Loss of the authenticated download surface (SEV-2)
+### 7.2 Loss of the public distribution channel (SEV-2)
 
-- **Existing installs are unaffected.** An outage of the download surface prevents new
-  downloads but does not affect already-installed CLIs or the CoreLink API.
+- **Existing installs are unaffected.** An outage of the public mirror or Homebrew tap
+  prevents new downloads but does not affect already-installed CLIs or the CoreLink API.
 - **Failover.** Release artifacts and signed checksums are reproducible and
   re-publishable from CI, so the surface can be restored or failed over to a documented
   alternate host without loss of artifacts. A secondary region/provider to serve as the

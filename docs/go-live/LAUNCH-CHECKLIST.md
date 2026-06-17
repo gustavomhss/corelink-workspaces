@@ -34,14 +34,14 @@
 ## ⏳ Owner actions — do these (each is concrete + unblocked)
 
 ### A. Provision the signing & release secrets (gates 4, 5)
-Decisions are already made in `docs/DISTRIBUTION.md`, and the signing/publish **step bodies are now implemented** in `.github/workflows/release.yml` (macOS codesign+notarize, Windows Azure Trusted Signing via the `sign` CLI, Linux minisign, signed `SHA256SUMS`, R2 upload — each guarded by secret-presence, so it no-ops cleanly in dry-run and runs for real once the secret exists). You only **provision the secrets** the chosen options imply (each is flagged `TODO(OWNER)` in the step `env:` blocks); there are **no dry-run guards left to delete**. Caveat: the bodies are written to vendor spec but are first exercised end-to-end on your provisioning run (no signing infra exists to test against beforehand).
+Decisions are already made in `docs/DISTRIBUTION.md`, and the signing/publish **step bodies are now implemented** in `.github/workflows/release.yml` (macOS codesign+notarize, Windows Azure Trusted Signing via the `sign` CLI, Linux minisign, signed `SHA256SUMS`, publish the GitHub Release on the public mirror + bump the Homebrew tap — each guarded by secret-presence, so it no-ops cleanly in dry-run and runs for real once the secret exists). You only **provision the secrets** the chosen options imply (each is flagged `TODO(OWNER)` in the step `env:` blocks); there are **no dry-run guards left to delete**. Caveat: the bodies are written to vendor spec but are first exercised end-to-end on your provisioning run (no signing infra exists to test against beforehand).
 
 - **Windows code-signing — Azure Trusted Signing** (decision (b); exportable `.pfx` was rejected — no longer obtainable from a reputable CA). Provision as GitHub **secrets**:
   `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE`, `AZURE_ENDPOINT` (e.g. `https://eus.codesigning.azure.net`), and `AZURE_CLIENT_SECRET` (OIDC via `azure/login` is the **preferred** alternative to the client secret).
 - **macOS — Developer ID + notarization** (decision (c): notarized **zip** for the bare-binary PATH install). Provision:
   `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, plus the App Store Connect notarization creds (`MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER_ID`).
 - **Linux — minisign** (sigstore documented as the alternative). Generate a minisign keypair; provision the secret key as `MINISIGN_SECRET_KEY` and the passphrase as `MINISIGN_PASSWORD`; publish the **public** key in the repo + `docs/DISTRIBUTION.md` trust-root section.
-- **Download surface — R2 behind a CoreLink auth route** (decision (a), tracked as server dep **D-12**). Provision the R2 S3 creds (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`); the publish step uploads to `releases/clw/<version>/`. Coordinate D-12 (the authenticated download route) with the corelink-server team.
+- **Distribution — public mirror Release + Homebrew tap** (decision (a); the binary host is the **public** mirror repo `humangr-labs/clw-releases`, with `humangr-labs/homebrew-clw` as the public tap). Provision a cross-repo publish credential `CLW_RELEASES_TOKEN` (publish the GitHub Release + 5 binaries on the mirror) and `HOMEBREW_TAP_TOKEN` (bump `Formula/clw.rb` on real `v<version>` tags only). No R2 creds and no `CLW_INSTALL_TOKEN` — the download surface is public, so there is no authenticated route to coordinate (server dep **D-12 is dropped/moot**).
 
 → See `docs/go-live/RUNBOOK-key-rotation-revocation.md` for how these keys are rotated/revoked once provisioned (gate 10).
 
@@ -52,7 +52,8 @@ cloud box), run the script in **`docs/go-live/WINDOWS-ACL-VERIFICATION.md`** —
 lines and we mark the Windows ACL runtime-verified for v0.1.0.
 
 ### C. Verify install **and** uninstall per platform (gate 4)
-After the signed binaries build: on each of macOS / Linux / Windows, run the authenticated install,
+After the signed binaries build: on each of macOS / Linux / Windows, run the public install
+(`brew install humangr-labs/clw/clw`, the `install.sh` curl fallback, or the direct `.exe` on Windows),
 confirm `clw doctor` is green, then run `clw uninstall --yes` and confirm `~/.clw` (config + PAT +
 cache) is gone and the binary-removal instruction is printed. (The uninstall **logic** is audited +
 e2e-tested; this is the per-platform packaging confirmation.)
@@ -86,7 +87,9 @@ gate 9 from operative-for-beta → published.
 
 1. Confirm `main` is gate-green and live-conformance-green (the `release.yml` `conformance` job gates this).
 2. Tag `v0.1.0`. The pipeline runs: preflight → conformance gate → build+sign (5 targets) → **signed**
-   SHA-256 checksums + SBOM → publish to the R2 surface.
+   SHA-256 checksums + SBOM → publish the GitHub Release on the public mirror `humangr-labs/clw-releases`
+   (`CLW_RELEASES_TOKEN`) → bump the Homebrew tap `humangr-labs/homebrew-clw` (`HOMEBREW_TAP_TOKEN`,
+   real tags only).
 3. Smoke-test the published, signed artifact on one machine per OS (download → verify signature →
    `clw doctor`).
 4. Announce per the support policy in `docs/SUPPORT-AND-EOL.md`.

@@ -38,7 +38,7 @@
 | D-2 | Back up `SIGNUP_TOKEN_KEY` (write-only secret) | always (ops hygiene) — ROADMAP M4.4 | BUGREPORT §secrets |
 | D-10 | Tenant `primary_region` lookup API | **only if** CONFIRM-b resolves to path (b) | ROADMAP §M7.1 |
 | D-11 | Distinct CAS-PUT status (created vs existed) | optional — faithful `chunks_uploaded` accounting (M1.2 is best-effort without it) | ROADMAP §M1.2 |
-| D-12 | Authenticated binary download route | **only if** the download surface is R2-behind-CoreLink (vs GitHub-SSO/vendor) — ROADMAP M3.3 | ROADMAP §M3.3 |
+| ~~D-12~~ | Authenticated binary download route | **SUPERSEDED / DROPPED 2026-06-17** — distribution is now **public** (Homebrew tap + public release mirror); no authenticated route is needed, so the server team **no longer owes this**. | ROADMAP §M3.3 |
 
 > **Already landed upstream (do not re-do):** AC-500 root cause — PR #139 (empty
 > `R2_AC_BUCKET`); wrangler@4 deploy fix (on `main`). D-3's `enam` value is
@@ -62,7 +62,7 @@
 |---|---|---|
 | **GDPR / launch-blocking** | **D-3** (residency), **D-7 + D-8** (Art.17 erasure), **D-1** (rm, erasure half), CONFIRM-a (auth scope), CONFIRM-b (residency routing) | Exit-gate #6 (AC delete round-trip), #8 (residency + right-to-erasure), #9 (compliance) |
 | **Campaign #1 (CI-acceleration)** | **D-4 → D-5** (cargo route), **D-6a → D-6** (write scaling), D-9 + CONFIRM-a (runner PAT for the e2e) | M7.4 (campaign), M7.5 (family e2e) |
-| **Conditional / low** | D-2, D-10, D-11, D-12 | per trigger above |
+| **Conditional / low** | D-2, D-10, ~~D-12~~ (D-12 SUPERSEDED 2026-06-17 — distribution is public, no auth'd route), D-11 | per trigger above |
 
 **The critical path (longest chain to a launchable, family-proven product):**
 
@@ -116,7 +116,7 @@ the constraint is the intra-track edges above.
 **Conditional / opportunistic (schedule when their trigger fires):**
 
 11. **D-2** (back up `SIGNUP_TOKEN_KEY`) — ops hygiene, do alongside D-3 while in the signup lane.
-12. **D-10** — only if CONFIRM-b → (b). **D-11** — optional accounting nicety. **D-12** — only if the download surface is R2-behind-CoreLink.
+12. **D-10** — only if CONFIRM-b → (b). **D-11** — optional accounting nicety. ~~**D-12**~~ — **SUPERSEDED / DROPPED 2026-06-17:** distribution is public (Homebrew tap + public release mirror), so there is no authenticated download route to build.
 
 **One-line scheduling heuristic:** *confirmations first (CONFIRM-a/b, D-6a) → D-3 + the D-7/D-8/D-1 erasure unit (launch-blocking) → kick off D-4 in parallel as the campaign keystone → D-5 → D-6 → D-9 → flag the ownerless runner repo (M7.3) to the owner.*
 

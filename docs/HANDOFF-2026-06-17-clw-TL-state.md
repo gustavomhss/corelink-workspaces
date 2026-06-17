@@ -78,8 +78,9 @@ Inbound docs now committed to `docs/` (no secrets in them — credentials are ou
 - **Owner (Gustavo):**
   - Re-mint trigger / point me to `~/Downloads/clw-family-e2e-tier-pats.txt` (+ enam cred) so I can run live.
   - **Prod Worker redeploy** to activate server #307 (for the live runner-mint path).
-  - **Signing secrets** (gate 4/5) — Azure Trusted Signing, macOS Developer-ID+notarization, minisign,
-    R2 creds. See `docs/go-live/LAUNCH-CHECKLIST.md §A`.
+  - **Signing + publish secrets** (gate 4/5) — Azure Trusted Signing, macOS Developer-ID+notarization,
+    minisign, and the public-distribution publish tokens (`CLW_RELEASES_TOKEN` for the mirror Release,
+    `HOMEBREW_TAP_TOKEN` for the tap bump). See `docs/go-live/LAUNCH-CHECKLIST.md §A`.
   - **Legal sign-off** (gate 9) — drafts done, need counsel.
 
 ---

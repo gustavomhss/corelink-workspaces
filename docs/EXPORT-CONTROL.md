@@ -37,9 +37,9 @@ geographic location of the CoreLink data-residency region (currently the United 
 nationality or that of your personnel, and (d) the parties with whom and
 end-uses for which you use the Software or Service.
 
-The Company distributes the Software through an authenticated download surface
-(`docs/DISTRIBUTION.md`); the Software is not published to a public package
-registry or anonymous mirror. This does not relieve you of the obligations in
+The Company distributes the Software's pre-built binaries publicly — via a public
+Homebrew tap and a public release mirror (`docs/DISTRIBUTION.md`); the source tree
+remains private and proprietary. This does not relieve you of the obligations in
 Section 6.
 
 ---
@@ -98,12 +98,14 @@ customer-customizable. That profile is consistent with **mass-market** treatment
 under the Cryptography Note (Note 3 to Category 5, Part 2), pointing toward
 **`5D992.c`**. The principal open questions for legal confirmation are:
 
-1. **Mass-market eligibility vs. the authenticated channel.** The Software's
-   download surface is authenticated and commercial rather than anonymous retail
-   (`docs/DISTRIBUTION.md`). Legal must confirm whether the authenticated
-   commercial channel still satisfies the "generally available to the public"
-   mass-market criteria, or whether the stricter `5D002` + License Exception ENC
-   (§740.17) analysis and its reporting obligations apply.
+1. **Mass-market eligibility of the public distribution channel.** The Software's
+   pre-built binaries are distributed publicly — via a public Homebrew tap and a
+   public release mirror, downloadable without authentication
+   (`docs/DISTRIBUTION.md`); the source tree stays private and the EULA governs use.
+   Legal must confirm whether this public, no-charge download channel satisfies the
+   "generally available to the public" mass-market criteria, or whether the stricter
+   `5D002` + License Exception ENC (§740.17) analysis and its reporting obligations
+   apply.
 2. **Open-source / publicly-available decontrol does not transfer to the
    product.** The *source* of the upstream crypto libraries is publicly available
    and may itself qualify under §742.15(b) / §734.3(b)(3) (TSU). The Software,
