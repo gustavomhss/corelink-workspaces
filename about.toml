@@ -25,14 +25,10 @@
 #   the workspace settings below — only third-party dependencies are attributed.
 # ---------------------------------------------------------------------------
 
-# Attribute the dependencies of the whole workspace, not just one crate.
-workspace = true
-
-# `no-clearly-defined`: when true, refuse to fall back to the clearlydefined.io
-# service for crates whose license cannot be harvested locally. Left false so
-# license text can still be resolved that way; flip to true for fully offline,
-# hermetic generation.
-no-clearly-defined = false
+# NOTE: whole-workspace attribution is selected via the `--workspace` CLI flag on
+# `cargo about generate` — cargo-about 0.9 REMOVED the top-level `workspace` and
+# `no-clearly-defined` config keys (`workspace` is now a flag). Keeping them here
+# is a hard parse error. See the THIRD-PARTY step in release.yml for the flag.
 
 # Do not attribute the first-party clw-* crates themselves; they are the
 # proprietary product (publish=false), not a third-party component to be

@@ -764,14 +764,18 @@ jobs:
           CARGO="$HOME/.clw-ci-rust/cargo/bin/cargo"
           export CARGO_HOME="$HOME/.clw-ci-rust/cargo"
           export RUSTUP_HOME="$HOME/.clw-ci-rust/rustup"
-          if ! "$CARGO" about --version >/dev/null 2>&1; then
-            echo "cargo-about absent — installing into the isolated CARGO_HOME (one-time)."
-            # `--features cli` is REQUIRED: cargo-about 0.9+ gates its binary behind
-            # the `cli` feature, so a plain `install` compiles the lib but installs NO
-            # `about` subcommand (=> "no such command: about"). Caught by v0.1.0-rc11.
-            "$CARGO" install cargo-about --locked --features cli
+          if ! "$CARGO" about --version 2>/dev/null | grep -q '0\.9\.0'; then
+            echo "cargo-about 0.9.0 absent — installing into the isolated CARGO_HOME (one-time)."
+            # PINNED + `--features cli`: cargo-about 0.9+ gates its binary behind the
+            # `cli` feature (a plain install builds the lib but installs NO `about`
+            # subcommand => "no such command: about", caught by rc11); and the version
+            # is pinned (like cargo-cyclonedx/zigbuild) because the config schema is
+            # version-sensitive — about.toml matches 0.9.0 (rc12 caught a schema drift).
+            "$CARGO" install cargo-about --locked --features cli --version 0.9.0
           fi
-          "$CARGO" about generate about.hbs > release/THIRD-PARTY-LICENSES.md
+          # `--workspace`: attribute the whole workspace's deps (cargo-about 0.9 moved
+          # this from an about.toml key to a CLI flag).
+          "$CARGO" about generate about.hbs --workspace > release/THIRD-PARTY-LICENSES.md
           echo "generated release/THIRD-PARTY-LICENSES.md"
           ls -la release/
 
