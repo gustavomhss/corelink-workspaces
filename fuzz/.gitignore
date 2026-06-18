@@ -4,4 +4,6 @@
 /corpus
 /artifacts
 /coverage
-Cargo.lock
+# Cargo.lock is COMMITTED on purpose: it is the input to the fuzz supply-chain
+# gate (cargo deny / cargo audit on the detached fuzz workspace — see
+# fuzz/deny.toml + the CLW_FUZZ_GATE lane in scripts/gates.sh). Do NOT re-ignore.

@@ -112,9 +112,13 @@ multiple-versions = "warn"
 # unacceptable in a closed-source supply chain (non-reproducible builds).
 wildcards = "deny"
 allow-wildcard-paths = true
-# Empty by design — future home for any pinned-version bans (deny) or
-# version-skip allowances (skip / skip-tree) once such a need is identified.
-deny = []
+# Pinned-version bans (the supply-chain FLOOR). `bytes` is held at exactly the
+# lowest non-vulnerable release vs RUSTSEC-2026-0007 (1.11.1) with zero headroom;
+# the advisories lane catches the vulnerable versions by RUSTSEC id, but a
+# lockfile that drifts BELOW the patched version could otherwise resolve silently
+# on an older index. Deny `bytes < 1.11.1` so any such regression fails the gate
+# deterministically — defence in depth alongside the [advisories] check.
+deny = [{ name = "bytes", version = "<1.11.1" }]
 skip = []
 skip-tree = []
 

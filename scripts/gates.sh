@@ -61,8 +61,18 @@ if [ "$SCOPE" = "full" ]; then
   # deny.toml) escalate to this lane in the SCOPED-lane gate above. Keep the two
   # in lockstep: adding an input these gates read means adding it to that regex.
   cargo deny check
+  # cargo-audit advisory lane. FAIL-CLOSED on every axis:
+  #   * --deny unmaintained / --deny unsound turn those advisory classes into hard
+  #     errors (the default only fails on vulnerabilities/yanked), closing the gap a
+  #     cold audit flagged: an unmaintained or unsound dep could previously pass.
+  #   * cargo-audit exits non-zero if it cannot fetch/update the RustSec advisory DB,
+  #     and `set -euo pipefail` (top of file) propagates that — so an advisory-DB
+  #     fetch FAILURE fails the gate rather than passing silently. We do NOT pass
+  #     --no-fetch; the gate must run against an up-to-date DB or fail.
+  #   * cargo-deny's own vulnerability/yanked fail-closed posture (above) is left
+  #     intact — this is defence in depth, not a replacement.
   if command -v cargo-audit >/dev/null 2>&1; then
-    cargo audit
+    cargo audit --deny unmaintained --deny unsound
   elif [ "${CI:-}" = "true" ]; then
     # CI is the AUTHORITATIVE supply-chain gate: a missing cargo-audit here is a HARD
     # FAILURE, never a silent skip — otherwise an advisory could ship unchecked. Try to
@@ -72,7 +82,7 @@ if [ "$SCOPE" = "full" ]; then
       echo "::error::cargo-audit is unavailable in CI and could not be installed — refusing to skip the supply-chain advisory gate"
       exit 1
     fi
-    cargo audit
+    cargo audit --deny unmaintained --deny unsound
   else
     echo "cargo-audit not installed — CI provisions it; skipping locally"
   fi
@@ -100,6 +110,38 @@ else
   cargo clippy $pkgs --all-targets -- -D warnings
   # shellcheck disable=SC2086
   cargo test $pkgs
+fi
+
+# ---------------------------------------------------------------------------
+# FUZZ supply-chain lane (opt-in; dev-only — the fuzz harness NEVER ships in clw).
+#
+# `fuzz/` is a DETACHED workspace (empty `[workspace]` table, not in the root
+# members list), so the workspace-wide `cargo deny check` / `cargo audit` above
+# never see its dependency graph. A cold audit flagged that gap. This lane closes
+# it by gating fuzz/Cargo.lock with the SAME two tools, against fuzz/'s own
+# manifest + lockfile.
+#
+# It is OPT-IN (CLW_FUZZ_GATE=1) so it never slows or breaks the normal fast lane:
+#   * the deps here are libfuzzer-sys/arbitrary, pulled in only under nightly
+#     `cargo fuzz`, and they are dev-only — nothing here is distributed;
+#   * fuzz/Cargo.lock is committed, so this lane is reproducible without nightly
+#     (it reads the manifest+lock; it does not build the fuzz targets).
+# Run it explicitly in the nightly fuzz CI lane:  CLW_FUZZ_GATE=1 bash scripts/gates.sh
+if [ "${CLW_FUZZ_GATE:-}" = "1" ]; then
+  echo "FUZZ supply-chain lane: gating fuzz/ (detached workspace) — dev-only"
+  # fuzz/ uses its OWN deny config (fuzz/deny.toml): the dev-only fuzz driver
+  # libfuzzer-sys carries `AND NCSA`, a permissive license that must NOT be added
+  # to the root deny.toml allow-list (that list mirrors about.toml `accepted` =
+  # the SHIPPED-binary licenses; nothing in fuzz/ ships). Same sources/advisories
+  # rigor, allow-list extended only for the non-shipping fuzz harness.
+  cargo deny --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml
+  if command -v cargo-audit >/dev/null 2>&1; then
+    cargo audit --file fuzz/Cargo.lock --deny unmaintained --deny unsound
+  else
+    echo "::error::cargo-audit unavailable — refusing to skip the fuzz advisory gate"
+    exit 1
+  fi
+  echo "FUZZ supply-chain lane GREEN"
 fi
 
 echo "ALL GATES GREEN"
