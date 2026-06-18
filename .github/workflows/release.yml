@@ -279,11 +279,18 @@ jobs:
           CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
         run: |
           set -euo pipefail
+          # For a REAL (non-prerelease) tag the live conformance gate is MANDATORY:
+          # an absent PAT can no longer skip-green and ship an unconformed binary.
+          # rc/prerelease tags keep the skip-green dry-run behavior.
+          if [ "${{ needs.preflight.outputs.prerelease }}" = "false" ] && [ -z "${CLW_TOKEN:-}" ]; then
+            echo "::error::real tag (non-prerelease) with no CLW_CI_TOKEN — the live conformance gate cannot run and MUST NOT be skipped for a real release. Provision the PAT secret before tagging a real version."
+            exit 1
+          fi
           # When the PAT is provisioned, REQUIRE every live case to actually run:
           # CLW_CONFORMANCE_REQUIRE=1 turns a skip (missing cred OR a 405/501
           # unavailable endpoint) into a hard failure, so a red/unreachable service
-          # blocks the tag. Absent the PAT, leave REQUIRE unset so the suite skips
-          # GREEN (the intentional dry-run on forks / before secrets exist).
+          # blocks the tag. Absent the PAT (rc only, per the guard above), leave
+          # REQUIRE unset so the suite skips GREEN (the intentional dry-run).
           if [ -n "${CLW_TOKEN:-}" ]; then
             echo "PAT present — requiring live conformance (skip => hard fail)."
             export CLW_CONFORMANCE_REQUIRE=1
@@ -466,10 +473,22 @@ jobs:
           # 3. A bare CLI binary cannot be stapled; notarize a ZIP of it instead.
           ditto -c -k --keepParent "dist/${ASSET}" "dist/${ASSET}.zip"
           printf '%s' "$MACOS_NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/notary.p8"
-          xcrun notarytool submit "dist/${ASSET}.zip" --wait \
-            --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID"
-          # 4. Gatekeeper assessment of the notarized zip (bare CLI -> no staple).
-          spctl -a -t open --context context:primary-signature -v "dist/${ASSET}.zip" || true
+          # Capture the notarytool result as JSON and ASSERT status == "Accepted":
+          # `--wait` alone returns 0 even for an "Invalid" submission, so an implicit
+          # exit could ship an UN-notarized binary. Parse .status and hard-fail unless
+          # the ticket was accepted.
+          NOTARY_JSON="$(xcrun notarytool submit "dist/${ASSET}.zip" --wait --output-format json \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID")"
+          echo "$NOTARY_JSON"
+          NOTARY_STATUS="$(printf '%s' "$NOTARY_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status",""))')"
+          if [ "$NOTARY_STATUS" != "Accepted" ]; then
+            echo "::error::notarization did not succeed (status='${NOTARY_STATUS}', expected 'Accepted')"
+            exit 1
+          fi
+          # 4. Gatekeeper assessment of the notarized zip (bare CLI -> no staple). NOT
+          # force-passed: a Gatekeeper rejection of our own notarized artifact must
+          # FAIL the step.
+          spctl -a -t open --context context:primary-signature -v "dist/${ASSET}.zip"
           # 5. Leave NO key material on the runner.
           security delete-keychain "$KEYCHAIN"
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
@@ -731,6 +750,28 @@ jobs:
           [ -f NOTICE ] && cp NOTICE release/ || true
           ls -la release/
 
+      # Generate the per-release third-party attribution bundle that NOTICE
+      # promises. Produced with cargo-about from about.toml/about.hbs (the
+      # workspace cargo-about config). Staged into release/ BEFORE the checksum
+      # step so it is covered by SHA256SUMS and shipped as a release asset. Uses
+      # the isolated CARGO_HOME/RUSTUP_HOME like every other rust step. Hard-fails
+      # on any error (NO `|| true`): NOTICE must never reference a bundle we did
+      # not actually ship.
+      - name: generate THIRD-PARTY-LICENSES bundle (cargo-about)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO="$HOME/.clw-ci-rust/cargo/bin/cargo"
+          export CARGO_HOME="$HOME/.clw-ci-rust/cargo"
+          export RUSTUP_HOME="$HOME/.clw-ci-rust/rustup"
+          if ! "$CARGO" about --version >/dev/null 2>&1; then
+            echo "cargo-about absent — installing into the isolated CARGO_HOME (one-time)."
+            "$CARGO" install cargo-about --locked
+          fi
+          "$CARGO" about generate about.hbs > release/THIRD-PARTY-LICENSES.md
+          echo "generated release/THIRD-PARTY-LICENSES.md"
+          ls -la release/
+
       # SHA-256 over every published binary + signature file, then SIGN the
       # checksum file itself (minisign) — the cross-platform signed-checksum
       # guarantee the roadmap demands.
@@ -835,6 +876,55 @@ jobs:
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       # =======================================================================
+      # PUBLISH install.sh TO THE PUBLIC MIRROR — REAL tags only.
+      # The docs advertise `curl …raw.githubusercontent.com/humangr-labs/
+      # clw-releases/main/install.sh | sh`, but nothing publishes scripts/install.sh
+      # there, so that URL 404s. Push the repo's scripts/install.sh to the mirror's
+      # main branch via the GitHub contents API (create-or-update: re-fetch the
+      # existing blob sha so a re-run UPDATEs instead of failing). Also upload it as
+      # an asset on the mirror Release. SECRET-GATED on CLW_RELEASES_TOKEN (skip with
+      # ::warning:: if absent) and gated on a real (non-prerelease) tag.
+      # =======================================================================
+      - name: publish install.sh to the public mirror (real tags only)
+        if: steps.mirror_release.outputs.published == 'true' && needs.preflight.outputs.prerelease == 'false'
+        shell: bash
+        env:
+          # Same scoped token as the mirror Release step (contents:write on
+          # humangr-labs/clw-releases).
+          GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING install.sh publish to the mirror (dry-run)."
+            exit 0
+          fi
+          REPO="humangr-labs/clw-releases"
+          SRC="scripts/install.sh"
+          # base64 of the file content (portable: -w0 on GNU, no wrap on BSD).
+          CONTENT_B64="$(base64 < "$SRC" | tr -d '\n')"
+          # Fetch the existing blob sha (if any) so this is an idempotent
+          # create-or-update — the contents API requires the prior sha to UPDATE.
+          EXISTING_SHA="$(gh api "repos/${REPO}/contents/install.sh?ref=main" \
+            --jq '.sha' 2>/dev/null || true)"
+          if [ -n "$EXISTING_SHA" ] && [ "$EXISTING_SHA" != "null" ]; then
+            gh api --method PUT "repos/${REPO}/contents/install.sh" \
+              -f message="clw ${VERSION}: publish install.sh" \
+              -f branch="main" \
+              -f content="$CONTENT_B64" \
+              -f sha="$EXISTING_SHA"
+            echo "updated install.sh on ${REPO}@main (prior sha ${EXISTING_SHA})"
+          else
+            gh api --method PUT "repos/${REPO}/contents/install.sh" \
+              -f message="clw ${VERSION}: publish install.sh" \
+              -f branch="main" \
+              -f content="$CONTENT_B64"
+            echo "created install.sh on ${REPO}@main"
+          fi
+          # Also attach install.sh as an asset on the mirror Release (idempotent).
+          gh release upload "v${VERSION}" "$SRC" --repo "$REPO" --clobber
+          echo "uploaded install.sh as a release asset on ${REPO} @ v${VERSION}"
+
+      # =======================================================================
       # SLSA PROVENANCE — build-provenance attestation for the release binaries.
       # Added provenance layer ON TOP OF minisign (which stays the offline
       # signature-of-record). Runs ONLY after a real successful upload
@@ -863,6 +953,9 @@ jobs:
           # subjects to this build.
           subject-path: |
             release/clw-${{ env.VERSION }}-*
+            release/SHA256SUMS
+            release/SHA256SUMS.minisig
+            release/*.cdx.json
 
       - name: SLSA provenance SKIPPED notice (private repo — deferred per waiver)
         if: steps.mirror_release.outputs.published == 'true' && github.event.repository.private == true
