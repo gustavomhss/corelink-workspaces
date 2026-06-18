@@ -121,9 +121,10 @@ impl ResolvedConfig {
     /// Applies the same flag > env > file > default precedence as [`resolve`], but
     /// a MISSING tenant/token yields an empty string rather than an error — so a
     /// half-configured state can still be diagnosed (`doctor`) or repaired
-    /// (`logout`). The tenant, when PRESENT, is still validated (a path-injection
-    /// value is reported, not silently accepted); an invalid present tenant is
-    /// surfaced to the caller as a diagnostic line rather than blanked.
+    /// (`logout`). The tenant is taken AS-IS here and is NOT validated on this path
+    /// (only `ref_domain` is checked, and a bad value is surfaced via
+    /// `ref_domain_invalid` rather than erroring) — the lenient consumers make no
+    /// network call, and `doctor` re-validates the tenant itself when it reports.
     #[must_use]
     pub fn resolve_lenient(cli: &Cli) -> Self {
         let file_cfg = read_config_file();

@@ -77,7 +77,11 @@ const JSON_NOT_APPLICABLE_HINT: &str =
 /// child's passed-through exit code so a caller (e.g. the CoreLink runner) can tell a
 /// clw failure from a child result, and never caches it. 125 is the docker / `env` /
 /// `timeout` "the wrapper itself failed" convention. FROZEN — see docs/CLI-CONTRACT.md.
-const CLW_RUN_INTERNAL_NOT_RUN: i32 = 125;
+///
+/// `pub` so `main.rs` can route a `clw run` that fails DURING config/identity
+/// resolution (before dispatch ever reaches this subcommand) through the SAME
+/// reserved code — a single source of truth for the frozen value.
+pub const CLW_RUN_INTERNAL_NOT_RUN: i32 = 125;
 
 pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // P6: `run` has no JSON form — it proxies the child's stdout/stderr verbatim,

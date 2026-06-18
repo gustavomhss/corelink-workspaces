@@ -323,6 +323,35 @@ fn command_runs_on_broken_config(cmd: &Commands) -> bool {
     }
 }
 
+/// What to do when STRICT config resolution fails, decided purely from the command.
+/// Extracted as a pure classifier so the exit-code contract is unit-testable without
+/// spawning the binary or constructing a failing config.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolveFailure {
+    /// `uninstall` — the cleanup path; resolve only the cache dir leniently and run.
+    UninstallLenient,
+    /// `clw run` — a failure here is a clw-INTERNAL "child never ran" error. It MUST
+    /// exit the reserved `125` (frozen contract), NOT the generic `2` — a child can
+    /// legitimately return 2, so the runner could not otherwise tell them apart.
+    RunInternalNotRun,
+    /// `doctor`/`auth logout`/`auth whoami` — run on the broken config leniently.
+    Lenient,
+    /// everything else (network commands) — a generic clw error, exit `2`.
+    Fatal,
+}
+
+fn classify_resolve_failure(cmd: &Commands) -> ResolveFailure {
+    if matches!(cmd, Commands::Uninstall(_)) {
+        ResolveFailure::UninstallLenient
+    } else if matches!(cmd, Commands::Run(_)) {
+        ResolveFailure::RunInternalNotRun
+    } else if command_runs_on_broken_config(cmd) {
+        ResolveFailure::Lenient
+    } else {
+        ResolveFailure::Fatal
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -356,27 +385,37 @@ async fn main() {
     //     missing tenant/token to `<unset>` rather than erroring out.
     let resolved = match ResolvedConfig::resolve(&cli) {
         Ok(c) => c,
-        Err(e) => {
-            if matches!(cli.command, Commands::Uninstall(_)) {
+        Err(e) => match classify_resolve_failure(&cli.command) {
+            ResolveFailure::UninstallLenient => {
                 let cache_dir = ResolvedConfig::resolve_cache_dir_lenient(&cli);
                 let json = cli.json;
                 let Commands::Uninstall(args) = cli.command else {
-                    unreachable!("guarded by matches! above")
+                    unreachable!("classify_resolve_failure guarantees Uninstall here")
                 };
                 if let Err(e) = subcmds::uninstall::run(args, cache_dir, json).await {
                     exit_err(&e);
                 }
                 return;
             }
+            // FROZEN CONTRACT (docs/CLI-SURFACE-EXIT-FREEZE.md): `clw run` failing
+            // BEFORE the child runs — here, identity/config resolution — is a
+            // clw-INTERNAL "child never ran" failure. Exit the RESERVED 125 (not the
+            // generic 2, which a child can return) with the same stderr sentinel as
+            // run.rs's post-dispatch internal-failure arm, so the runner classifies
+            // it as ClwFailed and never caches it.
+            ResolveFailure::RunInternalNotRun => {
+                eprintln!(
+                    "[clw] internal error — child not run: {}",
+                    actionable_error(&e)
+                );
+                std::process::exit(subcmds::run::CLW_RUN_INTERNAL_NOT_RUN);
+            }
             // `doctor` and the local-only `auth logout`/`whoami` fall back to a
             // LENIENT resolution (missing tenant/token => empty) so they run on a
             // broken config instead of erroring before they can diagnose/repair it.
-            if command_runs_on_broken_config(&cli.command) {
-                ResolvedConfig::resolve_lenient(&cli)
-            } else {
-                exit_err(&e);
-            }
-        }
+            ResolveFailure::Lenient => ResolvedConfig::resolve_lenient(&cli),
+            ResolveFailure::Fatal => exit_err(&e),
+        },
     };
 
     // Resolve the color policy once (flag > NO_COLOR env > non-TTY). clw emits
@@ -429,6 +468,40 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FROZEN-CONTRACT REGRESSION (docs/CLI-SURFACE-EXIT-FREEZE.md): a `clw run` that
+    // fails during config/identity resolution (before the child runs) must map to the
+    // reserved-125 "child never ran" path — NOT the generic exit-2 fatal path that a
+    // child's own exit 2 collides with. This is the exact bug the audit caught.
+    #[test]
+    fn run_resolve_failure_maps_to_reserved_125_not_run() {
+        let cli = Cli::try_parse_from(["clw", "run", "--input", "f", "--", "true"]).unwrap();
+        assert_eq!(
+            classify_resolve_failure(&cli.command),
+            ResolveFailure::RunInternalNotRun,
+            "clw run must be classified as the reserved-125 child-never-ran path"
+        );
+    }
+
+    #[test]
+    fn local_only_and_uninstall_keep_lenient_paths() {
+        let doctor = Cli::try_parse_from(["clw", "doctor"]).unwrap();
+        assert_eq!(
+            classify_resolve_failure(&doctor.command),
+            ResolveFailure::Lenient
+        );
+        let uninstall = Cli::try_parse_from(["clw", "uninstall"]).unwrap();
+        assert_eq!(
+            classify_resolve_failure(&uninstall.command),
+            ResolveFailure::UninstallLenient
+        );
+    }
+
+    #[test]
+    fn other_network_commands_stay_fatal_exit_2() {
+        let ls = Cli::try_parse_from(["clw", "ls"]).unwrap();
+        assert_eq!(classify_resolve_failure(&ls.command), ResolveFailure::Fatal);
+    }
 
     #[test]
     fn parse_init_basic() {
