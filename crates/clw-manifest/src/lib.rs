@@ -154,6 +154,17 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
             // Record as a candidate empty dir; we'll filter after collecting all entries.
             candidate_dirs.push((rel, abs));
         } else if file_type.is_file() {
+            // TOCTOU NOTE (audit Low, accepted for v0.1): this branch classifies
+            // `abs` as a regular file using the walker's `follow_links(false)`
+            // file type, but the snapshot read site (clw-snapshot, `std::fs::read`
+            // / `File::open`) opens it with symlink following. A concurrent hostile
+            // writer on a SHARED checkout could swap `abs` for a symlink between this
+            // classification and that open, causing snapshot to ingest out-of-workspace
+            // bytes. This is OUT OF the v0.1 threat model: `clw` is a single-operator
+            // local tool and a concurrent hostile writer to one's own working tree is
+            // not modeled. Hardening (cross-platform O_NOFOLLOW open + fstat-after-open
+            // to confirm the opened inode is the regular file we classified) is tracked
+            // separately; see the matching note in clw-snapshot at the read site.
             let meta = std::fs::metadata(&abs)?;
             // On unix, read the real permission bits. On Windows there is no
             // unix mode concept, so we record a constant default of 0o644 for

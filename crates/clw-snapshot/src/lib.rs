@@ -279,6 +279,19 @@ where
     for we in walked {
         match we {
             WalkedEntry::File(f) => {
+                // TOCTOU NOTE (audit Low, accepted for v0.1): the walker classified
+                // `f.abs` as a regular file with `follow_links(false)`, but the reads
+                // below (`std::fs::read` for the small path, `File::open` for the
+                // streaming path) FOLLOW symlinks. Between the walk's classification
+                // and these opens, a concurrent hostile writer on a SHARED checkout
+                // could replace `f.abs` with a symlink and make snapshot ingest
+                // out-of-workspace bytes. This race is OUT OF the v0.1 threat model:
+                // `clw` is a single-operator local tool, and a hostile concurrent
+                // writer to the operator's own working tree is not something v0.1
+                // defends against. The proper fix (cross-platform O_NOFOLLOW open +
+                // fstat-after-open confirming the opened inode matches the regular
+                // file we classified) is deliberately deferred as tracked hardening
+                // rather than a silent assumption; mirrored in clw-manifest's walk.
                 let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
                     // ---- small file: in-memory fast path -------------------
                     let abs = f.abs.clone();

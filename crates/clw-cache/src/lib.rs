@@ -335,22 +335,56 @@ struct NamedTmpFile {
 
 /// Create a uniquely named temporary file inside `dir`.  The file is NOT
 /// deleted on drop — the caller is responsible for renaming or removing it.
+///
+/// # Cross-process uniqueness
+/// The temp name combines the PID, thread-id, subsec-nanos, AND a process-wide
+/// monotonic [`AtomicU64`] sequence. Two processes sharing the same cache dir
+/// (e.g. concurrent `clw` invocations) can otherwise collide on
+/// `ThreadId(1)` + the same `subsec_nanos`, which under `create_new(true)`
+/// surfaces as a hard `AlreadyExists` error and a flaky `put`. The PID
+/// disambiguates across processes and the sequence disambiguates within a
+/// process; we still retry once on the (now astronomically unlikely)
+/// `AlreadyExists` to absorb any residual same-nanos/same-seq race. This
+/// mirrors the `TMP_SEQ` pattern in clw-hydrate's `materialize_file`.
 fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Use a combination of time + thread-id for uniqueness without external deps.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+
+    // Process-wide monotonic counter: guarantees uniqueness between two temp
+    // files created in the same process even when they land on the same
+    // `subsec_nanos` (thread-id + nanos alone can collide under concurrency).
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let pid = std::process::id();
     let tid = std::thread::current().id();
-    let name = format!(".tmp-{:?}-{}", tid, nanos);
-    let path = dir.join(&name);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(ClwError::Io)?;
-    Ok(NamedTmpFile { file, path })
+
+    // Try once; on the vanishingly unlikely `AlreadyExists` (two processes on
+    // the same PID-space + same nanos + same seq, which cannot happen on a
+    // single host) retry with a fresh nanos + seq before giving up.
+    let mut last_err = None;
+    for _ in 0..2 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".tmp-{pid}-{tid:?}-{nanos}-{seq}");
+        let path = dir.join(&name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok(NamedTmpFile { file, path }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(ClwError::Io(e)),
+        }
+    }
+    Err(ClwError::Io(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "temp file name collision")
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +774,40 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(blobs, vec![d.to_hex()], "only the final blob must remain");
+    }
+
+    // -----------------------------------------------------------------------
+    // temp-file naming: many rapid creations in the same dir never collide.
+    //
+    // Audit Low (cross-process temp collision): the prior name was
+    // `ThreadId + subsec_nanos` with NO counter, opened `create_new(true)`, so
+    // two creations on the same thread within the same nanosecond would hit a
+    // hard `AlreadyExists`. The name now carries a process-wide AtomicU64
+    // sequence (+ PID), so a tight loop of creations on ONE thread — exactly the
+    // same-nanos case the old code could not survive — must all succeed with
+    // distinct names.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn tempfile_in_is_collision_free_under_rapid_creation() {
+        use std::collections::HashSet;
+
+        let dir = TempDir::new().unwrap();
+        let mut names = HashSet::new();
+        let mut keep = Vec::new();
+        // 1000 rapid creations on a single thread: many will share subsec_nanos,
+        // so this fails outright (AlreadyExists) without the AtomicU64 sequence.
+        for _ in 0..1000 {
+            let tmp = tempfile_in(dir.path()).expect("rapid temp creation must not collide");
+            let name = tmp.path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                names.insert(name.clone()),
+                "duplicate temp file name generated: {name}"
+            );
+            // Keep the files (and their handles) alive so create_new sees them on
+            // disk — proving uniqueness against EXISTING files, not just names.
+            keep.push(tmp);
+        }
+        assert_eq!(names.len(), 1000);
     }
 
     // -----------------------------------------------------------------------
