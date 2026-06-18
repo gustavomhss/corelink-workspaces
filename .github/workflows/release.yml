@@ -766,7 +766,10 @@ jobs:
           export RUSTUP_HOME="$HOME/.clw-ci-rust/rustup"
           if ! "$CARGO" about --version >/dev/null 2>&1; then
             echo "cargo-about absent — installing into the isolated CARGO_HOME (one-time)."
-            "$CARGO" install cargo-about --locked
+            # `--features cli` is REQUIRED: cargo-about 0.9+ gates its binary behind
+            # the `cli` feature, so a plain `install` compiles the lib but installs NO
+            # `about` subcommand (=> "no such command: about"). Caught by v0.1.0-rc11.
+            "$CARGO" install cargo-about --locked --features cli
           fi
           "$CARGO" about generate about.hbs > release/THIRD-PARTY-LICENSES.md
           echo "generated release/THIRD-PARTY-LICENSES.md"
