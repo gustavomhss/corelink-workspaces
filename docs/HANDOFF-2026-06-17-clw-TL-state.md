@@ -1,5 +1,15 @@
 # clw TL — session handoff / state (2026-06-17)
 
+> ## ✅ SUPERSEDED — clw v0.1.0 SHIPPED (open beta, 2026-06-18)
+> **`clw` is LIVE: `brew install humangr-labs/clw/clw`.** The pre-launch detail below (dated 2026-06-17)
+> is preserved as a HISTORICAL record. Current state: tag `v0.1.0` (main `1b8059c`); public Release on
+> `humangr-labs/clw-releases` (latest, 24 signed assets); brew formula in `humangr-labs/homebrew-clw` at
+> `0.1.0`; all 4 release secrets set; e2e verified (brew install + minisign). **Remaining items are all
+> POST-LAUNCH, none blocking:** SLSA provenance (deferred per waiver — private repo), macOS Developer-ID +
+> Azure Windows signing ("último do último"), legal counsel (post-beta/pre-GA), live family-e2e (clw is now
+> delivered → cross-TL coordination CAN start). See the `clw-go-live-state` memory + `CLAUDE.md` for the
+> consolidated post-launch state.
+
 > **Purpose.** Single source of truth to resume *fresh* after a `/clear`. Reflects the **corrected**
 > state after reading the inbound server-TL correspondence (which had advanced past the prior summary).
 > I am TL of `clw` / corelink-workspaces (single human owner = Gustavo). Standing mandate: SOTA go-live,
