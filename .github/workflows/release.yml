@@ -842,9 +842,20 @@ jobs:
       # step set published=false, so the `if:` guard makes this a clean no-op.
       # Uses actions/attest-build-provenance (mints provenance via the OIDC token
       # granted by `id-token: write` + `attestations: write` above).
+      #
+      # PRIVATE-REPO GATE (rc8 finding, 2026-06-18): GitHub artifact attestation
+      # is NOT available for a PRIVATE source repo on the current plan — it hard-
+      # errors "Feature not available for user-owned private repositories". This
+      # repo stays private by design, so the step is GATED on visibility: it runs
+      # (and a real failure BLOCKS) only when the repo is public; on a private repo
+      # it is SKIPPED and the next step emits a loud ::warning:: so the gap is
+      # never silent. WAIVER (owner-authorized, Gustavo, 2026-06-18): SLSA
+      # provenance deferred for open beta — the release is still minisign-signed +
+      # SHA256SUMS + SBOM. Remediation/pre-GA: GitHub Enterprise (enables private-
+      # repo attestation) OR move the build/attest into the public mirror repo.
       # =======================================================================
-      - name: SLSA build-provenance attestation (real uploads only)
-        if: steps.mirror_release.outputs.published == 'true'
+      - name: SLSA build-provenance attestation (real uploads only, public repo only)
+        if: steps.mirror_release.outputs.published == 'true' && github.event.repository.private == false
         uses: actions/attest-build-provenance@v1
         with:
           # Attest the binaries (the artifacts a consumer runs). SHA256SUMS +
@@ -852,6 +863,12 @@ jobs:
           # subjects to this build.
           subject-path: |
             release/clw-${{ env.VERSION }}-*
+
+      - name: SLSA provenance SKIPPED notice (private repo — deferred per waiver)
+        if: steps.mirror_release.outputs.published == 'true' && github.event.repository.private == true
+        shell: bash
+        run: |
+          echo "::warning title=SLSA provenance skipped::GitHub artifact attestation is unavailable for this PRIVATE repo on the current plan, so SLSA build-provenance was SKIPPED. The release IS minisign-signed + SHA256SUMS + SBOM. SLSA deferred to pre-GA per owner waiver 2026-06-18 — remediation: GitHub Enterprise, or build/attest from the public mirror repo."
 
       # =======================================================================
       # HOMEBREW FORMULA BUMP — REAL tags only (PRERELEASE=="false") AND only when
