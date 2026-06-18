@@ -53,6 +53,16 @@ clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole clien
   so that is not expected in practice.) A non-zero run is **not** memoized — a failing job never poisons
   the cache. **Full frozen surface + exit table: `docs/CLI-SURFACE-EXIT-FREEZE.md`.**
 
+## `clw run` memoization scope (v0.1)
+The run cache key is derived **only** from: the declared `--input` path digests (+ unix mode bits), the
+declared `--env` variable **names** (and their current presence/value), the command vector + the resolved
+identity of `command[0]`, and the **canonicalized working directory**. Two runs that differ only in cwd get
+different keys (no cross-workspace stale replay). **Undeclared environment variables are the caller's
+responsibility:** clw does **not** sandbox the child environment in v0.1 (the child inherits the full
+ambient env — no `env_clear`), so any env var that affects the command's output **must** be declared via
+`--env` or it is invisible to the key and may replay a stale result. Child-env sandboxing (`env_clear` +
+allowlist) is a tracked post-beta hardening, deliberately out of scope for the `v0.1.0` line.
+
 ## JSON output
 The family-relevant verbs support `--json` for machine parsing (content-address root, cache
 hit/miss, byte counts). Pin against the documented fields in `docs/usage.md`; fields are additive

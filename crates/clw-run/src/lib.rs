@@ -4,6 +4,24 @@
 //! Keys are computed from input file/directory digests, command vector, and
 //! env vars. Results (stdout + stderr blobs) are stored in the CAS; the AC
 //! maps the run key → RunRecord.
+//!
+//! # Memoization contract (v0.1)
+//!
+//! `clw run` memoizes on, and ONLY on:
+//! - the digests (and unix mode bits) of the declared `--input` paths,
+//! - the declared `--env` variable NAMES (their current values + set/unset
+//!   presence are folded in; their *names* define the scope),
+//! - the command vector + the resolved identity of `command[0]` (the tool), and
+//! - the canonicalized absolute working directory the child runs in.
+//!
+//! **UNDECLARED environment variables are the CALLER's responsibility.** clw
+//! does **not** sandbox the child's environment in v0.1: the child inherits the
+//! orchestrator's full ambient environment (there is no `env_clear()`). An
+//! undeclared env var that changes the command's output will NOT change the key,
+//! so a caller whose command reads such a var MUST declare it via `--env` or risk
+//! a stale replay. Sandboxing the child environment (`env_clear` + an explicit
+//! allowlist) is a deliberate semantic change tracked as a post-beta hardening,
+//! reserved for owner approval; it is intentionally out of scope for v0.1.
 
 pub use clw_types as types;
 
@@ -59,6 +77,13 @@ struct KeyPayload {
     /// Folding this into the key prevents a stale replay after a toolchain
     /// upgrade (e.g. `cargo` upgraded in place would otherwise be a false hit).
     tool: String,
+    /// The canonicalized absolute working directory the child is spawned in
+    /// (`.current_dir(cwd)`). Folding this into the key prevents a stale cache
+    /// replay ACROSS workspaces: two invocations with identical inputs / command
+    /// / env but different cwds (e.g. the same relative `src/` in two checkouts)
+    /// would otherwise collide on one key and replay each other's output. This is
+    /// purely safer — distinct cwds now yield distinct keys, never a false hit.
+    cwd: String,
 }
 
 /// FIX 3: normalize a path string to `/` separators so the run key is stable
@@ -185,6 +210,13 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
 
 /// Compute the run key for the given options and working directory.
 ///
+/// The key folds in the declared `--input` digests (+ mode bits), the declared
+/// `--env` variable names (+ their current presence/value), the command vector,
+/// the resolved tool identity (`command[0]`), and the canonicalized absolute
+/// `cwd`. See the crate-level "Memoization contract (v0.1)" doc for the full
+/// boundary — notably that UNDECLARED env vars are NOT in the key and are the
+/// caller's responsibility (clw does not sandbox the child env in v0.1).
+///
 /// Returns `Err(ClwError::Io(...))` if any input path is missing, or
 /// `Err(ClwError::InvalidManifest(...))` for walk errors.
 async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
@@ -295,12 +327,25 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
         resolve_tool_id(cwd, &opts.command[0]).await
     };
 
+    // --- working directory ---
+    // Fold the canonicalized absolute cwd into the key so two invocations with
+    // identical inputs/command/env in DIFFERENT directories yield different keys
+    // (no stale cross-workspace replay). Canonicalize so equivalent spellings of
+    // the same dir (symlinks, `..`, relative) collapse to one identity; fall back
+    // to the `/`-normalized lossy path if the dir cannot be canonicalized (e.g. a
+    // permission quirk) so the key stays well-defined rather than failing.
+    let cwd_key = match tokio::fs::canonicalize(cwd).await {
+        Ok(abs) => norm_sep(&abs.to_string_lossy()),
+        Err(_) => norm_sep(&cwd.to_string_lossy()),
+    };
+
     // --- canonical JSON ---
     let payload = KeyPayload {
         inputs: input_pairs,
         command: opts.command.clone(),
         env: env_pairs,
         tool,
+        cwd: cwd_key,
     };
     let json_bytes = serde_json::to_vec(&payload)?;
 
@@ -370,6 +415,17 @@ where
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// Run `opts.command` in `cwd`, memoized on the content-addressed run key.
+///
+/// On a key HIT the stored stdout/stderr/exit are replayed without re-executing;
+/// on a MISS the child runs (inheriting the orchestrator's full ambient
+/// environment — clw does NOT `env_clear()` in v0.1) and a zero-exit result is
+/// memoized. The key is derived by [`compute_key`] from the declared `--input`
+/// digests, the declared `--env` variable NAMES, the command + tool identity,
+/// and the canonicalized `cwd`. See the crate-level "Memoization contract (v0.1)"
+/// doc: UNDECLARED env vars that affect the command's output are NOT in the key
+/// and are the CALLER's responsibility to declare via `--env`; child env
+/// sandboxing is a tracked post-beta hardening, not in scope here.
 pub async fn run_memoized<C: CasTransport + AcTransport>(
     cwd: &Path,
     client: &C,
@@ -788,6 +844,44 @@ mod tests {
         let outcome2 = run_memoized(cwd, &store, &opts2).await.unwrap();
         assert!(!outcome2.hit, "changed input must produce a miss");
         assert_ne!(outcome1.key, outcome2.key, "keys must differ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit Medium (cwd in key): identical inputs/command/env in DIFFERENT
+    // working directories MUST yield DIFFERENT keys — otherwise a stale result
+    // replays across workspaces. We create two cwds, each with a byte-identical
+    // `input.txt`, and run the SAME command/env in both; the keys must differ.
+    // A same-cwd repeat is also asserted stable (so the cwd fold is not noisy).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn different_cwd_yields_different_key() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cwd_a = dir_a.path();
+        let cwd_b = dir_b.path();
+
+        // Byte-identical inputs in both directories.
+        std::fs::write(cwd_a.join("input.txt"), b"same-bytes").unwrap();
+        std::fs::write(cwd_b.join("input.txt"), b"same-bytes").unwrap();
+
+        // Identical inputs / command / env — only the cwd differs.
+        let opts = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+
+        let key_a = compute_key(cwd_a, &opts).await.unwrap();
+        let key_b = compute_key(cwd_b, &opts).await.unwrap();
+        assert_ne!(
+            key_a, key_b,
+            "identical inputs/command/env in different cwds must yield different keys"
+        );
+
+        // The cwd fold is deterministic: same cwd → same key (no false miss).
+        let key_a2 = compute_key(cwd_a, &opts).await.unwrap();
+        assert_eq!(key_a, key_a2, "same cwd must yield a stable key");
     }
 
     // -----------------------------------------------------------------------

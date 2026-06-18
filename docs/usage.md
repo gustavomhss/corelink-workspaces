@@ -141,6 +141,21 @@ clw run --input src/ --env RUSTFLAGS --env CARGO_PROFILE -- cargo build --releas
 Only the variables listed with `--env` are included in the key. Unlisted variables
 are ignored — they do not affect the cache key.
 
+> **Caller responsibility — undeclared env vars.** The wrapped command inherits
+> the full ambient environment; `clw` does **not** sandbox it in v0.1. So if your
+> command reads an environment variable that changes its output, you **must** list
+> it with `--env` — otherwise that variable is invisible to the cache key and a run
+> can replay a **stale** result. Declaring it is on you; clw cannot infer it.
+> (Sandboxing the child env to an explicit allowlist is a tracked post-beta
+> hardening, intentionally out of scope for v0.1.)
+
+### Working directory is part of the key
+
+The cache key also folds in the (canonicalized, absolute) **working directory** the
+command runs in. Two runs with identical `--input` paths, command, and `--env` but
+in **different directories** therefore get **different** keys — one workspace can
+never replay another's cached result.
+
 ### Exit code propagation
 
 `clw run` exits with the child's exit code, making it drop-in safe in any
