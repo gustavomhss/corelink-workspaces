@@ -20,9 +20,9 @@
 # What it does:
 #   - detects OS (uname -s) + arch (uname -m) and maps to the release target
 #     triple naming from .github/workflows/release.yml (clw-<version>-<target>);
-#   - downloads the binary, the signed SHA256SUMS, its minisign signature, and
-#     the minisign trust-root public key;
-#   - verifies the minisign detached signature over SHA256SUMS FIRST, then the
+#   - downloads the binary, the signed SHA256SUMS, and its minisign signature;
+#   - verifies the minisign detached signature over SHA256SUMS FIRST — against a
+#     trust-root public key EMBEDDED in this script (NOT a fetched key), then the
 #     binary's SHA-256 checksum (hard fail on mismatch; NEVER skippable);
 #   - on macOS, strips the com.apple.quarantine xattr from the downloaded binary
 #     so Gatekeeper does not block a curl-installed CLI;
@@ -37,7 +37,11 @@
 #   asset basename : clw-<version>-<target>           (no ext on macOS/Linux)
 #   checksums      : SHA256SUMS            (one `<hex>  <file>` line per artifact)
 #   signature      : SHA256SUMS.minisig    (minisign detached over SHA256SUMS)
-#   trust root     : minisign.pub          (committed + published; pin its fingerprint)
+#   trust root     : EMBEDDED in this script (CLW_MINISIGN_PUBKEY below). The
+#                    published docs/minisign.pub is NOT fetched/trusted at install
+#                    time — the embedded constant IS the pin (mirror/CDN cannot
+#                    swap both sig + key past it). Keep it byte-equal to the key
+#                    line in docs/minisign.pub.
 #   asset URL      : <base-url>/v<version>/<file>
 #
 # NOTE on versioning: the release pipeline publishes one GitHub Release per tag
@@ -59,6 +63,20 @@ set -eu
 # Public mirror repo (humangr-labs/clw-releases) GitHub Release download base.
 # Assets are at <base>/v<version>/<file> — anonymous, no auth.
 DEFAULT_BASE_URL="https://github.com/humangr-labs/clw-releases/releases/download"
+
+# EMBEDDED minisign trust root (the pin). This is the production public key —
+# byte-equal to docs/minisign.pub in the source repo. We verify the release
+# signature against THIS embedded key, never a key fetched from the (public,
+# anonymous) download surface: a mirror/CDN compromise that swapped both the
+# signature AND a fetched pubkey would otherwise pass verification silently
+# (trust-on-first-use). With the key pinned here, an attacker would have to
+# forge a signature under the real private key, which they do not hold.
+#   key id: 4B57B8B54A0E396D
+# Two lines: the `untrusted comment:` line + the base64 key line, exactly as
+# minisign expects in a .pub file.
+MINISIGN_KEY_ID="4B57B8B54A0E396D"
+CLW_MINISIGN_PUBKEY_COMMENT="untrusted comment: minisign public key ${MINISIGN_KEY_ID}"
+CLW_MINISIGN_PUBKEY_LINE="RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0"
 
 # --- cleanup trap (runs on any exit, incl. set -e abort) ---------------------
 TMPDIR_INSTALL=""
@@ -201,15 +219,21 @@ fetch "${REL_DIR}/SHA256SUMS"          "${TMPDIR_INSTALL}/SHA256SUMS" \
   || die "failed to download SHA256SUMS"
 fetch "${REL_DIR}/SHA256SUMS.minisig"  "${TMPDIR_INSTALL}/SHA256SUMS.minisig" \
   || die "failed to download SHA256SUMS.minisig"
-fetch "${REL_DIR}/minisign.pub"        "${TMPDIR_INSTALL}/minisign.pub" \
-  || die "failed to download minisign.pub (trust root)"
+# NOTE: we do NOT fetch minisign.pub from the download surface — the trust root
+# is the EMBEDDED key (CLW_MINISIGN_PUBKEY_*), materialized just before verify.
 
 # --- verify signature over the checksum file (before trusting the checksums) -
 if command -v minisign >/dev/null 2>&1; then
-  info "verifying minisign signature over SHA256SUMS..."
-  ( cd "$TMPDIR_INSTALL" && minisign -V -p minisign.pub -m SHA256SUMS ) \
-    || die "minisign signature verification FAILED — refusing to install."
-  info "signature OK (trust root: minisign.pub)"
+  info "verifying minisign signature over SHA256SUMS (embedded trust root ${MINISIGN_KEY_ID})..."
+  # Materialize the EMBEDDED pubkey into a file WE control (never a fetched one).
+  # minisign reads the trust root from this -p file; because it is built from the
+  # in-script constant, a swapped remote key cannot influence verification.
+  printf '%s\n%s\n' \
+    "$CLW_MINISIGN_PUBKEY_COMMENT" "$CLW_MINISIGN_PUBKEY_LINE" \
+    > "${TMPDIR_INSTALL}/.clw-trust.pub"
+  ( cd "$TMPDIR_INSTALL" && minisign -V -p .clw-trust.pub -m SHA256SUMS ) \
+    || die "minisign signature verification FAILED against the embedded trust root (${MINISIGN_KEY_ID}) — refusing to install."
+  info "signature OK (embedded trust root: ${MINISIGN_KEY_ID})"
 else
   if [ "${CLW_SKIP_SIGNATURE:-}" = "1" ]; then
     info "WARNING: minisign not installed and CLW_SKIP_SIGNATURE=1 — proceeding on checksum only."
