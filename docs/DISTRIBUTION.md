@@ -110,6 +110,17 @@ persist on a runner after the signing step. The pipeline also publishes a
 `gh attestation` provenance statement (SLSA) as the SOTA supply-chain bar, with
 minisign as the offline signature-of-record.
 
+**What `brew install` actually verifies — and what the real backstop is.**
+`brew install` does **not** itself run minisign. It trusts the tap + mirror: it
+downloads the asset and checks it against the `sha256` baked into `Formula/clw.rb`,
+where that `sha256` was derived **at formula-bump time** from the minisign-verified
+`SHA256SUMS` (single source of truth, never recomputed). So the brew path's integrity
+rests on (1) branch-protection rulesets on the mirror + tap repos and (2) that
+bump-time chain back to the signed manifest — not on any per-machine signature check.
+Independent cryptographic verification is available to the diligent via the documented
+`minisign -V` / `gh attestation` path (`docs/INSTALL.md` §4), and **that** is the real
+backstop. Do not represent `brew install` as auto-verifying the minisign signature.
+
 **Decision (rotation).** A single active signing key with a documented successor
 procedure. On rotation, dual-publish the new public key (on the mirror and in-repo)
 **alongside** the old one for at least one release cycle, sign new releases with the

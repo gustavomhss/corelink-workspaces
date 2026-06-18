@@ -45,10 +45,11 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   | CLW_VERSION=<version> sh
 ```
 
-`install.sh` downloads the binary + the signed `SHA256SUMS` (+ `.minisig`) +
-`minisign.pub`, verifies the minisign signature over the checksum manifest, then the
-binary's SHA-256 (**never skippable**), strips the macOS quarantine attribute, and
-installs to `$HOME/.local/bin/clw`. See the
+Homebrew is the preferred path; this `curl` fallback verifies the minisign signature
+against the embedded trust-root (§4a) before installing. `install.sh` downloads the
+binary + the signed `SHA256SUMS` (+ `.minisig`) + `minisign.pub`, verifies the minisign
+signature over the checksum manifest, then the binary's SHA-256 (**never skippable**),
+strips the macOS quarantine attribute, and installs to `$HOME/.local/bin/clw`. See the
 [macOS quarantine note](#3-macos-quarantine-curl-path-only).
 
 ### Windows — direct `.exe` download
@@ -125,21 +126,34 @@ the checksum manifest **and**, where applicable, the platform signature.
 
 ### 4a. The minisign public key (trust root)
 
-`SHA256SUMS` is signed with **minisign**. The public key is published as
-`docs/minisign.pub` in the source tree **and** alongside every release on the public
-mirror (`.../v<version>/minisign.pub`). Pin its fingerprint out of band:
+`SHA256SUMS` is signed with **minisign**. The public key **is committed** to the
+source tree as `docs/minisign.pub` **and** published alongside every release on the
+public mirror (`.../v<version>/minisign.pub`) as the trust root — v0.1.0 and later are
+signed against it. Pin its fingerprint out of band:
 
 ```sh
-# Inspect the published key; compare its fingerprint to the one in this repo / README
+# Inspect the published key; compare its fingerprint to the one below / in docs/minisign.pub
 # out-of-band before trusting it.
 cat minisign.pub
 ```
 
-> **Trust-root fingerprint:** _(filled in when the owner provisions the minisign key —
-> `docs/go-live/LAUNCH-CHECKLIST.md` §A and `docs/DISTRIBUTION.md`. Until then
-> `docs/minisign.pub` is not yet committed.)_ On key rotation, the old and new public
-> keys are dual-published for one release cycle; see
-> `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
+> **Trust-root fingerprint (the committed `docs/minisign.pub`):**
+>
+> ```
+> minisign key id: 4B57B8B54A0E396D
+> RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0
+> ```
+>
+> On key rotation, the old and new public keys are dual-published for one release
+> cycle; see `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
+
+Verify `SHA256SUMS` directly against this trust-root key:
+
+```sh
+minisign -V -P RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0 \
+  -m SHA256SUMS
+# (equivalently: minisign -V -p minisign.pub -m SHA256SUMS — see §4b)
+```
 
 ### 4b. Verify the signed checksum manifest (all platforms)
 
@@ -253,17 +267,18 @@ brew upgrade clw
 clw --version
 ```
 
-### Install / pin a specific version
+### Install latest and pin
 
-The tap publishes versioned formulae, so you can install or pin an exact version:
+The tap publishes a single formula (`Formula/clw.rb`) tracking the latest release —
+there are no versioned `clw@<version>` formulae. Install the latest, then pin to stop
+a future `brew upgrade` from moving it:
 
 ```sh
-brew install humangr-labs/clw/clw@<version>   # e.g. clw@0.1.0
-# stop a future `brew upgrade` from moving it:
-brew pin clw                                   # `brew unpin clw` to allow upgrades again
+brew install humangr-labs/clw/clw   # installs the latest release
+brew pin clw                        # hold this version; `brew unpin clw` to allow upgrades
 ```
 
-To move from a pinned/old version to the latest:
+To roll back / move off a pinned version and re-track the latest:
 
 ```sh
 brew unpin clw 2>/dev/null || true
