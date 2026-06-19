@@ -86,14 +86,12 @@ if [ "$SCOPE" = "full" ]; then
   else
     echo "cargo-audit not installed — CI provisions it; skipping locally"
   fi
-  # Cross-platform COMPILE gate. GitHub-hosted runners are not used (billing); the
-  # self-hosted macOS runner cross-checks the one cfg-DIVERGENT target — Windows
-  # (`cfg(windows)` vs `cfg(unix)`) — so Windows breakage is caught on main without a
-  # native Windows runner. Linux is NOT cross-checked here: macOS natively compiles the
-  # entire `cfg(unix)` path (so a Linux cross-check adds little over the native build),
-  # AND `ring`'s C build needs an `x86_64-linux-gnu` cross-CC the runner lacks. The Linux
-  # release artifacts are produced on-demand via `cargo zigbuild` (see release.yml /
-  # docs/DISTRIBUTION.md). Runtime testing on Windows/Linux stays native/on-demand.
+  # Cross-platform COMPILE gate. CI runs on a Linux (ubuntu) GitHub-hosted runner,
+  # which natively compiles the entire `cfg(unix)` path; the one cfg-DIVERGENT target
+  # — Windows (`cfg(windows)` vs `cfg(unix)`) — is cross-CHECKED here (a `cargo check`,
+  # type-check only, so no cross-linker/CC is needed) so Windows breakage is caught on
+  # main without a native Windows runner. Per-OS NATIVE release binaries (Linux/macOS/
+  # Windows) are built by release.yml's matrix on their respective hosted runners.
   # Set CLW_SKIP_CROSS=1 for fast local iteration; CI/main must NOT skip it.
   if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
     echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
