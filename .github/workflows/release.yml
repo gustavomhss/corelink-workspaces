@@ -18,24 +18,21 @@
 #   * Proprietary: the download surface is NOT a public GitHub Release.
 #   * Signed: macOS Developer ID + notarize; Windows cloud/HSM Authenticode;
 #     Linux minisign (sigstore as documented alternative).
-#   * Cross-platform, 5 locked targets:
-#       aarch64-apple-darwin, x86_64-apple-darwin            (macOS)
-#       x86_64-pc-windows-gnu                                 (Windows)
-#       x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu  (Linux)
-#     aarch64-linux is BUILD-ONLY here: it is cross-compiled (cargo-zigbuild) and
-#     cannot be executed/tested on the self-hosted Mac build host.
-#   * Build host: the owner's OWN self-hosted single-owner Mac builds ALL legs —
-#     macOS native ×2 (a Mac compiles both apple arches natively), Linux cross ×2
-#     (cargo-zigbuild), and Windows cross ×1 (x86_64-pc-windows-gnu, also via
-#     zigbuild — zig targets windows-gnu). This is the owner's dedicated box, not
-#     GitHub-hosted billing and not a multi-tenant shared runner, so the earlier
-#     "no self-hosted Mac in the release path (M2 de-self-hosting mandate)"
-#     rationale is SUPERSEDED. The one hazard of a single-owner Mac — the owner's
-#     OTHER parallel projects nuking the shared ~/.rustup / ~/.cargo — is mitigated
-#     by a per-project isolated CARGO_HOME/RUSTUP_HOME ($HOME/.clw-ci-rust), set as
-#     the first step of every rust-using job (mirrors ci.yml's gates job).
-#     Windows is gnu, NOT msvc: msvc would require a Windows runner (a future
-#     option); the gnu ABI cross-compiles on the Mac via zigbuild.
+#   * Cross-platform, 5 locked targets — each built NATIVELY on its own
+#     GitHub-hosted runner (no cross-compilation):
+#       aarch64-apple-darwin       -> macos-14         (macOS)
+#       x86_64-apple-darwin        -> macos-14         (macOS, cross on Apple Silicon)
+#       x86_64-pc-windows-gnu      -> windows-latest   (Windows, gnu ABI)
+#       x86_64-unknown-linux-gnu   -> ubuntu-latest    (Linux)
+#       aarch64-unknown-linux-gnu  -> ubuntu-24.04-arm (Linux, native arm64)
+#   * Build hosts: GitHub-hosted, ephemeral, NATIVE per target. The release path
+#     migrated OFF the owner's self-hosted single-owner Mac to GitHub-hosted
+#     runners — every target now compiles on a runner of its own OS/arch, so there
+#     is no cross-compilation (cargo-zigbuild is gone) and no shared-host rustup to
+#     isolate (each ephemeral runner has a fresh rustup). The non-build jobs
+#     (preflight, conformance, sbom, publish) run on ubuntu-latest.
+#     Windows is gnu, NOT msvc: msvc would require an msvc toolchain; the gnu ABI
+#     builds natively on windows-latest (the GH Windows image ships mingw-w64).
 
 name: release
 
@@ -54,8 +51,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned toolchain — must match rust-toolchain.toml. Installed via STANDARD
-  # rustup on each leg; do NOT reproduce the founder-Mac PATH hack (M2.1).
+  # Pinned toolchain — must match rust-toolchain.toml. Installed via the standard
+  # preinstalled rustup on each ephemeral GitHub-hosted runner (`rustup show`
+  # materializes the rust-toolchain.toml pin).
   RUST_TOOLCHAIN: "1.91.1"
 
 jobs:
@@ -65,7 +63,7 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: preflight (guard + gates)
-    runs-on: [self-hosted, macOS]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -80,40 +78,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Isolate clw's Rust toolchain from the SHARED ~/.rustup + ~/.cargo on this
-      # single-owner self-hosted Mac. The owner's OTHER parallel projects can nuke
-      # the shared rustup home, dangling clw's cargo shims (`cargo: command not
-      # found`, exit 127). A clw-dedicated CARGO_HOME/RUSTUP_HOME survives that and
-      # self-heals if absent (mirrors ci.yml's gates job).
-      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
-        run: |
-          set -euo pipefail
-          CLW_RUST="$HOME/.clw-ci-rust"
-          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
-          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
-            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
-            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
-            # Supply-chain hardening: download the official rustup bootstrapper to a
-            # file FIRST, then execute it — never an un-inspectable live pipe-to-sh.
-            # Trust assumption is the official rustup HTTPS source (https://sh.rustup.rs,
-            # pinned proto=https + tlsv1.2). We deliberately do NOT pin a checksum: the
-            # upstream bootstrapper is versioned/rotated independently, so a pinned hash
-            # would be fragile and silently break the self-heal-if-absent path. The
-            # download-then-run split is the robust, non-fragile hardening here.
-            rustup_init="$(mktemp -t rustup-init.XXXXXX.sh)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
-            sh "$rustup_init" -y --no-modify-path --default-toolchain none --profile minimal
-            rm -f "$rustup_init"
-          fi
-          "$CLW_RUST/cargo/bin/rustup" --version
-
-      # The RUST_TOOLCHAIN env (used to drive the rustup installs on every leg)
-      # duplicates `channel` in rust-toolchain.toml. They MUST agree — a silent
-      # divergence would build/gate the release on a different toolchain than the
-      # one the repo pins for local dev. Assert equality at the earliest gate so a
-      # drift fails the release here, not somewhere downstream.
+      # The RUST_TOOLCHAIN env duplicates `channel` in rust-toolchain.toml. They
+      # MUST agree — a silent divergence would build/gate the release on a different
+      # toolchain than the one the repo pins for local dev. Assert equality at the
+      # earliest gate so a drift fails the release here, not somewhere downstream.
       - name: assert RUST_TOOLCHAIN matches rust-toolchain.toml
         run: |
           set -euo pipefail
@@ -123,10 +91,11 @@ jobs:
             exit 1
           fi
 
-      - name: install pinned rust toolchain
-        run: |
-          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component rustfmt,clippy
-          rustup default "${RUST_TOOLCHAIN}"
+      # Materialize the rust-toolchain.toml pin (1.91.1 + rustfmt/clippy) via the
+      # preinstalled rustup on the ephemeral runner. `rustup show` installs the
+      # pinned channel + its declared components on first use.
+      - name: install pinned rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       # Tag must be a semver shape (vX.Y.Z, optionally -rc.N / -rcN). Reject loose
       # `v*` tags that slipped past the broad trigger.
@@ -164,6 +133,17 @@ jobs:
             echo "::error::tag version '$TAG_VER' != Cargo workspace version '$CARGO_VER'"
             exit 1
           fi
+
+      # gates.sh's FULL lane runs `cargo deny check` + `cargo audit` (no install
+      # guard) and a windows-gnu cross-CHECK whose `ring` C build needs the mingw-w64
+      # cross-CC — provision them on the ephemeral runner (prebuilt = no slow compile),
+      # mirroring ci.yml's gates job.
+      - name: install cargo-deny + cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.8,cargo-audit
+      - name: install mingw-w64 (windows-gnu cross-CC for ring's C build)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 
       # Hard pre-tag gate: the full local gate (fmt + clippy -D warnings + test).
       # An unbuildable / un-lintable tag must never produce a release.
@@ -207,7 +187,7 @@ jobs:
   conformance:
     name: live conformance gate (pre-tag)
     needs: preflight
-    runs-on: [self-hosted, macOS]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # CI service identity for the live conformance suite. The suite reads these
@@ -222,37 +202,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
-      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
-      # if absent. Mirrors ci.yml's gates job.
-      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
-        run: |
-          set -euo pipefail
-          CLW_RUST="$HOME/.clw-ci-rust"
-          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
-          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
-            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
-            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
-            # Supply-chain hardening: download the official rustup bootstrapper to a
-            # file FIRST, then execute it — never an un-inspectable live pipe-to-sh.
-            # Trust assumption is the official rustup HTTPS source (https://sh.rustup.rs,
-            # pinned proto=https + tlsv1.2). We deliberately do NOT pin a checksum: the
-            # upstream bootstrapper is versioned/rotated independently, so a pinned hash
-            # would be fragile and silently break the self-heal-if-absent path. The
-            # download-then-run split is the robust, non-fragile hardening here.
-            rustup_init="$(mktemp -t rustup-init.XXXXXX.sh)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
-            sh "$rustup_init" -y --no-modify-path --default-toolchain none --profile minimal
-            rm -f "$rustup_init"
-          fi
-          "$CLW_RUST/cargo/bin/rustup" --version
-
-      - name: install pinned rust toolchain
-        run: |
-          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
-          rustup default "${RUST_TOOLCHAIN}"
+      # Materialize the rust-toolchain.toml pin (1.91.1) via the preinstalled
+      # rustup on the ephemeral runner.
+      - name: install pinned rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       - name: announce gate mode (true gate vs. env-skip)
         run: |
@@ -314,40 +267,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- macOS (Apple Silicon, native on the self-hosted Mac) ----------
+          # --- macOS (Apple Silicon, native on macos-14) --------------------
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS]
+            os: macos-14
             platform: macos
             ext: ""
-            cross: false
-          # --- macOS (Intel, native on the self-hosted Mac — a Mac builds both
-          #     apple arches natively) ---------------------------------------
+          # --- macOS (Intel: cross-built on the Apple-Silicon macos-14 runner.
+          #     The Apple toolchain builds both arches natively, and macos-13
+          #     (Intel) hosted runners are scarce/unschedulable on this plan —
+          #     v0.1.1-rc5 sat queued ~1h. `rustup target add x86_64-apple-darwin`
+          #     + `cargo build --target` on macos-14 produces a valid Intel binary.)
           - target: x86_64-apple-darwin
-            os: [self-hosted, macOS]
+            os: macos-14
             platform: macos
             ext: ""
-            cross: false
-          # --- Windows (x86_64, gnu ABI: cross-compiled on the Mac via
-          #     cargo-zigbuild — zig targets windows-gnu. msvc would need a
-          #     Windows runner, a future option) -----------------------------
+          # --- Windows (x86_64, gnu ABI: native on windows-latest — the GH
+          #     Windows image ships mingw-w64; msvc would need the msvc
+          #     toolchain, a future option) ----------------------------------
           - target: x86_64-pc-windows-gnu
-            os: [self-hosted, macOS]
+            os: windows-latest
             platform: windows
             ext: ".exe"
-            cross: true
-          # --- Linux (x86_64, cross-compiled on the Mac via cargo-zigbuild) --
+          # --- Linux (x86_64, native on ubuntu-latest) ----------------------
           - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, macOS]
+            os: ubuntu-latest
             platform: linux
             ext: ""
-            cross: true
-          # --- Linux (aarch64, BUILD-ONLY: cross-compiled via cargo-zigbuild,
-          #     CANNOT be run/tested on the self-hosted Mac build host) ------
+          # --- Linux (aarch64, native on the arm64 ubuntu runner) -----------
           - target: aarch64-unknown-linux-gnu
-            os: [self-hosted, macOS]
+            os: ubuntu-24.04-arm
             platform: linux
             ext: ""
-            cross: true
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
       # Final per-target asset basename. Keep this in lockstep with the M2.5
@@ -356,72 +306,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
-      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
-      # if absent. Mirrors ci.yml's gates job.
-      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
-        shell: bash
-        run: |
-          set -euo pipefail
-          CLW_RUST="$HOME/.clw-ci-rust"
-          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
-          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
-            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
-            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
-            # Supply-chain hardening: download the official rustup bootstrapper to a
-            # file FIRST, then execute it — never an un-inspectable live pipe-to-sh.
-            # Trust assumption is the official rustup HTTPS source (https://sh.rustup.rs,
-            # pinned proto=https + tlsv1.2). We deliberately do NOT pin a checksum: the
-            # upstream bootstrapper is versioned/rotated independently, so a pinned hash
-            # would be fragile and silently break the self-heal-if-absent path. The
-            # download-then-run split is the robust, non-fragile hardening here.
-            rustup_init="$(mktemp -t rustup-init.XXXXXX.sh)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
-            sh "$rustup_init" -y --no-modify-path --default-toolchain none --profile minimal
-            rm -f "$rustup_init"
-          fi
-          "$CLW_RUST/cargo/bin/rustup" --version
-
+      # Materialize the rust-toolchain.toml pin (1.91.1) via the preinstalled rustup
+      # on the ephemeral runner, then add this leg's NATIVE target. Every target now
+      # builds on a runner of its own OS/arch, so no cross-compilation is needed.
       - name: install pinned rust toolchain + target
         shell: bash
         run: |
-          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
-          rustup default "${RUST_TOOLCHAIN}"
+          set -euo pipefail
+          rustup show
           rustup target add "${{ matrix.target }}"
 
-      # cargo-zigbuild handles the aarch64-linux cross-compile cleanly (the M2.2
-      # decision; `cross` is the alternative). Installed only on the cross leg.
-      - name: install cargo-zigbuild (cross legs only)
-        if: matrix.cross
+      # windows-gnu links with the GNU (mingw-w64) toolchain, which the GitHub
+      # windows-latest image ships under the bundled MSYS2 (`C:\msys64`). Make the
+      # gnu linker (x86_64-w64-mingw32-gcc / dlltool) resolvable for the cargo build
+      # below; if it is already on PATH this is a no-op.
+      - name: ensure mingw-w64 gnu linker is on PATH (windows-gnu)
+        if: matrix.platform == 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          # ziglang ships as a pip package, but macOS' Homebrew Python is EXTERNALLY
-          # MANAGED (PEP 668) so `pip install` into it is REFUSED
-          # (error: externally-managed-environment). Install the pinned ziglang into a
-          # dedicated, ISOLATED venv (mirrors the isolated CARGO_HOME/RUSTUP_HOME
-          # pattern) and prepend it to PATH so cargo-zigbuild's `python3 -m ziglang`
-          # resolves to the venv python that has it — no system-python pollution.
-          ZIG_VENV="$HOME/.clw-ci-zigvenv"
-          if [ ! -x "$ZIG_VENV/bin/python3" ]; then
-            python3 -m venv "$ZIG_VENV"
+          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            echo "mingw-w64 gnu linker already on PATH: $(command -v x86_64-w64-mingw32-gcc)"
+            exit 0
           fi
-          echo "$ZIG_VENV/bin" >> "$GITHUB_PATH"
-          # Pinned for a reproducible cross toolchain (M2.2). Bump deliberately.
-          "$ZIG_VENV/bin/pip" install "ziglang==0.16.0"
-          cargo install --locked cargo-zigbuild --version 0.23.0
+          # The runner ships MSYS2 with the mingw64 gcc under C:\msys64\mingw64\bin.
+          MINGW_BIN="/c/msys64/mingw64/bin"
+          if [ -x "${MINGW_BIN}/x86_64-w64-mingw32-gcc.exe" ]; then
+            echo "$MINGW_BIN" >> "$GITHUB_PATH"
+            echo "added ${MINGW_BIN} to PATH for the gnu linker"
+          else
+            # Fall back to installing the mingw-w64 toolchain via the bundled MSYS2.
+            echo "mingw-w64 gcc not found at ${MINGW_BIN} — installing via MSYS2 pacman"
+            /c/msys64/usr/bin/pacman -S --noconfirm --needed mingw-w64-x86_64-gcc
+            echo "$MINGW_BIN" >> "$GITHUB_PATH"
+          fi
 
       - name: build release binary
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo zigbuild --release -p clw-cli --target "${{ matrix.target }}"
-          else
-            cargo build --release -p clw-cli --target "${{ matrix.target }}"
-          fi
+          # NATIVE build for this leg's target (no cross-compilation).
+          cargo build --release -p clw-cli --target "${{ matrix.target }}"
           # Stage the binary under its final per-target asset name.
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/clw${{ matrix.ext }}" "dist/${ASSET}"
@@ -557,10 +482,10 @@ jobs:
             exit 0
           fi
           # Real minisign detached signature -> dist/${ASSET}.minisig.
-          # Portable install (this leg now runs on the self-hosted Mac): brew on
-          # macOS, apt on Linux, skip if already present.
+          # This leg runs on a GitHub-hosted Ubuntu runner — install minisign via
+          # apt (skip if already present).
           if ! command -v minisign >/dev/null 2>&1; then
-            if command -v brew >/dev/null 2>&1; then brew install minisign; else sudo apt-get update -qq && sudo apt-get install -y -qq minisign; fi
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           fi
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
           trap 'rm -f minisign.key' EXIT   # remove the key even if signing aborts under set -e
@@ -597,7 +522,7 @@ jobs:
   sbom:
     name: sbom (CycloneDX)
     needs: [preflight, conformance]
-    runs-on: [self-hosted, macOS]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -605,46 +530,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Isolate clw's Rust toolchain from the shared ~/.rustup on this single-owner
-      # self-hosted Mac (the owner's other parallel projects can nuke it); self-heals
-      # if absent. Mirrors ci.yml's gates job.
-      - name: isolate + ensure clw Rust toolchain (immune to the shared-host rustup-nuke)
-        run: |
-          set -euo pipefail
-          CLW_RUST="$HOME/.clw-ci-rust"
-          echo "CARGO_HOME=$CLW_RUST/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=$CLW_RUST/rustup" >> "$GITHUB_ENV"
-          echo "$CLW_RUST/cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "$CLW_RUST/cargo/bin/rustup" ]; then
-            echo "isolated rustup absent — installing (clw-dedicated, one-time)"
-            export CARGO_HOME="$CLW_RUST/cargo" RUSTUP_HOME="$CLW_RUST/rustup"
-            # Supply-chain hardening: download the official rustup bootstrapper to a
-            # file FIRST, then execute it — never an un-inspectable live pipe-to-sh.
-            # Trust assumption is the official rustup HTTPS source (https://sh.rustup.rs,
-            # pinned proto=https + tlsv1.2). We deliberately do NOT pin a checksum: the
-            # upstream bootstrapper is versioned/rotated independently, so a pinned hash
-            # would be fragile and silently break the self-heal-if-absent path. The
-            # download-then-run split is the robust, non-fragile hardening here.
-            rustup_init="$(mktemp -t rustup-init.XXXXXX.sh)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
-            sh "$rustup_init" -y --no-modify-path --default-toolchain none --profile minimal
-            rm -f "$rustup_init"
-          fi
-          "$CLW_RUST/cargo/bin/rustup" --version
-
-      - name: install pinned rust toolchain
-        run: |
-          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
-          rustup default "${RUST_TOOLCHAIN}"
+      # Materialize the rust-toolchain.toml pin (1.91.1) via the preinstalled rustup
+      # on the ephemeral runner.
+      - name: install pinned rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       # cargo-cyclonedx emits a CycloneDX SBOM straight from the Cargo metadata /
       # Cargo.lock — no network egress and no signing secret, so this needs NO
-      # owner-gated credential and runs fully in the scaffold.
+      # owner-gated credential and runs fully in the scaffold. Installed from a
+      # PREBUILT release via taiki-e/install-action (avoids a slow from-source
+      # compile on the ephemeral runner).
       - name: install cargo-cyclonedx
-        # Pin the version (matches the cargo-zigbuild / ziglang discipline above):
-        # a breaking cargo-cyclonedx release must NOT silently change or break the
-        # SBOM at tag time. Bump deliberately after re-verifying the flags below.
-        run: cargo install --locked cargo-cyclonedx --version 0.5.9
+        # Pin the version: a breaking cargo-cyclonedx release must NOT silently
+        # change or break the SBOM at tag time. Bump deliberately after re-verifying
+        # the flags below.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
 
       - name: generate CycloneDX SBOM (workspace, JSON)
         run: |
@@ -685,11 +587,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # STAGE 4 — CHECKSUM + PUBLISH (REWORKED — public mirror + brew, WP-B/WP-C)
   # Collect every signed artifact, produce one signed SHA256SUMS, then publish a
-  # PUBLIC GitHub Release on the dedicated mirror repo `humangr-labs/clw-releases`
+  # PUBLIC GitHub Release on the dedicated mirror repo `HumanGuardrail/clw-releases`
   # (the source repo `corelink-workspaces` is PRIVATE, so its own Release assets
   # are not public — see DISTRIBUTION-REWORK-PLAN §8 B1). After a real upload,
   # add SLSA build-provenance attestation, then bump the Homebrew formula in
-  # `humangr-labs/homebrew-clw` (real tags only). minisign stays the offline
+  # `HumanGuardrail/homebrew-clw` (real tags only). minisign stays the offline
   # signature-of-record; attestation is the added provenance layer.
   # ---------------------------------------------------------------------------
   publish:
@@ -697,7 +599,7 @@ jobs:
     # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
     # predecessor of publish/sign — a red conformance tag never ships.
     needs: [preflight, conformance, build, sbom]
-    runs-on: [self-hosted, macOS]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Provenance attestation needs to mint an OIDC token + write the attestation.
     # `contents: write` is harmless here (the public Release is created on the
@@ -716,15 +618,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Clean slate: this job runs on a PERSISTENT self-hosted Mac, so a prior
-      # tag's `artifacts/` and `release/` (stale binaries + an old SHA256SUMS /
-      # .minisig) survive between runs and would be re-checksummed and re-published
-      # under the new version. Remove them before the download repopulates.
-      - name: clean stale release workspace (persistent self-hosted runner)
+      # Clean slate: the runner is now ephemeral (GitHub-hosted), so stale state is
+      # not expected — but keep this defensive rm so a re-run / restored cache can
+      # never leave a prior tag's `artifacts/` or `release/` (stale binaries + an
+      # old SHA256SUMS / .minisig) to be re-checksummed under the new version.
+      - name: clean stale release workspace (defensive)
         shell: bash
         run: |
           set -euo pipefail
           rm -rf release artifacts
+
+      # cargo-about (THIRD-PARTY-LICENSES, below) needs cargo — materialize the
+      # rust-toolchain.toml pin (1.91.1) via the preinstalled rustup on the
+      # ephemeral runner.
+      - name: install pinned rust toolchain (rust-toolchain.toml)
+        run: rustup show
 
       # Downloads EVERY uploaded artifact (per-target binaries AND the M4.3
       # `clw-sbom` CycloneDX SBOM) — no `name:` filter, so the SBOM rides along.
@@ -753,29 +661,25 @@ jobs:
       # Generate the per-release third-party attribution bundle that NOTICE
       # promises. Produced with cargo-about from about.toml/about.hbs (the
       # workspace cargo-about config). Staged into release/ BEFORE the checksum
-      # step so it is covered by SHA256SUMS and shipped as a release asset. Uses
-      # the isolated CARGO_HOME/RUSTUP_HOME like every other rust step. Hard-fails
-      # on any error (NO `|| true`): NOTICE must never reference a bundle we did
-      # not actually ship.
+      # step so it is covered by SHA256SUMS and shipped as a release asset. Hard-
+      # fails on any error (NO `|| true`): NOTICE must never reference a bundle we
+      # did not actually ship.
       - name: generate THIRD-PARTY-LICENSES bundle (cargo-about)
         shell: bash
         run: |
           set -euo pipefail
-          CARGO="$HOME/.clw-ci-rust/cargo/bin/cargo"
-          export CARGO_HOME="$HOME/.clw-ci-rust/cargo"
-          export RUSTUP_HOME="$HOME/.clw-ci-rust/rustup"
-          if ! "$CARGO" about --version 2>/dev/null | grep -q '0\.9\.0'; then
-            echo "cargo-about 0.9.0 absent — installing into the isolated CARGO_HOME (one-time)."
+          if ! cargo about --version 2>/dev/null | grep -q '0\.9\.0'; then
+            echo "cargo-about 0.9.0 absent — installing (one-time)."
             # PINNED + `--features cli`: cargo-about 0.9+ gates its binary behind the
             # `cli` feature (a plain install builds the lib but installs NO `about`
             # subcommand => "no such command: about", caught by rc11); and the version
-            # is pinned (like cargo-cyclonedx/zigbuild) because the config schema is
+            # is pinned (like cargo-cyclonedx) because the config schema is
             # version-sensitive — about.toml matches 0.9.0 (rc12 caught a schema drift).
-            "$CARGO" install cargo-about --locked --features cli --version 0.9.0
+            cargo install cargo-about --locked --features cli --version 0.9.0
           fi
           # `--workspace`: attribute the whole workspace's deps (cargo-about 0.9 moved
           # this from an about.toml key to a CLI flag).
-          "$CARGO" about generate about.hbs --workspace > release/THIRD-PARTY-LICENSES.md
+          cargo about generate about.hbs --workspace > release/THIRD-PARTY-LICENSES.md
           echo "generated release/THIRD-PARTY-LICENSES.md"
           ls -la release/
 
@@ -791,8 +695,8 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          # Portable SHA-256 (self-hosted Mac has `shasum`, Linux has `sha256sum`;
-          # both emit the same `<hex>  <file>` format).
+          # SHA-256 over every asset (ubuntu runner: sha256sum; fall back to shasum
+          # if ever run elsewhere — both emit the same `<hex>  <file>` format).
           if command -v sha256sum >/dev/null 2>&1; then sha256sum -- * > SHA256SUMS; else shasum -a 256 -- * > SHA256SUMS; fi
           echo "---- SHA256SUMS ----"
           cat SHA256SUMS
@@ -801,10 +705,9 @@ jobs:
             exit 0
           fi
           # Sign the checksum file itself -> SHA256SUMS.minisig (the cross-platform
-          # signed-checksum guarantee the roadmap demands).
-          # Portable install (self-hosted Mac): brew on macOS, apt on Linux.
+          # signed-checksum guarantee the roadmap demands). ubuntu runner: apt.
           if ! command -v minisign >/dev/null 2>&1; then
-            if command -v brew >/dev/null 2>&1; then brew install minisign; else sudo apt-get update -qq && sudo apt-get install -y -qq minisign; fi
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign
           fi
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > ../minisign.key
           trap 'rm -f ../minisign.key' EXIT   # remove the key even if signing aborts under set -e
@@ -825,7 +728,7 @@ jobs:
 
       # =======================================================================
       # PUBLISH — create a PUBLIC GitHub Release on the MIRROR repo
-      # `humangr-labs/clw-releases`, uploading ALL of release/* as assets.
+      # `HumanGuardrail/clw-releases`, uploading ALL of release/* as assets.
       #
       # WHY a cross-repo token: the source repo here is PRIVATE, so its own
       # Release assets are not public. The default GITHUB_TOKEN is scoped to THIS
@@ -840,19 +743,19 @@ jobs:
       # rc-vs-real: a prerelease tag (PRERELEASE=="true", classified once in
       # preflight) passes `--prerelease`; a real vX.Y.Z is published as latest.
       # =======================================================================
-      - name: publish GitHub Release on the public mirror (humangr-labs/clw-releases)
+      - name: publish GitHub Release on the public mirror (HumanGuardrail/clw-releases)
         id: mirror_release
         shell: bash
         env:
           # TODO(OWNER): provision CLW_RELEASES_TOKEN — a deploy key / fine-grained
-          # PAT scoped to ONLY humangr-labs/clw-releases, contents:write. The
+          # PAT scoped to ONLY HumanGuardrail/clw-releases, contents:write. The
           # default GITHUB_TOKEN cannot cross repos (confirmed, plan §8 B1).
           GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING public mirror Release (dry-run)."
-            echo "would create release v${VERSION} on humangr-labs/clw-releases (prerelease=${PRERELEASE}) with:"
+            echo "would create release v${VERSION} on HumanGuardrail/clw-releases (prerelease=${PRERELEASE}) with:"
             ls -la release/
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -869,22 +772,22 @@ jobs:
           # Create the cross-repo Release and upload every assembled asset. If the
           # release already exists (a re-run of the same tag), upload --clobber
           # rather than fail — the tag is immutable but a re-run must be idempotent.
-          if gh release view "v${VERSION}" --repo humangr-labs/clw-releases >/dev/null 2>&1; then
+          if gh release view "v${VERSION}" --repo HumanGuardrail/clw-releases >/dev/null 2>&1; then
             echo "release v${VERSION} already exists on the mirror — uploading assets with --clobber."
-            gh release upload "v${VERSION}" release/* --repo humangr-labs/clw-releases --clobber
+            gh release upload "v${VERSION}" release/* --repo HumanGuardrail/clw-releases --clobber
           else
             gh release create "v${VERSION}" release/* \
-              --repo humangr-labs/clw-releases \
+              --repo HumanGuardrail/clw-releases \
               --title "clw v${VERSION}" \
               --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed." \
               ${PRERELEASE_FLAG}
           fi
-          echo "published release/ -> humangr-labs/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
+          echo "published release/ -> HumanGuardrail/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       # =======================================================================
       # PUBLISH install.sh TO THE PUBLIC MIRROR — REAL tags only.
-      # The docs advertise `curl …raw.githubusercontent.com/humangr-labs/
+      # The docs advertise `curl …raw.githubusercontent.com/HumanGuardrail/
       # clw-releases/main/install.sh | sh`, but nothing publishes scripts/install.sh
       # there, so that URL 404s. Push the repo's scripts/install.sh to the mirror's
       # main branch via the GitHub contents API (create-or-update: re-fetch the
@@ -897,7 +800,7 @@ jobs:
         shell: bash
         env:
           # Same scoped token as the mirror Release step (contents:write on
-          # humangr-labs/clw-releases).
+          # HumanGuardrail/clw-releases).
           GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
         run: |
           set -euo pipefail
@@ -905,7 +808,7 @@ jobs:
             echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING install.sh publish to the mirror (dry-run)."
             exit 0
           fi
-          REPO="humangr-labs/clw-releases"
+          REPO="HumanGuardrail/clw-releases"
           SRC="scripts/install.sh"
           # base64 of the file content (portable: -w0 on GNU, no wrap on BSD).
           CONTENT_B64="$(base64 < "$SRC" | tr -d '\n')"
@@ -972,7 +875,7 @@ jobs:
 
       # =======================================================================
       # HOMEBREW FORMULA BUMP — REAL tags only (PRERELEASE=="false") AND only when
-      # HOMEBREW_TAP_TOKEN is present. Checks out humangr-labs/homebrew-clw, bumps
+      # HOMEBREW_TAP_TOKEN is present. Checks out HumanGuardrail/homebrew-clw, bumps
       # `version` + each of the 4 brew platforms' url+sha256 (aarch64/x86_64 ×
       # darwin/linux; Windows is not brew), then commits + pushes to the tap.
       #
@@ -988,13 +891,13 @@ jobs:
         shell: bash
         env:
           # TODO(OWNER): provision HOMEBREW_TAP_TOKEN — deploy key / fine-grained
-          # PAT scoped to ONLY humangr-labs/homebrew-clw, contents:write (R3).
+          # PAT scoped to ONLY HumanGuardrail/homebrew-clw, contents:write (R3).
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
             echo "::warning::HOMEBREW_TAP_TOKEN absent — SKIPPING Homebrew formula bump (dry-run)."
-            echo "would bump humangr-labs/homebrew-clw Formula/clw.rb to version ${VERSION} with url+sha256 from release/SHA256SUMS:"
+            echo "would bump HumanGuardrail/homebrew-clw Formula/clw.rb to version ${VERSION} with url+sha256 from release/SHA256SUMS:"
             grep -E "clw-${VERSION}-(aarch64|x86_64)-(apple-darwin|unknown-linux-gnu)$" release/SHA256SUMS || true
             exit 0
           fi
@@ -1010,7 +913,7 @@ jobs:
             fi
             printf '%s' "$line" | awk '{print $1}'
           }
-          BASE_URL="https://github.com/humangr-labs/clw-releases/releases/download/v${VERSION}"
+          BASE_URL="https://github.com/HumanGuardrail/clw-releases/releases/download/v${VERSION}"
           # The 4 brew platforms (Windows is NOT brew — excluded).
           A_DARWIN="clw-${VERSION}-aarch64-apple-darwin"
           X_DARWIN="clw-${VERSION}-x86_64-apple-darwin"
@@ -1024,7 +927,7 @@ jobs:
           # Check out the tap with the scoped token and regenerate Formula/clw.rb.
           TAP_DIR="$RUNNER_TEMP/homebrew-clw"
           rm -rf "$TAP_DIR"
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/humangr-labs/homebrew-clw.git" "$TAP_DIR"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/HumanGuardrail/homebrew-clw.git" "$TAP_DIR"
           mkdir -p "$TAP_DIR/Formula"
           cat > "$TAP_DIR/Formula/clw.rb" <<EOF
           # clw — CoreLink workspaces CLI. PROPRIETARY: the EULA governs use; the
@@ -1032,7 +935,7 @@ jobs:
           # is AUTO-GENERATED by the release pipeline — do not hand-edit.
           class Clw < Formula
             desc "CoreLink workspaces CLI"
-            homepage "https://github.com/humangr-labs/clw-releases"
+            homepage "https://github.com/HumanGuardrail/clw-releases"
             version "${VERSION}"
             # Closed-source: brew has no SPDX expression for this. tap CI gates on
             # \`brew style\` only (NOT \`brew audit --strict\`, which rejects this).
@@ -1079,4 +982,4 @@ jobs:
           git add Formula/clw.rb
           git commit -m "clw ${VERSION} (auto-bump from clw-releases v${VERSION})"
           git push origin HEAD
-          echo "bumped humangr-labs/homebrew-clw Formula/clw.rb -> ${VERSION}"
+          echo "bumped HumanGuardrail/homebrew-clw Formula/clw.rb -> ${VERSION}"
