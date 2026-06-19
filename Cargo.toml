@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # proprietary — binding terms in EULA.md (M4.2). `LicenseRef-Proprietary` is a
 # VALID SPDX expression (the `LicenseRef-` form for non-listed licenses), so

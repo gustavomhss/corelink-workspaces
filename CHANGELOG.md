@@ -1,6 +1,43 @@
 # Changelog
 
-## [Unreleased] — go-live hardening waves (2026-06-14)
+## [0.1.1] — post-launch audit remediation (2026-06-19)
+
+> Addresses all 20 cold-verified findings from a post-launch adversarial audit of v0.1.0
+> (9 PRs, #109–#117). No customer-facing behavior change beyond the `clw run` exit-code
+> correction; the rest hardens supply-chain, distribution glue, and docs.
+
+### Fixed
+- **`clw run` exit code (frozen-contract violation).** A clw-internal failure where the child
+  **never ran** (e.g. config/identity resolution failure) now exits the reserved **`125`** instead
+  of `2`. `2` collided with a child legitimately returning 2, so the CoreLink runner could
+  mis-attribute a clw substrate failure to the user's build. Now matches
+  `docs/CLI-SURFACE-EXIT-FREEZE.md`; regression-tested.
+- **`install.sh` trust root.** The installer now verifies the release signature against a
+  minisign public key **embedded in the script** (the pin), instead of trust-on-first-use against a
+  key fetched from the same surface as the signature.
+- **Third-party attribution.** `THIRD-PARTY-LICENSES.md` (the bundle `NOTICE` promises) is now
+  generated with `cargo-about` and shipped as a release asset — previously promised but never produced.
+- **Memoization key.** `clw run` now folds the (canonicalized) working directory into the cache key,
+  preventing a stale-replay across different directories with otherwise-identical inputs.
+- **Cache temp files.** Hardened against cross-process collisions (process id + atomic sequence),
+  mirroring the hydrate path.
+- **Docs.** Corrected the `INSTALL.md` trust-root fingerprint (the key **is** committed), removed a
+  non-existent `clw@<version>` Homebrew install claim, and made the brew-verification wording honest.
+
+### Changed
+- **Release pipeline.** SLSA provenance is gated to public repos (skipped with a loud warning on this
+  private repo — deferred per waiver); macOS notarization now asserts the notarytool JSON status; the
+  live-conformance gate is **ship-blocking for real tags** (requires `CLW_CI_TOKEN`); `install.sh` is
+  published to the public mirror; the SLSA subject set includes the checksums + SBOM.
+- **Supply-chain gates.** Added a `bytes` version floor, `cargo audit --deny unmaintained/unsound`, and
+  a committed `fuzz/Cargo.lock` + opt-in fuzz deny/audit lane.
+
+### Determinism note
+- `clw run` memoizes on declared `--input` + `--env` names + command + cwd. **Undeclared** environment
+  variables that affect a command's output remain the caller's responsibility to declare; clw does not
+  sandbox the child environment in this release (env-sandboxing is tracked as a post-beta hardening).
+
+## [0.1.0] — go-live hardening waves (2026-06-14)
 
 > Everything below shipped on `main` after the phase-1 baseline: the M0.5 audit-defect
 > fixes, the M2 Windows port, and the M1/M4/M5/M6 hardening waves. The phase-1 section
