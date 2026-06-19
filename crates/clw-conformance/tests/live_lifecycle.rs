@@ -135,12 +135,21 @@ fn is_capability_unavailable(err: &ClwError) -> bool {
 /// executable `exec.sh` (0o755), a symlink, and ONE larger multi-chunk file
 /// (5 MiB of deterministic bytes) so chunking + multi-chunk upload is exercised.
 #[cfg(unix)]
-fn build_workspace(root: &std::path::Path) -> WorkspaceFixture {
+fn build_workspace(root: &std::path::Path, suffix: &str) -> WorkspaceFixture {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    // Small file with known bytes.
-    let small_bytes = b"hello live lifecycle conformance\n".to_vec();
+    // Per-run uniqueness seed (FNV-1a over the run suffix). The CAS is
+    // content-addressed + DEDUPLICATED and the test tenant PERSISTS across runs, so
+    // a byte-identical fixture uploads chunks only on the very first run ever — every
+    // later run is all dedup hits (chunks_uploaded == 0) and fails the "fresh upload"
+    // assertion. Fold the suffix into the file CONTENT so each run uploads new chunks.
+    let seed: u32 = suffix.bytes().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+
+    // Small file with known, run-unique bytes.
+    let small_bytes = format!("hello live lifecycle conformance {suffix}\n").into_bytes();
     fs::write(root.join("small.txt"), &small_bytes).unwrap();
 
     // Executable file (mode 0o755).
@@ -159,7 +168,7 @@ fn build_workspace(root: &std::path::Path) -> WorkspaceFixture {
     // multi-chunk upload path).
     let big_len = 5 * 1024 * 1024usize;
     let big_bytes: Vec<u8> = (0u32..big_len as u32)
-        .map(|i| (i.wrapping_mul(0x9e37_79b9u32) >> 13) as u8)
+        .map(|i| (i.wrapping_mul(0x9e37_79b9u32).wrapping_add(seed) >> 13) as u8)
         .collect();
     fs::write(root.join("big.bin"), &big_bytes).unwrap();
 
@@ -217,7 +226,7 @@ async fn full_lifecycle_roundtrip_live() {
     // -- 1. Build the workspace fixture in a TempDir. ------------------------
     let src_tmp = tempfile::tempdir().expect("create src tempdir");
     let src_root = src_tmp.path();
-    let fixture = build_workspace(src_root);
+    let fixture = build_workspace(src_root, &suffix);
 
     // -- 2. snapshot → non-zero root digest + chunks uploaded. --------------
     let snap_cache_tmp = tempfile::tempdir().expect("create snapshot cache tempdir");
