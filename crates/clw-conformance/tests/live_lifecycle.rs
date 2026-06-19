@@ -240,9 +240,15 @@ async fn full_lifecycle_roundtrip_live() {
         Digest::of_bytes(&[]),
         "snapshot root digest must be non-zero / non-trivial"
     );
+    // `SnapshotReport.files` counts regular `File` manifest entries ONLY — symlinks
+    // and directories are deliberately NOT counted (documented on the field + pinned
+    // by clw-snapshot's own unit test). The fixture has 3 regular files (small.txt,
+    // exec.sh, big.bin); link.txt is a symlink (verified to round-trip below), so the
+    // expected file count is 3, not 4. (Was `>= 4` — an off-by-one that counted the
+    // symlink; it had never executed in CI because the gate skipped without a PAT.)
     assert!(
-        report.files >= 4,
-        "expected at least 4 files, got {}",
+        report.files >= 3,
+        "expected at least 3 regular files, got {}",
         report.files
     );
     assert!(
