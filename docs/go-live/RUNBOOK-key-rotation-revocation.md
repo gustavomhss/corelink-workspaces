@@ -111,9 +111,9 @@ may have cached the (now-bad) `sha256` in `~/Library/Caches/Homebrew`. **Never r
 to "fix" a bad release — a different binary at the same URL is a `sha256` mismatch for everyone who cached
 it. Procedure:
 
-1. **Stop the bleed.** On `humangr-labs/clw-releases`, mark the bad GitHub Release as a **draft** (or
-   delete it) so new `brew install`s can't fetch it. `gh release edit vX.Y.Z --repo humangr-labs/clw-releases --draft`.
-2. **Yank the formula.** On `humangr-labs/homebrew-clw`, **revert** the formula-bump commit (point
+1. **Stop the bleed.** On `HumanGuardrail/clw-releases`, mark the bad GitHub Release as a **draft** (or
+   delete it) so new `brew install`s can't fetch it. `gh release edit vX.Y.Z --repo HumanGuardrail/clw-releases --draft`.
+2. **Yank the formula.** On `HumanGuardrail/homebrew-clw`, **revert** the formula-bump commit (point
    `Formula/clw.rb` back at the last-good `vX.Y.(Z-1)`). `brew update` then serves the good version again.
 3. **Re-release forward.** Fix the defect, **bump to a NEW patch** `vX.Y.(Z+1)` (never re-cut the bad
    tag), tag → the pipeline publishes the new Release + re-bumps the formula. Users get the fix via

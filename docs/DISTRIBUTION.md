@@ -5,8 +5,8 @@ the release scaffold (`.github/workflows/release.yml`) needs to run end-to-end.
 
 > **Decision (owner, 2026-06-17) — SUPERSEDES the prior posture.** `clw` is now
 > distributed **publicly**: binaries are hosted on a **public mirror repo**
-> (`humangr-labs/clw-releases`) as GitHub Release assets, installed primarily via a
-> **public Homebrew tap** (`brew install humangr-labs/clw/clw`), with the `curl`
+> (`HumanGuardrail/clw-releases`) as GitHub Release assets, installed primarily via a
+> **public Homebrew tap** (`brew install humanguardrail/clw/clw`), with the `curl`
 > `scripts/install.sh` one-liner as the fallback. This **replaces** the earlier
 > "authenticated Cloudflare-R2-only, NOT a public GitHub Release, dedicated
 > `CLW_INSTALL_TOKEN`" model recorded in the previous decision (a)/(e).
@@ -26,25 +26,25 @@ the release scaffold (`.github/workflows/release.yml`) needs to run end-to-end.
 ```
   private corelink-workspaces (source) ── release.yml ── build×5 (signed) ──┐
                                                                             ▼
-                              publish job → PUBLIC mirror humangr-labs/clw-releases
+                              publish job → PUBLIC mirror HumanGuardrail/clw-releases
                                 ├─ GitHub Release per tag v<version>  (PUBLIC binary host)
                                 │    • 5 binaries (mac arm/intel, linux arm/intel, windows .exe)
                                 │    • SHA256SUMS + SHA256SUMS.minisig + minisign.pub
                                 │    • SBOM + gh attestation (provenance)
                                 │    • rc tags ⇒ --prerelease (no formula bump)
                                 └─ bump Homebrew formula on REAL tags only
-                                     → humangr-labs/homebrew-clw : Formula/clw.rb
+                                     → HumanGuardrail/homebrew-clw : Formula/clw.rb
   consumers:
-    • macOS/Linux : brew install humangr-labs/clw/clw   (brew formula → not quarantined)
+    • macOS/Linux : brew install humanguardrail/clw/clw   (brew formula → not quarantined)
     • any *nix    : curl … install.sh | sh              (fallback; strips macOS quarantine)
     • Windows     : direct .exe download from the Release (no brew on Windows)
 ```
 
-- **Binary host = public GitHub Releases on `humangr-labs/clw-releases`.** The main
+- **Binary host = public GitHub Releases on `HumanGuardrail/clw-releases`.** The main
   `corelink-workspaces` repo is **private**, so its own Release assets are not public;
   the mirror repo exists solely to host the public, immutable, per-tag release assets.
-  Asset URL: `https://github.com/humangr-labs/clw-releases/releases/download/v<version>/<asset>`.
-- **Primary install = public Homebrew tap** `humangr-labs/homebrew-clw` holding
+  Asset URL: `https://github.com/HumanGuardrail/clw-releases/releases/download/v<version>/<asset>`.
+- **Primary install = public Homebrew tap** `HumanGuardrail/homebrew-clw` holding
   `Formula/clw.rb` (4 platforms; Windows is not brew). The release pipeline bumps the
   formula on real tags; each per-binary `sha256` is parsed from the SAME `SHA256SUMS`
   the pipeline computes (single source of truth — never recomputed).

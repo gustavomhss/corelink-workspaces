@@ -9,7 +9,7 @@ content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + ten
 (never `x-corelink-tenant-id`). Config is env-driven (`CLW_ENDPOINT/CLW_TENANT/CLW_TOKEN/CLW_REF_DOMAIN`),
 no config file required. Single human owner = Gustavo (stakeholder + approver).
 
-**Status: SHIPPED — v0.1.0 is live (open beta, 2026-06-18).** `brew install humangr-labs/clw/clw`.
+**Status: SHIPPED — v0.1.0 is live (open beta, 2026-06-18).** `brew install humanguardrail/clw/clw`.
 
 ## Build / test / gate
 - The repo gate is `bash verify.sh` (FULL) or `bash verify.sh --scoped [base]` (change-scoped fast lane).
@@ -33,8 +33,8 @@ no config file required. Single human owner = Gustavo (stakeholder + approver).
   (mac×2 native, linux×2 + windows-gnu cross) → SBOM → checksum + publish.
 - **`vX.Y.Z-rc.N` = dry-run** (⇒ `--prerelease`, NO formula bump, reversible). Cut an rc to exercise the
   tag-only legs before a real release — rc dry-runs have repeatedly caught latent, tag-only bugs.
-- **Real `vX.Y.Z`** publishes the GitHub Release on the PUBLIC mirror `humangr-labs/clw-releases` (latest)
-  and bumps the formula in the PUBLIC tap `humangr-labs/homebrew-clw`.
+- **Real `vX.Y.Z`** publishes the GitHub Release on the PUBLIC mirror `HumanGuardrail/clw-releases` (latest)
+  and bumps the formula in the PUBLIC tap `HumanGuardrail/homebrew-clw`.
 - Binaries are minisign-signed (`SHA256SUMS.minisig`, trust-root `docs/minisign.pub`). SLSA provenance is
   gated to public repos only (deferred per waiver — this repo is private). macOS Developer-ID + Azure
   Windows signing are deferred.
