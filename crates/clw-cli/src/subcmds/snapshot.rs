@@ -57,7 +57,7 @@ pub async fn run(
 
     let report = snapshot(&args.path, &client, &cache, &opts)
         .await
-        .map_err(map_auth_error)?;
+        .map_err(|e| map_snapshot_error(e, &args.name))?;
 
     // Non-destructive warning: secret-looking files were uploaded, not dropped.
     // Printed to stderr so it never pollutes the `--json` stdout payload, and
@@ -96,13 +96,61 @@ pub async fn run(
     Ok(())
 }
 
+/// Map snapshot errors to actionable messages. A re-snapshot of an existing
+/// workspace name currently returns **HTTP 409** from the AC `PUT` (the server's
+/// ref store is create-only — in-place versioning/upsert isn't live yet). Translate
+/// that bare `HTTP 409` into a clear, actionable message (v0.1.1 power-user finding);
+/// other errors fall through to the shared auth mapping.
+fn map_snapshot_error(err: ClwError, name: &str) -> ClwError {
+    match &err {
+        ClwError::Http { status: 409, .. } => ClwError::Message(format!(
+            "workspace '{name}' already exists and the server rejected the in-place update (HTTP 409) \
+             — re-snapshot/versioning of an existing name is not supported server-side yet. To replace \
+             it, run `clw rm --name {name} --yes` first, then snapshot again."
+        )),
+        _ => map_auth_error(err),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::map_snapshot_error;
     use clw_snapshot::SnapshotOptions;
+    use clw_types::ClwError;
+
+    #[test]
+    fn re_snapshot_409_maps_to_actionable_rm_first_message() {
+        // v0.1.1 power-user finding: a re-snapshot returns a bare 'HTTP 409'. Translate
+        // it into a clear message that names the workspace and the rm-first workaround.
+        let mapped = map_snapshot_error(
+            ClwError::Http {
+                status: 409,
+                context: "PUT /v1/ac/...".to_string(),
+            },
+            "my-ws",
+        );
+        let msg = mapped.to_string();
+        assert!(
+            !msg.starts_with("HTTP 409"),
+            "must not be a bare HTTP 409: {msg}"
+        );
+        assert!(msg.contains("my-ws"), "must name the workspace: {msg}");
+        assert!(
+            msg.contains("clw rm --name my-ws --yes"),
+            "must give the rm-first workaround: {msg}"
+        );
+    }
+
+    #[test]
+    fn snapshot_error_passes_auth_through() {
+        // Non-409 errors fall through to the shared auth mapping (Message, not 'transport').
+        let mapped = map_snapshot_error(ClwError::Auth, "ws");
+        assert!(mapped.to_string().contains("CLW_TOKEN") || mapped.to_string().contains("config"));
+    }
 
     // NOTE (pass-2 audit de-vacuous): the previous `concurrency_zero_is_clamped_to_one`
     // and `concurrency_flag_is_passed_through_to_opts` tests defined a test-local `clamp`
