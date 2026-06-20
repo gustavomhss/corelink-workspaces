@@ -1,0 +1,87 @@
+# Live-conformance canary — SCHEDULED continuous validation of SHIPPED behavior
+# against LIVE prod. Closes the gap between point-in-time release-time conformance
+# (release.yml's pre-tag gate) and "is prod + the shipped clw contract still healthy
+# TODAY". A failure here = prod regressed or the shipped contract drifted -> visible
+# in the Actions tab.
+#
+# This REUSES, verbatim, two proven pieces:
+#   * release.yml's live-conformance cred wiring: the CI service-identity secrets
+#     (CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT) mapped onto the names the
+#     suite actually reads (CLW_TOKEN / CLW_TENANT / CLW_ENDPOINT), plus the
+#     `cargo test -p clw-conformance --features live` invocation.
+#   * ci.yml's self-hosted "put pinned Rust toolchain on PATH" step (the rustup
+#     proxy can be nuked on the shared self-hosted Mac).
+#
+# DIFFERENCE from release.yml's gate: there the missing-PAT SKIP is an intentional
+# dry-run no-op (green). HERE the canary always sets CLW_CONFORMANCE_REQUIRE=1, so a
+# SKIP (missing creds OR an unavailable endpoint) FAILS the canary LOUDLY rather than
+# green-passing — a silent canary is worse than no canary.
+
+name: conformance-canary
+
+on:
+  # Daily — catch a prod/contract regression within ~24h, not at the next release.
+  schedule:
+    - cron: "0 13 * * *"
+  # Manual trigger for on-demand validation.
+  workflow_dispatch:
+
+# Never run two canaries at once.
+concurrency:
+  group: conformance-canary
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  canary:
+    name: live conformance canary (prod)
+    # Self-hosted Mac (clw-mac-1): GitHub-hosted Actions minutes are currently
+    # exhausted, so the self-hosted runner is the only working lane.
+    runs-on: [self-hosted, macOS, X64]
+    timeout-minutes: 20
+    env:
+      # CI service identity for the live conformance suite (same secrets as
+      # release.yml's conformance gate). Declared here for visibility; the actual
+      # name-mapping the suite reads happens on the test step below.
+      CLW_CI_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+      CLW_CI_TENANT: ${{ secrets.CLW_CI_TENANT }}
+      CLW_CI_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # On the self-hosted Mac the shared-host "rustup-nuke" can break the rustup
+      # PROXY (~/.cargo/bin/cargo → rustup), so we do NOT rely on `rustup show`.
+      # Instead put the pinned toolchain's OWN bin (cargo+rustc, installed under the
+      # rust-toolchain.toml channel) directly on PATH — proxy-independent.
+      - name: put pinned Rust toolchain on PATH (rust-toolchain.toml channel)
+        run: |
+          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          BIN="$HOME/.rustup/toolchains/${CH}-x86_64-apple-darwin/bin"
+          test -x "$BIN/cargo" || { echo "pinned toolchain $CH is not installed on the runner at $BIN — run 'rustup toolchain install $CH' on clw-mac-1"; exit 1; }
+          echo "$BIN" >> "$GITHUB_PATH"
+
+      # The canary REQUIRES the live cases to actually run: a missing PAT (or an
+      # unreachable/unavailable endpoint) must FAIL loudly, never green-skip.
+      - name: live conformance suite (clw-conformance --features live, REQUIRE=1)
+        env:
+          # CRITICAL: the suite reads CLW_TOKEN/CLW_TENANT/CLW_ENDPOINT
+          # (clw-conformance/tests/live_conformance.rs::try_config), NOT the CLW_CI_*
+          # names. Map the CI service-identity secrets onto the names the suite
+          # actually reads — without this mapping every live case skips even when the
+          # PAT is provisioned.
+          CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+          CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
+          CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+          # REQUIRE=1 turns a skip (missing cred OR a 405/501 unavailable endpoint)
+          # into a hard failure, so a red/unreachable prod fails the canary.
+          CLW_CONFORMANCE_REQUIRE: "1"
+        run: |
+          set -euo pipefail
+          if [ -z "${CLW_TOKEN:-}" ]; then
+            echo "::error::CLW_CI_TOKEN absent — the canary REQUIRES live conformance to run (CLW_CONFORMANCE_REQUIRE=1). A missing PAT must fail the canary, not green-skip. Provision the CI service PAT secret."
+            exit 1
+          fi
+          echo "Running live conformance against prod (REQUIRE=1 — a skip is a hard failure)."
+          cargo test -p clw-conformance --features live
