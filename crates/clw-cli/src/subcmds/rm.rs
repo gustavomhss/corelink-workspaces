@@ -1,4 +1,5 @@
-//! `clw rm --name <NAME>` — delete a workspace ref.
+//! `clw rm --name <NAME>` — delete a workspace ref (or `--ref-key <KEY>` to delete a
+//! dangling/corrupt ref by its raw key, with no usable name).
 //!
 //! The corelink-server `DELETE /v1/ac` capability is LIVE (D-1, conformance-
 //! green). The 405/501 branch is a defensive guard: a LIVE capability returning
@@ -7,17 +8,27 @@
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_types::{ref_key_in, AcTransport, ClwError};
+use clw_types::{ref_key_in, AcTransport, ClwError, Digest, RefDomain};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
 
 #[derive(Debug, Args)]
-#[command(about = "Delete a workspace ref by name (idempotent)")]
+#[command(about = "Delete a workspace ref — by name, or by raw key (--ref-key) for a dangling ref")]
 pub struct RmArgs {
-    /// Workspace name (ref key).
-    #[arg(long, help = "Workspace name to delete")]
-    pub name: String,
+    /// Workspace name (ref key). Mutually exclusive with --ref-key.
+    #[arg(long, conflicts_with = "ref_key", help = "Workspace name to delete")]
+    pub name: Option<String>,
+
+    /// Delete a ref by its raw 64-hex ref KEY directly — for removing a DANGLING or
+    /// CORRUPT ref that `ls --all` / `prune` surfaced (they print the `ref_key`) but
+    /// that has no parseable name. Mutually exclusive with --name.
+    #[arg(
+        long,
+        value_name = "KEY",
+        help = "Raw 64-hex ref key to delete (for a dangling/corrupt ref with no usable name)"
+    )]
+    pub ref_key: Option<String>,
 
     /// Skip the interactive confirmation prompt.
     #[arg(
@@ -26,6 +37,31 @@ pub struct RmArgs {
         help = "Skip the y/N confirmation prompt (required for --json / non-interactive use)"
     )]
     pub yes: bool,
+}
+
+/// Resolve the (ref key, human label) to delete from `--name` XOR `--ref-key`.
+/// Extracted so the name-vs-key contract is unit-testable without a live server.
+fn resolve_rm_target(
+    name: Option<&str>,
+    ref_key: Option<&str>,
+    domain: RefDomain,
+) -> Result<(Digest, String), ClwError> {
+    match (name, ref_key) {
+        (Some(n), None) => Ok((ref_key_in(domain, n), format!("ref '{n}'"))),
+        (None, Some(k)) => {
+            let digest = Digest::from_hex(k).map_err(|_| {
+                ClwError::Message(format!(
+                    "--ref-key must be a 64-char lowercase hex ref key, got '{k}'"
+                ))
+            })?;
+            Ok((digest, format!("ref-key {k}")))
+        }
+        (None, None) => Err(ClwError::Message(
+            "specify the ref to delete: --name <NAME> or --ref-key <KEY>".to_string(),
+        )),
+        // clap's conflicts_with already rejects --name + --ref-key together.
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with rejects --name + --ref-key"),
+    }
 }
 
 pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
@@ -39,19 +75,31 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
     // able to tell "the delete did NOT happen" from a completed delete (they would
     // otherwise share exit 0). So in `--json` the structured `deleted:false` note
     // is printed FIRST, then an `Err` propagates carrying "left unchanged".
-    if !args.yes && !confirm_rm(&args.name)? {
-        return declined(&args.name, json);
+    let (rk, label) = resolve_rm_target(
+        args.name.as_deref(),
+        args.ref_key.as_deref(),
+        cfg.ref_domain,
+    )?;
+
+    if !args.yes && !confirm_rm(&label)? {
+        return declined(&label, json);
     }
 
     let client = HttpClient::new(cfg.clw_config)?;
-    let rk = ref_key_in(cfg.ref_domain, &args.name);
 
     match AcTransport::delete(&client, &rk).await {
         Ok(()) => {
             if json {
-                println!("{}", json!({ "name": args.name, "deleted": true }));
+                // Preserve the `{name:…}` shape for the name case (contract); the
+                // by-key case reports `{ref_key:…}`.
+                let out = match (&args.name, &args.ref_key) {
+                    (Some(n), _) => json!({ "name": n, "deleted": true }),
+                    (None, Some(k)) => json!({ "ref_key": k, "deleted": true }),
+                    _ => json!({ "deleted": true }),
+                };
+                println!("{out}");
             } else {
-                println!("deleted ref '{}'", args.name);
+                println!("deleted {label}");
             }
             Ok(())
         }
@@ -72,19 +120,20 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
 /// `deleted:false` note is printed FIRST, then the `Err` propagates carrying
 /// "left unchanged". (Was Ok(()) / exit 0 before the 2026-06-15 audit; the rm
 /// declined-exit tests were updated to assert this Err in both modes.)
-fn declined(name: &str, json: bool) -> Result<(), ClwError> {
+fn declined(label: &str, json: bool) -> Result<(), ClwError> {
     if json {
         println!(
             "{}",
             json!({
-                "name": name,
+                "ref": label,
                 "deleted": false,
                 "note": "aborted — confirmation declined (use --yes for non-interactive delete)"
             })
         );
     }
-    Err(ClwError::Transport(format!(
-        "aborted — confirmation declined; ref '{name}' left unchanged"
+    // Message (not Transport): a declined confirmation is not a transport failure.
+    Err(ClwError::Message(format!(
+        "aborted — confirmation declined; {label} left unchanged"
     )))
 }
 
@@ -125,13 +174,13 @@ fn map_auth_error(err: ClwError) -> ClwError {
 /// Prompt for confirmation before deleting a ref. Returns `false` immediately if
 /// stdin is not a TTY (non-interactive), so `--json`/pipelines never delete
 /// without an explicit `--yes`.
-fn confirm_rm(name: &str) -> Result<bool, ClwError> {
+fn confirm_rm(label: &str) -> Result<bool, ClwError> {
     use std::io::{IsTerminal as _, Write as _};
     if !std::io::stdin().is_terminal() {
         // Non-interactive without --yes: refuse to delete.
         return Ok(false);
     }
-    eprint!("delete ref '{name}'? this cannot be undone [y/N]: ");
+    eprint!("delete {label}? this cannot be undone [y/N]: ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
@@ -152,6 +201,26 @@ mod tests {
             "ref deletion failed: server returned 405/501 for DELETE /v1/ac".to_string(),
         );
         assert!(is_capability_unavailable(&err));
+    }
+
+    #[test]
+    fn resolve_rm_target_by_name_or_ref_key() {
+        // by name → the domain-folded ref key + a "ref '<name>'" label.
+        let (k_name, label) = resolve_rm_target(Some("my-ws"), None, RefDomain::User).unwrap();
+        assert_eq!(label, "ref 'my-ws'");
+        assert_eq!(k_name, ref_key_in(RefDomain::User, "my-ws"));
+        // by raw ref-key (64-hex) → that exact digest + a "ref-key …" label (v0.1.1
+        // power-user finding: lets a user delete a dangling/corrupt ref with no name).
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let (k_key, label2) = resolve_rm_target(None, Some(hex), RefDomain::User).unwrap();
+        assert_eq!(k_key, Digest::from_hex(hex).unwrap());
+        assert!(label2.contains(hex));
+        // invalid hex → actionable Message error (not a panic / not "transport").
+        let bad = resolve_rm_target(None, Some("not-hex"), RefDomain::User).unwrap_err();
+        assert!(!bad.to_string().starts_with("transport error"));
+        // neither flag → error naming BOTH options.
+        let none = resolve_rm_target(None, None, RefDomain::User).unwrap_err();
+        assert!(none.to_string().contains("--name") && none.to_string().contains("--ref-key"));
     }
 
     #[test]

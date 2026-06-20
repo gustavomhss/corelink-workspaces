@@ -644,7 +644,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clw", "rm", "--name", "some-ws"]).unwrap();
         match &cli.command {
             Commands::Rm(a) => {
-                assert_eq!(a.name, "some-ws");
+                assert_eq!(a.name.as_deref(), Some("some-ws"));
                 assert!(!a.yes);
             }
             other => panic!("expected Rm, got {other:?}"),
