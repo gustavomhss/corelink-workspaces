@@ -2303,3 +2303,207 @@ async fn snapshot_surfaces_nonretryable_tier_403_cleanly() {
         "a tier error must be a clean error, not a panic, got:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Config RESOLUTION precedence + identity persistence, through the BINARY.
+//
+// Precedence (config.rs): CLI flag > CLW_* env > CORELINK_* legacy env > ~/.clw/
+// config.toml > default. `config.rs` unit-tests the resolver in-process; these prove
+// it holds for a SPAWNED `clw` (what a runner / a real user actually gets), observed
+// via `auth whoami`, which prints the RESOLVED tenant offline (no network). Identity
+// persistence (`auth login`/`logout`) is asserted against an isolated $HOME.
+// ---------------------------------------------------------------------------
+
+/// Build a `clw` invocation with a pristine identity environment: an isolated $HOME
+/// (so no real ~/.clw leaks in) and every CLW_*/CORELINK_* var stripped. Tests then
+/// set EXACTLY the layers they are exercising.
+fn clw_clean_env(home: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("clw").unwrap();
+    cmd.env("HOME", home.to_str().unwrap())
+        .env_remove("CLW_ENDPOINT")
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env_remove("CLW_REF_DOMAIN")
+        .env_remove("CLW_CACHE_DIR")
+        .env_remove("CORELINK_ENDPOINT")
+        .env_remove("CORELINK_TENANT")
+        .env_remove("CORELINK_TOKEN");
+    cmd
+}
+
+/// A `--tenant` FLAG must beat `CLW_TENANT` env. whoami prints the resolved tenant.
+#[test]
+fn config_precedence_flag_tenant_beats_env() {
+    let home = TempDir::new().unwrap();
+    let out = clw_clean_env(home.path())
+        .env("CLW_TENANT", "env-tenant")
+        .env("CLW_TOKEN", "tok")
+        .args(["--tenant", "flag-tenant", "auth", "whoami"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "whoami must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("flag-tenant"),
+        "the --tenant flag must win over CLW_TENANT, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("env-tenant"),
+        "the env tenant must NOT be the resolved value when the flag is set, got:\n{stdout}"
+    );
+}
+
+/// `CLW_TENANT` env must beat the `~/.clw/config.toml` file value.
+#[test]
+fn config_precedence_env_tenant_beats_file() {
+    let home = TempDir::new().unwrap();
+    // Seed a config file with a DIFFERENT tenant + a token (so resolve succeeds).
+    let clw_dir = home.path().join(".clw");
+    std::fs::create_dir_all(&clw_dir).unwrap();
+    std::fs::write(
+        clw_dir.join("config.toml"),
+        "tenant = \"file-tenant\"\ntoken = \"filetok\"\n",
+    )
+    .unwrap();
+
+    let out = clw_clean_env(home.path())
+        .env("CLW_TENANT", "env-tenant")
+        .args(["auth", "whoami"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "whoami must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("env-tenant"),
+        "CLW_TENANT env must win over the config file tenant, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("file-tenant"),
+        "the file tenant must NOT be resolved when CLW_TENANT is set, got:\n{stdout}"
+    );
+}
+
+/// The `CORELINK_*` legacy aliases are accepted as a fallback, AND `CLW_*` wins when
+/// both are present (the runner injects CORELINK_*; an explicit CLW_* must override).
+#[test]
+fn config_corelink_alias_is_accepted_and_clw_wins() {
+    // (a) CORELINK_TENANT alone is honored.
+    let home_a = TempDir::new().unwrap();
+    let out_a = clw_clean_env(home_a.path())
+        .env("CORELINK_TENANT", "corelink-tenant")
+        .env("CORELINK_TOKEN", "ctok")
+        .args(["auth", "whoami"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_a.status.code(),
+        Some(0),
+        "whoami must exit 0 (CORELINK_*)"
+    );
+    assert!(
+        String::from_utf8_lossy(&out_a.stdout).contains("corelink-tenant"),
+        "CORELINK_TENANT must be accepted as a fallback, got:\n{}",
+        String::from_utf8_lossy(&out_a.stdout)
+    );
+
+    // (b) When BOTH are set, CLW_TENANT wins over CORELINK_TENANT.
+    let home_b = TempDir::new().unwrap();
+    let out_b = clw_clean_env(home_b.path())
+        .env("CLW_TENANT", "clw-tenant")
+        .env("CLW_TOKEN", "tok")
+        .env("CORELINK_TENANT", "corelink-tenant")
+        .env("CORELINK_TOKEN", "ctok")
+        .args(["auth", "whoami"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_b.status.code(),
+        Some(0),
+        "whoami must exit 0 (both set)"
+    );
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    assert!(
+        stdout_b.contains("clw-tenant") && !stdout_b.contains("corelink-tenant"),
+        "CLW_TENANT must win over CORELINK_TENANT when both are set, got:\n{stdout_b}"
+    );
+}
+
+/// `auth login` persists the resolved identity to ~/.clw/config.toml at 0600 and NEVER
+/// echoes the token value (only `<set>` presence). Mirrors a real user logging in.
+#[test]
+fn auth_login_persists_0600_config_without_echoing_token() {
+    let home = TempDir::new().unwrap();
+    let out = clw_clean_env(home.path())
+        .env("CLW_ENDPOINT", "https://example.com")
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", SECRET_TOKEN)
+        .args(["auth", "login"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "auth login must exit 0");
+
+    let config_path = home.path().join(".clw").join("config.toml");
+    assert!(config_path.exists(), "login must write the config file");
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "login must write config.toml 0600 (holds the PAT)"
+    );
+
+    // The token VALUE must never appear on either stream — only the path + <set>.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "login must NEVER echo the token value"
+    );
+    assert!(
+        stderr.contains(TEST_TENANT) || stdout.contains(TEST_TENANT),
+        "login should report the tenant it persisted, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `auth logout` removes the token line while KEEPING other keys, and never echoes the
+/// token. A real user logging out must scrub the on-disk PAT but not lose other config.
+#[test]
+fn auth_logout_removes_token_keeps_other_keys() {
+    let home = TempDir::new().unwrap();
+    let clw_dir = home.path().join(".clw");
+    std::fs::create_dir_all(&clw_dir).unwrap();
+    let config_path = clw_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("endpoint = \"https://example.com\"\ntenant = \"{TEST_TENANT}\"\ntoken = \"{SECRET_TOKEN}\"\n"),
+    )
+    .unwrap();
+
+    let out = clw_clean_env(home.path())
+        .args(["auth", "logout"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "auth logout must exit 0");
+
+    let after = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !after.contains(SECRET_TOKEN),
+        "logout must remove the token from the config file"
+    );
+    assert!(
+        after.contains(TEST_TENANT) && after.contains("endpoint"),
+        "logout must KEEP non-token keys (tenant, endpoint), got:\n{after}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "logout must NEVER echo the token value"
+    );
+}
