@@ -16,35 +16,40 @@ env:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    # Self-hosted Mac fallback (clw-mac-1): runs WITHOUT consuming GitHub-hosted
+    # Actions minutes. The GitHub-hosted lane (ubuntu-latest) is the preferred path;
+    # this is the fallback when hosted minutes are exhausted/unavailable.
+    runs-on: [self-hosted, macOS, X64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Ephemeral GitHub-hosted runner: a fresh rustup per run, so there is NO
-      # shared-host "rustup-nuke" to defend against (the reason the old self-hosted
-      # Mac used an isolated CARGO_HOME). rust-toolchain.toml pins 1.91.1 + rustfmt
-      # + clippy; `rustup show` eagerly installs them so a toolchain problem fails
-      # here, not mid-gate.
-      - name: install pinned Rust toolchain (rust-toolchain.toml)
-        run: rustup show
-      # Provision the supply-chain tools as PREBUILT binaries (fast; no per-run
-      # `cargo install` compile). gates.sh runs `cargo deny check` + `cargo audit`.
+      # On the self-hosted Mac the shared-host "rustup-nuke" can break the rustup
+      # PROXY (~/.cargo/bin/cargo → rustup), so we do NOT rely on `rustup show`.
+      # Instead put the pinned toolchain's OWN bin (cargo+rustc, installed under the
+      # rust-toolchain.toml channel) directly on PATH — proxy-independent.
+      - name: put pinned Rust toolchain on PATH (rust-toolchain.toml channel)
+        run: |
+          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          BIN="$HOME/.rustup/toolchains/${CH}-x86_64-apple-darwin/bin"
+          test -x "$BIN/cargo" || { echo "pinned toolchain $CH is not installed on the runner at $BIN — run 'rustup toolchain install $CH' on clw-mac-1"; exit 1; }
+          echo "$BIN" >> "$GITHUB_PATH"
+      # Provision the supply-chain tools as PREBUILT binaries (gates.sh runs
+      # `cargo deny check` + `cargo audit`). Works on macOS too.
       - name: install cargo-deny + cargo-audit (prebuilt)
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.8,cargo-audit
       # The windows-gnu cross-CHECK in gates.sh compiles `ring`'s C build script,
-      # which needs the mingw-w64 cross-CC (`x86_64-w64-mingw32-gcc`). The old
-      # self-hosted Mac had it via brew; ubuntu-latest does not preinstall it.
-      - name: install mingw-w64 (windows-gnu cross-CC for ring's C build)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+      # which needs the mingw-w64 cross-CC. On the Mac it comes from brew.
+      - name: ensure mingw-w64 (windows-gnu cross-CC for ring's C build)
+        run: brew list mingw-w64 >/dev/null 2>&1 || brew install mingw-w64
       - name: gates (fmt + clippy + test + supply-chain + windows cross-check)
         run: bash scripts/gates.sh
 
   dco:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
