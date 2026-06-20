@@ -2507,3 +2507,234 @@ fn auth_logout_removes_token_keeps_other_keys() {
         "logout must NEVER echo the token value"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Coverage-fill (common single-command paths) + a full real-user JOURNEY.
+//
+// The audit found a handful of frequently-used paths with no binary test
+// (`ls --name`, `hydrate` into a non-empty dest, `init --force`) and NO single
+// scenario chaining the whole lifecycle as a real user actually drives it. These
+// close that, the last of the binary-E2E gap series.
+// ---------------------------------------------------------------------------
+
+/// `clw ls --name <NAME>` (the single-ref lookup, distinct from `--all`) must report
+/// the snapshotted ref by name and exit 0.
+#[tokio::test]
+async fn ls_name_lists_the_single_ref() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-ls-name";
+    let _src = snapshot_tiny(&server.uri(), cache.path(), ws);
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["ls", "--name", ws])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "ls --name must exit 0");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(ws),
+        "ls --name must report the looked-up ref '{ws}', got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `clw hydrate` into a NON-EMPTY destination must refuse (exit 2) and leave the
+/// pre-existing content untouched — never clobber a user's directory.
+#[tokio::test]
+async fn hydrate_into_nonempty_dest_refuses_and_preserves_existing() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-hyd-nonempty";
+    let _src = snapshot_tiny(&server.uri(), cache.path(), ws);
+
+    // A destination dir that already holds a file the user cares about.
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("precious.txt"), b"do not clobber me").unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", ws])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "hydrate into a non-empty dest must refuse with exit 2, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The pre-existing file is byte-for-byte intact.
+    assert_eq!(
+        std::fs::read(dest.join("precious.txt")).unwrap(),
+        b"do not clobber me",
+        "a refused hydrate must NOT touch pre-existing destination content"
+    );
+}
+
+/// `clw init --force` overwrites an existing config (the default `init` refuses), and
+/// the rewritten file stays 0600.
+#[test]
+fn init_force_overwrites_existing_config_keeping_0600() {
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let run_init = |args: &[&str], token: &str| {
+        Command::cargo_bin("clw")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("CLW_ENDPOINT", "https://example.com")
+            .env("CLW_TENANT", TEST_TENANT)
+            .env("CLW_TOKEN", token)
+            .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+            .args(["init"].iter().chain(args.iter()))
+            .output()
+            .unwrap()
+    };
+
+    // First init writes the file; a second WITHOUT --force refuses (regression guard).
+    assert_eq!(run_init(&[], "tok-one").status.code(), Some(0));
+    assert!(
+        !run_init(&[], "tok-two").status.success(),
+        "re-init without --force must refuse"
+    );
+
+    // init --force succeeds and rewrites the file, still 0600.
+    let forced = run_init(&["--force"], "tok-three");
+    assert_eq!(
+        forced.status.code(),
+        Some(0),
+        "init --force must overwrite an existing config, got: {:?}\nstderr={}",
+        forced.status.code(),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let config_path = home.path().join(".clw").join("config.toml");
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "init --force must keep config.toml 0600");
+    // No token value is echoed on the forced overwrite either.
+    assert!(
+        !String::from_utf8_lossy(&forced.stdout).contains("tok-three")
+            && !String::from_utf8_lossy(&forced.stderr).contains("tok-three"),
+        "init --force must not echo the token"
+    );
+}
+
+/// A full real-user JOURNEY in ONE scenario: save work, verify it, detect a local
+/// change, reuse via a memoized run, restore it elsewhere, then clean up — every stage
+/// chained through the real binary against one backend, asserting the state transitions
+/// a power user actually depends on end-to-end.
+#[tokio::test]
+async fn full_lifecycle_journey_save_verify_run_hydrate_remove() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-journey";
+
+    // 1. A real workspace tree (multi-type) and SNAPSHOT it.
+    let src = TempDir::new().unwrap();
+    build_source_tree(src.path());
+    clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    assert!(
+        ac.lock().unwrap().contains_key(&ref_key_hex(ws)),
+        "snapshot must have written the ref"
+    );
+
+    // 2. STATUS is clean right after a snapshot.
+    clw_cmd(&server.uri(), cache.path())
+        .args(["status", src.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+
+    // 3. LS --name surfaces the ref by name.
+    let ls = clw_cmd(&server.uri(), cache.path())
+        .args(["ls", "--name", ws])
+        .output()
+        .unwrap();
+    assert!(
+        ls.status.success() && String::from_utf8_lossy(&ls.stdout).contains(ws),
+        "ls --name must list the just-snapshotted ref"
+    );
+
+    // 4. A local edit makes STATUS dirty (exit 1) and names the changed file.
+    std::fs::write(src.path().join("small.txt"), b"locally edited").unwrap();
+    let dirty = clw_cmd(&server.uri(), cache.path())
+        .args(["status", src.path().to_str().unwrap(), "--name", ws])
+        .output()
+        .unwrap();
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a local edit must make status dirty (exit 1)"
+    );
+    assert!(String::from_utf8_lossy(&dirty.stdout).contains("small.txt"));
+
+    // 5. A memoized RUN: first miss, second hit, identical replayed stdout.
+    let run = |label: &str| {
+        clw_cmd(&server.uri(), cache.path())
+            .current_dir(src.path())
+            .args([
+                "run",
+                "--input",
+                "small.txt",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo journey-output",
+            ])
+            .output()
+            .unwrap_or_else(|_| panic!("run {label} must spawn"))
+    };
+    let r1 = run("miss");
+    assert!(
+        r1.status.success() && String::from_utf8_lossy(&r1.stderr).contains("cache miss"),
+        "first run must be a cache miss"
+    );
+    let r2 = run("hit");
+    assert!(
+        r2.status.success() && String::from_utf8_lossy(&r2.stderr).contains("cache hit"),
+        "second identical run must be a cache hit"
+    );
+    assert_eq!(
+        r1.stdout, r2.stdout,
+        "replayed stdout must be byte-identical"
+    );
+
+    // 6. HYDRATE the saved ref to a fresh destination — byte-identical restore of the
+    //    ORIGINAL snapshot (not the local edit), with a fresh cache (bytes off server).
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("restored");
+    clw_cmd(&server.uri(), cache_hyd.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(dest.join("small.txt")).unwrap(),
+        b"hello e2e test",
+        "hydrate must restore the SNAPSHOTTED content, not the later local edit"
+    );
+
+    // 7. RM the ref, then LS --all no longer lists it: the workspace is cleaned up.
+    clw_cmd(&server.uri(), cache.path())
+        .args(["rm", "--name", ws, "--yes"])
+        .assert()
+        .success();
+    assert!(!ac.lock().unwrap().contains_key(&ref_key_hex(ws)));
+    let ls_after = clw_cmd(&server.uri(), cache.path())
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        ls_after.status.success() && !String::from_utf8_lossy(&ls_after.stdout).contains(ws),
+        "after rm, ls --all must no longer list '{ws}'"
+    );
+}
