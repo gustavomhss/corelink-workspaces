@@ -2174,3 +2174,132 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
         "a signal-killed result must NOT be cached (second run is still a miss)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Resource-abuse caps + non-retryable error tiers, surfaced through the BINARY.
+//
+// The cap LOGIC (enforce_resource_bounds) and the tier classification
+// (retryable vs not) are unit/integration-tested; these prove the CLI surfaces
+// them as a real user sees them — a clean exit-2, an explanatory message, NO
+// panic, and NO partial destination — rather than crashing or hanging.
+// ---------------------------------------------------------------------------
+
+/// A hostile-but-well-formed manifest whose single chunk DECLARES a size above the
+/// 1 TiB hydrate disk-fill cap must be refused up-front (exit 2), before any chunk is
+/// fetched or any destination is written. Planted directly in the mock CAS + an AC ref
+/// (the chunk is never fetched, so it need not exist). This is the anti disk-fill guard
+/// a real user is protected by when hydrating an untrusted ref.
+#[tokio::test]
+async fn hydrate_refuses_manifest_declaring_over_total_bytes_cap() {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+
+    let huge: u64 = (1u64 << 40) + 1; // 1 TiB + 1 byte → over MAX_HYDRATE_TOTAL_BYTES
+    let manifest = clw_types::Manifest {
+        version: clw_types::MANIFEST_VERSION,
+        total_size: huge,
+        entries: vec![clw_types::Entry::File {
+            path: "big.bin".to_string(),
+            mode: 0o644,
+            size: huge,
+            chunks: vec![clw_types::ChunkRef {
+                digest: clw_types::Digest::of_bytes(b"never fetched"),
+                size: huge,
+            }],
+        }],
+    };
+    let manifest_bytes = manifest.canonical_bytes().unwrap();
+    let root = clw_types::Digest::of_bytes(&manifest_bytes);
+    cas.lock()
+        .unwrap()
+        .insert(root.to_hex(), manifest_bytes.clone());
+
+    let name = "e2e-cap-totalbytes";
+    let rec = clw_types::RefRecord {
+        name: name.to_string(),
+        root,
+        manifest_size: manifest_bytes.len() as u64,
+        created_at_unix: 0,
+        parent: None,
+        tool_version: "test".to_string(),
+    };
+    ac.lock()
+        .unwrap()
+        .insert(ref_key_hex(name), rec.to_bytes().unwrap());
+
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", name])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an over-cap manifest must be refused with exit 2, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeding the hydrate cap") || stderr.contains("disk-fill"),
+        "the refusal must explain the resource cap, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a cap violation must be a clean error, not a panic, got:\n{stderr}"
+    );
+    assert!(
+        !dest.exists(),
+        "a refused hydrate must NOT materialize a partial destination tree"
+    );
+}
+
+/// A non-retryable error tier (403 scope/forbidden here, representative of the
+/// 402/403/410 family the client maps as non-retryable) must surface as a clean CLI
+/// exit-2 that names the HTTP status — no panic, no retry storm/hang. The retryable-
+/// vs-not classification itself is covered exhaustively in clw-integration-tests.
+#[tokio::test]
+async fn snapshot_surfaces_nonretryable_tier_403_cleanly() {
+    let server = MockServer::start().await;
+    // Every CAS PUT returns 403; HEAD is unmounted (wiremock 404 ⇒ "blob missing" ⇒
+    // the client attempts the PUT, which 403s). 403 is non-retryable, so it fails fast.
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("/v1/cas/{TEST_TENANT}/[a-f0-9]{{64}}$")))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"tier payload").unwrap();
+    let cache = TempDir::new().unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "e2e-tier-403",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a non-retryable 403 tier must fail the snapshot with exit 2, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("403"),
+        "the CLI must surface the HTTP 403 status to the user, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a tier error must be a clean error, not a panic, got:\n{stderr}"
+    );
+}
