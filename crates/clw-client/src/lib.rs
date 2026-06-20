@@ -216,7 +216,8 @@ impl HttpClient {
         let is_local_http = is_loopback_http(ep);
         if !is_https && !is_local_http {
             return Err(ClwError::Transport(format!(
-                "refusing to send PAT over plaintext: endpoint must be https:// with no embedded credentials (got '{ep}'); http:// is only allowed for loopback"
+                "refusing to send PAT over plaintext: endpoint must be https:// with no embedded credentials (got '{}'); http:// is only allowed for loopback",
+                redact_endpoint_for_display(ep)
             )));
         }
 
@@ -587,6 +588,40 @@ fn is_safe_https(ep: &str) -> bool {
         return false;
     }
     url.host().is_some()
+}
+
+/// Redact any embedded `user:pass@` userinfo from an endpoint string before it is
+/// shown in an error message.
+///
+/// SECURITY (info-hygiene): the plaintext guard REJECTS endpoints carrying embedded
+/// credentials (the `@`-smuggling vector), but its rejection message must not then
+/// echo the offending value verbatim — a misconfigured `https://user:secret@host`
+/// would otherwise print the user's embedded secret to stderr / captured logs. This
+/// is best-effort and never panics: it parses with the same `url` crate used to dial
+/// when it can, else falls back to a conservative string strip. (The CLW_TOKEN PAT is
+/// unaffected — it travels in the Authorization header, never the URL.)
+fn redact_endpoint_for_display(ep: &str) -> String {
+    if let Ok(u) = url::Url::parse(ep.trim()) {
+        if !u.username().is_empty() || u.password().is_some() {
+            let scheme = u.scheme();
+            let host = u.host_str().unwrap_or("");
+            let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+            return format!("{scheme}://<redacted>@{host}{port}{}", u.path());
+        }
+        return ep.to_string();
+    }
+    // Unparseable as a URL: strip a leading `scheme://userinfo@` if the `@` precedes
+    // any path separator (so it is genuinely authority userinfo, not a later `@`).
+    if let Some(scheme_end) = ep.find("://") {
+        let after = &ep[scheme_end + 3..];
+        let slash = after.find('/').unwrap_or(after.len());
+        if let Some(at) = after.find('@') {
+            if at < slash {
+                return format!("{}://<redacted>@{}", &ep[..scheme_end], &after[at + 1..]);
+            }
+        }
+    }
+    ep.to_string()
 }
 
 /// Generous ceiling for a single list page (D-7/D-8): ≤1000 small JSON items per
@@ -1131,6 +1166,49 @@ mod tests {
             token: "test-token".into(),
             cache_dir: PathBuf::from("/tmp/clw-test-cache"),
         }
+    }
+
+    // Security regression (sweep finding, LOW): the plaintext-guard rejection message
+    // must NOT echo an embedded userinfo credential. The guard correctly REJECTS such
+    // an endpoint; it must not reflect the secret back to stderr/logs.
+    #[test]
+    fn plaintext_guard_error_redacts_embedded_userinfo() {
+        // https-with-userinfo is rejected by is_safe_https (embedded creds) → the guard
+        // fires; the error must not contain the secret.
+        let secret = "SENTINEL_USERINFO_SECRET_do_not_leak";
+        let cfg = test_config(format!("https://user:{secret}@evil.example.com"));
+        let err = HttpClient::with_concurrency(cfg, 4)
+            .expect_err("an endpoint with embedded credentials must be refused");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(secret),
+            "the plaintext-guard error must NOT echo the embedded userinfo secret, got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to send PAT over plaintext") && msg.contains("<redacted>"),
+            "the error must still be the actionable guard message with userinfo redacted, got: {msg}"
+        );
+    }
+
+    // The redaction helper handles both URL-parseable and unparseable inputs without
+    // leaking userinfo, and leaves clean endpoints untouched.
+    #[test]
+    fn redact_endpoint_for_display_strips_userinfo_only() {
+        assert_eq!(
+            redact_endpoint_for_display("https://u:p@host.example.com/v1"),
+            "https://<redacted>@host.example.com/v1"
+        );
+        // Clean endpoint (no userinfo) is returned unchanged (modulo url normalization
+        // is avoided — no userinfo branch ⇒ verbatim).
+        assert_eq!(
+            redact_endpoint_for_display("https://host.example.com"),
+            "https://host.example.com"
+        );
+        // Unparseable-but-has-authority-userinfo still gets stripped.
+        assert_eq!(
+            redact_endpoint_for_display("ht!tp://user:secret@host/x"),
+            "ht!tp://<redacted>@host/x"
+        );
     }
 
     // -----------------------------------------------------------------------
