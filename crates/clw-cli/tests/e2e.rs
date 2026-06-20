@@ -2987,3 +2987,69 @@ async fn snapshot_large_tree_reports_count_and_hydrates_every_file() {
         );
     }
 }
+
+// `clw run` memo records share the tenant's AC keyspace with workspace refs, so
+// `ls --all` enumerates them too. They must be recognized as run-cache entries (counted
+// separately, NOT warned as "unparseable"), while a genuinely-corrupt record is still
+// reported — and neither floods stderr with a per-record warning line (the user-sim
+// campaign found `ls --all` double-printing + drowning in run-memo noise).
+#[tokio::test]
+async fn ls_all_distinguishes_run_cache_from_corrupt_refs_without_flooding() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-lsall-runcache";
+    let _src = snapshot_tiny(&server.uri(), cache.path(), ws); // one real workspace ref
+
+    // A valid run-cache record (clw-run RunRecord shape) under a 64-hex key.
+    let digest = "ab".repeat(32);
+    ac.lock().unwrap().insert(
+        "11".repeat(32),
+        format!("{{\"exit_code\":0,\"stdout\":\"{digest}\",\"stderr\":\"{digest}\"}}").into_bytes(),
+    );
+    // A genuinely-corrupt (non-JSON) record.
+    let corrupt = "22".repeat(32);
+    ac.lock()
+        .unwrap()
+        .insert(corrupt.clone(), b"not json at all".to_vec());
+
+    // --json: the real ref counts, the run-cache entry is recognized, only the corrupt one is skipped.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "ls", "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "ls --all must exit 0");
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["count"], 1,
+        "the real workspace ref must be counted, got:\n{parsed}"
+    );
+    assert_eq!(
+        parsed["run_cache_entries"], 1,
+        "the run-cache entry must be recognized, NOT counted as corrupt, got:\n{parsed}"
+    );
+    assert_eq!(
+        parsed["skipped"], 1,
+        "only the genuinely-corrupt record is skipped, got:\n{parsed}"
+    );
+    assert_eq!(
+        parsed["errors"][0]["ref_key"], corrupt,
+        "the skipped record must be the corrupt one (not the run-cache entry)"
+    );
+
+    // human mode: summary names both, and there is NO per-record warning flood on stderr.
+    let human = clw_cmd(&server.uri(), cache.path())
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+    let hstdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        hstdout.contains("run-cache entries") && hstdout.contains("corrupt record(s) skipped"),
+        "the summary must name run-cache entries + the corrupt skip, got:\n{hstdout}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&human.stderr).contains("warning: skipping"),
+        "there must be NO per-record 'warning: skipping' flood on stderr"
+    );
+}

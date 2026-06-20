@@ -110,11 +110,15 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
 ///
 /// TOLERANT BY DESIGN (the opposite of prune's fail-safe): `ls` is READ-ONLY, so a
 /// single corrupt/unparseable ref record must NOT blind the operator to every
-/// other ref. We SKIP the bad record, emit a `tracing::warn!`/stderr note that
-/// NAMES it (by its ref key), and continue. In `--json` each skipped record is
-/// reported as a structured `{key, error}` entry under `errors` so a machine
-/// caller sees the partial-listing rather than a hard failure. Partial output is
-/// strictly better than no output for a listing.
+/// other ref. We SKIP the bad record, emit a `tracing::warn!` that NAMES it (by its
+/// ref key, shown with `-v`), record it for the `--json` `errors` array + an
+/// end-of-listing summary, and continue — but NOT a per-record stderr line, which
+/// would flood a large/degraded tenant. `clw run` memo records (the AC-backed run
+/// cache) legitimately share the keyspace; they are recognized via
+/// [`clw_run::is_run_record`], counted as `run_cache_entries`, and never warned.
+/// In `--json` each genuinely-corrupt record is a structured `{key, error}` entry
+/// under `errors` so a machine caller sees the partial-listing rather than a hard
+/// failure. Partial output is strictly better than no output for a listing.
 async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let tenant = cfg.clw_config.tenant.clone();
     let client = HttpClient::new(cfg.clw_config)?;
@@ -133,20 +137,27 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // per-record TRANSPORT error (a network blip fetching one record) — for a
     // read-only listing, neither should be fatal to the whole command.
     let mut skipped: Vec<(String, String)> = Vec::new();
+    // `clw run` memo records (the AC-backed run cache) share this tenant's AC keyspace
+    // with workspace refs, so enumeration surfaces them too. They are NOT corrupt — count
+    // them separately and never warn about them (they would otherwise flood the listing
+    // and grow with every `clw run`).
+    let mut run_cache = 0usize;
     for key in &keys {
         // Fetch this record. AUTH (401) is fatal — it means the WHOLE listing is
         // unauthorized, so abort (map it to the actionable message first). Any
         // OTHER per-record error (a transient transport blip) is TOLERATED the
-        // same way a corrupt record is: skip it, report it (named), and keep
-        // listing the rest. A ref deleted between enumeration and fetch (Ok(None))
-        // simply drops out of the list.
+        // same way a corrupt record is: skip it, record it (named) for the summary +
+        // --json, and keep listing the rest. A ref deleted between enumeration and
+        // fetch (Ok(None)) simply drops out of the list.
         let fetched = match AcTransport::get(&client, key).await {
             Ok(b) => b,
             Err(ClwError::Auth) => return Err(map_auth_error(ClwError::Auth)),
             Err(e) => {
                 let key_hex = key.to_hex();
+                // Diagnostic channel only (shown with -v); the end-of-listing summary +
+                // --json carry it to the user — NO per-record stderr line (avoids flooding
+                // a large/degraded tenant and the duplicate tracing+eprintln print).
                 tracing::warn!(ref_key = %key_hex, error = %e, "skipping ref record after a transport error");
-                eprintln!("warning: skipping ref record {key_hex} after a transport error: {e}");
                 skipped.push((key_hex, e.to_string()));
                 continue;
             }
@@ -156,13 +167,20 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
         };
         match RefRecord::from_bytes(&bytes) {
             Ok(record) => rows.push(record),
-            // A corrupt record is SKIPPED (read-only ⇒ tolerant): warn + continue
-            // so every good ref still lists. Name the offender by its ref key.
             Err(e) => {
                 let key_hex = key.to_hex();
-                tracing::warn!(ref_key = %key_hex, error = %e, "skipping unparseable ref record");
-                eprintln!("warning: skipping unparseable ref record {key_hex}: {e}");
-                skipped.push((key_hex, e.to_string()));
+                // A `clw run` memo record is NOT a corrupt ref — it legitimately shares the
+                // tenant keyspace. Count it as a run-cache entry and stay silent.
+                if clw_run::is_run_record(&bytes) {
+                    run_cache += 1;
+                    tracing::debug!(ref_key = %key_hex, "skipping run-cache entry in ref listing");
+                } else {
+                    // Genuinely corrupt/unparseable: diagnostic warn (shown with -v) +
+                    // structured --json error + end-of-listing summary. No per-record stderr
+                    // flood (a tenant with many corrupt records must not bury the listing).
+                    tracing::warn!(ref_key = %key_hex, error = %e, "skipping unparseable ref record");
+                    skipped.push((key_hex, e.to_string()));
+                }
             }
         }
     }
@@ -189,11 +207,12 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
                 "tenant": tenant,
                 "count": rows.len(),
                 "refs": arr,
+                "run_cache_entries": run_cache,
                 "skipped": errors.len(),
                 "errors": errors,
             })
         );
-    } else if rows.is_empty() && skipped.is_empty() {
+    } else if rows.is_empty() && skipped.is_empty() && run_cache == 0 {
         println!("no refs for tenant '{tenant}'");
     } else {
         for r in &rows {
@@ -204,15 +223,18 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
                 r.name
             );
         }
-        if skipped.is_empty() {
-            println!("({} refs in tenant '{tenant}')", rows.len());
-        } else {
-            println!(
-                "({} refs in tenant '{tenant}'; {} record(s) skipped — see warnings above)",
-                rows.len(),
-                skipped.len()
-            );
+        let mut summary = format!("({} refs in tenant '{tenant}'", rows.len());
+        if run_cache > 0 {
+            summary.push_str(&format!("; {run_cache} run-cache entries"));
         }
+        if !skipped.is_empty() {
+            summary.push_str(&format!(
+                "; {} corrupt record(s) skipped — run with -v or --json for details",
+                skipped.len()
+            ));
+        }
+        summary.push(')');
+        println!("{summary}");
     }
 
     Ok(())

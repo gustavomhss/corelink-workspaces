@@ -62,6 +62,19 @@ struct RunRecord {
     stderr: Digest,
 }
 
+/// Returns `true` if `bytes` is a `clw run` memoization record (AC-backed run cache).
+///
+/// `clw run` stores its memo records in the SAME AC tenant keyspace as workspace refs
+/// (both are AC PUTs under an opaque `BLAKE3` key), so a tenant-wide enumeration
+/// (`clw ls --all` → `list_refs`) surfaces run-cache entries alongside refs. Those
+/// records are NOT `RefRecord`s, so a naive parse fails and they look "corrupt". This
+/// lets a caller tell a legitimate run-cache entry apart from a genuinely-corrupt ref:
+/// a `RunRecord` and a `RefRecord` have disjoint required fields (`exit_code`/`stdout`/
+/// `stderr` vs `name`/`root`/…), so neither parses as the other.
+pub fn is_run_record(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<RunRecord>(bytes).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // Key derivation
 // ---------------------------------------------------------------------------
@@ -587,6 +600,29 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn is_run_record_distinguishes_run_records_from_refs_and_garbage() {
+        let d = "ab".repeat(32);
+        // A RunRecord-shaped payload is recognized.
+        let run = format!("{{\"exit_code\":0,\"stdout\":\"{d}\",\"stderr\":\"{d}\"}}");
+        assert!(is_run_record(run.as_bytes()));
+        // A RefRecord-shaped payload is NOT a run record (disjoint required fields).
+        let ref_rec = clw_types::RefRecord {
+            name: "ws".into(),
+            root: Digest::of_bytes(b"r"),
+            manifest_size: 1,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "t".into(),
+        }
+        .to_bytes()
+        .unwrap();
+        assert!(!is_run_record(&ref_rec));
+        // Non-JSON / garbage is not a run record.
+        assert!(!is_run_record(b"not json at all"));
+        assert!(!is_run_record(b""));
+    }
 
     // -----------------------------------------------------------------------
     // PART A — proptest: the cache-hit-path `RunRecord` parse
