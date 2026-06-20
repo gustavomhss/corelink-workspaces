@@ -114,7 +114,7 @@ fn is_capability_unavailable(err: &ClwError) -> bool {
 /// `ls`/`status`); pass everything else through.
 fn map_auth_error(err: ClwError) -> ClwError {
     if matches!(err, ClwError::Auth) {
-        ClwError::Transport(
+        ClwError::Message(
             "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
         )
     } else {

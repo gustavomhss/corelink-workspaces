@@ -270,7 +270,7 @@ async fn compute_live_set(client: &HttpClient) -> Result<HashSet<Digest>, ClwErr
 /// repair/removal path. Carried as a `Transport` error whose message contains the
 /// `live set is incomplete` token (asserted by tests and detected by the caller).
 fn live_set_incomplete(ref_label: &str, why: &str) -> ClwError {
-    ClwError::Transport(format!(
+    ClwError::Message(format!(
         "refusing to prune: the live set is incomplete — ref '{ref_label}' {why}, so the set of \
          reachable blobs cannot be computed in full. Pruning now would delete live blobs as false \
          orphans. NOTHING was deleted. Repair or remove the offending ref (e.g. `clw rm --name \
@@ -281,7 +281,7 @@ fn live_set_incomplete(ref_label: &str, why: &str) -> ClwError {
 /// True if the error is the fail-safe incomplete-live-set abort raised by
 /// [`compute_live_set`] for an unresolvable ref.
 fn is_live_set_incomplete(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("live set is incomplete"))
+    matches!(err, ClwError::Message(msg) if msg.contains("live set is incomplete"))
 }
 
 /// True if the error is the server-regression case (the client maps 405/501 to a

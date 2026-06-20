@@ -191,7 +191,7 @@ pub async fn run(
     // a bad cache target. Fail loud and remove nothing.
     for t in &targets {
         if let Some(reason) = unsafe_removal_reason(&t.path) {
-            return Err(ClwError::Transport(format!(
+            return Err(ClwError::Message(format!(
                 "refusing to uninstall: {} ({}) {reason} — this looks like a misconfigured cache_dir, not a dedicated clw directory. Remove it by hand if you truly intend to.",
                 t.label,
                 t.path.display()
@@ -205,7 +205,7 @@ pub async fn run(
     // the OUTPUT shape only via the message, never bypassed by it.
     if !args.dry_run && !args.yes {
         if json || !is_interactive() {
-            return Err(ClwError::Transport(
+            return Err(ClwError::Message(
                 "refusing to uninstall without confirmation: pass --yes \
                  (required with --json or when non-interactive)"
                     .to_string(),
@@ -224,7 +224,7 @@ pub async fn run(
                     json!({ "removed": [], "note": "aborted — confirmation declined" })
                 );
             }
-            return Err(ClwError::Transport(
+            return Err(ClwError::Message(
                 "aborted — confirmation declined; nothing was removed".to_string(),
             ));
         }
@@ -243,7 +243,7 @@ pub async fn run(
                 std::fs::remove_file(&t.path)
             };
             if let Err(e) = res {
-                return Err(ClwError::Transport(format!(
+                return Err(ClwError::Message(format!(
                     "failed to remove {}: {e}",
                     t.path.display()
                 )));

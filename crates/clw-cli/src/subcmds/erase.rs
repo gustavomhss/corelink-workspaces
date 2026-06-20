@@ -139,7 +139,7 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
                     })
                 );
             }
-            return Err(ClwError::Transport(format!(
+            return Err(ClwError::Message(format!(
                 "erasure FAILED mid-delete for tenant '{tenant}': {refs_deleted} ref(s) + \
                  {blobs_deleted} blob(s) were already erased before the error below. Re-run \
                  `clw erase` to resume; do NOT record this tenant as erased until a run \
@@ -166,7 +166,7 @@ pub async fn run(args: EraseArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
                 })
             );
         }
-        return Err(ClwError::Transport(format!(
+        return Err(ClwError::Message(format!(
             "erasure INCOMPLETE for tenant '{tenant}': deleted {refs_deleted} ref(s) + {blobs_deleted} blob(s), but {remaining_refs} ref(s) + {remaining_blobs} blob(s) still remain after {pass} pass(es) — likely concurrent writes or a server-side enumeration fault. Re-run `clw erase` or escalate; do NOT record this tenant as erased."
         )));
     }

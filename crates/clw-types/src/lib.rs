@@ -589,6 +589,13 @@ pub enum ClwError {
     Config(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// A pre-formatted, actionable, user-facing message rendered VERBATIM (no
+    /// prefix). For application-level conditions a subcommand has already turned
+    /// into a clear message — auth hints, "workspace not found", "destination not
+    /// empty", usage errors — that are NOT transport failures and must not be
+    /// mislabeled `transport error:` (the v0.1.1 power-user test caught that).
+    #[error("{0}")]
+    Message(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -1004,6 +1011,25 @@ mod tests {
                 prop_assert_eq!(parsed, manifest);
             }
         }
+    }
+
+    #[test]
+    fn message_variant_renders_verbatim_without_transport_prefix() {
+        // v0.1.1 power-user finding: auth / usage / not-found errors were rendered
+        // as "transport error: ..." (mislabel). The Message variant renders VERBATIM.
+        let e = ClwError::Message("specify exactly one of --name <NAME> or --all".to_string());
+        assert_eq!(
+            e.to_string(),
+            "specify exactly one of --name <NAME> or --all"
+        );
+        assert!(
+            !e.to_string().starts_with("transport error"),
+            "Message must not be labeled 'transport error', got: {e}"
+        );
+        // Transport keeps its prefix (genuine transport failures are still labeled).
+        assert!(ClwError::Transport("blip".into())
+            .to_string()
+            .starts_with("transport error"));
     }
 
     #[test]

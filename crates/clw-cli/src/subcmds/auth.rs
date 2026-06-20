@@ -120,7 +120,7 @@ fn build_login_summary_json(cfg: &ResolvedConfig, wrote: &std::path::Path) -> se
 /// key already in the file (e.g. one a future config feature adds) is PRESERVED.
 fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
-        ClwError::Transport("cannot determine home directory for config file".to_string())
+        ClwError::Message("cannot determine home directory for config file".to_string())
     })?;
 
     ensure_config_parent_0700(&path)?;
@@ -154,7 +154,7 @@ fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
 /// whole file with `--all`. Prints WHAT was removed, never the value.
 fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
-        ClwError::Transport("cannot determine home directory for config file".to_string())
+        ClwError::Message("cannot determine home directory for config file".to_string())
     })?;
 
     if !path.exists() {
@@ -175,7 +175,7 @@ fn logout(args: &LogoutArgs, json: bool) -> Result<(), ClwError> {
         // TTY without `--yes` we prompt y/N.
         if !args.yes {
             if must_refuse_clear_without_consent(args.yes, json, is_interactive()) {
-                return Err(ClwError::Transport(
+                return Err(ClwError::Message(
                     "refusing to clear the config file without confirmation: pass --yes \
                      (required with --json or when non-interactive)"
                         .to_string(),
@@ -260,7 +260,7 @@ fn must_refuse_clear_without_consent(yes: bool, json: bool, interactive: bool) -
 /// uninstall), not 0. Extracted as a seam so the declined-is-an-error contract is
 /// unit-testable without driving real stdin through `confirm_clear`.
 fn declined_clear_err() -> ClwError {
-    ClwError::Transport("aborted — config file left unchanged".to_string())
+    ClwError::Message("aborted — config file left unchanged".to_string())
 }
 
 /// Prompt for confirmation before clearing the whole config file.
@@ -563,7 +563,7 @@ mod tests {
     fn declined_logout_all_is_an_error() {
         let err = declined_clear_err();
         assert!(
-            matches!(err, ClwError::Transport(ref m) if m.contains("left unchanged")),
+            matches!(err, ClwError::Message(ref m) if m.contains("left unchanged")),
             "a declined logout --all must return an Err naming the unchanged file, got: {err:?}"
         );
     }

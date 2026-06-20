@@ -82,15 +82,15 @@ pub async fn run(
 /// Map hydrate-specific errors to actionable user-facing messages.
 fn map_hydrate_error(err: ClwError, name: &str, tenant: &str, dest: &Path) -> ClwError {
     match &err {
-        ClwError::Auth => ClwError::Transport(
+        ClwError::Auth => ClwError::Message(
             "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
         ),
-        ClwError::NotFound(_) => ClwError::Transport(format!(
+        ClwError::NotFound(_) => ClwError::Message(format!(
             "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
         )),
         ClwError::Io(io_err) if io_err.kind() == ErrorKind::AlreadyExists => {
             let dest = dest.display();
-            ClwError::Transport(format!(
+            ClwError::Message(format!(
                 "destination '{dest}' is not empty — pass an empty directory or a new path that does not yet exist",
             ))
         }

@@ -41,7 +41,7 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
         .await
         .map_err(map_auth_error)?
         .ok_or_else(|| {
-            ClwError::Transport(format!(
+            ClwError::Message(format!(
                 "workspace '{}' not found for tenant '{}' — run 'clw snapshot --name {}' first or check --tenant",
                 args.name, tenant, args.name
             ))
@@ -106,7 +106,7 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
 /// Map a 401 `Auth` error to an actionable message; pass other errors through.
 pub fn map_auth_error(err: ClwError) -> ClwError {
     if matches!(err, ClwError::Auth) {
-        ClwError::Transport(
+        ClwError::Message(
             "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
         )
     } else {
@@ -122,7 +122,7 @@ pub fn map_auth_error(err: ClwError) -> ClwError {
 /// Non-`NotFound` errors (and a `NotFound` on a different digest) pass through.
 pub fn map_missing_manifest(err: ClwError, name: &str, tenant: &str, root: &Digest) -> ClwError {
     match &err {
-        ClwError::NotFound(d) if d == root => ClwError::Transport(format!(
+        ClwError::NotFound(d) if d == root => ClwError::Message(format!(
             "workspace '{name}' (tenant '{tenant}') is missing its manifest blob {root} — the ref \
              resolves but its manifest is unreachable (pruned, lost, or replica lag); re-run \
              'clw snapshot --name {name}' to repair it"

@@ -38,7 +38,7 @@ pub async fn run(args: LsArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
         (None, true) => run_all(cfg, json).await,
         // clap's `conflicts_with` already rejects `--name X --all`; this guards
         // the `neither` case with an actionable message instead of a panic.
-        _ => Err(ClwError::Transport(
+        _ => Err(ClwError::Message(
             "specify exactly one of --name <NAME> or --all".to_string(),
         )),
     }
@@ -55,7 +55,7 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
         .await
         .map_err(map_auth_error)?
         .ok_or_else(|| {
-            ClwError::Transport(format!(
+            ClwError::Message(format!(
                 "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
             ))
         })?;

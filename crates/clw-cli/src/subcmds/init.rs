@@ -25,11 +25,11 @@ pub struct InitArgs {
 #[allow(clippy::unused_async)]
 pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     let path = clw_config_path().ok_or_else(|| {
-        ClwError::Transport("cannot determine home directory for config file".to_string())
+        ClwError::Message("cannot determine home directory for config file".to_string())
     })?;
 
     if path.exists() && !args.force {
-        return Err(ClwError::Transport(format!(
+        return Err(ClwError::Message(format!(
             "config file already exists at {}; use --force to overwrite",
             path.display()
         )));
