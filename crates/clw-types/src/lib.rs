@@ -187,8 +187,11 @@ impl Manifest {
         }
         for entry in &self.entries {
             validate_rel_path(entry.path())?;
-            if let Entry::Symlink { target, .. } = entry {
-                validate_symlink_target(target)?;
+            if let Entry::Symlink { path, target } = entry {
+                // Consumer-side validation MUST match the producer (clw-manifest):
+                // allow `..` that stays inside the workspace, reject only escapes.
+                // Otherwise a manifest the producer accepts would fail to hydrate.
+                validate_symlink_target_contained(path, target)?;
             }
         }
         Ok(())
@@ -288,6 +291,64 @@ pub fn validate_symlink_target(t: &str) -> Result<()> {
             return Err(ClwError::InvalidManifest(format!(
                 "colon not allowed in symlink target (Windows drive-letter / NTFS ADS): {t}"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a symlink target while ALLOWING `..` traversal that stays INSIDE the
+/// workspace. `link_rel` is the link's own path relative to the workspace root
+/// (e.g. `bin/main-alias.rs`); `t` is the (already `/`-normalized) target. The
+/// target is resolved LEXICALLY (no filesystem access) against the link's parent
+/// directory and rejected only if it would ESCAPE the workspace root, is absolute,
+/// or uses characters no client can represent (backslash, colon/NTFS-ADS).
+///
+/// This is the producer-side check the v0.1.1 power-user test motivated: the strict
+/// [`validate_symlink_target`] rejects ANY `..`, which breaks real projects whose
+/// relative symlinks (e.g. `bin/x -> ../src/x`) resolve harmlessly within the tree.
+pub fn validate_symlink_target_contained(link_rel: &str, t: &str) -> Result<()> {
+    if t.is_empty() {
+        return Err(ClwError::InvalidManifest("empty symlink target".into()));
+    }
+    if t.starts_with('/') {
+        return Err(ClwError::InvalidManifest(format!(
+            "absolute symlink target not allowed: {t}"
+        )));
+    }
+    if t.contains('\\') {
+        return Err(ClwError::InvalidManifest(format!(
+            "backslash not allowed in symlink target: {t}"
+        )));
+    }
+    // Seed the resolution stack with the link's PARENT directory components (the
+    // dir the relative target is interpreted from). `link_rel` is workspace-root-
+    // relative and already validated by `validate_rel_path`.
+    let mut depth: Vec<&str> = link_rel.split('/').collect();
+    depth.pop(); // drop the link's own filename → its parent dir
+    depth.retain(|c| !c.is_empty() && *c != ".");
+    for comp in t.split('/') {
+        if comp.contains(':') {
+            return Err(ClwError::InvalidManifest(format!(
+                "colon not allowed in symlink target (Windows drive-letter / NTFS ADS): {t}"
+            )));
+        }
+        match comp {
+            // Reject empty ('//', trailing '/') components — same as the strict check.
+            "" => {
+                return Err(ClwError::InvalidManifest(format!(
+                    "empty component in symlink target: {t}"
+                )));
+            }
+            "." => { /* current dir — a harmless no-op in the middle of a path */ }
+            ".." => {
+                if depth.pop().is_none() {
+                    // Popped above the workspace root → escapes.
+                    return Err(ClwError::InvalidManifest(format!(
+                        "symlink target escapes workspace: {t}"
+                    )));
+                }
+            }
+            normal => depth.push(normal),
         }
     }
     Ok(())
@@ -639,11 +700,23 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_traversal_symlink_target() {
+        // `../../x` from `link` (at the root) escapes the workspace → rejected.
         let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"symlink","path":"link","target":"../../x"}]}"#;
         let err = Manifest::from_bytes(bytes).unwrap_err();
         assert!(
             matches!(err, ClwError::InvalidManifest(_)),
             "expected InvalidManifest, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_accepts_intra_workspace_dotdot_symlink() {
+        // `bin/main-alias.rs -> ../src/main.rs` resolves to `src/main.rs` INSIDE the
+        // tree — the consumer must accept it (matches the producer; v0.1.1 finding).
+        let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"symlink","path":"bin/main-alias.rs","target":"../src/main.rs"}]}"#;
+        assert!(
+            Manifest::from_bytes(bytes).is_ok(),
+            "intra-workspace `..` symlink must hydrate"
         );
     }
 
@@ -931,6 +1004,24 @@ mod tests {
                 prop_assert_eq!(parsed, manifest);
             }
         }
+    }
+
+    #[test]
+    fn validate_symlink_target_contained_allows_intra_workspace_dotdot() {
+        // v0.1.1 power-user finding: `bin/x -> ../src/x` resolves INSIDE the tree
+        // and must be ACCEPTED (the strict validator rejected all `..`).
+        assert!(validate_symlink_target_contained("bin/main-alias.rs", "../src/main.rs").is_ok());
+        assert!(validate_symlink_target_contained("a/b/link", "../../c").is_ok()); // a/b -> a -> root -> c
+        assert!(validate_symlink_target_contained("src/alias.rs", "main.rs").is_ok()); // same dir
+        assert!(validate_symlink_target_contained("deep/x", "./sib").is_ok());
+        // ESCAPES the workspace root → still rejected.
+        assert!(validate_symlink_target_contained("link", "../x").is_err()); // root -> escape
+        assert!(validate_symlink_target_contained("bin/link", "../../../etc/passwd").is_err());
+        // Absolute / backslash / colon / empty → still rejected.
+        assert!(validate_symlink_target_contained("bin/link", "/etc/passwd").is_err());
+        assert!(validate_symlink_target_contained("bin/link", "..\\x").is_err());
+        assert!(validate_symlink_target_contained("bin/link", "a//b").is_err());
+        assert!(validate_symlink_target_contained("bin/link", "").is_err());
     }
 
     #[test]

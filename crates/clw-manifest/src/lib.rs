@@ -140,7 +140,10 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
             // FIX 3: validate the entry's OWN rel path too (not just the target),
             // so an unrepresentable symlink path fails fast at walk time.
             clw_types::validate_rel_path(&rel)?;
-            clw_types::validate_symlink_target(&target)?;
+            // Resolve the target against the LINK's location and allow `..` that
+            // stays inside the workspace (real projects have e.g. `bin/x -> ../src/x`);
+            // reject only a target that escapes the root / is otherwise unrepresentable.
+            clw_types::validate_symlink_target_contained(&rel, &target)?;
             entries.push(WalkedEntry::Symlink { rel, target });
         } else if file_type.is_dir() {
             // FIX 3: validate Dir entry paths at walk time — the SAME point symlink
