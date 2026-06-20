@@ -875,32 +875,34 @@ async fn json_report() {
     let parsed: serde_json::Value =
         serde_json::from_str(stdout_str.trim()).expect("stdout must be valid JSON");
 
-    // Check required report fields
-    assert!(
-        parsed.get("root").and_then(|v| v.as_str()).is_some(),
-        "JSON report must have 'root' field, got: {parsed}"
+    // Validate the field VALUES against the KNOWN fixture (one file, `data.txt`,
+    // holding the 16-byte string "json report test") — not merely that the fields
+    // exist. A regression reporting the wrong file/byte/chunk counts must fail here.
+    assert_eq!(
+        parsed.get("files").and_then(|v| v.as_u64()),
+        Some(1),
+        "JSON report must count exactly the 1 fixture file, got: {parsed}"
     );
-    assert!(
-        parsed.get("files").and_then(|v| v.as_u64()).is_some(),
-        "JSON report must have 'files' field, got: {parsed}"
+    assert_eq!(
+        parsed.get("bytes_total").and_then(|v| v.as_u64()),
+        Some(16), // "json report test".len()
+        "JSON report bytes_total must equal the fixture's 16 bytes, got: {parsed}"
     );
+    let chunks_total = parsed
+        .get("chunks_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    let chunks_uploaded = parsed
+        .get("chunks_uploaded")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
     assert!(
-        parsed.get("bytes_total").and_then(|v| v.as_u64()).is_some(),
-        "JSON report must have 'bytes_total' field, got: {parsed}"
+        chunks_total >= 1,
+        "a non-empty file must produce at least one chunk, got: {parsed}"
     );
-    assert!(
-        parsed
-            .get("chunks_total")
-            .and_then(|v| v.as_u64())
-            .is_some(),
-        "JSON report must have 'chunks_total' field, got: {parsed}"
-    );
-    assert!(
-        parsed
-            .get("chunks_uploaded")
-            .and_then(|v| v.as_u64())
-            .is_some(),
-        "JSON report must have 'chunks_uploaded' field, got: {parsed}"
+    assert_eq!(
+        chunks_uploaded, chunks_total,
+        "a fresh snapshot must upload EVERY chunk (none deduped), got: {parsed}"
     );
 
     // root must be a 64-char hex string
@@ -2117,6 +2119,13 @@ async fn run_missing_command_exits_reserved_125_child_never_ran() {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
+    // It must take the clw-internal "child not run" branch (the same sentinel as the
+    // dead-endpoint case) — proving this is the spawn-failure 125, not some other path.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("child not run") || stderr.contains("internal"),
+        "an un-spawnable command must report the clw-internal child-not-run failure, got:\n{stderr}"
+    );
 }
 
 /// A child killed by a signal must propagate the POSIX 128+signal code (SIGTERM → 143),
@@ -2131,6 +2140,10 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
     let input = work.path().join("in.txt");
     std::fs::write(&input, b"declared input").unwrap();
 
+    // The child touches a marker BEFORE signalling itself, so we can PROVE the child
+    // actually executed (distinguishing the 143-via-signal path from a 125 spawn failure).
+    let marker = work.path().join("child_started.marker");
+    let shell_cmd = format!("touch {}; kill -TERM $$", marker.to_str().unwrap());
     let run_self_sigterm = || {
         clw_cmd(&server.uri(), cache.path())
             .current_dir(work.path())
@@ -2141,7 +2154,7 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
                 "--",
                 "/bin/sh",
                 "-c",
-                "kill -TERM $$", // the shell signals itself → SIGTERM (15)
+                &shell_cmd, // touch a marker, then the shell signals itself → SIGTERM (15)
             ])
             .output()
             .unwrap()
@@ -2154,6 +2167,11 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
         Some(143),
         "a SIGTERM-killed child must propagate 128+15=143, got: {:?}",
         out1.status.code()
+    );
+    assert!(
+        marker.exists(),
+        "the child must have actually RUN (marker present) — proving this is the signal \
+         path, not a spawn failure"
     );
     assert!(
         String::from_utf8_lossy(&out1.stderr).contains("cache miss"),
@@ -2264,11 +2282,25 @@ async fn hydrate_refuses_manifest_declaring_over_total_bytes_cap() {
 #[tokio::test]
 async fn snapshot_surfaces_nonretryable_tier_403_cleanly() {
     let server = MockServer::start().await;
-    // Every CAS PUT returns 403; HEAD is unmounted (wiremock 404 ⇒ "blob missing" ⇒
-    // the client attempts the PUT, which 403s). 403 is non-retryable, so it fails fast.
+    // CAS PUT returns 403, and we PIN it to EXACTLY ONE attempt: 403 is non-retryable,
+    // so the client must NOT retry-storm. `.expect(1)` is verified when `server` drops —
+    // a request-level assertion (not just an observed exit code) that the client issued
+    // one PUT and gave up. HEAD is unmounted (wiremock 404 ⇒ "blob missing" ⇒ PUT attempted).
     Mock::given(method("PUT"))
         .and(path_regex(format!("/v1/cas/{TEST_TENANT}/[a-f0-9]{{64}}$")))
         .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Back the AC PUT with a real store so we can PROVE the failed upload wrote NO ref —
+    // a 403 mid-snapshot must leave the namespace clean, not a dangling ref.
+    let ac_store: Store = Arc::new(Mutex::new(HashMap::new()));
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("/v1/ac/{TEST_TENANT}/[a-f0-9]{{64}}$")))
+        .respond_with(AcResponder {
+            store: Arc::clone(&ac_store),
+            auth_ok: true,
+        })
         .mount(&server)
         .await;
 
@@ -2302,6 +2334,12 @@ async fn snapshot_surfaces_nonretryable_tier_403_cleanly() {
         !stderr.contains("panicked"),
         "a tier error must be a clean error, not a panic, got:\n{stderr}"
     );
+    // No partial state: the failed upload wrote NO AC ref.
+    assert!(
+        ac_store.lock().unwrap().is_empty(),
+        "a snapshot that 403s on upload must NOT write a workspace ref"
+    );
+    // `server` drops here → wiremock verifies the `.expect(1)` (exactly one PUT, no retry storm).
 }
 
 // ---------------------------------------------------------------------------
