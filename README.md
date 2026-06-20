@@ -114,6 +114,16 @@ clw snapshot --name myapp-main
 `chunks_uploaded` < `chunks_total` means deduplication is working — chunks
 already in the CAS from a previous snapshot are skipped.
 
+Re-snapshotting a name with **identical** content is a **no-op success** — it
+prints `already up to date` and writes no new ref. To replace a name whose
+content **differs**, pass `--force` (it does an rm-then-write); without it the
+server rejects the in-place overwrite (HTTP 409) and clw prints the `--force` /
+`clw rm` workaround.
+
+```sh
+clw snapshot --name myapp-main --force
+```
+
 ### 3. Hydrate on another machine
 
 ```sh

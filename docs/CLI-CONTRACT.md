@@ -15,10 +15,10 @@ the consumer image). No library/ABI coupling. This is the model the runners TL r
 | Verb | Purpose |
 |---|---|
 | **`snapshot [PATH] --name <NAME>`** | snapshot a workspace dir → content-addressed ref |
-| **`hydrate <NAME> <DEST>`** | materialize a ref into DEST — byte+mode+symlink identical |
+| **`hydrate <DEST> --name <NAME>`** | materialize a ref into DEST — byte+mode+symlink identical |
 | **`run …`** | content-addressed, memoized execution (cache miss→hit) |
 | `ls [--all]` | list refs (`--all` enumerates the tenant) |
-| `rm <NAME> --yes` | delete a ref (idempotent) |
+| `rm --name <NAME> --yes` | delete a ref (idempotent; or `--ref-key <KEY>` for a dangling ref) |
 | `prune` | CAS GC (mark-and-sweep; fail-safe on incomplete live set) |
 | `erase --yes` | GDPR Art.17 — wipe the tenant, verify-empty |
 | `doctor` / `status` | environment + auth health |

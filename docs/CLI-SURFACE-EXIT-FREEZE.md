@@ -11,6 +11,12 @@
 - `PATH` — positional, the workspace directory to snapshot; **defaults to `.`** if omitted (`crates/clw-cli/src/subcmds/snapshot.rs`).
 - `--name <NAME>` — **required**, the workspace name to store the snapshot under.
 - Effect: chunk + content-address + upload; writes the AC ref for `<NAME>` (in the active ref domain).
+- **ADDITIVE (post-freeze, PR #143 — new flag + softened error, not a contract change):**
+  re-snapshotting a name with **identical** content is a **no-op success** (exit 0; prints
+  `already up to date`) — it does **not** error. Re-snapshotting **differing** content still
+  rejects (HTTP 409) unless the new `--force` flag is passed, which does an rm-then-write.
+  Both are additive (new flag / a former error path now succeeding) and so are permitted under
+  this freeze; no frozen exit code or arg meaning changed.
 
 ### `clw hydrate <DEST> --name <NAME>`
 - `DEST` — positional, destination directory (must not exist or be empty) (`…/subcmds/hydrate.rs`).

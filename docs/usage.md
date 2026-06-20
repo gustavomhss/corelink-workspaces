@@ -25,6 +25,41 @@ clw snapshot --name myapp-dev
 Each snapshot records the previous root digest as `parent`, so the lineage is
 always visible via `clw ls`.
 
+### Re-snapshotting a name: identical content vs. `--force`
+
+The ref store is **create-only** (in-place versioning isn't live yet), so the two
+re-snapshot cases differ:
+
+- **Identical content → no-op success.** Re-snapshotting a name that already
+  points at the *same* content does nothing and succeeds (exit 0). It prints
+  `already up to date` rather than `snapshot complete`, and `chunks_uploaded` is
+  `0` (unless the server had lost/pruned blobs that were re-uploaded). No `--force`
+  is needed.
+
+  ```sh
+  clw snapshot --name myapp-dev
+  # already up to date — 'myapp-dev' already points at this content (no change)
+  #   name:            myapp-dev
+  #   root:            af1349b9f5f9...
+  #   files:           312
+  #   bytes_total:     41943040
+  #   chunks_uploaded: 0
+  ```
+
+- **Different content → needs `--force`.** Re-snapshotting a name to *different*
+  content is rejected by the server (HTTP 409) unless you pass `--force`, which
+  does an rm-then-write (delete the old ref, then write the new one).
+
+  ```sh
+  clw snapshot --name myapp-dev --force
+  # snapshot complete
+  #   name:            myapp-dev
+  #   ...
+  ```
+
+  Without `--force`, clw surfaces the actionable message naming the `--force` flag
+  (or the `clw rm --name <ws> --yes` then re-snapshot workaround).
+
 ---
 
 ## Resume on another machine
@@ -60,11 +95,15 @@ clw snapshot --name myapp-dev
 clw ls --name myapp-dev
 # name:         myapp-dev
 # root:         af1349b9f5f9...
-# created_at:   1748995200
+# created_at:   2025-06-04 00:00:00 UTC
 # parent:       c3d7e2a1b4f8...
 # files:        312
 # bytes_total:  41943040
 ```
+
+The human-readable `created_at` is a UTC datetime; the raw epoch is preserved as
+`created_at_unix` in the `--json` form (and `ls --all --json` adds a
+`run_cache_entries` count of memoized `clw run` records).
 
 ---
 
@@ -288,6 +327,11 @@ This is a destructive operation, so it is gated by a confirmation:
 - In non-interactive contexts (no TTY) and with `--json`, `clw rm` **refuses to
   delete without `--yes`** — it never silently deletes in a pipeline.
 
+`clw rm` reports **honestly** whether the ref actually existed. Deleting a name
+that exists prints `deleted ref '<ws>'`; deleting one that never existed still
+succeeds (idempotent, exit 0) but prints `no such ref '<ws>' (nothing to delete)`.
+Under `--json` this is `{"deleted":true}` vs `{"deleted":false}`.
+
 ```sh
 clw rm --name myapp-dev
 # delete ref 'myapp-dev'? this cannot be undone [y/N]: y
@@ -296,6 +340,16 @@ clw rm --name myapp-dev
 # Non-interactive / scripted:
 clw rm --name myapp-dev --yes
 # deleted ref 'myapp-dev'
+
+# Removing a name that does not exist — still exit 0, but says so honestly:
+clw rm --name never-existed --yes
+# no such ref 'never-existed' (nothing to delete)
+
+# JSON form reflects whether the ref actually existed:
+clw --json rm --name myapp-dev --yes
+# {"name":"myapp-dev","deleted":true}
+clw --json rm --name never-existed --yes
+# {"name":"never-existed","deleted":false}
 ```
 
 `clw rm` removes **only the ref** (the named pointer in the AC); it does **not**
