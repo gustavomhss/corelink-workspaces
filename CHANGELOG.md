@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.2] — power-user acceptance findings (2026-06-20)
+
+> Fixes the 4 findings from an end-to-end power-user test of the shipped v0.1.1 binary. The core
+> engine (snapshot/hydrate byte-identity, run memoization, exit-125 contract, prune safety-floor) was
+> confirmed solid; these address the rough edges around it.
+
+### Added
+- **`clw rm --ref-key <KEY>`** — delete a ref by its raw 64-hex key, for removing a dangling/corrupt
+  ref that `ls --all` / `prune` surface (by key) but that has no usable name (and that blocks `prune`).
+  Mutually exclusive with `--name`; existing `clw rm --name` is unchanged.
+
+### Fixed
+- **Relative symlinks with `..` that stay inside the workspace** (e.g. `bin/x -> ../src/x`) are now
+  snapshotted instead of rejected with "symlink target escapes workspace". Resolved on both the
+  producer and consumer; symlinks that genuinely escape the workspace root are still rejected.
+- **Re-snapshot error message.** Re-snapshotting an existing workspace name returned a bare
+  `HTTP 409`; it now explains the situation and the `clw rm --name <X> --yes` workaround. (The
+  underlying in-place versioning needs server-side upsert support — tracked separately.)
+- **Error labels.** Authentication, usage, not-found, prune-refusal and similar application errors are
+  no longer mislabeled `transport error: …` (a new verbatim message class); genuine transport/HTTP
+  capability errors keep their label.
+
 ## [0.1.1] — post-launch audit remediation (2026-06-19)
 
 > Addresses all 20 cold-verified findings from a post-launch adversarial audit of v0.1.0
