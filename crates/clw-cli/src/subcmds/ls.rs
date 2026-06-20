@@ -38,8 +38,9 @@ pub async fn run(args: LsArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
         (None, true) => run_all(cfg, json).await,
         // clap's `conflicts_with` already rejects `--name X --all`; this guards
         // the `neither` case with an actionable message instead of a panic.
+        // FIX 5: point a bare `clw ls` at `--help` so the user can discover the flags.
         _ => Err(ClwError::Message(
-            "specify exactly one of --name <NAME> or --all".to_string(),
+            "specify exactly one of --name <NAME> or --all (run `clw ls --help`)".to_string(),
         )),
     }
 }
@@ -54,11 +55,7 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
     let ref_bytes = AcTransport::get(&client, &rk)
         .await
         .map_err(map_auth_error)?
-        .ok_or_else(|| {
-            ClwError::Message(format!(
-                "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
-            ))
-        })?;
+        .ok_or_else(|| ClwError::Message(not_found_msg(name, &tenant)))?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
 
     // Fetch manifest to count files and total size. The ref exists but its
@@ -93,7 +90,8 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
     } else {
         println!("name:         {}", record.name);
         println!("root:         {}", record.root);
-        println!("created_at:   {}", record.created_at_unix);
+        // FIX 1: render a human UTC datetime; the raw epoch stays in `--json` only.
+        println!("created_at:   {}", format_unix_utc(record.created_at_unix));
         println!("parent:       {parent_str}");
         println!("files:        {file_count}");
         println!("bytes_total:  {}", manifest.total_size);
@@ -216,10 +214,11 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
         println!("no refs for tenant '{tenant}'");
     } else {
         for r in &rows {
+            // FIX 1: human UTC datetime in the table column (epoch kept in --json).
             println!(
                 "{}  {}  {}",
                 &r.root.to_hex()[..16],
-                r.created_at_unix,
+                format_unix_utc(r.created_at_unix),
                 r.name
             );
         }
@@ -238,6 +237,48 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     }
 
     Ok(())
+}
+
+/// FIX 4: the workspace-not-found message, shared with hydrate/status. Beyond
+/// "snapshot first or check --tenant" it now points at `--ref-domain`: a
+/// runner-produced ref lives in the `runner` keyspace, so a user-domain lookup of
+/// it (or vice versa) "not found" is most often a ref-domain mismatch, not a
+/// missing snapshot.
+pub fn not_found_msg(name: &str, tenant: &str) -> String {
+    format!(
+        "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' \
+         first or check --tenant — if this is a runner-produced workspace, set \
+         CLW_REF_DOMAIN=runner (or --ref-domain runner)"
+    )
+}
+
+/// FIX 1: render a Unix epoch (seconds) as `YYYY-MM-DD HH:MM:SS UTC` WITHOUT a new
+/// crate dependency — chrono/time are not in the dep tree and the machine-facing
+/// epoch stays in `--json`, so a hand-rolled civil-from-days is the right weight.
+/// Uses Howard Hinnant's `civil_from_days` (days since the 1970-01-01 epoch → Y-M-D).
+fn format_unix_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let (hour, min, sec) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+
+    // civil_from_days: days-since-epoch → (year, month, day). Shift the epoch to
+    // 0000-03-01 (era arithmetic) so leap days fall at the END of each 400-year era.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} UTC")
 }
 
 /// True if the error is the server-regression case (the client maps 405/501 to a
@@ -296,15 +337,27 @@ mod tests {
 
     #[test]
     fn not_found_error_is_actionable() {
-        let name = "ws-x";
-        let tenant = "t1";
-        let msg = format!(
-            "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
-        );
+        let msg = not_found_msg("ws-x", "t1");
         assert!(msg.contains("not found"), "must mention not found");
-        assert!(msg.contains(name), "must mention workspace name");
-        assert!(msg.contains(tenant), "must mention tenant");
+        assert!(msg.contains("ws-x"), "must mention workspace name");
+        assert!(msg.contains("t1"), "must mention tenant");
         assert!(msg.contains("--tenant"), "must mention --tenant flag");
+        // FIX 4 — the not-found hint now points at the ref-domain mismatch case.
+        assert!(
+            msg.contains("CLW_REF_DOMAIN=runner") && msg.contains("--ref-domain"),
+            "must hint at --ref-domain/CLW_REF_DOMAIN for runner-produced refs, got: {msg}"
+        );
+    }
+
+    // FIX 1 — the hand-rolled civil-from-days renderer matches `date -u` for known
+    // epochs (verified against `date -u -r <epoch>`); the epoch boundary and a
+    // mid-2026 timestamp both land exactly.
+    #[test]
+    fn format_unix_utc_matches_known_epochs() {
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_unix_utc(1_781_980_856), "2026-06-20 18:40:56 UTC");
+        // A leap day (2024-02-29) — exercises the era leap-handling.
+        assert_eq!(format_unix_utc(1_709_208_000), "2024-02-29 12:00:00 UTC");
     }
 
     #[test]

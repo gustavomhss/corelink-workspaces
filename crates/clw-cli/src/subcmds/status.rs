@@ -40,12 +40,8 @@ pub async fn run(args: StatusArgs, cfg: ResolvedConfig, json: bool) -> Result<()
     let ref_bytes = AcTransport::get(&client, &rk)
         .await
         .map_err(map_auth_error)?
-        .ok_or_else(|| {
-            ClwError::Message(format!(
-                "workspace '{}' not found for tenant '{}' — run 'clw snapshot --name {}' first or check --tenant",
-                args.name, tenant, args.name
-            ))
-        })?;
+        // FIX 4: shared not-found message — also hints at --ref-domain.
+        .ok_or_else(|| ClwError::Message(crate::subcmds::ls::not_found_msg(&args.name, &tenant)))?;
     let record = RefRecord::from_bytes(&ref_bytes)?;
 
     // Fetch manifest blob from CAS. The ref resolved but its manifest blob may be
@@ -235,15 +231,16 @@ mod tests {
 
     #[test]
     fn not_found_error_message_is_actionable() {
-        // Simulate the NotFound-mapped error message that run() would produce.
-        let name = "my-workspace";
-        let tenant = "acme";
-        let msg = format!(
-            "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
-        );
+        // The real shared message that run() produces on a missing ref.
+        let msg = crate::subcmds::ls::not_found_msg("my-workspace", "acme");
         assert!(msg.contains("not found"), "must say 'not found'");
-        assert!(msg.contains(name), "must mention workspace name");
-        assert!(msg.contains(tenant), "must mention tenant");
+        assert!(msg.contains("my-workspace"), "must mention workspace name");
+        assert!(msg.contains("acme"), "must mention tenant");
         assert!(msg.contains("clw snapshot"), "must suggest clw snapshot");
+        // FIX 4 — not-found now hints at the ref-domain mismatch case.
+        assert!(
+            msg.contains("CLW_REF_DOMAIN=runner") && msg.contains("--ref-domain"),
+            "must hint at --ref-domain for runner-produced refs, got: {msg}"
+        );
     }
 }

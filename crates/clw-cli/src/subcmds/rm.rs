@@ -87,19 +87,32 @@ pub async fn run(args: RmArgs, cfg: ResolvedConfig, json: bool) -> Result<(), Cl
 
     let client = HttpClient::new(cfg.clw_config)?;
 
+    // FIX 3: the server DELETE is idempotent (a delete of an absent ref still
+    // 204s), so a blind delete printed "deleted" for a ref that NEVER existed —
+    // dishonest. GET the ref FIRST to learn whether it actually existed, then
+    // report truthfully (`deleted:true` vs `deleted:false`). Still idempotent: rm
+    // of an absent ref is SUCCESS (exit 0), it just says "nothing to delete".
+    let existed = AcTransport::get(&client, &rk)
+        .await
+        .map_err(map_auth_error)?
+        .is_some();
+
     match AcTransport::delete(&client, &rk).await {
         Ok(()) => {
             if json {
                 // Preserve the `{name:…}` shape for the name case (contract); the
-                // by-key case reports `{ref_key:…}`.
+                // by-key case reports `{ref_key:…}`. `deleted` reflects whether the
+                // ref actually existed (FIX 3).
                 let out = match (&args.name, &args.ref_key) {
-                    (Some(n), _) => json!({ "name": n, "deleted": true }),
-                    (None, Some(k)) => json!({ "ref_key": k, "deleted": true }),
-                    _ => json!({ "deleted": true }),
+                    (Some(n), _) => json!({ "name": n, "deleted": existed }),
+                    (None, Some(k)) => json!({ "ref_key": k, "deleted": existed }),
+                    _ => json!({ "deleted": existed }),
                 };
                 println!("{out}");
-            } else {
+            } else if existed {
                 println!("deleted {label}");
+            } else {
+                println!("no such {label} (nothing to delete)");
             }
             Ok(())
         }

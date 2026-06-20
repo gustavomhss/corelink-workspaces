@@ -1466,6 +1466,38 @@ async fn rm_deletes_ref_is_idempotent_and_requires_yes() {
         "idempotent rm must leave the ref absent"
     );
 
+    // FIX 3: rm of a name that NEVER existed must still exit 0 (idempotent) but be
+    // HONEST — `deleted:false` + a "nothing to delete" human line, not a false
+    // "deleted". The first rm above deleted the only ref, so this name is absent.
+    let out_absent = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "rm", "--name", "e2e-rm-never-existed", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_absent.status.code(),
+        Some(0),
+        "rm of an absent ref must still exit 0 (idempotent)"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out_absent.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["deleted"],
+        false,
+        "rm of a never-existed ref must report deleted:false, got:\n{}",
+        String::from_utf8_lossy(&out_absent.stdout)
+    );
+    // Human mode says "nothing to delete" rather than a false "deleted".
+    let out_absent_human = clw_cmd(&server.uri(), cache.path())
+        .args(["rm", "--name", "e2e-rm-never-existed", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(out_absent_human.status.code(), Some(0));
+    let stdout_human = String::from_utf8_lossy(&out_absent_human.stdout);
+    assert!(
+        stdout_human.contains("nothing to delete"),
+        "human rm of an absent ref must say 'nothing to delete', got:\n{stdout_human}"
+    );
+
     // Re-snapshot, then rm WITHOUT --yes in a non-interactive context must REFUSE
     // (non-zero exit) and delete nothing.
     let _src2 = snapshot_tiny(&server.uri(), cache.path(), ws);

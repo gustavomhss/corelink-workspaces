@@ -13,10 +13,20 @@ use serde_json::json;
 use crate::config::ResolvedConfig;
 
 #[derive(Debug, Args)]
-#[command(about = "Materialize a workspace snapshot into a local directory")]
+#[command(
+    about = "Materialize a workspace snapshot into a local directory",
+    // FIX 8: the destination is POSITIONAL — `--path DIR` yields a confusing clap
+    // error. Spell the correct form out so a user reaches for `<DEST>`, not --path.
+    long_about = "Materialize a workspace snapshot into a local directory.\n\n\
+                  The destination is a POSITIONAL argument, not a flag: \
+                  `clw hydrate <DEST> --name X` (NOT `--path DEST`)."
+)]
 pub struct HydrateArgs {
     /// Destination directory (must not exist or be empty).
-    #[arg(help = "Destination directory — must not exist or must be empty")]
+    #[arg(
+        help = "Destination directory — POSITIONAL, e.g. `clw hydrate <DEST> --name X` \
+                (not `--path DEST`); must not exist or must be empty"
+    )]
     pub dest: PathBuf,
 
     /// Workspace name (ref key).
@@ -85,9 +95,9 @@ fn map_hydrate_error(err: ClwError, name: &str, tenant: &str, dest: &Path) -> Cl
         ClwError::Auth => ClwError::Message(
             "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
         ),
-        ClwError::NotFound(_) => ClwError::Message(format!(
-            "workspace '{name}' not found for tenant '{tenant}' — run 'clw snapshot --name {name}' first or check --tenant",
-        )),
+        // FIX 4: shared not-found message — now also hints at --ref-domain (the
+        // likely cause when a runner-domain ref is looked up in the user domain).
+        ClwError::NotFound(_) => ClwError::Message(crate::subcmds::ls::not_found_msg(name, tenant)),
         ClwError::Io(io_err) if io_err.kind() == ErrorKind::AlreadyExists => {
             let dest = dest.display();
             ClwError::Message(format!(
@@ -131,6 +141,11 @@ mod tests {
         assert!(
             msg.contains("clw snapshot"),
             "must suggest snapshot command"
+        );
+        // FIX 4 — not-found now hints at the ref-domain mismatch case.
+        assert!(
+            msg.contains("CLW_REF_DOMAIN=runner") && msg.contains("--ref-domain"),
+            "must hint at --ref-domain for runner-produced refs, got: {msg}"
         );
     }
 

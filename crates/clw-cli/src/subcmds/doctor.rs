@@ -122,10 +122,14 @@ fn build_report(cfg: &ResolvedConfig) -> String {
 
     // --- reporting note ----------------------------------------------------
     out.push_str("-----------------------------------\n");
+    // FIX 2: tighten the "redacted" framing — only the TOKEN is redacted; the
+    // tenant ID is an account identifier shown in full ON PURPOSE (support needs
+    // it), so the note no longer over-promises a blanket redaction before inviting
+    // the user to paste the output.
     out.push_str(
-        "note: this bundle is redacted; your token is never shown. To report a bug, see \
-         SECURITY.md for responsible-disclosure of security issues, or open an issue and \
-         paste this output.\n",
+        "note: only the token is redacted (the tenant ID is an account identifier, shown in full \
+         intentionally — support needs it). To report a bug, see SECURITY.md for \
+         responsible-disclosure of security issues, or open an issue and paste this output.\n",
     );
 
     out
@@ -283,6 +287,28 @@ mod tests {
         assert!(
             report.contains("SECURITY.md"),
             "report must point to SECURITY.md for bug/security reporting"
+        );
+    }
+
+    // FIX 2 — the closing note must clarify that ONLY the token is redacted and the
+    // tenant ID is shown in full intentionally (it's an account identifier, not a
+    // credential), so the "redacted" framing no longer over-promises.
+    #[test]
+    fn report_note_clarifies_only_token_is_redacted() {
+        let cfg = cfg_with_token("tok");
+        let report = build_report(&cfg);
+        assert!(
+            report.contains("only the token is redacted"),
+            "note must say only the token is redacted, got:\n{report}"
+        );
+        assert!(
+            report.contains("account identifier") && report.contains("shown in full"),
+            "note must explain the tenant ID is shown in full intentionally, got:\n{report}"
+        );
+        // The tenant value is still printed in full (support needs it).
+        assert!(
+            report.contains("tenant value:   acme-tenant"),
+            "tenant value must still be shown in full, got:\n{report}"
         );
     }
 

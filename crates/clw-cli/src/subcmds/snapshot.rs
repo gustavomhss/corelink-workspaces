@@ -13,12 +13,21 @@ use crate::config::ResolvedConfig;
 use crate::subcmds::status::map_auth_error;
 
 #[derive(Debug, Args)]
-#[command(about = "Snapshot a workspace directory and upload it to CoreLink")]
+#[command(
+    about = "Snapshot a workspace directory and upload it to CoreLink",
+    // FIX 8: the directory is POSITIONAL — `--path DIR` yields a confusing clap
+    // error. Spell the correct form out so a user reaches for `<DIR>`, not --path.
+    long_about = "Snapshot a workspace directory and upload it to CoreLink.\n\n\
+                  The directory is a POSITIONAL argument, not a flag: \
+                  `clw snapshot <DIR> --name X` (NOT `--path DIR`). Omit it to snapshot \
+                  the current directory."
+)]
 pub struct SnapshotArgs {
     /// Workspace directory to snapshot (default: current directory).
     #[arg(
         default_value = ".",
-        help = "Workspace directory to snapshot (default: current directory)"
+        help = "Workspace directory to snapshot — POSITIONAL, e.g. `clw snapshot <DIR> --name X` \
+                (not `--path DIR`); default: current directory"
     )]
     pub path: PathBuf,
 
@@ -68,6 +77,18 @@ pub async fn run(
     let report = snapshot(&args.path, &client, &cache, &opts)
         .await
         .map_err(|e| map_snapshot_error(e, &args.name))?;
+
+    // FIX 7 (DOWNGRADED to a stderr note — see fn docs): the `ignore` walker drops
+    // gitignored entries silently mid-iteration and does NOT expose a skip count
+    // through its standard iterator, so an EXACT excluded count would mean a second
+    // full walk (double I/O) or a from-scratch matcher rewrite — too invasive for a
+    // low-severity polish. Instead emit a one-line stderr note when the snapshotted
+    // tree carries an ignore file, so the user is not surprised that gitignored
+    // files were dropped. stderr only (keeps --json stdout clean); does not change
+    // the exit code.
+    if has_ignore_file(&args.path) {
+        eprintln!("note: files matched by .gitignore/.clwignore were excluded from this snapshot");
+    }
 
     // Non-destructive warning: secret-looking files were uploaded, not dropped.
     // Printed to stderr so it never pollutes the `--json` stdout payload, and
@@ -119,6 +140,16 @@ pub async fn run(
     Ok(())
 }
 
+/// FIX 7: cheap presence check for a root-level ignore file (`.gitignore` /
+/// `.clwignore`) so the CLI can emit a "files were excluded" note without a second
+/// walk. A root-level ignore file is the overwhelmingly common case; a nested-only
+/// ignore would not trip this, which is an accepted limitation of the cheap signal
+/// (the alternative — an exact count — needs a full second walk or a matcher
+/// rewrite). Pure over the filesystem so the trigger is unit-testable.
+fn has_ignore_file(path: &std::path::Path) -> bool {
+    path.join(".gitignore").exists() || path.join(".clwignore").exists()
+}
+
 /// Map snapshot errors to actionable messages. A re-snapshot of an existing
 /// workspace name currently returns **HTTP 409** from the AC `PUT` (the server's
 /// ref store is create-only — in-place versioning/upsert isn't live yet). Translate
@@ -142,9 +173,32 @@ fn map_snapshot_error(err: ClwError, name: &str) -> ClwError {
 
 #[cfg(test)]
 mod tests {
-    use super::map_snapshot_error;
+    use super::{has_ignore_file, map_snapshot_error};
     use clw_snapshot::SnapshotOptions;
     use clw_types::ClwError;
+
+    // FIX 7 — the excluded-files note fires only when the tree carries a root-level
+    // ignore file; a clean tree stays quiet (no spurious note).
+    #[test]
+    fn has_ignore_file_detects_gitignore_and_clwignore() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !has_ignore_file(dir.path()),
+            "a tree with no ignore file must not trip the note"
+        );
+        std::fs::write(dir.path().join(".gitignore"), b"target/\n").unwrap();
+        assert!(
+            has_ignore_file(dir.path()),
+            ".gitignore presence must trip the note"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join(".clwignore"), b"secret\n").unwrap();
+        assert!(
+            has_ignore_file(dir2.path()),
+            ".clwignore presence must trip the note"
+        );
+    }
 
     #[test]
     fn re_snapshot_409_maps_to_actionable_rm_first_message() {
