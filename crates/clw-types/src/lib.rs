@@ -306,7 +306,18 @@ pub fn validate_symlink_target(t: &str) -> Result<()> {
 /// This is the producer-side check the v0.1.1 power-user test motivated: the strict
 /// [`validate_symlink_target`] rejects ANY `..`, which breaks real projects whose
 /// relative symlinks (e.g. `bin/x -> ../src/x`) resolve harmlessly within the tree.
+///
+/// PRECONDITION: `link_rel` MUST already be a clean workspace-relative path (no `..`,
+/// `.`, empty, or absolute components). Every caller runs [`validate_rel_path`] on the
+/// link path first, so this holds at all real call sites; the `debug_assert!` below
+/// pins it. (The seed is the link's parent dir taken from a clean `link_rel`; it does
+/// NOT lexically resolve a `..` inside `link_rel`, so an unclean `link_rel` would be
+/// modeled wrong — hence the precondition rather than silent handling.)
 pub fn validate_symlink_target_contained(link_rel: &str, t: &str) -> Result<()> {
+    debug_assert!(
+        !link_rel.split('/').any(|c| c == ".." || c == "."),
+        "validate_symlink_target_contained requires a validate_rel_path-clean link_rel, got: {link_rel}"
+    );
     if t.is_empty() {
         return Err(ClwError::InvalidManifest("empty symlink target".into()));
     }
@@ -322,7 +333,8 @@ pub fn validate_symlink_target_contained(link_rel: &str, t: &str) -> Result<()> 
     }
     // Seed the resolution stack with the link's PARENT directory components (the
     // dir the relative target is interpreted from). `link_rel` is workspace-root-
-    // relative and already validated by `validate_rel_path`.
+    // relative and already validated by `validate_rel_path` (precondition above),
+    // so its only droppable components are the trailing-slash/`.` artifacts.
     let mut depth: Vec<&str> = link_rel.split('/').collect();
     depth.pop(); // drop the link's own filename → its parent dir
     depth.retain(|c| !c.is_empty() && *c != ".");
@@ -1048,6 +1060,10 @@ mod tests {
         assert!(validate_symlink_target_contained("bin/link", "..\\x").is_err());
         assert!(validate_symlink_target_contained("bin/link", "a//b").is_err());
         assert!(validate_symlink_target_contained("bin/link", "").is_err());
+        // A target may climb to the root and back down, but not one level past it.
+        assert!(validate_symlink_target_contained("a/b/link", "../../sib/x").is_ok()); // a/b -> root -> sib/x
+        assert!(validate_symlink_target_contained("a/b/link", "../../../x").is_err());
+        // one past root
     }
 
     #[test]

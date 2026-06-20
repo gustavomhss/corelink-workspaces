@@ -127,6 +127,57 @@ impl Respond for AcResponder {
     }
 }
 
+/// A create-only AC PUT responder: `PUT` of a key that is ALREADY present returns
+/// HTTP 409 (the live CoreLink AC store rejects in-place overwrites — see
+/// `docs/REQUEST-server-TL-ac-put-upsert-2026-06-20.md`); a first PUT inserts and
+/// returns 201. GET/DELETE behave exactly like [`AcResponder`]. This reproduces
+/// the server semantics that make a re-snapshot of an existing name fail, which the
+/// default [`AcResponder`] (unconditional upsert) cannot exercise.
+#[derive(Clone)]
+struct AcCreateOnlyResponder {
+    store: Store,
+    auth_ok: bool,
+}
+
+impl Respond for AcCreateOnlyResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let auth = request
+            .headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !self.auth_ok || auth != format!("Bearer {TEST_PAT}") {
+            return ResponseTemplate::new(401);
+        }
+
+        let key = last_segment(&request.url);
+        let m = request.method.as_str();
+
+        if m == "PUT" {
+            let mut guard = self.store.lock().unwrap();
+            if guard.contains_key(&key) {
+                // Create-only: the key already exists → reject the overwrite.
+                return ResponseTemplate::new(409);
+            }
+            guard.insert(key, request.body.clone());
+            return ResponseTemplate::new(201);
+        }
+        if m == "GET" {
+            let guard = self.store.lock().unwrap();
+            if let Some(data) = guard.get(&key) {
+                return ResponseTemplate::new(200).set_body_bytes(data.clone());
+            } else {
+                return ResponseTemplate::new(404);
+            }
+        }
+        if m == "DELETE" {
+            self.store.lock().unwrap().remove(&key);
+            return ResponseTemplate::new(204);
+        }
+        ResponseTemplate::new(405)
+    }
+}
+
 /// `GET /v1/cas/{tenant}` (no trailing digest) → CAS blob listing page in the
 /// ratified D-8 envelope `{"blobs":[{"hash":"<64hex>"}, …], "next_cursor":null}`.
 /// Enumerates the live CAS store keys as a single full page. `?limit`/`?cursor`
@@ -197,7 +248,20 @@ impl Respond for AcListResponder {
 }
 
 /// Mount stateful CAS + AC mocks on `server`. Returns `(cas_store, ac_store)`.
+/// The AC PUT route is an unconditional upsert (the common case).
 async fn mount_corelink(server: &MockServer, auth_ok: bool) -> (Store, Store) {
+    mount_corelink_opts(server, auth_ok, false).await
+}
+
+/// Like [`mount_corelink`], but when `ac_create_only` is set the AC PUT route
+/// rejects overwrites with HTTP 409 ([`AcCreateOnlyResponder`]) — modelling the
+/// live store's create-only AC semantics so a re-snapshot of an existing name
+/// reproduces the real 409 path.
+async fn mount_corelink_opts(
+    server: &MockServer,
+    auth_ok: bool,
+    ac_create_only: bool,
+) -> (Store, Store) {
     let cas_store: Store = Arc::new(Mutex::new(HashMap::new()));
     let ac_store: Store = Arc::new(Mutex::new(HashMap::new()));
 
@@ -235,14 +299,26 @@ async fn mount_corelink(server: &MockServer, auth_ok: bool) -> (Store, Store) {
         })
         .mount(server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path_regex(&ac_pattern))
-        .respond_with(AcResponder {
-            store: Arc::clone(&ac_store),
-            auth_ok,
-        })
-        .mount(server)
-        .await;
+    // AC PUT: create-only (409-on-overwrite) when requested, else upsert.
+    if ac_create_only {
+        Mock::given(method("PUT"))
+            .and(path_regex(&ac_pattern))
+            .respond_with(AcCreateOnlyResponder {
+                store: Arc::clone(&ac_store),
+                auth_ok,
+            })
+            .mount(server)
+            .await;
+    } else {
+        Mock::given(method("PUT"))
+            .and(path_regex(&ac_pattern))
+            .respond_with(AcResponder {
+                store: Arc::clone(&ac_store),
+                auth_ok,
+            })
+            .mount(server)
+            .await;
+    }
     Mock::given(method("GET"))
         .and(path_regex(&ac_pattern))
         .respond_with(AcResponder {
@@ -1729,5 +1805,217 @@ async fn erase_yes_confirmed_empties_both_stores() {
     assert!(
         cas.lock().unwrap().is_empty(),
         "erase must leave the CAS store empty"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Power-user acceptance regressions (the v0.1.2 fixes).
+//
+// Each of the four power-user findings fixed in v0.1.2 is locked in here as a
+// binary-level regression so it cannot silently come back. See the findings note
+// `memory/clw-v011-poweruser-test-findings.md` and CHANGELOG [0.1.2]. Without
+// these, the very bugs we shipped fixes for had ZERO automated coverage.
+// ---------------------------------------------------------------------------
+
+// Finding #1 — re-snapshot of an EXISTING name hits the server's create-only AC
+// PUT (HTTP 409). The raw 409 used to surface verbatim with no guidance; v0.1.2
+// maps it to an actionable message pointing at `clw rm --name <X> --yes`. This
+// test uses the create-only AC mock so the real 409 path is exercised, asserts
+// the actionable wording, and proves the documented workaround (rm then re-snapshot)
+// actually works.
+#[tokio::test]
+async fn resnapshot_existing_name_409_is_actionable_and_rm_then_retry_works() {
+    let server = MockServer::start().await;
+    // Create-only AC: a second PUT of the same ref key returns 409, like the live store.
+    let (_cas, ac) = mount_corelink_opts(&server, true, true).await;
+
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-resnapshot-409";
+
+    // First snapshot of the name succeeds (AC PUT is a create → 201).
+    let src1 = TempDir::new().unwrap();
+    std::fs::write(src1.path().join("f.txt"), b"version one").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src1.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    assert!(ac.lock().unwrap().contains_key(&ref_key_hex(ws)));
+
+    // Re-snapshot the SAME name with DIFFERENT content → the AC overwrite is 409.
+    // It must fail with the actionable message, NOT a raw "409"/"transport error".
+    let src2 = TempDir::new().unwrap();
+    std::fs::write(src2.path().join("f.txt"), b"version two - changed").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src2.path().to_str().unwrap(), "--name", ws])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "re-snapshot of an existing name must fail on the create-only store, got: {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("workspace '{ws}' already exists")),
+        "409 must be reported as an actionable 'already exists', got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("clw rm --name {ws} --yes")),
+        "the message must point at the rm-then-retry workaround, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("transport error"),
+        "the actionable 409 must NOT be mislabeled 'transport error', got:\n{stderr}"
+    );
+
+    // The documented workaround: rm the ref, then snapshot again → succeeds.
+    clw_cmd(&server.uri(), cache.path())
+        .args(["rm", "--name", ws, "--yes"])
+        .assert()
+        .success();
+    clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src2.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    assert!(
+        ac.lock().unwrap().contains_key(&ref_key_hex(ws)),
+        "after rm, a fresh snapshot of the name must re-create the ref"
+    );
+}
+
+// Finding #2 — a relative symlink whose target uses `..` but resolves INSIDE the
+// workspace (e.g. `bin/current -> ../releases/v1.txt`) used to be rejected as an
+// escape. v0.1.2 allows intra-workspace `..` on both the producer and consumer.
+// This asserts such a tree snapshots AND hydrates with the symlink target preserved
+// verbatim and the linked file byte-identical.
+#[tokio::test]
+async fn intra_workspace_dotdot_symlink_roundtrips() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    // Tree: releases/v1.txt + bin/current -> ../releases/v1.txt (resolves in-tree).
+    let src = TempDir::new().unwrap();
+    std::fs::create_dir(src.path().join("releases")).unwrap();
+    std::fs::create_dir(src.path().join("bin")).unwrap();
+    std::fs::write(src.path().join("releases/v1.txt"), b"release one payload").unwrap();
+    std::os::unix::fs::symlink("../releases/v1.txt", src.path().join("bin/current")).unwrap();
+
+    let cache_snap = TempDir::new().unwrap();
+    clw_cmd(&server.uri(), cache_snap.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "e2e-dotdot-symlink",
+        ])
+        .assert()
+        .success();
+
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    clw_cmd(&server.uri(), cache_hyd.path())
+        .args([
+            "hydrate",
+            dest.to_str().unwrap(),
+            "--name",
+            "e2e-dotdot-symlink",
+        ])
+        .assert()
+        .success();
+
+    // Symlink target preserved VERBATIM (the `..` is kept, not normalized away).
+    assert_eq!(
+        std::fs::read_link(dest.join("bin/current"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "../releases/v1.txt",
+        "intra-workspace `..` symlink target must hydrate verbatim"
+    );
+    // And it resolves to the byte-identical linked file.
+    assert_eq!(
+        std::fs::read(dest.join("bin/current")).unwrap(),
+        b"release one payload",
+        "the `..` symlink must resolve to the byte-identical in-tree file"
+    );
+}
+
+// Finding #3 — operational/usage errors used to be mislabeled `transport error:`.
+// `rm` with NEITHER --name nor --ref-key is a usage error (ClwError::Message); it
+// must render the actionable text VERBATIM, never under a bogus transport prefix.
+#[tokio::test]
+async fn usage_error_is_not_mislabeled_transport_error() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let cache = TempDir::new().unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["rm", "--yes"]) // no --name, no --ref-key
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "rm with no selector must fail, got: {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--name") && stderr.contains("--ref-key"),
+        "the usage error must name both selectors, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("transport error"),
+        "a usage error must NOT be mislabeled 'transport error', got:\n{stderr}"
+    );
+}
+
+// Finding #4 — a dangling/corrupt AC record (one `ls --all`/`prune` surface but
+// whose name cannot be decoded) can't be targeted by `clw rm --name`. v0.1.2 adds
+// `clw rm --ref-key <64hex>` to delete it by raw key. This plants a corrupt record
+// and proves the raw-key delete removes exactly it.
+#[tokio::test]
+async fn rm_ref_key_deletes_a_dangling_corrupt_ref() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+
+    let cache = TempDir::new().unwrap();
+    // Keep one healthy ref around to prove the raw-key delete is surgical.
+    let _src = snapshot_tiny(&server.uri(), cache.path(), "e2e-refkey-healthy");
+    let healthy_key = ref_key_hex("e2e-refkey-healthy");
+
+    // Plant a corrupt AC record under a real-shaped (64-hex) but undecodable key.
+    let dangling = "ab".repeat(32);
+    ac.lock()
+        .unwrap()
+        .insert(dangling.clone(), b"{ not a valid ref record".to_vec());
+
+    // rm --ref-key deletes exactly the dangling key; --json reports it by ref_key.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "rm", "--ref-key", &dangling, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "rm --ref-key must succeed, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["ref_key"], dangling,
+        "by-key rm --json must report the deleted ref_key, got:\n{parsed}"
+    );
+
+    let guard = ac.lock().unwrap();
+    assert!(
+        !guard.contains_key(&dangling),
+        "rm --ref-key must delete the dangling record"
+    );
+    assert!(
+        guard.contains_key(&healthy_key),
+        "rm --ref-key must NOT touch the unrelated healthy ref"
     );
 }

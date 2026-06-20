@@ -407,9 +407,13 @@ where
     // in enforce_resource_bounds, before any filesystem work — see pass 2c.
     for entry in &manifest.entries {
         if let Entry::Symlink { path, target } = entry {
-            // Defense-in-depth: validate both the link path and its target.
+            // Defense-in-depth: validate both the link path and its target. The
+            // target is checked with the CONTAINED validator (same as the manifest
+            // producer + `Manifest::from_bytes`): an intra-workspace `..` that
+            // resolves within the tree (e.g. `bin/x -> ../src/x`) is allowed, while
+            // any target that would escape the workspace root is still rejected.
             clw_types::validate_rel_path(path)?;
-            clw_types::validate_symlink_target(target)?;
+            clw_types::validate_symlink_target_contained(path, target)?;
             let abs = dest.join(path);
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -423,8 +427,9 @@ where
             // snapshot→hydrate round-trip on Windows yields COPIES, not links —
             // a documented, non-silent divergence from the unix behavior, not a
             // skipped entry. Correctness is preserved: the target was already
-            // validated by validate_symlink_target (relative, no `..`, no
-            // drive-letter/backslash), and because symlinks are materialised in
+            // validated by validate_symlink_target_contained (relative, no
+            // drive-letter/backslash, and any `..` resolves within the workspace
+            // root), and because symlinks are materialised in
             // pass 3c AFTER all files (M1.7 ordering), any file target already
             // exists under `dest`.
             #[cfg(windows)]
@@ -549,8 +554,10 @@ where
 //
 // Windows has no unprivileged symlinks, so clw copies the target instead of
 // linking. The `target` is relative to the LINK's parent directory and was
-// already validated (relative, no `..`, no drive-letter/backslash) by
-// validate_symlink_target. We resolve it within `dest`, then:
+// already validated (relative, no drive-letter/backslash, and any `..` resolves
+// within the workspace root) by validate_symlink_target_contained. Joining it
+// component-by-component onto `link_parent` therefore resolves to a path inside
+// `dest`. We resolve it within `dest`, then:
 //   - regular FILE target  -> copy its bytes (std::fs::copy),
 //   - DIRECTORY target      -> recursively copy the subtree,
 //   - missing target        -> a dangling symlink can't be copied: clear error.

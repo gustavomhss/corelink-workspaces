@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Hydrating a relative `..` symlink that stays inside the workspace** (e.g. `bin/x -> ../src/x`) no
+  longer fails with "symlink target escapes workspace". The v0.1.2 fix updated the producer and the
+  manifest parse but missed the hydrate *materialization* path, which still re-validated with the
+  strict (any-`..`) check — so a snapshot succeeded but the round-trip `hydrate` aborted. Hydrate now
+  uses the same contained validator; targets that genuinely escape the workspace root are still
+  rejected. Caught by a new binary-level snapshot→hydrate regression test.
+
+### Tests
+- **Binary-level power-user acceptance regressions** for all four v0.1.2 findings (re-snapshot 409 is
+  actionable + the rm-then-retry workaround works, intra-workspace `..` symlink round-trips, usage
+  errors are not mislabeled `transport error`, `rm --ref-key` deletes a dangling/corrupt ref). These
+  run in the default CI lane against the wiremock mock server — the bugs the v0.1.2 fixes addressed
+  previously had zero automated coverage. A new create-only AC mock reproduces the live store's
+  409-on-overwrite so the real re-snapshot path is exercised.
+
 ## [0.1.2] — power-user acceptance findings (2026-06-20)
 
 > Fixes the 4 findings from an end-to-end power-user test of the shipped v0.1.1 binary. The core
