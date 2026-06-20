@@ -25,6 +25,15 @@ pub struct SnapshotArgs {
     /// Workspace name (ref key).
     #[arg(long, help = "Workspace name to store the snapshot under")]
     pub name: String,
+
+    /// Replace an existing name whose content differs (delete-then-write). Not needed
+    /// to re-snapshot identical content — that is always a no-op success.
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Replace an existing workspace name whose content differs (rm-then-write)"
+    )]
+    pub force: bool,
 }
 
 pub async fn run(
@@ -44,6 +53,7 @@ pub async fn run(
     let mut opts = SnapshotOptions::new(&args.name);
     opts.concurrency = concurrency;
     opts.ref_domain = cfg.ref_domain;
+    opts.force = args.force;
 
     // Progress feedback on a long, otherwise-silent op: tell an interactive user
     // work has started so a slow snapshot isn't mistaken for a hung one. stderr
@@ -81,8 +91,21 @@ pub async fn run(
             "bytes_total": report.bytes_total,
             "chunks_total": report.chunks_total,
             "chunks_uploaded": report.chunks_uploaded,
+            "unchanged": report.unchanged,
         });
         println!("{out}");
+    } else if report.unchanged {
+        println!(
+            "already up to date — '{}' already points at this content (no change)",
+            args.name
+        );
+        println!("  name:            {}", args.name);
+        println!("  root:            {}", report.root);
+        println!("  files:           {}", report.files);
+        println!("  bytes_total:     {}", report.bytes_total);
+        // Non-zero only if the server had lost/pruned blobs and they were re-uploaded
+        // during this otherwise-no-op run — surfaced so "no change" isn't misleading.
+        println!("  chunks_uploaded: {}", report.chunks_uploaded);
     } else {
         println!("snapshot complete");
         println!("  name:            {}", args.name);
@@ -104,9 +127,10 @@ pub async fn run(
 fn map_snapshot_error(err: ClwError, name: &str) -> ClwError {
     match &err {
         ClwError::Http { status: 409, .. } => ClwError::Message(format!(
-            "workspace '{name}' already exists and the server rejected the in-place update (HTTP 409) \
-             — re-snapshot/versioning of an existing name is not supported server-side yet. To replace \
-             it, run `clw rm --name {name} --yes` first, then snapshot again."
+            "workspace '{name}' already exists with different content and the server rejected the in-place \
+             update (HTTP 409) — the ref store is create-only (in-place versioning isn't live yet). To \
+             replace it, re-run `clw snapshot --name {name} --force`, or `clw rm --name {name} --yes` first \
+             then snapshot again. (Re-snapshotting identical content is a no-op and needs neither.)"
         )),
         _ => map_auth_error(err),
     }

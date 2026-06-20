@@ -3053,3 +3053,94 @@ async fn ls_all_distinguishes_run_cache_from_corrupt_refs_without_flooding() {
         "there must be NO per-record 'warning: skipping' flood on stderr"
     );
 }
+
+// Re-snapshot ergonomics (user-sim headline finding): against a create-only AC store,
+// (a) re-snapshotting IDENTICAL content under the same name is a clean no-op success
+// (not a 409); (b) DIFFERENT content without --force still 409s with guidance that now
+// names --force; (c) --force replaces it (rm-then-write) and succeeds with the new root.
+#[tokio::test]
+async fn resnapshot_identical_is_noop_and_force_replaces() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink_opts(&server, true, true).await; // create-only AC
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-resnap-noop";
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"content v1").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+
+    // (a) IDENTICAL re-snapshot → no-op success, unchanged=true, NOT a 409.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            ws,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "re-snapshot of identical content must be a no-op success, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["unchanged"], true,
+        "identical re-snapshot must report unchanged=true, got:\n{parsed}"
+    );
+
+    // (b) DIFFERENT content WITHOUT --force → 409 actionable message that names --force.
+    std::fs::write(src.path().join("f.txt"), b"content v2 - changed").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "differing re-snapshot without --force must exit 2"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--force"),
+        "the 409 guidance must now point at --force, got:\n{stderr}"
+    );
+
+    // (c) WITH --force → replace succeeds (rm-then-write), unchanged=false, new root.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            ws,
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "snapshot --force must replace a differing ref, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["unchanged"], false,
+        "a --force replace is a real write, not a no-op"
+    );
+    assert!(
+        ac.lock().unwrap().contains_key(&ref_key_hex(ws)),
+        "after --force the ref must be present (re-created)"
+    );
+}

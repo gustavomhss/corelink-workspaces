@@ -29,6 +29,13 @@ pub struct SnapshotOptions {
     pub concurrency: usize,
     /// Ref keyspace the snapshot's ref is written under (default [`RefDomain::User`]).
     pub ref_domain: RefDomain,
+    /// Replace an existing name whose content DIFFERS: because the AC ref PUT is
+    /// create-only server-side, an in-place overwrite 409s. With `force`, snapshot
+    /// deletes the existing ref then writes the new one (blobs are already uploaded,
+    /// so the only gap is a sub-second local round-trip — far safer than the manual
+    /// rm-then-snapshot, where a failure leaves NO ref). Re-snapshotting IDENTICAL
+    /// content is always a no-op success and needs no `force`.
+    pub force: bool,
 }
 
 impl SnapshotOptions {
@@ -38,6 +45,7 @@ impl SnapshotOptions {
             workspace_name: name.into(),
             concurrency: 8,
             ref_domain: RefDomain::User,
+            force: false,
         }
     }
 
@@ -45,6 +53,13 @@ impl SnapshotOptions {
     #[must_use]
     pub fn with_ref_domain(mut self, ref_domain: RefDomain) -> Self {
         self.ref_domain = ref_domain;
+        self
+    }
+
+    /// Replace an existing differing ref (rm-then-write). See [`SnapshotOptions::force`].
+    #[must_use]
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
         self
     }
 }
@@ -66,6 +81,10 @@ pub struct SnapshotReport {
     /// field is purely advisory so the CLI can warn the user. Empty when no
     /// entry matched.
     pub secret_warnings: Vec<String>,
+    /// True when the name already pointed at this EXACT root: the snapshot was a
+    /// no-op (no ref write). The CLI reports "already up to date" instead of a
+    /// misleading 409 / a redundant overwrite.
+    pub unchanged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -411,15 +430,31 @@ where
         CasTransport::put(client, &manifest_digest, manifest_bytes).await?;
     }
 
-    // --- 6. Read existing ref for parent lineage ----------------------------
+    // --- 6. Read existing ref (parent lineage + idempotency) ----------------
     let rk = ref_key_in(opts.ref_domain, &opts.workspace_name);
-    let parent: Option<Digest> = match AcTransport::get(client, &rk).await? {
-        Some(bytes) => match RefRecord::from_bytes(&bytes) {
-            Ok(rec) => Some(rec.root),
-            Err(_) => None, // corrupt → treat as absent
-        },
+    let existing: Option<RefRecord> = match AcTransport::get(client, &rk).await? {
+        Some(bytes) => RefRecord::from_bytes(&bytes).ok(), // corrupt → treat as absent
         None => None,
     };
+
+    // Idempotent no-op: the name already points at this EXACT root, so there is
+    // nothing to write. This makes "save again, nothing changed" (and a runner's
+    // idempotent re-snapshot per job) a clean SUCCESS instead of the create-only
+    // AC PUT's 409. Blobs were still re-verified/deduped above (chunks_uploaded
+    // reflects that), so the content is provably present.
+    if let Some(ex) = &existing {
+        if ex.root == manifest_digest {
+            return Ok(SnapshotReport {
+                root: manifest_digest,
+                files: files_count,
+                bytes_total: total_size,
+                chunks_total,
+                chunks_uploaded,
+                secret_warnings,
+                unchanged: true,
+            });
+        }
+    }
 
     // --- 7. Write new ref record --------------------------------------------
     let created_at_unix = SystemTime::now()
@@ -432,10 +467,18 @@ where
         root: manifest_digest,
         manifest_size,
         created_at_unix,
-        parent,
+        parent: existing.as_ref().map(|e| e.root),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
+    // The AC ref PUT is create-only server-side, so REPLACING an existing name whose
+    // content DIFFERS needs an explicit rm-first. `--force` does the rm+PUT here: the
+    // blobs are already uploaded, so the only gap is this sub-second local round-trip
+    // (vs the manual rm-then-snapshot, where a crash between the two leaves NO ref).
+    // Without `force`, the PUT 409s and the CLI surfaces the actionable guidance.
+    if opts.force && existing.is_some() {
+        AcTransport::delete(client, &rk).await?;
+    }
     AcTransport::put(client, &rk, ref_record.to_bytes()?).await?;
 
     // --- 8. Return report ---------------------------------------------------
@@ -446,6 +489,7 @@ where
         chunks_total,
         chunks_uploaded,
         secret_warnings,
+        unchanged: false,
     })
 }
 
@@ -663,15 +707,28 @@ mod tests {
             "second snapshot of unchanged tree should upload 0 chunks"
         );
 
-        // Parent lineage: second ref's parent == first root
+        // Re-snapshot of IDENTICAL content is a NO-OP: it reports `unchanged` and does
+        // NOT write a new ref version (writing a v2-identical-to-v1 would 409 against the
+        // create-only server anyway). So the stored ref is untouched — still the first
+        // snapshot's record with parent == None (there is no v2; nothing changed).
+        assert!(
+            report2.unchanged,
+            "re-snapshot of identical content must be a no-op"
+        );
         let rk = ref_key("ws-unchanged");
         let ac = client.ac.lock().await;
-        let ref_bytes = ac.get(&rk).unwrap();
-        let rec = RefRecord::from_bytes(ref_bytes).unwrap();
+        let rec = RefRecord::from_bytes(ac.get(&rk).unwrap()).unwrap();
         assert_eq!(
-            rec.parent,
-            Some(report1.root),
-            "second snapshot parent should be first root"
+            rec.root, report1.root,
+            "the ref still points at the same root"
+        );
+        assert_eq!(
+            rec.parent, None,
+            "a no-op re-snapshot must NOT write a new ref version (parent stays None)"
+        );
+        assert!(
+            !report1.unchanged,
+            "the FIRST snapshot is a real write, not a no-op"
         );
     }
 
