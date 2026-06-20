@@ -75,6 +75,23 @@ pub fn is_run_record(bytes: &[u8]) -> bool {
     serde_json::from_slice::<RunRecord>(bytes).is_ok()
 }
 
+/// If `bytes` is a `clw run` memoization record, return the `(stdout, stderr)` CAS
+/// digests it points at; otherwise return `None`.
+///
+/// `clw run` stores its memo records in the SAME AC tenant keyspace as workspace refs,
+/// and each `RunRecord` references two CAS blobs (the captured stdout/stderr). A
+/// tenant-wide GC (`clw prune`) that walks `list_refs` must NOT treat those blobs as
+/// orphans — deleting them would corrupt the run cache (a later cache HIT would fail
+/// to fetch its output). This lets the GC pull a run-cache entry's live blobs into the
+/// live set instead of mistaking the unparseable-as-`RefRecord` entry for corruption.
+/// Returns `None` for a `RefRecord` or any non-`RunRecord` bytes (disjoint required
+/// fields, so a `RefRecord` never parses as a `RunRecord`).
+pub fn run_record_blobs(bytes: &[u8]) -> Option<(Digest, Digest)> {
+    serde_json::from_slice::<RunRecord>(bytes)
+        .ok()
+        .map(|r| (r.stdout, r.stderr))
+}
+
 // ---------------------------------------------------------------------------
 // Key derivation
 // ---------------------------------------------------------------------------
@@ -622,6 +639,37 @@ mod tests {
         // Non-JSON / garbage is not a run record.
         assert!(!is_run_record(b"not json at all"));
         assert!(!is_run_record(b""));
+    }
+
+    #[test]
+    fn run_record_blobs_returns_digests_for_run_records_and_none_otherwise() {
+        // A RunRecord → Some((stdout, stderr)) with the exact digests it carries.
+        let stdout = Digest::of_bytes(b"the stdout blob");
+        let stderr = Digest::of_bytes(b"the stderr blob");
+        let run = RunRecord {
+            exit_code: 0,
+            stdout,
+            stderr,
+        };
+        let bytes = serde_json::to_vec(&run).unwrap();
+        assert_eq!(run_record_blobs(&bytes), Some((stdout, stderr)));
+
+        // A RefRecord (disjoint required fields) → None.
+        let ref_rec = clw_types::RefRecord {
+            name: "ws".into(),
+            root: Digest::of_bytes(b"r"),
+            manifest_size: 1,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "t".into(),
+        }
+        .to_bytes()
+        .unwrap();
+        assert_eq!(run_record_blobs(&ref_rec), None);
+
+        // Garbage / empty → None.
+        assert_eq!(run_record_blobs(b"not json at all"), None);
+        assert_eq!(run_record_blobs(b""), None);
     }
 
     // -----------------------------------------------------------------------

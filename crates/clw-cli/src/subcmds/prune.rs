@@ -213,7 +213,9 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
 /// skip is NOT unconditionally safe — the exposure is bounded by dry-run-by-default
 /// and the store's last-write-wins (a re-push restores a raced blob). See the
 /// RESIDUAL note in `run` for the full skew model.
-async fn compute_live_set(client: &HttpClient) -> Result<HashSet<Digest>, ClwError> {
+async fn compute_live_set<C: AcTransport + CasTransport>(
+    client: &C,
+) -> Result<HashSet<Digest>, ClwError> {
     let mut live = HashSet::new();
 
     for key in AcTransport::list_refs(client).await? {
@@ -227,9 +229,29 @@ async fn compute_live_set(client: &HttpClient) -> Result<HashSet<Digest>, ClwErr
         // From here on, ANY failure to resolve this ref to a parsed manifest
         // means the live set is incomplete: abort and NAME the ref. Pruning on a
         // partial live set would delete live blobs as false orphans.
-        let record = RefRecord::from_bytes(&bytes).map_err(|e| {
-            live_set_incomplete(&key.to_hex(), &format!("ref record is corrupt ({e})"))
-        })?;
+        //
+        // EXCEPT: `clw run` memo records (RunRecords) legitimately share this AC
+        // keyspace, so they DON'T parse as a RefRecord — but they are NOT corrupt.
+        // A RunRecord points at its captured stdout/stderr CAS blobs, which are
+        // run-cache LIVE data: insert both into the live set and skip on. Treating
+        // a RunRecord as corruption would abort prune entirely; SKIPPING it without
+        // marking its blobs would orphan them, so `prune --yes` would DELETE the run
+        // cache's stdout/stderr blobs (cache corruption). Only bytes that are NEITHER
+        // a RefRecord NOR a RunRecord are genuinely corrupt.
+        let record = match RefRecord::from_bytes(&bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                if let Some((stdout, stderr)) = clw_run::run_record_blobs(&bytes) {
+                    live.insert(stdout);
+                    live.insert(stderr);
+                    continue;
+                }
+                return Err(live_set_incomplete(
+                    &key.to_hex(),
+                    &format!("ref record is corrupt ({e})"),
+                ));
+            }
+        };
 
         // The manifest root is itself a CAS blob and is always live.
         live.insert(record.root);
@@ -314,6 +336,188 @@ fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clw_types::{ChunkRef, Manifest, Result as ClwResult, MANIFEST_VERSION};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // In-memory fake transport for driving the REAL `compute_live_set`.
+    // -----------------------------------------------------------------------
+    #[derive(Clone, Default)]
+    struct FakeStore {
+        cas: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        ac: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for FakeStore {
+        async fn exists(&self, digest: &Digest) -> ClwResult<bool> {
+            Ok(self.cas.lock().unwrap().contains_key(digest))
+        }
+        async fn get(&self, digest: &Digest) -> ClwResult<Vec<u8>> {
+            self.cas
+                .lock()
+                .unwrap()
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> ClwResult<()> {
+            self.cas.lock().unwrap().insert(*digest, bytes);
+            Ok(())
+        }
+        async fn delete(&self, digest: &Digest) -> ClwResult<()> {
+            self.cas.lock().unwrap().remove(digest);
+            Ok(())
+        }
+        async fn list_blobs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(self.cas.lock().unwrap().keys().copied().collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for FakeStore {
+        async fn get(&self, key: &Digest) -> ClwResult<Option<Vec<u8>>> {
+            Ok(self.ac.lock().unwrap().get(key).cloned())
+        }
+        async fn put(&self, key: &Digest, value: Vec<u8>) -> ClwResult<()> {
+            self.ac.lock().unwrap().insert(*key, value);
+            Ok(())
+        }
+        async fn delete(&self, key: &Digest) -> ClwResult<()> {
+            self.ac.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list_refs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(self.ac.lock().unwrap().keys().copied().collect())
+        }
+    }
+
+    // FIX #2 — a RunRecord shares the AC keyspace with refs. `compute_live_set`
+    // must (a) NOT abort prune on the RunRecord (it is not corruption), and (b)
+    // mark the RunRecord's stdout/stderr CAS blobs as LIVE so a `prune --yes`
+    // never orphans + deletes the run cache. We plant BOTH a real workspace ref
+    // (manifest root + a file chunk) AND a RunRecord (whose stdout/stderr blobs
+    // are in CAS), drive the REAL `compute_live_set`, and assert: it does not
+    // abort, and the run-cache blobs are in the live set (so NOT would-be orphans).
+    #[tokio::test]
+    async fn run_records_do_not_abort_prune_and_their_blobs_stay_live() {
+        let store = FakeStore::default();
+
+        // --- A real workspace ref: a file chunk + a manifest root in CAS. ---
+        let chunk = Digest::of_bytes(b"a live file chunk");
+        CasTransport::put(&store, &chunk, b"a live file chunk".to_vec())
+            .await
+            .unwrap();
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 17,
+            entries: vec![Entry::File {
+                path: "f.txt".into(),
+                mode: 0o644,
+                size: 17,
+                chunks: vec![ChunkRef {
+                    digest: chunk,
+                    size: 17,
+                }],
+            }],
+        };
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let root = Digest::of_bytes(&manifest_bytes);
+        CasTransport::put(&store, &root, manifest_bytes)
+            .await
+            .unwrap();
+        let ref_rec = RefRecord {
+            name: "ws".into(),
+            root,
+            manifest_size: 1,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "t".into(),
+        };
+        AcTransport::put(
+            &store,
+            &Digest::of_bytes(b"refkey"),
+            ref_rec.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // --- A `clw run` memo record sharing the AC keyspace. Its stdout/stderr
+        // blobs live in CAS and MUST be treated as live (never orphaned). ---
+        let out_blob = Digest::of_bytes(b"captured stdout");
+        let err_blob = Digest::of_bytes(b"captured stderr");
+        CasTransport::put(&store, &out_blob, b"captured stdout".to_vec())
+            .await
+            .unwrap();
+        CasTransport::put(&store, &err_blob, b"captured stderr".to_vec())
+            .await
+            .unwrap();
+        // Build the RunRecord bytes via clw-run's own serializer surrogate: it is a
+        // JSON object {exit_code, stdout, stderr}. We synthesize the exact wire form
+        // and confirm clw_run recognizes it.
+        let run_bytes = format!(
+            r#"{{"exit_code":0,"stdout":"{}","stderr":"{}"}}"#,
+            out_blob.to_hex(),
+            err_blob.to_hex()
+        )
+        .into_bytes();
+        assert!(
+            clw_run::run_record_blobs(&run_bytes).is_some(),
+            "the synthesized RunRecord must be recognized by clw-run"
+        );
+        AcTransport::put(&store, &Digest::of_bytes(b"runkey"), run_bytes)
+            .await
+            .unwrap();
+
+        // --- Drive the REAL mark phase. It must NOT abort on the RunRecord. ---
+        let live = compute_live_set(&store)
+            .await
+            .expect("a RunRecord must not abort prune as 'live set incomplete'");
+
+        // The ref's manifest root + chunk are live (the normal path).
+        assert!(live.contains(&root), "manifest root must be live");
+        assert!(live.contains(&chunk), "the file chunk must be live");
+        // The crux: the run-cache stdout/stderr blobs are LIVE — so the orphan set
+        // (all_blobs - live) excludes them and `prune --yes` would NOT delete them.
+        assert!(
+            live.contains(&out_blob),
+            "RunRecord stdout blob must be live (never orphaned)"
+        );
+        assert!(
+            live.contains(&err_blob),
+            "RunRecord stderr blob must be live (never orphaned)"
+        );
+
+        // Concretely: with this live set, no run-cache blob appears as an orphan.
+        let all_blobs = CasTransport::list_blobs(&store).await.unwrap();
+        let orphans: Vec<Digest> = all_blobs
+            .into_iter()
+            .filter(|d| !live.contains(d))
+            .collect();
+        assert!(
+            !orphans.contains(&out_blob) && !orphans.contains(&err_blob),
+            "run-cache blobs must NOT be in the would-delete/orphan set"
+        );
+    }
+
+    // A genuinely-corrupt AC entry (neither RefRecord nor RunRecord) still aborts.
+    #[tokio::test]
+    async fn genuinely_corrupt_ac_entry_still_aborts_prune() {
+        let store = FakeStore::default();
+        AcTransport::put(
+            &store,
+            &Digest::of_bytes(b"bad"),
+            b"{not a record}".to_vec(),
+        )
+        .await
+        .unwrap();
+        let err = compute_live_set(&store).await.unwrap_err();
+        assert!(
+            is_live_set_incomplete(&err),
+            "neither-RefRecord-nor-RunRecord bytes must abort as incomplete, got: {err:?}"
+        );
+    }
 
     // NOTE (pass-2 audit de-vacuous): the previous `orphan_set_is_all_blobs_minus_live`,
     // `empty_live_set_makes_everything_an_orphan`, and `full_live_set_prunes_nothing`

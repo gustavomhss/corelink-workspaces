@@ -432,9 +432,22 @@ where
 
     // --- 6. Read existing ref (parent lineage + idempotency) ----------------
     let rk = ref_key_in(opts.ref_domain, &opts.workspace_name);
+    // Capture RAW presence separately from a successful parse. A present-but-corrupt
+    // ref still OCCUPIES the create-only AC key, so a force-replace must delete it on
+    // RAW presence — gating the delete on `existing.is_some()` (a successful parse)
+    // would skip the delete for a corrupt ref and the create-only PUT below would 409,
+    // making `--force` unable to recover a corrupt-but-present ref. `existing` (the
+    // parsed record) is still used for the no-op short-circuit and the parent lineage.
+    let raw_present;
     let existing: Option<RefRecord> = match AcTransport::get(client, &rk).await? {
-        Some(bytes) => RefRecord::from_bytes(&bytes).ok(), // corrupt → treat as absent
-        None => None,
+        Some(bytes) => {
+            raw_present = true;
+            RefRecord::from_bytes(&bytes).ok() // corrupt → treat as absent for lineage
+        }
+        None => {
+            raw_present = false;
+            None
+        }
     };
 
     // Idempotent no-op: the name already points at this EXACT root, so there is
@@ -476,7 +489,11 @@ where
     // blobs are already uploaded, so the only gap is this sub-second local round-trip
     // (vs the manual rm-then-snapshot, where a crash between the two leaves NO ref).
     // Without `force`, the PUT 409s and the CLI surfaces the actionable guidance.
-    if opts.force && existing.is_some() {
+    // Gate on RAW presence, NOT a successful parse: a present-but-corrupt ref must
+    // also be deleted so the create-only PUT does not 409. (A no-op identical re-
+    // snapshot already returned above, so reaching here with `force` means we intend
+    // to replace whatever currently occupies the key — parseable or not.)
+    if opts.force && raw_present {
         AcTransport::delete(client, &rk).await?;
     }
     AcTransport::put(client, &rk, ref_record.to_bytes()?).await?;
@@ -912,6 +929,114 @@ mod tests {
             }
             other => panic!("expected InvalidManifest, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX #1: a create-only AC (mirrors the server: a PUT to an OCCUPIED key
+    // 409s). `snapshot(--force)` must DELETE the present-but-corrupt ref first
+    // so the create-only PUT succeeds, rather than skipping the delete (because
+    // the corrupt bytes don't parse) and then 409-ing.
+    // -----------------------------------------------------------------------
+
+    /// CAS behaves normally; AC is create-only: `put` to an existing key errors
+    /// (like the server's 409) unless `delete` clears it first.
+    #[derive(Clone, Default)]
+    struct CreateOnlyAc {
+        cas: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        ac: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for CreateOnlyAc {
+        async fn exists(&self, digest: &Digest) -> Result<bool> {
+            Ok(self.cas.lock().await.contains_key(digest))
+        }
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            self.cas
+                .lock()
+                .await
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            self.cas.lock().await.insert(*digest, bytes);
+            Ok(())
+        }
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().await.remove(digest);
+            Ok(())
+        }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for CreateOnlyAc {
+        async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {
+            Ok(self.ac.lock().await.get(key).cloned())
+        }
+        async fn put(&self, key: &Digest, value: Vec<u8>) -> Result<()> {
+            // Create-only: a PUT to an occupied key conflicts (server 409).
+            let mut ac = self.ac.lock().await;
+            if ac.contains_key(key) {
+                return Err(ClwError::Transport("409 ref already exists".into()));
+            }
+            ac.insert(*key, value);
+            Ok(())
+        }
+        async fn delete(&self, key: &Digest) -> Result<()> {
+            self.ac.lock().await.remove(key);
+            Ok(())
+        }
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            Ok(self.ac.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn force_recovers_a_present_but_corrupt_ref() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"content").unwrap();
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = CreateOnlyAc::default();
+
+        // Plant a present-but-CORRUPT ref under this name's key (unparseable bytes).
+        let rk = ref_key("ws-corrupt");
+        client
+            .ac
+            .lock()
+            .await
+            .insert(rk, b"this is not a valid RefRecord".to_vec());
+
+        // Without --force, the create-only PUT would 409 (delete is skipped).
+        let opts_noforce = SnapshotOptions::new("ws-corrupt");
+        let res = snapshot(root, &client, &cache, &opts_noforce)
+            .await
+            .map(|_| ()); // discard the non-Debug SnapshotReport so we can match cleanly
+        match res {
+            Err(ClwError::Transport(m)) if m.contains("409") => {}
+            other => panic!("without --force a corrupt-but-present ref must 409, got: {other:?}"),
+        }
+
+        // With --force, snapshot deletes the corrupt ref then recreates it: success.
+        let opts_force = SnapshotOptions::new("ws-corrupt").with_force(true);
+        let report = snapshot(root, &client, &cache, &opts_force)
+            .await
+            .expect("--force must recover a present-but-corrupt ref (delete + recreate)");
+        assert!(!report.unchanged);
+
+        // The ref now parses (the corrupt bytes were replaced).
+        let ac = client.ac.lock().await;
+        let rec = RefRecord::from_bytes(ac.get(&rk).unwrap())
+            .expect("the ref must be a valid RefRecord after --force");
+        assert_eq!(rec.root, report.root);
+        // A corrupt prior ref yields no parent lineage (it never parsed).
+        assert_eq!(rec.parent, None);
     }
 
     #[tokio::test]

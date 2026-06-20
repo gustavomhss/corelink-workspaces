@@ -370,19 +370,27 @@ impl HttpClient {
         base_url: &str,
         unavailable_msg: &str,
     ) -> Result<Vec<Digest>> {
-        self.list_digests_capped::<P>(base_url, unavailable_msg, MAX_TOTAL_DIGESTS)
+        self.list_digests_capped::<P>(base_url, unavailable_msg, MAX_TOTAL_DIGESTS, MAX_PAGES)
             .await
     }
 
-    /// Inner paginator with an explicit total-entry ceiling so the FIX-2 abort can
-    /// be exercised with a small cap in tests (driving a real 10M-entry server is
-    /// infeasible). Production callers go through [`list_digests`](Self::list_digests),
-    /// which passes [`MAX_TOTAL_DIGESTS`].
+    /// Inner paginator with explicit ceilings (total entries AND page count) so the
+    /// liveness aborts can be exercised with small caps in tests — driving a real
+    /// 10M-entry or 1M-page server is infeasible. Production callers go through
+    /// [`list_digests`](Self::list_digests), which passes [`MAX_TOTAL_DIGESTS`] and
+    /// [`MAX_PAGES`].
+    ///
+    /// The `max_pages` cap is the HARD bound that makes the loop terminate REGARDLESS
+    /// of cursor uniqueness: a server returning empty pages with always-advancing
+    /// (never-repeating) cursors never trips the entry cap (no entries accumulate) nor
+    /// the repeated-cursor guard (cursors never repeat) and would otherwise grow
+    /// `seen_cursors` without bound (OOM). The page-count cap aborts it first.
     async fn list_digests_capped<P: ListPage + Send>(
         &self,
         base_url: &str,
         unavailable_msg: &str,
         max_total: u64,
+        max_pages: u64,
     ) -> Result<Vec<Digest>> {
         let auth = self.auth_header();
         let client = &self.inner;
@@ -394,7 +402,6 @@ impl HttpClient {
         // total pages. `limit=1000` ⇒ the cap still allows ~10^9 entries.
         let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pages: u64 = 0;
-        const MAX_PAGES: u64 = 1_000_000;
 
         loop {
             let page: P = self
@@ -460,11 +467,17 @@ impl HttpClient {
                 });
             }
 
+            // HARD page-count cap — the bound that guarantees termination regardless
+            // of cursor uniqueness. An adversarial server returning empty pages with
+            // forever-advancing cursors trips neither the entry cap (no entries) nor
+            // the repeated-cursor guard (cursors never repeat); without this cap
+            // `seen_cursors` would grow without bound (OOM). Counting pages — not
+            // entries — is what makes the loop terminable here.
             pages += 1;
-            if pages > MAX_PAGES {
+            if pages > max_pages {
                 return Err(ClwError::Transport(format!(
-                    "pagination exceeded {MAX_PAGES} pages at {base_url}; aborting a likely \
-                     unbounded server cursor"
+                    "pagination exceeded {max_pages} pages at {base_url}; aborting a likely \
+                     unbounded/misbehaving server cursor"
                 )));
             }
             match next {
@@ -637,6 +650,15 @@ const LIST_PAGE_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// headroom) yet finite, so an unbounded server is aborted with `TooLarge` instead
 /// of exhausting memory.
 const MAX_TOTAL_DIGESTS: u64 = 10_000_000;
+
+/// HARD page-count ceiling for a paginated listing (FIX #4). The cursor is opaque,
+/// so cycle-detection (`seen_cursors`) catches a REPEATING cursor — but a server
+/// returning empty pages with always-ADVANCING (never-repeating) cursors trips
+/// neither the repeated-cursor guard nor the total-entry cap (no entries accumulate),
+/// growing `seen_cursors` without bound (OOM). This page cap is the bound that
+/// terminates the loop regardless of cursor uniqueness. At `limit=1000`/page it still
+/// permits ~10^9 entries, so it never aborts a legitimate listing.
+const MAX_PAGES: u64 = 1_000_000;
 
 /// Read a response body into memory with a HARD size ceiling, so a hostile or
 /// buggy server cannot OOM the client by answering a small request with a
@@ -2463,14 +2485,55 @@ mod tests {
 
         let client = make_client(server.uri());
         let base_url = format!("{}/v1/cas/test-tenant", server.uri());
-        // Cap at 3 entries: the 4th accumulated entry must trip the abort.
+        // Cap at 3 entries (page cap left huge so the ENTRY cap trips first): the
+        // 4th accumulated entry must trip the abort.
         let err = client
-            .list_digests_capped::<CasListPage>(&base_url, "unused", 3)
+            .list_digests_capped::<CasListPage>(&base_url, "unused", 3, u64::MAX)
             .await
             .unwrap_err();
         assert!(
             matches!(err, ClwError::TooLarge { cap, .. } if cap == 3),
             "exceeding the total-entry cap must abort with TooLarge, got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // FIX #4: a server returning EMPTY pages with ALWAYS-ADVANCING (never-repeating)
+    // cursors trips neither the entry cap (zero entries accumulate) nor the repeated-
+    // cursor guard (every cursor is unique) — without a hard PAGE cap, `seen_cursors`
+    // would grow without bound (OOM). The page-count cap must abort the loop at the
+    // cap with a clear "pagination exceeded N pages" error, not OOM/hang. We drive the
+    // inner paginator with a tiny max_pages so the abort is reachable in a test.
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn list_aborts_on_always_advancing_empty_pages_at_page_cap() {
+        let server = MockServer::start().await;
+
+        // Every response: an EMPTY blob list + a UNIQUE, advancing cursor → the loop
+        // would page forever, accumulating one fresh cursor per page, but never any
+        // entry. Only the page cap can stop it.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.store(0, Ordering::SeqCst);
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(|_: &wiremock::Request| {
+                let n = SEQ.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"blobs":[],"next_cursor":"cur-{}"}}"#, n + 1))
+            })
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let base_url = format!("{}/v1/cas/test-tenant", server.uri());
+        // Entry cap huge (never trips — no entries); page cap = 5 → aborts at page 6.
+        let err = client
+            .list_digests_capped::<CasListPage>(&base_url, "unused", u64::MAX, 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClwError::Transport(ref m) if m.contains("pagination exceeded 5 pages")),
+            "always-advancing empty pages must abort at the page cap, got: {err:?}"
         );
     }
 

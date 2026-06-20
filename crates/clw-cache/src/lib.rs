@@ -61,6 +61,14 @@ pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 /// blobs) between sweeps, which is acceptable for a best-effort eviction policy.
 const GC_CHECK_EVERY_PUTS: u64 = 256;
 
+/// Filename prefix of an in-flight temp file (the temp-file + atomic-rename `put`
+/// path). A committed blob is named by its 64-hex digest and NEVER starts with this;
+/// only an in-progress (or crash-stranded) write does. `gc` excludes these from both
+/// the budget total and the eviction set — counting a half-written temp toward the
+/// budget skews eviction, and evicting one would delete another writer's in-flight
+/// blob (a stale temp from a crashed writer is harmless and best left alone here).
+const TMP_PREFIX: &str = ".tmp-";
+
 // ---------------------------------------------------------------------------
 // LocalCache
 // ---------------------------------------------------------------------------
@@ -292,6 +300,13 @@ impl LocalCache {
             };
             for entry in rd {
                 let entry = entry?;
+                // Skip in-flight temp files (`.tmp-*`): they are not committed blobs,
+                // so counting them toward the budget would skew eviction, and evicting
+                // one would clobber another writer's in-progress put. Only digest-named
+                // (committed) blobs participate in the budget + eviction.
+                if entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+                    continue;
+                }
                 let meta = entry.metadata()?;
                 if !meta.is_file() {
                     continue;
@@ -367,7 +382,7 @@ fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".tmp-{pid}-{tid:?}-{nanos}-{seq}");
+        let name = format!("{TMP_PREFIX}{pid}-{tid:?}-{nanos}-{seq}");
         let path = dir.join(&name);
         match fs::OpenOptions::new()
             .write(true)
@@ -533,6 +548,48 @@ mod tests {
 
         // Suppress unused variable warning.
         let _ = base;
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX #3: gc must NOT count `.tmp-*` in-flight temp files toward the budget,
+    // and must NEVER evict them. We seed exactly one committed (digest-named) blob
+    // that is WITHIN budget, then plant a large `.tmp-*` file in the same shard.
+    // If the temp were counted, the total would exceed the budget and gc would
+    // start evicting; instead gc must report 0 freed, leave the committed blob in
+    // place, and leave the temp file untouched.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn gc_ignores_tmp_files_in_budget_and_eviction() {
+        let dir = TempDir::new().unwrap();
+        let budget: u64 = 1024;
+        let cache = LocalCache::with_budget(dir.path(), budget).unwrap();
+
+        // One committed blob, comfortably within budget (64 bytes ≪ 1 KiB).
+        let data = vec![7u8; 64];
+        let d = Digest::of_bytes(&data);
+        cache.put(&d, &data).unwrap();
+        let committed = cache.blob_path(&d);
+        assert!(committed.exists(), "committed blob must be on disk");
+
+        // Plant a large `.tmp-*` temp file in the SAME shard. Its size (4 KiB)
+        // alone exceeds the budget, so if gc counted it, eviction would trigger.
+        let shard = cache.shard_dir(&d);
+        let tmp = shard.join(".tmp-planted-inflight");
+        fs::write(&tmp, vec![0u8; 4096]).unwrap();
+
+        // gc must see the cache as within budget (temp excluded) → 0 freed.
+        let freed = cache.gc(budget).unwrap();
+        assert_eq!(
+            freed, 0,
+            "the .tmp-* file must not count toward the budget, so nothing is evicted"
+        );
+
+        // The committed blob is untouched, AND the temp file is never evicted.
+        assert!(committed.exists(), "committed blob must survive gc");
+        assert!(
+            tmp.exists(),
+            "an in-flight .tmp-* file must never be evicted by gc"
+        );
     }
 
     // -----------------------------------------------------------------------
