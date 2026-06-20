@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+> Live user-simulation hardening: 6 real-user personas drove the shipped binary against live prod; the
+> confirmed findings are addressed to SOTA across severities. Plus an adversarial security sweep (1 LOW
+> finding, fixed). Held for the next release cut.
+
+### Security
+- **The plaintext-guard rejection no longer echoes embedded userinfo.** A misconfigured
+  `CLW_ENDPOINT=https://user:secret@host` is still refused (the PAT never leaves over plaintext), but the
+  error message now redacts the embedded `user:pass@` instead of printing it to stderr/logs. (LOW — the
+  CLW_TOKEN PAT travels in the header, never the URL; this is a secondary self-inflicted-credential hygiene
+  fix.)
+
+### Added
+- **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an atomic
+  rm-then-write within the one command (vs the manual `rm`-then-snapshot, where a crash between the two
+  leaves no ref). Re-snapshotting *identical* content needs neither — see Changed.
+
+### Changed
+- **Re-snapshotting identical content is now a no-op success** (was HTTP 409). The most natural loop —
+  "save again, nothing changed" / a runner's idempotent re-snapshot — now exits 0 reporting "already up to
+  date" instead of erroring. (Full in-place versioning of *changed* content remains a server-side
+  capability, tracked separately; `--force` is the client-side replace path meanwhile.)
+- **`ls --all` no longer floods the terminal.** It distinguishes `clw run` memo records (which share the
+  tenant keyspace — counted as `run_cache_entries`) from genuinely-corrupt refs, and stopped emitting a
+  duplicate per-record warning; corrupt records go to the diagnostic channel (`-v`) + `--json` + a summary.
+- **`clw ls` shows human-readable timestamps** (`YYYY-MM-DD HH:MM:SS UTC`) in its text output; `--json`
+  keeps `created_at_unix`.
+- **`clw rm` is honest about a no-op** — removing a name that never existed reports "nothing to delete"
+  (`--json {"deleted":false}`) instead of claiming it deleted something; still idempotent (exit 0).
+- **Clearer messages** — not-found errors hint at `CLW_REF_DOMAIN=runner`; bare `clw ls` points at
+  `--help`; `clw doctor`'s note clarifies the tenant ID is shown intentionally (only the token is
+  redacted); snapshot/hydrate help notes the directory is a positional arg; `clw snapshot` prints a note
+  when files were excluded by `.gitignore`/`.clwignore`.
+
+### Tests / CI
+- Binary-level E2E coverage push: `clw run` exit-code contract (reserved 125, 128+signal), a resource cap
+  + non-retryable tiers (402/403/410) surfaced cleanly, config-resolution precedence + identity
+  persistence, single-command coverage fill + a full-lifecycle journey, process-level concurrency + a
+  1500-file tree — plus assertion-depth hardening (validate output VALUES/state, not just exit codes).
+- CI gains a **self-hosted runner fallback** (`clw-mac-1`) for the gates+dco jobs, for when GitHub-hosted
+  Actions minutes are unavailable; the GitHub-hosted lane remains the preferred path.
+
 ## [0.1.3] — complete the symlink `..` fix + lock the power-user findings (2026-06-20)
 
 > Completes the v0.1.2 intra-workspace `..` symlink fix on the hydrate path (it was only half-resolved,
