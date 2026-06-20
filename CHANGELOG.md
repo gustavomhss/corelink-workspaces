@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.3] — complete the symlink `..` fix + lock the power-user findings (2026-06-20)
+
+> Completes the v0.1.2 intra-workspace `..` symlink fix on the hydrate path (it was only half-resolved,
+> so a snapshot succeeded but the round-trip `hydrate` aborted) and lands binary-level regression tests
+> for all four power-user findings so they cannot silently come back.
 
 ### Fixed
 - **Hydrating a relative `..` symlink that stays inside the workspace** (e.g. `bin/x -> ../src/x`) no
