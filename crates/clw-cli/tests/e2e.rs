@@ -2019,3 +2019,158 @@ async fn rm_ref_key_deletes_a_dangling_corrupt_ref() {
         "rm --ref-key must NOT touch the unrelated healthy ref"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `clw run` EXIT-CODE CONTRACT (frozen cross-team seam — docs/CLI-SURFACE-EXIT-FREEZE.md).
+//
+// The runner DRIVES `clw run` and depends on this contract verbatim:
+//   - child ran      → `clw run` exits the CHILD's code (passthrough; non-zero not cached),
+//   - child KILLED   → POSIX 128+signal (e.g. SIGTERM → 143),
+//   - child NEVER RAN (clw-internal failure: substrate unreachable, bad config, spawn
+//                      failure) → the RESERVED 125, distinct from any child code, never cached.
+// `run_memoization_and_exit_codes` already covers the 0/7 passthrough + non-zero-not-cached;
+// these lock the 125 and 128+signal legs, which only the real spawned binary can prove.
+// ---------------------------------------------------------------------------
+
+/// A clw-internal failure where the child NEVER ran must exit the reserved 125 — NOT
+/// a child code, NOT the generic exit-2. Driven by pointing at a dead endpoint so the
+/// memoization substrate is unreachable; a side-effect marker proves the child never ran.
+#[tokio::test]
+async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = work.path().join("in.txt");
+    std::fs::write(&input, b"declared input").unwrap();
+    // Absolute marker the child would `touch` IF it ever ran.
+    let marker = work.path().join("child_ran.marker");
+
+    // http://127.0.0.1:1 — port 1 is not listening: connection refused (no mock).
+    // A connection-refused IS retried (Transport errors walk the AIMD ladder), so this
+    // is bounded by MAX_ATTEMPTS (~20s), not instant. Wrap it in a hard timeout so a
+    // FUTURE retry-policy change that turned this into an unbounded hang fails loudly
+    // instead of silently stalling CI.
+    let mut cmd = clw_cmd("http://127.0.0.1:1", cache.path());
+    cmd.current_dir(work.path()).args([
+        "run",
+        "--input",
+        input.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!("touch {}", marker.to_str().unwrap()),
+    ]);
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        tokio::task::spawn_blocking(move || cmd.output().unwrap()),
+    )
+    .await
+    .expect("clw run against a dead endpoint must fail within the retry budget, not hang")
+    .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a clw-internal failure (substrate unreachable) must exit the RESERVED 125, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "the child must NEVER have run on a 125 (child-never-ran) failure"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("child not run") || stderr.contains("internal"),
+        "the 125 path must announce a clw-internal child-not-run failure, got:\n{stderr}"
+    );
+}
+
+/// A command that cannot be spawned (ENOENT) is also "child never ran" → reserved 125,
+/// even though the substrate (mock) is healthy. Distinguishes spawn-failure from a child
+/// that ran and exited non-zero.
+#[tokio::test]
+async fn run_missing_command_exits_reserved_125_child_never_ran() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = work.path().join("in.txt");
+    std::fs::write(&input, b"declared input").unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .args([
+            "run",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+            "/no/such/command/clw-e2e-does-not-exist",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "an un-spawnable command (child never ran) must exit the RESERVED 125, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A child killed by a signal must propagate the POSIX 128+signal code (SIGTERM → 143),
+/// not a truncated 255, and a signal-killed (non-zero) result must NOT be cached.
+#[tokio::test]
+async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = work.path().join("in.txt");
+    std::fs::write(&input, b"declared input").unwrap();
+
+    let run_self_sigterm = || {
+        clw_cmd(&server.uri(), cache.path())
+            .current_dir(work.path())
+            .args([
+                "run",
+                "--input",
+                input.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "kill -TERM $$", // the shell signals itself → SIGTERM (15)
+            ])
+            .output()
+            .unwrap()
+    };
+
+    // First run: cache miss, child runs, kills itself with SIGTERM → 128+15 = 143.
+    let out1 = run_self_sigterm();
+    assert_eq!(
+        out1.status.code(),
+        Some(143),
+        "a SIGTERM-killed child must propagate 128+15=143, got: {:?}",
+        out1.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&out1.stderr).contains("cache miss"),
+        "the first run must be a cache miss"
+    );
+
+    // Second identical run: a signal-killed (non-zero) result is NOT cached, so it is
+    // STILL a miss and STILL 143 — never replayed from cache as if it were a real exit.
+    let out2 = run_self_sigterm();
+    assert_eq!(
+        out2.status.code(),
+        Some(143),
+        "a signal-killed result must not be cached → still 143 on re-run, got: {:?}",
+        out2.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&out2.stderr).contains("cache miss"),
+        "a signal-killed result must NOT be cached (second run is still a miss)"
+    );
+}
