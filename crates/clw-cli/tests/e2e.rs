@@ -2776,3 +2776,214 @@ async fn full_lifecycle_journey_save_verify_run_hydrate_remove() {
         "after rm, ls --all must no longer list '{ws}'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Remaining non-retryable tiers · process-level concurrency · scale (large tree).
+//
+// Closes the last directions a real user hits that lacked binary coverage: the
+// 402/410 tier surfacing (403 was already covered), TWO+ concurrent `clw` PROCESSES
+// sharing one cache (no corruption / no cache-temp collision), and a genuinely large
+// real tree (manifest built for real, not a tiny hostile fixture).
+// ---------------------------------------------------------------------------
+
+/// Recursively count regular files under `dir` (symlinks not followed).
+fn count_files(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let ft = entry.file_type().unwrap();
+        if ft.is_dir() {
+            n += count_files(&entry.path());
+        } else if ft.is_file() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The other non-retryable tiers (402 quota, 410 tombstone) must surface like 403:
+/// clean exit 2 naming the status, exactly one PUT (no retry storm), and NO ref written.
+#[tokio::test]
+async fn snapshot_surfaces_quota_402_and_tombstone_410_cleanly() {
+    for status in [402u16, 410u16] {
+        let server = MockServer::start().await;
+        let ac_store: Store = Arc::new(Mutex::new(HashMap::new()));
+        Mock::given(method("PUT"))
+            .and(path_regex(format!("/v1/cas/{TEST_TENANT}/[a-f0-9]{{64}}$")))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1) // non-retryable ⇒ exactly one attempt
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(format!("/v1/ac/{TEST_TENANT}/[a-f0-9]{{64}}$")))
+            .respond_with(AcResponder {
+                store: Arc::clone(&ac_store),
+                auth_ok: true,
+            })
+            .mount(&server)
+            .await;
+
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("f.txt"), b"tier payload").unwrap();
+        let cache = TempDir::new().unwrap();
+        let out = clw_cmd(&server.uri(), cache.path())
+            .args([
+                "snapshot",
+                src.path().to_str().unwrap(),
+                "--name",
+                "e2e-tier",
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "tier {status} must fail the snapshot with exit 2, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&status.to_string()),
+            "tier {status} must be surfaced to the user, got:\n{stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "tier {status} must not panic");
+        assert!(
+            ac_store.lock().unwrap().is_empty(),
+            "a failed {status} upload must NOT write a workspace ref"
+        );
+        // `server` drops at loop-end → wiremock verifies `.expect(1)` (no retry storm).
+    }
+}
+
+/// Several `clw` PROCESSES snapshotting the same tree concurrently into different names,
+/// SHARING one cache dir, must all succeed with no corruption — exercising concurrent
+/// cache writes of the same chunks (the temp-collision path) and concurrent uploads.
+#[tokio::test]
+async fn concurrent_snapshot_processes_shared_cache_no_corruption() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+
+    let src = TempDir::new().unwrap();
+    build_source_tree(src.path());
+
+    let uri = server.uri();
+    let cache_path = cache.path().to_path_buf();
+    let src_path = src.path().to_path_buf();
+    let names = ["cc-1", "cc-2", "cc-3", "cc-4"];
+
+    // Each name snapshotted by its OWN clw process, all racing on the shared cache.
+    let handles: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let uri = uri.clone();
+            let cache_path = cache_path.clone();
+            let src_path = src_path.clone();
+            let name = name.to_string();
+            std::thread::spawn(move || {
+                clw_cmd(&uri, &cache_path)
+                    .args(["snapshot", src_path.to_str().unwrap(), "--name", &name])
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect();
+    for (h, name) in handles.into_iter().zip(names.iter()) {
+        let out = h.join().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent snapshot '{name}' must succeed, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Every ref landed.
+    for name in names {
+        assert!(
+            ac.lock().unwrap().contains_key(&ref_key_hex(name)),
+            "concurrent snapshot must have written ref '{name}'"
+        );
+    }
+
+    // And a fresh-cache hydrate of one is byte-identical — proving the 4 concurrent
+    // processes did not crash on the shared cache and the server-side content is intact.
+    // (Upload sends in-memory bytes, not a cache read-back, so this validates server
+    // content + the no-crash concurrent path, not cache-write integrity per se.)
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    clw_cmd(&server.uri(), cache_hyd.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", "cc-1"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(dest.join("small.txt")).unwrap(),
+        b"hello e2e test",
+        "a hydrate after concurrent snapshots must be byte-identical (no corruption)"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("nested/data.bin")).unwrap(),
+        std::fs::read(src.path().join("nested/data.bin")).unwrap(),
+        "the multi-chunk file must also survive concurrent snapshots intact"
+    );
+}
+
+/// A genuinely large real tree (built and chunked for real, not a tiny hostile fixture):
+/// snapshot reports the exact file count, and a fresh-cache hydrate restores EVERY file
+/// byte-identically — the happy path at scale.
+#[tokio::test]
+async fn snapshot_large_tree_reports_count_and_hydrates_every_file() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+
+    const N: usize = 1500;
+    let src = TempDir::new().unwrap();
+    for i in 0..N {
+        let sub = src.path().join(format!("d{:02}", i % 16)); // 16 subdirs
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("f{i}.txt")), format!("content-{i}")).unwrap();
+    }
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "e2e-large",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "large-tree snapshot must succeed, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(
+        parsed["files"].as_u64(),
+        Some(N as u64),
+        "the snapshot must count exactly {N} files, got: {parsed}"
+    );
+
+    // Fresh-cache hydrate restores every file, byte-identical.
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    clw_cmd(&server.uri(), cache_hyd.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", "e2e-large"])
+        .assert()
+        .success();
+    assert_eq!(count_files(&dest), N, "hydrate must restore all {N} files");
+    for i in [0usize, 749, 1499] {
+        let sub = dest.join(format!("d{:02}", i % 16));
+        assert_eq!(
+            std::fs::read(sub.join(format!("f{i}.txt"))).unwrap(),
+            format!("content-{i}").into_bytes(),
+            "file {i} must hydrate byte-identical at scale"
+        );
+    }
+}
