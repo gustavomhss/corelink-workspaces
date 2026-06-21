@@ -36,10 +36,19 @@
 
 ## Open items (none blocking; all external or owner-gated)
 
-1. **Release v0.1.4** — staged in `CHANGELOG.md [Unreleased]` (now includes the audit-2 fixes + fuzz +
-   canary). One-step cut (`changelog-bump` is already satisfied; tag `v0.1.4`) **next month when
-   GitHub-hosted Actions minutes reset** — `release.yml` is still hosted-only (5-target cross-builds).
-   Self-hosted release plan only if an urgent fix must ship before minutes return.
+0. **family-e2e (live cross-team E2E)** — clw is READY (suites #66 mock-classification + #67 live-lifecycle
+   merged; CLI contract frozen; v0.1.3 binary digests handed to runner-TL). The chain is tracked in
+   `docs/family-e2e-STATUS.md`. **Single blocker = server-TL's D1 test-env decision (M7)** — chased in
+   `RELAY-server-TL-family-e2e-D1-CHASE-2026-06-21.md` (pick staging-reuse or new-standup→escalate CF cred
+   to owner); that unblocks seed-apply + 6 tier PATs (M8) → the live run (M10). Runner build (M9) can start
+   NOW mock-first (no clw blocker) — `RELAY-runner-TL-family-e2e-binary-ready-2026-06-21.md`. When the 6
+   PATs land: run #67 per tier tenant + live conformance in REQUIRE mode, report in the STATUS ledger.
+
+1. **Release v0.1.4** — **STAGED on branch `release/v0.1.4-prep` / PR #151**: `Cargo.toml` bumped to 0.1.4
+   (+ 11 `clw-*` in `Cargo.lock`), CHANGELOG `[Unreleased]` finalized as `[0.1.4]`. Once merged + hosted
+   Actions minutes return, the cut is ONE step: `git tag -a v0.1.4 -m "clw 0.1.4" && git push origin v0.1.4`
+   (preflight asserts tag == Cargo version; `release.yml` 5-target cross-build is hosted-only). Self-hosted
+   release plan only if an urgent fix must ship before minutes return.
 2. **Prod intermittent HTTP 503 → server-TL.** Flagged via `docs/RELAY-server-intermittent-503-2026-06-20.md`.
    Pattern: a bounded window where ~all authenticated requests 503, then self-recovers (seen in a manual
    conformance run 8/9 and the canary's first dispatch 8×). clw side is correct (503 transient, never
