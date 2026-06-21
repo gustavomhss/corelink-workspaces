@@ -35,11 +35,34 @@
   redacted); snapshot/hydrate help notes the directory is a positional arg; `clw snapshot` prints a note
   when files were excluded by `.gitignore`/`.clwignore`.
 
+### Fixed
+- **`clw prune` no longer aborts — or corrupts — on a tenant that used `clw run`.** A run-cache memo record
+  shares the AC keyspace with workspace refs; the live-set walk parsed every key as a `RefRecord`, so the
+  first run record tripped the fail-safe and disabled prune. The walk now recognizes a `RunRecord` and
+  **pulls its stdout/stderr CAS blobs into the live set** — so prune both runs and never orphans/deletes a
+  run record's captured output. (Data-safety: a later cache hit can still fetch its output.)
+- **`clw snapshot --force` can now recover a corrupt-but-present ref.** The replace path gated on a
+  *parseable* existing ref; it now gates on raw AC presence, so a name whose stored record is unreadable
+  can be overwritten with `--force` (previously only `rm --name` could clear it).
+- **Paginated listings (`ls`/`prune`) are bounded against a hostile/buggy server.** A hard page-count cap
+  bounds the cursor-cycle guard's memory, so a server emitting empty pages with ever-advancing cursors
+  can no longer grow client memory without limit.
+- **The cache GC no longer counts in-flight temp files toward the budget.** `.tmp-*` staging files are
+  excluded from the cache-size accounting and from eviction, so a concurrent write can't skew GC.
+
 ### Tests / CI
 - Binary-level E2E coverage push: `clw run` exit-code contract (reserved 125, 128+signal), a resource cap
   + non-retryable tiers (402/403/410) surfaced cleanly, config-resolution precedence + identity
   persistence, single-command coverage fill + a full-lifecycle journey, process-level concurrency + a
   1500-file tree — plus assertion-depth hardening (validate output VALUES/state, not just exit codes).
+- **In-tree fuzzing of every untrusted-input parser** — 26 stable-`proptest` fuzzers across manifest /
+  ref-record / run-record decode, `Digest::from_hex`, the `validate_*` path checks, AC/CAS list-page
+  decode, config parsing, and the endpoint-userinfo redaction (a security invariant: credentials never
+  survive into a displayed endpoint). Gate-friendly: 1k cases per PR, 50k under `CLW_FUZZ_GATE=1`. No
+  crashes found at 50k.
+- **Daily live-conformance canary** (`conformance-canary.yml`) runs the prod round-trip in honest mode
+  (`CLW_CONFORMANCE_REQUIRE=1`) on a schedule, so a prod-side availability regression surfaces as a
+  recurring red signal rather than being noticed only on the next manual run.
 - CI gains a **self-hosted runner fallback** (`clw-mac-1`) for the gates+dco jobs, for when GitHub-hosted
   Actions minutes are unavailable; the GitHub-hosted lane remains the preferred path.
 
