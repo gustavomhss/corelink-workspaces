@@ -1,10 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.4] — post-launch hardening: data-safety, fuzzing, daily conformance canary (2026-06-21)
 
-> Live user-simulation hardening: 6 real-user personas drove the shipped binary against live prod; the
-> confirmed findings are addressed to SOTA across severities. Plus an adversarial security sweep (1 LOW
-> finding, fixed). Held for the next release cut.
+> Staged and tag-ready: `Cargo.toml` is bumped to 0.1.4 and this entry is final. The release is cut with
+> `git tag -a v0.1.4 -m "clw 0.1.4" && git push origin v0.1.4` once GitHub-hosted Actions minutes return
+> (`release.yml` runs the 5-target cross-build on hosted runners). No code changes remain.
+>
+> Three post-launch hardening waves: (1) live user-simulation — 6 real-user personas drove the shipped
+> binary against live prod, confirmed findings fixed to SOTA across severities; (2) a second brutal
+> adversarial audit (40 agents → 7 findings, 0 high) closed to SOTA, the data-safety fixes below being the
+> substantive ones; (3) in-tree fuzzing of every untrusted-input parser. Plus an adversarial security
+> sweep (1 LOW, fixed) and a daily live-conformance canary.
 
 ### Security
 - **The plaintext-guard rejection no longer echoes embedded userinfo.** A misconfigured
