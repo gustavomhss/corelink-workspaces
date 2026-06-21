@@ -682,8 +682,45 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        // Case count for the in-crate fuzzers. The deep run (50k) is OPT-IN via
+        // the repo's existing fuzz lane signal (CLW_FUZZ_GATE=1, see
+        // scripts/gates.sh); the default keeps the per-PR gate fast while still
+        // exercising a meaningful 1k cases.
+        fn fuzz_cases() -> u32 {
+            if std::env::var("CLW_FUZZ_GATE").is_ok() {
+                50_000
+            } else {
+                1_000
+            }
+        }
+
+        // A RunRecord-shaped JSON value (right keys, hostile field values) so the
+        // fuzzer reaches serde's structural decode, not just JSON-syntax reject.
+        // Returns the bytes PLUS an INDEPENDENT oracle for "should decode as a
+        // RunRecord": a RunRecord requires `exit_code` (any i32 is valid) plus
+        // both `stdout`/`stderr` as valid 64-hex `Digest`s. The oracle is computed
+        // via `Digest::from_hex` — a DIFFERENT code path than `is_run_record`'s
+        // `from_slice::<RunRecord>` — so the assertion is a real cross-check rather
+        // than `f(x) == f(x)`.
+        fn runrecordish_json() -> impl Strategy<Value = (Vec<u8>, bool)> {
+            let digestish = prop_oneof![
+                "[0-9a-f]{64}",      // valid 64-hex digest
+                "[0-9a-fA-F]{0,80}", // wrong length / uppercase
+                ".{0,16}",           // arbitrary garbage
+            ];
+            (any::<i32>(), digestish.clone(), digestish).prop_map(|(ec, so, se)| {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "exit_code": ec, "stdout": so, "stderr": se,
+                }))
+                .unwrap();
+                let expected = clw_types::Digest::from_hex(&so).is_ok()
+                    && clw_types::Digest::from_hex(&se).is_ok();
+                (bytes, expected)
+            })
+        }
+
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(512))]
+            #![proptest_config(ProptestConfig::with_cases(fuzz_cases()))]
 
             /// `serde_json::from_slice::<RunRecord>` on ARBITRARY bytes never
             /// panics — only Ok/Err (the cache-hit replay decode path).
@@ -692,6 +729,48 @@ mod tests {
                 bytes in proptest::collection::vec(any::<u8>(), 0..4096)
             ) {
                 let _: std::result::Result<RunRecord, _> = serde_json::from_slice(&bytes);
+            }
+
+            /// `is_run_record` (the ls/prune classifier) on ARBITRARY bytes never
+            /// panics — only true/false (pure no-panic guard over hostile input;
+            /// the structured fuzzer below cross-checks the true/false result).
+            #[test]
+            fn is_run_record_never_panics(
+                bytes in proptest::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                let _ = is_run_record(&bytes);
+            }
+
+            /// `is_run_record` on STRUCTURED RunRecord-shaped JSON never panics AND
+            /// agrees with an INDEPENDENT oracle (both digest fields valid 64-hex,
+            /// via `Digest::from_hex` — not the `from_slice` `is_run_record` uses).
+            /// Exercises the field-decode path (valid/garbage digest hex) rather
+            /// than the JSON-syntax reject, and is non-vacuous.
+            #[test]
+            fn is_run_record_structured_matches_digest_oracle(case in runrecordish_json()) {
+                let (bytes, expected) = case;
+                prop_assert_eq!(is_run_record(&bytes), expected);
+            }
+
+            /// DISJOINTNESS: a well-formed `RefRecord` (the OTHER thing in the AC
+            /// keyspace) must NEVER be classified as a run record — the property the
+            /// ls/prune classifier relies on to tell run-cache entries from refs.
+            #[test]
+            fn refrecord_never_misclassified_as_run_record(
+                name in ".*",
+                created in any::<u64>(),
+                msize in any::<u64>(),
+            ) {
+                let rr = clw_types::RefRecord {
+                    name,
+                    root: clw_types::Digest::of_bytes(b"root"),
+                    manifest_size: msize,
+                    created_at_unix: created,
+                    parent: None,
+                    tool_version: "test".to_string(),
+                };
+                let bytes = rr.to_bytes().unwrap();
+                prop_assert!(!is_run_record(&bytes));
             }
         }
     }

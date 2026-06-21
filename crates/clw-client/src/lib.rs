@@ -1243,8 +1243,45 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        // Case count for the in-crate fuzzers. The deep run (50k) is OPT-IN via
+        // the repo's existing fuzz lane signal (CLW_FUZZ_GATE=1, see
+        // scripts/gates.sh); the default keeps the per-PR gate fast while still
+        // exercising a meaningful 1k cases.
+        fn fuzz_cases() -> u32 {
+            if std::env::var("CLW_FUZZ_GATE").is_ok() {
+                50_000
+            } else {
+                1_000
+            }
+        }
+
+        // A list-page-shaped JSON value (right envelope keys, hostile item values)
+        // so the fuzzer reaches serde's field decode + Digest::from_hex on each
+        // item, not just the JSON-syntax reject.
+        fn listpageish_json(
+            item_key: &'static str,
+            arr_key: &'static str,
+        ) -> impl Strategy<Value = Vec<u8>> {
+            let hexish = prop_oneof![
+                "[0-9a-f]{64}",      // valid digest
+                "[0-9a-fA-F]{0,80}", // wrong length / case
+                ".{0,16}",           // garbage
+            ];
+            let item = hexish.prop_map(move |h| serde_json::json!({ item_key: h }));
+            let cursor = prop_oneof![
+                Just(serde_json::Value::Null),
+                "[a-z0-9]{0,8}".prop_map(serde_json::Value::String),
+            ];
+            (proptest::collection::vec(item, 0..6), cursor).prop_map(move |(items, cur)| {
+                serde_json::to_vec(&serde_json::json!({
+                    arr_key: items, "next_cursor": cur,
+                }))
+                .unwrap()
+            })
+        }
+
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(512))]
+            #![proptest_config(ProptestConfig::with_cases(fuzz_cases()))]
 
             /// `serde_json::from_slice::<AcListPage>` on ARBITRARY bytes never
             /// panics — only Ok/Err.
@@ -1262,6 +1299,71 @@ mod tests {
                 bytes in proptest::collection::vec(any::<u8>(), 0..4096)
             ) {
                 let _: std::result::Result<CasListPage, _> = serde_json::from_slice(&bytes);
+            }
+
+            /// STRUCTURED AcListPage envelope (valid keys, hostile ref_key hex)
+            /// never panics. INVARIANT: a page that parses Ok yields a finite,
+            /// non-looping cursor (empty-string cursor normalized to None).
+            #[test]
+            fn ac_list_page_structured_never_panics(
+                bytes in listpageish_json("ref_key", "refs")
+            ) {
+                if let Ok(p) = serde_json::from_slice::<AcListPage>(&bytes) {
+                    let (_keys, cursor) = p.into_parts();
+                    prop_assert!(cursor.as_deref() != Some(""));
+                }
+            }
+
+            /// STRUCTURED CasListPage envelope (valid keys, hostile hash hex)
+            /// never panics; same cursor-normalization invariant.
+            #[test]
+            fn cas_list_page_structured_never_panics(
+                bytes in listpageish_json("hash", "blobs")
+            ) {
+                if let Ok(p) = serde_json::from_slice::<CasListPage>(&bytes) {
+                    let (_keys, cursor) = p.into_parts();
+                    prop_assert!(cursor.as_deref() != Some(""));
+                }
+            }
+
+            /// A missing array key (server bug / proxy `{}`) must be a HARD parse
+            /// ERROR, never a silently-empty live set (which would drive prune to
+            /// wipe the tenant). This pins that contract under fuzzing.
+            #[test]
+            fn ac_list_page_missing_array_is_error(cursor in "[a-z0-9]{0,8}") {
+                let bytes = serde_json::to_vec(&serde_json::json!({ "next_cursor": cursor })).unwrap();
+                prop_assert!(serde_json::from_slice::<AcListPage>(&bytes).is_err());
+            }
+
+            /// `redact_endpoint_for_display` (the plaintext-guard error path) on an
+            /// ARBITRARY endpoint string never panics — only returns a String.
+            #[test]
+            fn redact_endpoint_never_panics(ep in ".*") {
+                let _ = redact_endpoint_for_display(&ep);
+            }
+
+            /// SECURITY INVARIANT: a `user:secret@host` userinfo must NEVER survive
+            /// into the displayed string. We assemble a `scheme://user:PASSWORD@host`
+            /// endpoint from fuzzed parts and assert the unique password sentinel is
+            /// absent from the redaction. Both code paths (url-crate parse AND the
+            /// string-scan fallback) are exercised because the host/scheme draws mix
+            /// parseable and unparseable authorities.
+            #[test]
+            fn redact_endpoint_strips_credentials(
+                scheme in prop_oneof!["https", "http", "[a-z]{1,6}"],
+                user in "[a-zA-Z0-9._-]{1,12}",
+                host in prop_oneof!["[a-z0-9.-]{1,20}", "[a-z0-9.:\\[\\]-]{1,24}"],
+                tail in "[a-zA-Z0-9/_.-]{0,16}",
+            ) {
+                // A high-entropy password sentinel that cannot occur by chance in
+                // the fuzzed scheme/user/host/tail alphabets above.
+                let password = "Zq7Pw3xK9vN2secretSENTINEL";
+                let ep = format!("{scheme}://{user}:{password}@{host}/{tail}");
+                let shown = redact_endpoint_for_display(&ep);
+                prop_assert!(
+                    !shown.contains(password),
+                    "password leaked through redaction: input={:?} shown={:?}", ep, shown
+                );
             }
         }
     }

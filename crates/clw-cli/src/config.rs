@@ -1535,8 +1535,20 @@ cache_dir = "~/.clw/cache"
         use super::*;
         use proptest::prelude::*;
 
+        // Case count for the in-crate fuzzers. The deep run (50k) is OPT-IN via
+        // the repo's existing fuzz lane signal (CLW_FUZZ_GATE=1, see
+        // scripts/gates.sh); the default keeps the per-PR gate fast while still
+        // exercising a meaningful 1k cases.
+        fn fuzz_cases() -> u32 {
+            if std::env::var("CLW_FUZZ_GATE").is_ok() {
+                50_000
+            } else {
+                1_000
+            }
+        }
+
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(1024))]
+            #![proptest_config(ProptestConfig::with_cases(fuzz_cases()))]
 
             /// `parse_config_lines` on ARBITRARY text never panics and always
             /// terminates — only mutates the map. The `.*` regex covers embedded
@@ -1559,6 +1571,49 @@ cache_dir = "~/.clw/cache"
             ) {
                 let mut map = HashMap::new();
                 parse_config_lines(&content, &mut map);
+            }
+
+            /// `parse_ref_domain` on an ARBITRARY string never panics. INVARIANT:
+            /// it accepts ONLY the closed set {None, "", "user", "runner"} and any
+            /// other value is a hard config error — no arbitrary string ever
+            /// silently selects a keyspace.
+            #[test]
+            fn parse_ref_domain_never_panics(s in ".*") {
+                let r = parse_ref_domain(Some(&s));
+                match s.as_str() {
+                    "" | "user" => prop_assert_eq!(r.unwrap(), RefDomain::User),
+                    "runner" => prop_assert_eq!(r.unwrap(), RefDomain::Runner),
+                    _ => prop_assert!(r.is_err()),
+                }
+            }
+
+            /// The TENANT-resolution invariant, fuzzed at the boundary `resolve`
+            /// actually enforces: validate_tenant accepts an arbitrary string ONLY
+            /// when it carries no '/'/'\\' separator and no traversal form — so a
+            /// path-injection tenant can never reach a request URL. (resolve()
+            /// itself reads global env/HOME and is covered by the unit tests under
+            /// ENV_LOCK; this fuzzes the pure decision it delegates to.)
+            #[test]
+            fn tenant_resolution_rejects_injection(
+                t in prop_oneof![
+                    "[A-Za-z0-9._/\\\\-]{0,16}",
+                    Just("../other".to_string()),
+                    Just("a/b".to_string()),
+                    Just("..".to_string()),
+                    Just("tenant".to_string()),
+                ]
+            ) {
+                let ok = clw_types::validate_tenant(&t).is_ok();
+                if ok {
+                    prop_assert!(!t.contains('/') && !t.contains('\\'));
+                    prop_assert!(t != "." && t != "..");
+                } else {
+                    prop_assert!(true); // rejection is always acceptable
+                }
+                // Conversely, anything with a separator MUST be rejected.
+                if t.contains('/') || t.contains('\\') {
+                    prop_assert!(!ok);
+                }
             }
         }
     }

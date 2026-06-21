@@ -934,8 +934,63 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        // Case count for the in-crate fuzzers. The deep run (50k) is OPT-IN via
+        // the repo's existing fuzz lane signal (CLW_FUZZ_GATE=1, see
+        // scripts/gates.sh); the default keeps the per-PR gate fast while still
+        // exercising a meaningful 1k cases.
+        fn fuzz_cases() -> u32 {
+            if std::env::var("CLW_FUZZ_GATE").is_ok() {
+                50_000
+            } else {
+                1_000
+            }
+        }
+
+        // A JSON value that LOOKS like a manifest (right keys, plausible shapes)
+        // so the fuzzer reaches serde's structural decode + validate_canonical,
+        // not just the first-byte JSON rejection. Mixes valid-ish and hostile
+        // fields (bad versions, traversal paths, escaping symlink targets).
+        fn manifestish_json() -> impl Strategy<Value = Vec<u8>> {
+            // A hostile-ish path/target value: mixes clean-looking strings with
+            // traversal/absolute/ADS payloads so validate_canonical is exercised.
+            let pathish = prop_oneof![
+                "[a-zA-Z0-9_/.-]{0,12}",
+                Just("../escape".to_string()),
+                Just("/abs".to_string()),
+                Just("a/../b".to_string()),
+                Just("c:\\ads".to_string()),
+            ];
+            // One arbitrary entry as a serde_json::Value (kind chosen at random,
+            // hostile path/target). prop_flat_map picks the kind AFTER the fields
+            // are drawn so each kind is reachable.
+            let entry = (pathish.clone(), any::<u32>(), any::<u64>(), pathish, 0u8..3u8)
+                .prop_map(|(p, mode, size, target, kind)| match kind {
+                    0 => serde_json::json!({"kind":"file","path":p,"mode":mode,"size":size,"chunks":[]}),
+                    1 => serde_json::json!({"kind":"symlink","path":p,"target":target}),
+                    _ => serde_json::json!({"kind":"dir","path":p}),
+                });
+            // Bias `version` toward the ONLY accepted value (MANIFEST_VERSION):
+            // `from_bytes` rejects any other version at the version-gate BEFORE
+            // `validate_canonical` runs, so an unbiased `any::<u32>()` would make
+            // the parses-Ok branch (and its canonical invariant) effectively
+            // unreachable. Keep arbitrary versions in the mix to still fuzz the
+            // version-reject path.
+            let verish = prop_oneof![
+                9 => Just(MANIFEST_VERSION),
+                1 => any::<u32>(),
+            ];
+            (verish, any::<u64>(), proptest::collection::vec(entry, 0..6)).prop_map(
+                |(ver, total, entries)| {
+                    serde_json::to_vec(&serde_json::json!({
+                        "version": ver, "total_size": total, "entries": entries,
+                    }))
+                    .unwrap()
+                },
+            )
+        }
+
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(512))]
+            #![proptest_config(ProptestConfig::with_cases(fuzz_cases()))]
 
             /// `Manifest::from_bytes` on ARBITRARY bytes never panics — only
             /// `Ok`/`Err`. Covers the serde_json + validate_canonical parse path
@@ -945,7 +1000,22 @@ mod tests {
                 let _ = Manifest::from_bytes(&bytes);
             }
 
-            /// `RefRecord::from_bytes` (clw-types:312) on ARBITRARY bytes never
+            /// `Manifest::from_bytes` on STRUCTURED manifest-shaped JSON (right
+            /// keys, hostile path/target values) never panics — reaches serde's
+            /// field decode + validate_canonical, not just the JSON-syntax reject.
+            /// INVARIANT: any manifest that parses Ok has strictly-ascending paths
+            /// and only safe/contained entries (validate_canonical held).
+            #[test]
+            fn manifest_from_bytes_structured_never_panics(bytes in manifestish_json()) {
+                if let Ok(m) = Manifest::from_bytes(&bytes) {
+                    prop_assert!(m.validate_canonical().is_ok());
+                    for w in m.entries.windows(2) {
+                        prop_assert!(w[0].path() < w[1].path());
+                    }
+                }
+            }
+
+            /// `RefRecord::from_bytes` (clw-types:393) on ARBITRARY bytes never
             /// panics — only `Ok`/`Err`.
             #[test]
             fn refrecord_from_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
@@ -953,10 +1023,111 @@ mod tests {
             }
 
             /// `Digest::from_hex` on an ARBITRARY string never panics — only
-            /// `Ok`/`Err` (non-hex, wrong-length, unicode all yield `Err`).
+            /// `Ok`/`Err`. INVARIANT: a successful parse round-trips back to the
+            /// 64-char lowercase-hex canonical form.
             #[test]
             fn digest_from_hex_never_panics(s in ".*") {
-                let _ = Digest::from_hex(&s);
+                if let Ok(d) = Digest::from_hex(&s) {
+                    prop_assert_eq!(d.to_hex().len(), 64);
+                    prop_assert_eq!(Digest::from_hex(&d.to_hex()).unwrap(), d);
+                }
+            }
+
+            /// `Digest::from_hex` on hex-ALPHABET strings of every length never
+            /// panics; INVARIANT: Ok IFF the input is exactly 64 hex chars.
+            #[test]
+            fn digest_from_hex_len_invariant(s in "[0-9a-fA-F]{0,80}") {
+                let ok = Digest::from_hex(&s).is_ok();
+                prop_assert_eq!(ok, s.len() == 64);
+            }
+
+            /// `validate_rel_path` on ARBITRARY strings never panics — only
+            /// Ok/Err. INVARIANT: an accepted path has no '.'/'..'/empty/colon
+            /// component, no leading '/', and no backslash.
+            #[test]
+            fn validate_rel_path_never_panics(p in ".*") {
+                if validate_rel_path(&p).is_ok() {
+                    prop_assert!(!p.is_empty());
+                    prop_assert!(!p.starts_with('/'));
+                    prop_assert!(!p.contains('\\'));
+                    for c in p.split('/') {
+                        prop_assert!(!c.is_empty() && c != "." && c != ".." && !c.contains(':'));
+                    }
+                }
+            }
+
+            /// `validate_symlink_target` (strict) on ARBITRARY strings never
+            /// panics. INVARIANT: an accepted target is relative, has no '..',
+            /// no backslash, no empty/'.'/colon component.
+            #[test]
+            fn validate_symlink_target_never_panics(t in ".*") {
+                if validate_symlink_target(&t).is_ok() {
+                    prop_assert!(!t.is_empty());
+                    prop_assert!(!t.starts_with('/'));
+                    prop_assert!(!t.contains('\\'));
+                    for c in t.split('/') {
+                        prop_assert!(!c.is_empty() && c != "." && c != ".." && !c.contains(':'));
+                    }
+                }
+            }
+
+            /// `validate_symlink_target_contained` on a CLEAN link_rel (precondition)
+            /// + ARBITRARY target never panics. INVARIANT: an accepted target,
+            /// resolved lexically against the link's parent dir, never escapes the
+            /// workspace root (the pop-below-root depth check held).
+            #[test]
+            fn validate_symlink_target_contained_never_panics(
+                link in safe_rel_path(),
+                t in ".*",
+            ) {
+                if validate_symlink_target_contained(&link, &t).is_ok() {
+                    // Re-derive the lexical resolution and assert non-escape.
+                    let mut depth: i64 = link.split('/').filter(|c| !c.is_empty() && *c != ".").count() as i64 - 1;
+                    let mut escaped = false;
+                    for c in t.split('/') {
+                        match c {
+                            "" | "." => {}
+                            ".." => { depth -= 1; if depth < 0 { escaped = true; } }
+                            _ => depth += 1,
+                        }
+                    }
+                    prop_assert!(!escaped);
+                }
+            }
+
+            /// `validate_tenant` on ARBITRARY strings never panics. INVARIANT: an
+            /// accepted tenant is non-empty, contains only [A-Za-z0-9._-], is not
+            /// '.'/'..', and does not start or end with '.' — i.e. it cannot carry
+            /// a '/' path-injection payload into the request URL.
+            #[test]
+            fn validate_tenant_never_panics(t in ".*") {
+                if validate_tenant(&t).is_ok() {
+                    prop_assert!(!t.is_empty());
+                    prop_assert!(t != "." && t != "..");
+                    prop_assert!(!t.starts_with('.') && !t.ends_with('.'));
+                    prop_assert!(!t.contains('/') && !t.contains('\\'));
+                    for c in t.chars() {
+                        prop_assert!(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+                    }
+                }
+            }
+
+            /// Path-injection corpus: NO tenant containing a separator or traversal
+            /// form is ever accepted (the cross-tenant-misroute defense).
+            #[test]
+            fn validate_tenant_rejects_injection(
+                t in prop_oneof![
+                    "[A-Za-z0-9._/-]{0,16}",
+                    Just("../other".to_string()),
+                    Just("a/b".to_string()),
+                    Just("..".to_string()),
+                    Just(".".to_string()),
+                    Just("a\\b".to_string()),
+                ]
+            ) {
+                if t.contains('/') || t.contains('\\') || t == "." || t == ".." {
+                    prop_assert!(validate_tenant(&t).is_err());
+                }
             }
         }
 
@@ -991,7 +1162,7 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(256))]
+            #![proptest_config(ProptestConfig::with_cases(fuzz_cases()))]
 
             /// Canonical round-trip: build an ARBITRARY `Manifest`, sort+dedup its
             /// entries by path (the canonical-form precondition), then assert
