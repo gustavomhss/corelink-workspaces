@@ -38,8 +38,11 @@ paths for M7: **(a)** reuse an existing **staging** D1 (server-TL confirms the n
   (`docs/RELAY-runner-TL-family-e2e-binary-ready-2026-06-21.md`).
 - ▶ Defined the creds-delivery shape clw wants for the 6 tier PATs (in the D1 chase relay) so M8's output
   is directly consumable — `cargo test -p clw-conformance --features live` per tenant, no glue.
-- ⏭ When the 6 PATs land: run #67 against each of the 6 tier tenants (proves each tier's PAT auths +
-  keyspace-isolates) and the live conformance in `REQUIRE` mode; report results here as M10 progress.
+- ✅ **M10 driver ready** (`scripts/family-e2e.sh`, PR #152): give it the creds file (the shape above) and
+  it runs the live conformance + solo-lifecycle once per tier tenant in `REQUIRE` mode and prints a
+  PASS/FAIL/SKIP table — absent tiers report SKIP (never PASS). PAT never echoed; `*.creds` gitignored.
+  So the live run is **one command** the moment the 6 PATs land. Cold-reviewed APPROVE (leak-safe).
+- ⏭ When the 6 PATs land: `scripts/family-e2e.sh <creds-file>` → report the table here as M10 progress.
   (Live per-tier *quota* enforcement — tripping a 10 GB free ceiling — is not cheaply CI-testable; the
   mock suite #66 already pins clw's classification of every tier code, so live validates auth+lifecycle
   per tenant, not quota-tripping.)
