@@ -3,6 +3,8 @@
 .DS_Store
 *.local
 .env*
+# family-e2e live tier PATs (out-of-band creds for scripts/family-e2e.sh) — never tracked.
+*.creds
 # Owner's local legal-fill worksheet — prefilled scratch, never tracked.
 /OWNER-LEGAL-FILLINS.html
 .pass2-findings.json
