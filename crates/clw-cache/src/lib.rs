@@ -171,7 +171,16 @@ impl LocalCache {
         .map_err(ClwError::Io)
     }
 
-    /// Remove every cached blob, leaving the shard directories in place.
+    /// Remove every committed cached blob, leaving the shard directories — and any
+    /// in-flight `.tmp-*` put — in place.
+    ///
+    /// Concurrency: a shared cache may be cleared by one process while another is
+    /// mid-`put`. Two rules keep that safe, mirroring [`gc`](Self::gc):
+    /// * **skip `.tmp-*`** — removing another writer's in-flight temp file would make
+    ///   its `rename` fail with `ENOENT`; only digest-named (committed) blobs are wiped.
+    /// * **treat a concurrently-vanished entry as benign** — if another process removes
+    ///   a blob (or the dir entry) between our `read_dir` and our `metadata`/`remove`,
+    ///   `NotFound` is success (the goal — that blob being gone — already holds).
     fn clear_content(&self) -> Result<()> {
         let blobs_root = self.root.join("blobs");
         for i in 0u16..=255 {
@@ -183,9 +192,27 @@ impl LocalCache {
                 Err(e) => return Err(ClwError::Io(e)),
             };
             for entry in rd {
-                let entry = entry?;
-                if entry.metadata()?.is_file() {
-                    fs::remove_file(entry.path())?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(ClwError::Io(e)),
+                };
+                // Never clobber another writer's in-flight put (matches gc).
+                if entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+                    continue;
+                }
+                let is_file = match entry.metadata() {
+                    Ok(m) => m.is_file(),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(ClwError::Io(e)),
+                };
+                if is_file {
+                    match fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        // Another process already removed it — benign.
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(ClwError::Io(e)),
+                    }
                 }
             }
         }
@@ -299,7 +326,12 @@ impl LocalCache {
                 Err(e) => return Err(ClwError::Io(e)),
             };
             for entry in rd {
-                let entry = entry?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    // A concurrent process removing an entry mid-iteration is benign.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(ClwError::Io(e)),
+                };
                 // Skip in-flight temp files (`.tmp-*`): they are not committed blobs,
                 // so counting them toward the budget would skew eviction, and evicting
                 // one would clobber another writer's in-progress put. Only digest-named
@@ -307,7 +339,12 @@ impl LocalCache {
                 if entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
                     continue;
                 }
-                let meta = entry.metadata()?;
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    // Removed by another process between read_dir and metadata — benign.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(ClwError::Io(e)),
+                };
                 if !meta.is_file() {
                     continue;
                 }
@@ -330,7 +367,13 @@ impl LocalCache {
             if total <= max_total_bytes {
                 break;
             }
-            fs::remove_file(&path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                // Another process (its own gc) already evicted this blob — benign;
+                // the space is freed either way, so still count it toward the target.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ClwError::Io(e)),
+            }
             total -= size;
             freed += size;
         }
@@ -741,6 +784,43 @@ mod tests {
         // The store is still usable after invalidation.
         cache.put(&d, data).unwrap();
         assert!(cache.has(&d));
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency: a format-mismatch `clear_content` must NOT clobber another
+    // process's in-flight `.tmp-*` put. Removing it would make that writer's
+    // rename fail with ENOENT — exactly the kind of spurious cross-process
+    // failure a shared cache must never inflict. (Matches gc's `.tmp-*` skip.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn clear_content_preserves_inflight_tmp_but_wipes_committed_blobs() {
+        let dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+        let data = b"committed blob";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+        assert!(cache.has(&d));
+
+        // Simulate a concurrent writer's in-flight put: a `.tmp-*` file sitting in
+        // the SAME shard as a committed blob, mid-rename.
+        let shard = cache.shard_dir(&d);
+        let inflight = shard.join(format!("{TMP_PREFIX}other-writer-inflight"));
+        fs::write(&inflight, b"another process's half-written put").unwrap();
+
+        // Force a format mismatch, then reopen → check_format_version → clear_content.
+        fs::write(
+            dir.path().join(VERSION_FILE),
+            (CACHE_FORMAT_VERSION + 7).to_string(),
+        )
+        .unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+
+        // Committed blob wiped; the other writer's in-flight temp file survives.
+        assert!(!cache.has(&d), "committed blob must be invalidated");
+        assert!(
+            inflight.exists(),
+            "clear_content must NOT remove another writer's in-flight .tmp-* put"
+        );
     }
 
     // -----------------------------------------------------------------------
