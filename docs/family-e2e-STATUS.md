@@ -18,18 +18,22 @@
 | M4 | clw solo live-lifecycle suite (`--features live`) | clw | ✅ DONE (PR #67, `live_lifecycle.rs`) | — |
 | M5 | clw binary published + digests handed to runner | clw | ✅ DONE (v0.1.3 on mirror; digests in the runner relay) | M9 |
 | M6 | server D-9 per-job PAT mint shipped | server | ✅ DONE (#305/#307/#312, per REPLY 2026-06-16) | M8 |
-| M7 | **D1-active test env decision + standup** | server (+owner CF cred) | 🔴 OPEN — the single blocker | M8 |
-| M8 | apply `family-e2e-tier-seed.sql` + mint/confirm 6 tier PATs | server | ⛔ BLOCKED on M7 | M10 |
+| M7 | **D1-active test env decision** | server | ✅ DONE (2026-06-28) — **path (a)**: reuse prod `CONFIG_DB` + sandbox tier-tenants; NO new D1, NO CF-cred escalation | M8 |
+| M8 | apply `family-e2e-tier-seed.sql` + mint 6 tier PATs | server prep / **owner `!`** | 🟡 OWNER-GATED — the mint is a prod-credential `!`; owner picks tooling #1 (`provision-personas.py`) or #2 (wrangler one-shot); seed verified compliant (read-only) | M10 |
 | M9 | runner: clw-on-image + `CLW_*` inject + invocation step (mock-first) | runner | 🟡 CAN-START-NOW (no clw blocker) | M10 |
-| M10 | live family run (per-tier mint → cache-hit, cross-repo) | all | ⛔ BLOCKED on M8 + M9 | — |
+| M10 | live family run (per-tier mint → cache-hit, cross-repo) | all | ⛔ BLOCKED on M8 (PATs) + M9 | — |
 | M11 | prod Worker redeploy picks up server #307 (live mint auths) | owner/launch | 🟡 OPEN — confirm | M10 (prod) |
 
 ## The critical path
-**M7 (D1 env) is the one decision that unblocks the chain.** Until D1 is live, the seed can't be applied
-(M8), so there are no durable per-tier PATs to run M4 against the 6 tenants, and M10 can't happen. Two
-paths for M7: **(a)** reuse an existing **staging** D1 (server-TL confirms the name + migration tail), or
-**(b)** stand up a **new** D1 (needs a Cloudflare cred → escalate to owner). Chasing server-TL to pick one:
-`docs/RELAY-server-TL-family-e2e-D1-CHASE-2026-06-21.md`.
+**RESOLVED 2026-06-28: M7 = path (a).** Server-TL picked reuse of prod `CONFIG_DB` (`d64742ea…`, migration
+tail 0079, current) with dedicated sandbox tier-tenants — no new D1, no CF-cred escalation. The seed
+(`corelink-server/scripts/family-e2e-tier-seed.sql`) is verified compliant with ADR-S19-001/CF-3 (slugs
+`{free,solo,starter,pro,max,enterprise}`, `primary_region=wnam`). **The single remaining gate is now M8: the
+owner runs the seed+mint `!`** (a prod-credential op — server-TL preps tooling #1 `provision-personas.py` or
+#2 wrangler one-shot; owner picks). The 6 PATs come back OOB in the exact `ENDPOINT=` + `tier tenant pat`
+shape `scripts/family-e2e.sh` consumes → the live matrix is one command. Decision doc:
+`docs/REPLY-server-TL-family-e2e-D1-path-PICKED-2026-06-28.md`; clw ACK:
+`docs/REPLY-clw-TL-to-server-TL-family-e2e-path-a-ACK-2026-06-28.md`.
 
 ## What clw is doing UNILATERALLY (no external wait)
 - ✅ Suites #66/#67 merged + green; #67 skips cleanly without creds and hard-fails under

@@ -49,14 +49,20 @@
    now settled BOTH sides (producer + Runners consumer), zero drift. The operational `clw snapshot` + set is
    queued downstream of the check-host (B) executing a real check (it waits on the runner fabric being live),
    not a blocker today. ACK: `docs/REPLY-clw-TL-to-hugit-toolchain-ref-settled-2026-06-28.md`.
-   **Only open external thread = the Cache TL R2 confirm:** pin that hugit's snapshot target == the
-   check-host's hydrate source == an R2-backed CAS (hugit hot-CAS tenants `d863fafb` git / `3560e213` AC) —
-   `docs/RELAY-cache-TL-checkhost-r2-placement-2026-06-28.md`.
+   **Cache R2 CONFIRMED (2026-06-28):** push==read==R2-backed CAS `https://corelink-api.humangr.com/v1/cas`
+   (bucket `corelink-cas-prod`, zero-egress, same CF account) — `docs/REPLY-cache-TL-r2-placement-CONFIRMED-2026-06-28.md`.
+   **So BOTH check-host external confirms are now done (hugit + Cache).** The ONLY remaining gate for #153 is
+   the Runners TL's **W6 ping** (runner fabric / check-host going live). Optimization for when B snapshots:
+   deterministic public toolchains can use the CAS `_public` namespace for cross-tenant dedup (Cache TL note).
 
-1. **family-e2e (live cross-team E2E)** — clw READY (suites #66/#67 merged; CLI frozen; v0.1.3 digests handed
-   over; M10 driver `scripts/family-e2e.sh` built). Tracked in `docs/family-e2e-STATUS.md`. **Single blocker
-   = server-TL's D1 test-env decision (M7)** — chased in `RELAY-server-TL-family-e2e-D1-CHASE-2026-06-21.md`.
-   When the 6 tier PATs land: `scripts/family-e2e.sh <creds-file>` and report in the STATUS ledger.
+1. **family-e2e (live cross-team E2E)** — clw 100% READY (suites #66/#67 merged; CLI frozen; M10 driver
+   `scripts/family-e2e.sh` built; delivery shape confirmed matching). Tracked in `docs/family-e2e-STATUS.md`.
+   **M7 RESOLVED (2026-06-28): path (a)** — reuse prod `CONFIG_DB` + sandbox tier-tenants, no new D1, no
+   CF-cred escalation; seed verified compliant. **Single remaining gate = M8: the owner runs the seed+mint `!`**
+   (prod-credential op; server-TL preps tooling #1 `provision-personas.py` or #2 wrangler one-shot — owner
+   picks). 6 PATs land OOB → `scripts/family-e2e.sh family-e2e.creds` → report the table in the STATUS ledger.
+   Decision: `REPLY-server-TL-family-e2e-D1-path-PICKED-2026-06-28.md`; ACK: `REPLY-clw-TL-to-server-TL-family-e2e-path-a-ACK-2026-06-28.md`.
+   (Also: server-TL offered to correlate the prod 503 — pull timestamped 503 windows from the canary run history and send them.)
 
 2. **Release v0.1.4** — staged on `main` (see TL;DR). Cut when hosted Actions minutes return (next month).
 
