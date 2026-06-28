@@ -8,3 +8,5 @@
 # Owner's local legal-fill worksheet — prefilled scratch, never tracked.
 /OWNER-LEGAL-FILLINS.html
 .pass2-findings.json
+# Agent worktrees (cold-review isolation) — transient, never tracked.
+.claude/worktrees/
