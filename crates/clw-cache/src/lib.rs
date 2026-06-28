@@ -252,7 +252,7 @@ impl LocalCache {
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(ClwError::Io(e)),
+            Err(e) => return Err(io_ctx("get: read", &path, e)),
         };
 
         let actual = Digest::of_bytes(&bytes);
@@ -279,12 +279,27 @@ impl LocalCache {
         let dir = self.shard_dir(d);
         // Write to a named temp file in the same directory so rename is atomic.
         let mut tmp = tempfile_in(&dir)?;
-        tmp.file.write_all(bytes)?;
-        tmp.file.flush()?;
+        tmp.file
+            .write_all(bytes)
+            .map_err(|e| io_ctx("put: write", &tmp.path, e))?;
+        tmp.file
+            .flush()
+            .map_err(|e| io_ctx("put: flush", &tmp.path, e))?;
         // Persist and rename.
         let tmp_path = tmp.path.clone();
         drop(tmp.file); // close before rename on Windows
-        fs::rename(&tmp_path, &dest)?;
+        fs::rename(&tmp_path, &dest).map_err(|e| {
+            // Name BOTH paths: under concurrent shared-cache load an ENOENT here is
+            // exactly the failure we want to pinpoint (tmp vs. dest-parent).
+            ClwError::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "cache put: rename {} -> {}: {e}",
+                    tmp_path.display(),
+                    dest.display()
+                ),
+            ))
+        })?;
 
         // Eviction is wired HERE so every write path (snapshot uploads + hydrate's
         // download-side caching) is bounded without each caller remembering to call
@@ -437,12 +452,31 @@ fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
                 last_err = Some(e);
                 continue;
             }
-            Err(e) => return Err(ClwError::Io(e)),
+            // Name the path: a non-AlreadyExists error here (e.g. ENOENT if the
+            // shard dir is unexpectedly absent under concurrent load) must say
+            // WHICH file/dir, not just an opaque errno.
+            Err(e) => return Err(io_ctx("put: create temp", &path, e)),
         }
     }
-    Err(ClwError::Io(last_err.unwrap_or_else(|| {
+    let e = last_err.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::AlreadyExists, "temp file name collision")
-    })))
+    });
+    // Name the dir on this (astronomically unlikely) retries-exhausted path too,
+    // so every tempfile_in exit is diagnosable — preserves the AlreadyExists kind.
+    Err(io_ctx("put: create temp (retries exhausted)", dir, e))
+}
+
+/// Attach the failing operation + path to an io error while preserving its
+/// [`io::ErrorKind`] (so `NotFound`-matching callers — see `gc`/`clear_content`
+/// — keep working). This turns an opaque, undiagnosable bare errno like
+/// `No such file or directory (os error 2)` into a precise
+/// `cache put: create temp ".../blobs/ab/.tmp-…": …`, so a rare CI failure on a
+/// shared cache becomes an actionable bug report instead of a guess.
+fn io_ctx(op: &str, path: &Path, e: io::Error) -> ClwError {
+    ClwError::Io(io::Error::new(
+        e.kind(),
+        format!("cache {op} {}: {e}", path.display()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -961,5 +995,54 @@ mod tests {
         let freed = cache.gc(1024 * 1024).unwrap();
         assert_eq!(freed, 0);
         assert!(cache.has(&d));
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnosability: cache fs errors carry the operation + path (so a rare
+    // shared-cache failure is an actionable message, not an opaque `os error 2`),
+    // while preserving the original ErrorKind for NotFound-matching callers.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn io_ctx_preserves_kind_and_adds_op_and_path() {
+        let raw = io::Error::new(io::ErrorKind::NotFound, "No such file or directory");
+        let wrapped = io_ctx("put: rename", Path::new("/blobs/ab/deadbeef"), raw);
+        match wrapped {
+            ClwError::Io(e) => {
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::NotFound,
+                    "kind() must be preserved so gc/clear_content NotFound-matching still works"
+                );
+                let msg = e.to_string();
+                assert!(msg.contains("put: rename"), "must name the op: {msg}");
+                assert!(
+                    msg.contains("/blobs/ab/deadbeef"),
+                    "must name the path: {msg}"
+                );
+            }
+            other => panic!("expected ClwError::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_into_missing_shard_reports_the_path() {
+        let (_dir, cache) = make_cache();
+        let data = b"payload for a removed shard";
+        let d = Digest::of_bytes(data);
+        // Remove the (empty, fresh) shard dir this digest maps to, so the put's
+        // temp-file create hits ENOENT — the exact opaque failure we want named.
+        let shard = cache.shard_dir(&d);
+        fs::remove_dir(&shard).unwrap();
+
+        let err = cache.put(&d, data).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cache put") && msg.contains("create temp"),
+            "put error must name the operation, got: {msg}"
+        );
+        assert!(
+            msg.contains(&shard.display().to_string()),
+            "put error must name the failing shard path, got: {msg}"
+        );
     }
 }
