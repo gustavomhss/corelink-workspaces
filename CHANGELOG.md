@@ -2,9 +2,11 @@
 
 ## [0.1.4] — post-launch hardening: data-safety, fuzzing, daily conformance canary (2026-06-21)
 
-> Staged and tag-ready: `Cargo.toml` is bumped to 0.1.4 and this entry is final. The release is cut with
+> Staged and tag-ready: `Cargo.toml` is bumped to 0.1.4. The release is cut with
 > `git tag -a v0.1.4 -m "clw 0.1.4" && git push origin v0.1.4` once GitHub-hosted Actions minutes return
-> (`release.yml` runs the 5-target cross-build on hosted runners). No code changes remain.
+> (`release.yml` runs the 5-target cross-build on hosted runners). A few small, safe fixes landed on `main`
+> after the initial stage and so will ship in this same un-cut tag — folded into the sections below (a
+> security dependency bump and shared-cache concurrency/diagnosability hardening).
 >
 > Three post-launch hardening waves: (1) live user-simulation — 6 real-user personas drove the shipped
 > binary against live prod, confirmed findings fixed to SOTA across severities; (2) a second brutal
@@ -18,6 +20,9 @@
   error message now redacts the embedded `user:pass@` instead of printing it to stderr/logs. (LOW — the
   CLW_TOKEN PAT travels in the header, never the URL; this is a secondary self-inflicted-credential hygiene
   fix.)
+- **`quinn-proto` bumped 0.11.14 → 0.11.15** for **RUSTSEC-2026-0185** (remote memory exhaustion, HIGH).
+  Lockfile-only; the crate is a phantom dependency (`reqwest`'s unused HTTP/3 feature), so there is no
+  compiled path into the binary — this keeps the supply-chain gate green and the patched dep in the lock.
 
 ### Added
 - **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an atomic
@@ -55,6 +60,12 @@
   can no longer grow client memory without limit.
 - **The cache GC no longer counts in-flight temp files toward the budget.** `.tmp-*` staging files are
   excluded from the cache-size accounting and from eviction, so a concurrent write can't skew GC.
+- **A shared cache no longer spuriously fails under concurrent processes.** The removal paths
+  (`clear_content`, the format-version-mismatch wipe run on every open; and `gc` eviction) now skip
+  in-flight `.tmp-*` puts and treat a concurrently-removed blob (`NotFound`) as benign instead of erroring.
+  Without this, two `clw` processes sharing a cache that start right after a cache-format bump could fail
+  with a bare "No such file or directory". Cache fs errors now also carry the failing operation + path
+  (e.g. `cache put: rename …`) so a rare concurrency failure is diagnosable instead of an opaque errno.
 
 ### Tests / CI
 - Binary-level E2E coverage push: `clw run` exit-code contract (reserved 125, 128+signal), a resource cap
