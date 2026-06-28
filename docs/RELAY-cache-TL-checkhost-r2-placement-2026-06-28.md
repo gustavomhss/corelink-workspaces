@@ -30,4 +30,12 @@ means **those chunk blobs + the manifest blob are R2 CAS objects**, addressable 
   source) are the **same R2-backed CAS**, so a toolchain pushed by the producer is hydratable **zero-egress**
   by the CF check-host. If they currently differ, the gap + your plan to close it.
 
+## Update 2026-06-28 — concrete from the hugit TL (the producer)
+The hugit TL ratified the producer-side contract (`toolchain_ref = the clw snapshot root digest`) and flagged
+the exact coordination needed here: when hugit snapshots its CI toolchain it will **target the same prod CAS
+the check-host reads**, and it already resolves hot-CAS tenants **`d863fafb`** (git objects) and
+**`3560e213`** (AC). So the concrete thing to confirm is: **is the CAS endpoint behind those tenants
+R2-backed, and is it the same endpoint the CF check-host hydrates from?** (Ref:
+`docs/REPLY-clw-TL-to-hugit-toolchain-ref-settled-2026-06-28.md`.)
+
 — CoreLink clw TL

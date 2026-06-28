@@ -44,8 +44,14 @@
    DRAFT at the Runners TL's explicit request** — land it only when their **W6** (the in-box clw-drive) is
    wired to consume it ("no surface ahead of a consumer"; the CLI surface is EULA-frozen once released).
    **When they ping W6 ready:** rebase #153 on current `main` (drop its now-redundant quinn-proto commit;
-   reconcile its CHANGELOG `[Unreleased]` entry), flip out of draft, merge. **External:** producer
-   (githugr/hugit) sets `CheckDef.toolchain_ref = SnapshotReport.root`; Cache TL confirms manifests+chunks on R2.
+   reconcile its CHANGELOG `[Unreleased]` entry), flip out of draft, merge.
+   **Producer (hugit) ACCEPTED (2026-06-28):** `CheckDef.toolchain_ref = SnapshotReport.root` ratified — seam
+   now settled BOTH sides (producer + Runners consumer), zero drift. The operational `clw snapshot` + set is
+   queued downstream of the check-host (B) executing a real check (it waits on the runner fabric being live),
+   not a blocker today. ACK: `docs/REPLY-clw-TL-to-hugit-toolchain-ref-settled-2026-06-28.md`.
+   **Only open external thread = the Cache TL R2 confirm:** pin that hugit's snapshot target == the
+   check-host's hydrate source == an R2-backed CAS (hugit hot-CAS tenants `d863fafb` git / `3560e213` AC) —
+   `docs/RELAY-cache-TL-checkhost-r2-placement-2026-06-28.md`.
 
 1. **family-e2e (live cross-team E2E)** — clw READY (suites #66/#67 merged; CLI frozen; v0.1.3 digests handed
    over; M10 driver `scripts/family-e2e.sh` built). Tracked in `docs/family-e2e-STATUS.md`. **Single blocker
