@@ -637,6 +637,97 @@ fn redact_endpoint_for_display(ep: &str) -> String {
     ep.to_string()
 }
 
+/// Redeem a single-use, lease-bound credential ticket for a per-job CAS PAT
+/// (C2c env-0). `clw` calls this ONCE at the trusted boot (runner ref-domain,
+/// before any untrusted `clw run`): the fabric injected `CLW_CRED_TICKET` instead
+/// of `CLW_TOKEN`, and this exchanges it at
+/// `POST {fabric_endpoint}/v1/leases/{lease_id}/cas-cred` (the ticket IS the auth,
+/// carried in the JSON body — not a bearer) for the scope-narrowed PAT in the 200
+/// `{"cas_pat": ...}`.
+///
+/// **Fail-closed:** any non-2xx (`410` reused, `401` bad ticket, `404`
+/// unknown/not-Held, or a transport error) is an error — the caller MUST NOT fall
+/// back to an env token. The returned PAT is held in memory only. The ticket is
+/// never logged; on a plaintext-endpoint refusal only the redacted endpoint is shown.
+pub async fn redeem_cred_ticket(
+    fabric_endpoint: &str,
+    lease_id: &str,
+    ticket: &str,
+) -> Result<String> {
+    // Same plaintext refusal as HttpClient: the ticket (and the returned PAT) are
+    // PAT-equivalent secrets, so require https:// (loopback http:// only for tests).
+    let ep = fabric_endpoint.trim();
+    if !is_safe_https(ep) && !is_loopback_http(ep) {
+        return Err(ClwError::Transport(format!(
+            "refusing to redeem a cred ticket over plaintext: CLW_FABRIC_ENDPOINT must be https:// with no embedded credentials (got '{}'); http:// is only allowed for loopback",
+            redact_endpoint_for_display(ep)
+        )));
+    }
+    // `lease_id` is interpolated RAW into the URL path — reject a value that could
+    // mangle it (it is fabric-injected and trusted, but this mirrors the tenant
+    // path-injection guard and fails loud rather than silently misrouting).
+    if lease_id.is_empty()
+        || lease_id.contains('/')
+        || lease_id
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(ClwError::Config(
+            "invalid CLW_LEASE_ID for cred redemption: must be non-empty and contain no '/', whitespace, or control characters".to_string(),
+        ));
+    }
+    let url = format!(
+        "{}/v1/leases/{}/cas-cred",
+        ep.trim_end_matches('/'),
+        lease_id
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        // Same single-origin no-redirect posture as HttpClient (SSRF/secret-leak safe).
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| ClwError::Transport(e.to_string()))?;
+
+    // Build the JSON body manually (reqwest's `.json()`/`.json().await` need the
+    // `json` feature, which the workspace reqwest doesn't enable — avoid coupling
+    // this to a shared dependency's feature set).
+    let payload = serde_json::json!({ "ticket": ticket }).to_string();
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|e| ClwError::Transport(format!("cred-ticket redemption transport error: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // Fail-closed. Deliberately terse (no body echo) — the response could carry
+        // sensitive detail, and the caller never falls back to CLW_TOKEN regardless.
+        return Err(ClwError::Transport(format!(
+            "cred-ticket redemption failed: HTTP {} (fail-closed; no CLW_TOKEN fallback in the runner ref-domain)",
+            status.as_u16()
+        )));
+    }
+
+    // Parse via Value to avoid coupling to a serde-derive feature; extract `cas_pat`.
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ClwError::Transport(format!("cred-ticket response read error: {e}")))?;
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| ClwError::Transport(format!("cred-ticket response parse error: {e}")))?;
+    let pat = body
+        .get("cas_pat")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ClwError::Transport("cred-ticket 200 missing a non-empty `cas_pat`".to_string())
+        })?;
+    Ok(pat.to_string())
+}
+
 /// Generous ceiling for a single list page (D-7/D-8): ≤1000 small JSON items per
 /// page, so 16 MiB is orders of magnitude above any legitimate page while still
 /// bounding a hostile/buggy server's response.
@@ -1231,6 +1322,113 @@ mod tests {
             redact_endpoint_for_display("ht!tp://user:secret@host/x"),
             "ht!tp://<redacted>@host/x"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // redeem_cred_ticket (C2c env-0)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn redeem_refuses_plaintext_fabric_endpoint() {
+        // A non-loopback http:// fabric base is refused BEFORE any request (the
+        // ticket + returned PAT are PAT-equivalent secrets).
+        let err = redeem_cred_ticket("http://fabric.example.com", "lease1", "tkt")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => {
+                assert!(
+                    m.contains("plaintext"),
+                    "expected a plaintext refusal, got: {m}"
+                )
+            }
+            other => panic!("expected Transport plaintext refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redeem_happy_path_returns_cas_pat() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/lease-xyz/cas-cred"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"cas_pat":"per-job-pat-abc"}"#),
+            )
+            .mount(&server)
+            .await;
+        let pat = redeem_cred_ticket(&server.uri(), "lease-xyz", "the-ticket")
+            .await
+            .expect("redeem should succeed");
+        assert_eq!(pat, "per-job-pat-abc");
+    }
+
+    #[tokio::test]
+    async fn redeem_410_reuse_is_fail_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/lease-1/cas-cred"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "lease-1", "reused")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => assert!(m.contains("410"), "expected HTTP 410, got: {m}"),
+            other => panic!("expected Transport fail-closed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redeem_200_missing_cas_pat_is_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/l/cas-cred"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"nope":"x"}"#))
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "l", "t")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => assert!(m.contains("cas_pat"), "got: {m}"),
+            other => panic!("expected missing-cas_pat error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redeem_rejects_path_injection_lease_id() {
+        // A lease id with a '/' would mangle the URL path — rejected before any
+        // request (loopback endpoint passes the plaintext gate, so this exercises
+        // the lease-id guard specifically).
+        let err = redeem_cred_ticket("http://127.0.0.1:1", "bad/lease", "t")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Config(m) => assert!(m.contains("CLW_LEASE_ID"), "got: {m}"),
+            other => panic!("expected a lease-id config error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redeem_does_not_follow_redirects_and_fails_closed() {
+        // With redirects disabled, a 3xx is surfaced as a non-success → fail-closed
+        // (never chased to another host carrying the ticket/PAT).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/l/cas-cred"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.example/"),
+            )
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "l", "t")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => assert!(m.contains("302"), "expected HTTP 302, got: {m}"),
+            other => panic!("expected fail-closed on 3xx, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

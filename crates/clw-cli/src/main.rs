@@ -323,6 +323,20 @@ fn command_runs_on_broken_config(cmd: &Commands) -> bool {
     }
 }
 
+/// Whether `cmd` should redeem the C2c credential (`CLW_CRED_TICKET`) at boot.
+///
+/// The ticket is **single-use** — redeeming it burns it — so ONLY commands that
+/// actually make a CAS/AC network call may redeem. A no-network diagnostic
+/// (`doctor`/`auth whoami`/`auth logout`) or the cleanup path (`uninstall`) must
+/// NOT redeem, or it would consume the ticket the real `snapshot`/`hydrate`/`run`
+/// workload needs (leaving that workload to fail-closed on the fabric's `410`).
+/// (`completions` never reaches credential resolution — it returns earlier.)
+/// This is a no-op off the broker path (`resolve_credential` does nothing when no
+/// ticket was injected), so it only matters in the runner ref-domain.
+fn command_redeems_credential(cmd: &Commands) -> bool {
+    !command_runs_on_broken_config(cmd) && !matches!(cmd, Commands::Uninstall(_))
+}
+
 /// What to do when STRICT config resolution fails, decided purely from the command.
 /// Extracted as a pure classifier so the exit-code contract is unit-testable without
 /// spawning the binary or constructing a failing config.
@@ -383,7 +397,7 @@ async fn main() {
     //     and make NO network call; they must run on the exact broken/half-
     //     configured config a user invokes them to diagnose or repair, resolving
     //     missing tenant/token to `<unset>` rather than erroring out.
-    let resolved = match ResolvedConfig::resolve(&cli) {
+    let mut resolved = match ResolvedConfig::resolve(&cli) {
         Ok(c) => c,
         Err(e) => match classify_resolve_failure(&cli.command) {
             ResolveFailure::UninstallLenient => {
@@ -417,6 +431,28 @@ async fn main() {
             ResolveFailure::Fatal => exit_err(&e),
         },
     };
+
+    // C2c env-0 (runner ref-domain): redeem the single-use cred ticket at the
+    // trusted boot — before dispatch, and before `clw run` execs the untrusted
+    // child. Gated to commands that make a CAS/AC call, so a no-network
+    // diagnostic never burns the single-use ticket. No-op on the default path.
+    // Fail-closed, classified like a config failure: for `clw run` a redeem
+    // failure is a "child never ran" → the RESERVED 125 (never the generic 2 a
+    // child can return); otherwise the normal fatal exit.
+    if command_redeems_credential(&cli.command) {
+        if let Err(e) = resolved.resolve_credential().await {
+            match classify_resolve_failure(&cli.command) {
+                ResolveFailure::RunInternalNotRun => {
+                    eprintln!(
+                        "[clw] internal error — child not run: {}",
+                        actionable_error(&e)
+                    );
+                    std::process::exit(subcmds::run::CLW_RUN_INTERNAL_NOT_RUN);
+                }
+                _ => exit_err(&e),
+            }
+        }
+    }
 
     // Resolve the color policy once (flag > NO_COLOR env > non-TTY). clw emits
     // no ANSI today, so this currently only documents/guarantees the contract.
@@ -501,6 +537,29 @@ mod tests {
     fn other_network_commands_stay_fatal_exit_2() {
         let ls = Cli::try_parse_from(["clw", "ls"]).unwrap();
         assert_eq!(classify_resolve_failure(&ls.command), ResolveFailure::Fatal);
+    }
+
+    // C2c (cold-review B1): the single-use cred ticket must be redeemed ONLY by a
+    // command that makes a CAS/AC call — a no-network diagnostic (or uninstall)
+    // must NOT redeem and burn the ticket the real workload needs.
+    #[test]
+    fn credential_redeem_gated_to_network_commands() {
+        for (argv, redeems) in [
+            (vec!["clw", "snapshot", "--name", "w", "."], true),
+            (vec!["clw", "run", "--input", "f", "--", "true"], true),
+            (vec!["clw", "ls"], true),
+            (vec!["clw", "doctor"], false),
+            (vec!["clw", "auth", "whoami"], false),
+            (vec!["clw", "auth", "logout"], false),
+            (vec!["clw", "uninstall"], false),
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            assert_eq!(
+                command_redeems_credential(&cli.command),
+                redeems,
+                "{argv:?} redeem-gating wrong (a no-network command must NOT burn the ticket)"
+            );
+        }
     }
 
     #[test]

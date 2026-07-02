@@ -27,6 +27,33 @@ const DEFAULT_CACHE_DIR: &str = "~/.clw/cache";
 // ResolvedConfig
 // ---------------------------------------------------------------------------
 
+/// Runner ref-domain credential-broker inputs (C2c env-0). When the fabric arms
+/// C2c it injects a single-use, lease-bound `CLW_CRED_TICKET` (NOT the PAT) plus
+/// the lease id and the `corelink-fabricd` base; `clw` redeems the ticket ONCE at
+/// the trusted boot (before any untrusted `clw run`) for a scope-narrowed per-job
+/// CAS PAT held in process memory only — see [`ResolvedConfig::resolve_credential`].
+pub struct BrokerCred {
+    /// `corelink-fabricd` base URL (`CLW_FABRIC_ENDPOINT`) hosting the redeem route.
+    pub fabric_endpoint: String,
+    /// The lease this container is bound to (`CLW_LEASE_ID`).
+    pub lease_id: String,
+    /// The single-use redemption ticket (`CLW_CRED_TICKET`) — the auth, not a PAT.
+    pub ticket: String,
+}
+
+// Manual Debug: redact the ticket (a single-use secret) while showing the
+// non-secret fabric_endpoint + lease_id — mirroring `Config`'s redacting Debug so
+// the ticket never appears in logs/diagnostics.
+impl std::fmt::Debug for BrokerCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerCred")
+            .field("fabric_endpoint", &self.fabric_endpoint)
+            .field("lease_id", &self.lease_id)
+            .field("ticket", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Fully resolved configuration ready to hand off to subcommands.
 pub struct ResolvedConfig {
     pub clw_config: Config,
@@ -37,6 +64,12 @@ pub struct ResolvedConfig {
     /// it as a diagnostic instead of silently falling back to `user`. `None` on
     /// the strict path (which errors on an invalid value before reaching here).
     pub ref_domain_invalid: Option<String>,
+    /// C2c env-0: `Some` when the CAS PAT must be redeemed from the credential
+    /// broker at the trusted boot (runner ref-domain + an injected
+    /// `CLW_CRED_TICKET`) — `clw_config.token` stays empty until
+    /// [`resolve_credential`](ResolvedConfig::resolve_credential) fills it. `None`
+    /// = the static token is already in `clw_config.token` (the default path).
+    pub broker: Option<BrokerCred>,
 }
 
 impl ResolvedConfig {
@@ -73,19 +106,6 @@ impl ResolvedConfig {
         // `../other`) fails early (exit 2) with an actionable message.
         validate_tenant(&tenant)?;
 
-        // NEVER print the token; only validate it is present.
-        let token = cli
-            .token
-            .clone()
-            .or_else(|| corelink_env("CORELINK_TOKEN"))
-            .or_else(|| file_cfg.get("token").cloned())
-            .ok_or_else(|| {
-                ClwError::Config(
-                    "missing token: set --token, CLW_TOKEN/CORELINK_TOKEN, or add token to ~/.clw/config.toml"
-                        .to_string(),
-                )
-            })?;
-
         let cache_dir_str = cli
             .cache_dir
             .clone()
@@ -100,6 +120,34 @@ impl ResolvedConfig {
                 .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
         )?;
 
+        // Credential resolution. Default path (user/check/hermetic, OR a runner
+        // still on the legacy env-PAT rollout): the `CLW_TOKEN` chain, byte-identical
+        // to the pre-broker client. C2c env-0 path (runner ref-domain AND the fabric
+        // injected a `CLW_CRED_TICKET`): the PAT is NOT in the env — capture the
+        // broker inputs now and redeem the single-use ticket later at the trusted
+        // boot (`resolve_credential`), fail-closed, never falling back to `CLW_TOKEN`.
+        // The decision is a pure fn (`resolve_credential_inputs`) so it is unit-tested
+        // without touching process env.
+        let (token, broker) = resolve_credential_inputs(
+            ref_domain,
+            corelink_env("CLW_CRED_TICKET"),
+            corelink_env("CLW_LEASE_ID"),
+            corelink_env("CLW_FABRIC_ENDPOINT"),
+            || {
+                // NEVER print the token; only validate it is present.
+                cli.token
+                    .clone()
+                    .or_else(|| corelink_env("CORELINK_TOKEN"))
+                    .or_else(|| file_cfg.get("token").cloned())
+                    .ok_or_else(|| {
+                        ClwError::Config(
+                            "missing token: set --token, CLW_TOKEN/CORELINK_TOKEN, or add token to ~/.clw/config.toml"
+                                .to_string(),
+                        )
+                    })
+            },
+        )?;
+
         Ok(ResolvedConfig {
             clw_config: Config {
                 endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -111,7 +159,29 @@ impl ResolvedConfig {
             // Strict resolve errors on an invalid ref-domain above, so by here it
             // was always valid.
             ref_domain_invalid: None,
+            broker,
         })
+    }
+
+    /// Resolve the CAS PAT into `clw_config.token`, redeeming the C2c credential
+    /// broker ticket when armed. MUST be called after [`resolve`] and BEFORE any
+    /// CAS/AC request — and, for `clw run`, before the untrusted child is exec'd
+    /// (the `CLI-SURFACE-EXIT-FREEZE` ordering: snapshot → hydrate → run).
+    ///
+    /// - Default path (`broker == None`): no-op — the static token is already set.
+    /// - C2c env-0 path (`broker == Some`): redeem the single-use, lease-bound
+    ///   ticket ONCE at this trusted boot for a scope-narrowed per-job PAT, stored
+    ///   in `clw_config.token` (process memory only). **Fail-closed**: any redeem
+    ///   error propagates — there is NO fallback to `CLW_TOKEN` (which is absent
+    ///   under C2c). A second redemption would hit the fabric's single-use `410`,
+    ///   so this is called exactly once.
+    pub async fn resolve_credential(&mut self) -> Result<(), ClwError> {
+        if let Some(b) = &self.broker {
+            let pat =
+                clw_client::redeem_cred_ticket(&b.fabric_endpoint, &b.lease_id, &b.ticket).await?;
+            self.clw_config.token = pat;
+        }
+        Ok(())
     }
 
     /// Resolve config LENIENTLY for LOCAL-ONLY subcommands that operate on
@@ -179,6 +249,9 @@ impl ResolvedConfig {
             },
             ref_domain,
             ref_domain_invalid,
+            // Lenient consumers (doctor/logout/whoami) make NO network call, so
+            // there is never a broker redemption on this path.
+            broker: None,
         }
     }
 
@@ -211,6 +284,51 @@ impl ResolvedConfig {
 /// namespace (server D-9 dispatch-time env injection).
 fn corelink_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Decide the credential path from the resolved ref-domain and the (optionally
+/// injected) C2c broker env values. **Pure** (no env / no I/O) so it is unit-tested
+/// directly — [`resolve`](ResolvedConfig::resolve) supplies the real env reads.
+///
+/// Returns `(token, broker)`:
+/// - **C2c env-0 path** — `RefDomain::Runner` AND a `ticket` present: returns an
+///   empty token + the [`BrokerCred`] to redeem later. **Fail-closed** — a ticket
+///   with a missing lease-id or fabric-endpoint is a hard error, never a silent
+///   fall-through to the static token.
+/// - **Default path** — everything else: resolves the static token eagerly via
+///   `static_token` (byte-identical to the pre-broker client), `broker == None`.
+fn resolve_credential_inputs(
+    ref_domain: RefDomain,
+    ticket: Option<String>,
+    lease_id: Option<String>,
+    fabric_endpoint: Option<String>,
+    static_token: impl FnOnce() -> Result<String, ClwError>,
+) -> Result<(String, Option<BrokerCred>), ClwError> {
+    match (ref_domain, ticket) {
+        (RefDomain::Runner, Some(ticket)) => {
+            let lease_id = lease_id.ok_or_else(|| {
+                ClwError::Config(
+                    "C2c: CLW_CRED_TICKET is set but CLW_LEASE_ID is missing (fail-closed)"
+                        .to_string(),
+                )
+            })?;
+            let fabric_endpoint = fabric_endpoint.ok_or_else(|| {
+                ClwError::Config(
+                    "C2c: CLW_CRED_TICKET is set but CLW_FABRIC_ENDPOINT (the corelink-fabricd base) is missing (fail-closed)"
+                        .to_string(),
+                )
+            })?;
+            Ok((
+                String::new(),
+                Some(BrokerCred {
+                    fabric_endpoint,
+                    lease_id,
+                    ticket,
+                }),
+            ))
+        }
+        _ => Ok((static_token()?, None)),
+    }
 }
 
 /// Parse the ref-domain selector (`--ref-domain` / `CLW_REF_DOMAIN` / config
@@ -1631,5 +1749,84 @@ cache_dir = "~/.clw/cache"
         // $HOME present → it wins over %USERPROFILE% (unix-correct precedence).
         std::env::set_var("HOME", "/primary/home");
         assert_eq!(home_dir(), Some(PathBuf::from("/primary/home")));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_credential_inputs (C2c env-0) — pure, no process env touched
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cred_user_domain_uses_static_token() {
+        let (token, broker) = resolve_credential_inputs(
+            RefDomain::User,
+            Some("tkt".into()), // a ticket present is IGNORED off the runner domain
+            Some("lease".into()),
+            Some("https://fab".into()),
+            || Ok("static-pat".to_string()),
+        )
+        .unwrap();
+        assert_eq!(token, "static-pat");
+        assert!(broker.is_none());
+    }
+
+    #[test]
+    fn cred_runner_without_ticket_is_legacy_static_path() {
+        // A runner still on the env-PAT rollout (no ticket injected) is byte-identical
+        // to the old behavior: static token, no broker.
+        let (token, broker) =
+            resolve_credential_inputs(RefDomain::Runner, None, None, None, || {
+                Ok("legacy-pat".to_string())
+            })
+            .unwrap();
+        assert_eq!(token, "legacy-pat");
+        assert!(broker.is_none());
+    }
+
+    #[test]
+    fn cred_runner_with_full_ticket_is_broker_and_never_reads_static_token() {
+        // env-0: the static-token closure MUST NOT be consulted (a runner container
+        // has no CLW_TOKEN) — panic if it is.
+        let (token, broker) = resolve_credential_inputs(
+            RefDomain::Runner,
+            Some("the-ticket".into()),
+            Some("lease-123".into()),
+            Some("https://fabricd.example".into()),
+            || panic!("static token MUST NOT be read on the broker path (env-0)"),
+        )
+        .unwrap();
+        assert!(
+            token.is_empty(),
+            "PAT is empty until redeemed at the trusted boot"
+        );
+        let b = broker.expect("broker inputs captured");
+        assert_eq!(b.ticket, "the-ticket");
+        assert_eq!(b.lease_id, "lease-123");
+        assert_eq!(b.fabric_endpoint, "https://fabricd.example");
+    }
+
+    #[test]
+    fn cred_runner_ticket_missing_lease_is_fail_closed() {
+        let err = resolve_credential_inputs(
+            RefDomain::Runner,
+            Some("tkt".into()),
+            None, // lease missing
+            Some("https://fab".into()),
+            || panic!("must not fall back to a static token"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClwError::Config(m) if m.contains("CLW_LEASE_ID")));
+    }
+
+    #[test]
+    fn cred_runner_ticket_missing_fabric_is_fail_closed() {
+        let err = resolve_credential_inputs(
+            RefDomain::Runner,
+            Some("tkt".into()),
+            Some("lease".into()),
+            None, // fabric endpoint missing
+            || panic!("must not fall back to a static token"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClwError::Config(m) if m.contains("CLW_FABRIC_ENDPOINT")));
     }
 }

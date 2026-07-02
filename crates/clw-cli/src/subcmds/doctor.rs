@@ -223,6 +223,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            broker: None,
             ref_domain_invalid: None,
         }
     }
@@ -356,6 +357,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            broker: None,
             ref_domain_invalid: None,
         }
     }
@@ -389,6 +391,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            broker: None,
             ref_domain_invalid: None,
         };
         let problems = config_problems(&cfg);
@@ -410,6 +413,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/clw-cache"),
             },
             ref_domain: clw_types::RefDomain::User,
+            broker: None,
             ref_domain_invalid: Some("bogus".into()),
         };
         let problems = config_problems(&cfg);
