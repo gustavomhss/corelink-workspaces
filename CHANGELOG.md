@@ -28,6 +28,13 @@
 - **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an atomic
   rm-then-write within the one command (vs the manual `rm`-then-snapshot, where a crash between the two
   leaves no ref). Re-snapshotting *identical* content needs neither — see Changed.
+- **C2c credential-source: single-use cred-ticket redemption for untrusted runner boots (#165).** When a
+  runner ref-domain (`CLW_REF_DOMAIN=runner`) is injected with a `CLW_CRED_TICKET` + `CLW_LEASE_ID` +
+  `CLW_FABRIC_ENDPOINT` instead of a static `CLW_TOKEN`, clw redeems the ticket ONCE at trusted boot
+  (`POST {CLW_FABRIC_ENDPOINT}/v1/leases/{lease_id}/cas-cred`, ticket in the body) into a scope-narrowed
+  CAS PAT — so the PAT never lives in the untrusted container env. Fail-closed (no `CLW_TOKEN` fallback once
+  a ticket is present); only network commands redeem (a no-network `doctor`/`whoami` never burns the
+  single-use ticket); the ticket is never logged (redacting `Debug`). Unlocks the runner-fabric env-0 boot.
 
 ### Changed
 - **Re-snapshotting identical content is now a no-op success** (was HTTP 409). The most natural loop —
