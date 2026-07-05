@@ -23,6 +23,8 @@
 - **`quinn-proto` bumped 0.11.14 → 0.11.15** for **RUSTSEC-2026-0185** (remote memory exhaustion, HIGH).
   Lockfile-only; the crate is a phantom dependency (`reqwest`'s unused HTTP/3 feature), so there is no
   compiled path into the binary — this keeps the supply-chain gate green and the patched dep in the lock.
+- **`anyhow` bumped 1.0.102 → 1.0.103** for **RUSTSEC-2026-0190** (unsoundness in `Error::downcast_mut()`,
+  advisory 2026-06-25). Lockfile-only; keeps the release supply-chain gate green on the patched release.
 
 ### Added
 - **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an atomic
