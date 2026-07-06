@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.5] — content-addressed hydrate by manifest digest (2026-07-06)
+
+> The W6 deliverable: `clw hydrate --manifest-digest` unblocks the CF-native check-host image, which
+> hydrates a toolchain snapshot from a content-addressed `toolchain_ref = <digest>` at container start.
+> Additive under the CLI surface freeze — no existing flag, behavior, or exit code changed. The by-digest
+> path re-verifies the fetched manifest against the supplied digest **before** any filesystem write, and
+> reuses the identical path-escape / symlink-containment validators as the named-ref path.
+
 ### Added
 - **`clw hydrate --manifest-digest <HEX>`** — materialize a snapshot **directly by its content-addressed
   manifest digest**, as an alternative to `--name <NAME>` (mutually exclusive; exactly one required). The
