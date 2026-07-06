@@ -44,6 +44,17 @@
    NOW mock-first (no clw blocker) — `RELAY-runner-TL-family-e2e-binary-ready-2026-06-21.md`. When the 6
    PATs land: run #67 per tier tenant + live conformance in REQUIRE mode, report in the STATUS ledger.
 
+0-bis. **Check-host toolchain resolver seam (NEW thread, 2026-06-26)** — Runners TL's CF-native check-host
+   needs a `toolchain_ref → content` resolver (their ASK `corelink-runners/docs/handoff/2026-06-26-ASK-cache-
+   clw-tl-toolchain-resolver-seam.md`). **Answered (option b):** a toolchain = a `clw snapshot`;
+   `toolchain_ref` = its manifest digest; the `{content_key,size}` layer list falls straight out of the
+   manifest entries; materialize with `clw hydrate` (not a reimpl). Reply: `docs/REPLY-clw-TL-toolchain-
+   resolver-seam-2026-06-26.md`. **clw deliverable = one small seam**, `clw hydrate --manifest-digest <D>
+   <dest>` (inject root directly, skip AC name lookup; existing materialize path) — plugs into their **W6**,
+   land on their timeline (no surface ahead of a consumer). **Needs from others:** producer (githugr/hugit)
+   sets `CheckDef.toolchain_ref` = the snapshot digest; Cache TL confirms manifests+chunks live on R2 (zero-
+   egress). Awaiting owner to courier the reply + the two confirms.
+
 1. **Release v0.1.4** — **STAGED on branch `release/v0.1.4-prep` / PR #151**: `Cargo.toml` bumped to 0.1.4
    (+ 11 `clw-*` in `Cargo.lock`), CHANGELOG `[Unreleased]` finalized as `[0.1.4]`. Once merged + hosted
    Actions minutes return, the cut is ONE step: `git tag -a v0.1.4 -m "clw 0.1.4" && git push origin v0.1.4`

@@ -18,9 +18,16 @@
   Both are additive (new flag / a former error path now succeeding) and so are permitted under
   this freeze; no frozen exit code or arg meaning changed.
 
-### `clw hydrate <DEST> --name <NAME>`
+### `clw hydrate <DEST> (--name <NAME> | --manifest-digest <HEX>)`
 - `DEST` — positional, destination directory (must not exist or be empty) (`…/subcmds/hydrate.rs`).
-- `--name <NAME>` — **required**, the workspace name to materialize.
+- `--name <NAME>` — the workspace name to materialize (one of `--name` / `--manifest-digest`, required).
+- **ADDITIVE (post-freeze — new alternative flag, not a contract change):**
+  - `--manifest-digest <HEX>` — materialize a snapshot **directly by its manifest digest**, skipping the
+    named-ref (AC) lookup. Mutually exclusive with `--name`; exactly one of the two is required. The fetched
+    manifest is verified to hash to the digest (self-verifying: the ref equals the content key). This is the
+    content-addressed seam a runner uses when it already holds the digest (e.g. `toolchain_ref = <digest>`
+    for the CF-native check-host). Purely additive (a new flag + a new way to identify the same snapshot),
+    so permitted under the freeze. See `docs/REPLY-clw-TL-toolchain-resolver-seam-2026-06-26.md`.
 
 ### `clw run --input <PATH>… --env <KEY>… -- <CMD>…`
 - `--input <PATH>` — repeatable; the file/dir paths that form the memoization key (`…/subcmds/run.rs`).

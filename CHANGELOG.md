@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`clw hydrate --manifest-digest <HEX>`** — materialize a snapshot **directly by its content-addressed
+  manifest digest**, as an alternative to `--name <NAME>` (mutually exclusive; exactly one required). The
+  fetched manifest is verified to hash to the supplied digest, so the reference is self-verifying — the ref
+  *is* the content. This is the content-addressed hydrate seam for callers that already hold the digest
+  (e.g. a CF-native check-host hydrating `toolchain_ref = <digest>`); it skips the named-ref (AC) lookup
+  entirely. Additive flag under the CLI freeze — see `docs/REPLY-clw-TL-toolchain-resolver-seam-2026-06-26.md`.
+
 ## [0.1.4] — post-launch hardening: data-safety, fuzzing, daily conformance canary (2026-06-21)
 
 > Staged and tag-ready: `Cargo.toml` is bumped to 0.1.4. The release is cut with

@@ -620,10 +620,41 @@ mod tests {
         match &cli.command {
             Commands::Hydrate(a) => {
                 assert_eq!(a.dest, std::path::PathBuf::from("/out"));
-                assert_eq!(a.name, "ws");
+                assert_eq!(a.name.as_deref(), Some("ws"));
+                assert_eq!(a.manifest_digest, None);
             }
             other => panic!("expected Hydrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_hydrate_by_manifest_digest() {
+        let cli = Cli::try_parse_from(["clw", "hydrate", "/out", "--manifest-digest", "deadbeef"])
+            .unwrap();
+        match &cli.command {
+            Commands::Hydrate(a) => {
+                assert_eq!(a.name, None);
+                assert_eq!(a.manifest_digest.as_deref(), Some("deadbeef"));
+            }
+            other => panic!("expected Hydrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hydrate_requires_one_source() {
+        // Neither --name nor --manifest-digest → clap rejects.
+        assert!(Cli::try_parse_from(["clw", "hydrate", "/out"]).is_err());
+        // Both at once → mutually exclusive, clap rejects.
+        assert!(Cli::try_parse_from([
+            "clw",
+            "hydrate",
+            "/out",
+            "--name",
+            "ws",
+            "--manifest-digest",
+            "deadbeef",
+        ])
+        .is_err());
     }
 
     #[test]

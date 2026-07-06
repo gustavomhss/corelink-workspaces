@@ -156,6 +156,14 @@ pub struct HydrateOptions {
     pub concurrency: usize,
     /// Ref keyspace the ref is looked up in (default [`RefDomain::User`]).
     pub ref_domain: RefDomain,
+    /// Hydrate DIRECTLY from this manifest digest, skipping the AC name→ref
+    /// resolution entirely. When `Some`, `workspace_name`/`ref_domain` are not
+    /// used to fetch a [`RefRecord`] — the digest IS the root. The fetched
+    /// manifest is still verified to hash to this digest (self-verifying: the
+    /// ref equals the content key), so a hostile/buggy CAS cannot substitute a
+    /// different manifest. This is the seam a content-addressed caller uses when
+    /// it already holds the manifest digest (e.g. `toolchain_ref = <digest>`).
+    pub root_override: Option<Digest>,
 }
 
 impl HydrateOptions {
@@ -165,6 +173,19 @@ impl HydrateOptions {
             workspace_name: name.into(),
             concurrency: 8,
             ref_domain: RefDomain::User,
+            root_override: None,
+        }
+    }
+
+    /// Create options that hydrate DIRECTLY from a manifest `root` digest,
+    /// bypassing the named-ref AC lookup. The fetched manifest is verified to
+    /// hash to `root` (the digest is self-verifying).
+    pub fn from_manifest_digest(root: Digest) -> Self {
+        Self {
+            workspace_name: String::new(),
+            concurrency: 8,
+            ref_domain: RefDomain::User,
+            root_override: Some(root),
         }
     }
 
@@ -233,26 +254,38 @@ where
     }
 
     // ------------------------------------------------------------------
-    // 2a. Fetch RefRecord from AC.
+    // 2a. Resolve the root manifest digest.
+    //
+    // Two paths: either a caller-supplied manifest digest (content-addressed
+    // hydrate — skip the AC entirely), or the usual name→RefRecord lookup. Both
+    // converge on a single `root` that 2b then fetches + integrity-checks, so
+    // the manifest-digest path inherits the SAME verification as the named path.
     // ------------------------------------------------------------------
-    let ref_key = clw_types::ref_key_in(opts.ref_domain, &opts.workspace_name);
-    let ref_bytes = AcTransport::get(client, &ref_key)
-        .await?
-        .ok_or(ClwError::NotFound(ref_key))?;
-    let record = RefRecord::from_bytes(&ref_bytes)?;
+    let root = match opts.root_override {
+        Some(root) => root,
+        None => {
+            let ref_key = clw_types::ref_key_in(opts.ref_domain, &opts.workspace_name);
+            let ref_bytes = AcTransport::get(client, &ref_key)
+                .await?
+                .ok_or(ClwError::NotFound(ref_key))?;
+            RefRecord::from_bytes(&ref_bytes)?.root
+        }
+    };
 
     // ------------------------------------------------------------------
     // 2b. Fetch manifest blob from CAS; parse.
     // ------------------------------------------------------------------
-    let manifest_bytes = CasTransport::get(client, &record.root).await?;
-    // SECURITY (M1.7): re-verify the whole manifest blob against record.root
-    // BEFORE parsing — symmetric to the per-chunk integrity check in
-    // fetch_chunk. A hostile or buggy CasTransport must not be able to
-    // substitute a different manifest than the one the RefRecord pins.
+    let manifest_bytes = CasTransport::get(client, &root).await?;
+    // SECURITY (M1.7): re-verify the whole manifest blob against `root` BEFORE
+    // parsing — symmetric to the per-chunk integrity check in fetch_chunk. A
+    // hostile or buggy CasTransport must not be able to substitute a different
+    // manifest than the one the root pins. For the manifest-digest path this is
+    // exactly what makes a caller-supplied `toolchain_ref` self-verifying: the
+    // bytes we hydrate provably hash to the digest the caller asked for.
     let actual = Digest::of_bytes(&manifest_bytes);
-    if actual != record.root {
+    if actual != root {
         return Err(ClwError::Integrity {
-            expected: record.root,
+            expected: root,
             actual,
         });
     }
@@ -444,7 +477,7 @@ where
     let _ = cache.gc_to_budget();
 
     Ok(HydrateReport {
-        root: record.root,
+        root,
         files: files_count.load(std::sync::atomic::Ordering::Relaxed),
         bytes_total: manifest.total_size,
         bytes_from_cache: bytes_from_cache.load(std::sync::atomic::Ordering::Relaxed),
@@ -938,6 +971,91 @@ mod tests {
             let mb = manifest.canonical_bytes().unwrap();
             Digest::of_bytes(&mb)
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1b: hydrate DIRECTLY from a manifest digest — with an EMPTY AC.
+    // Proves `HydrateOptions::from_manifest_digest` performs zero named-ref
+    // lookup (the content-addressed seam behind `clw hydrate --manifest-digest`,
+    // e.g. a runner hydrating `toolchain_ref = <digest>`).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn hydrate_by_manifest_digest_needs_no_ref() {
+        let data = b"toolchain-payload".as_ref();
+        let (d, bytes) = make_chunk(data);
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![Entry::File {
+                path: "bin/rustc".into(),
+                mode: 0o755,
+                size: data.len() as u64,
+                chunks: vec![ChunkRef {
+                    digest: d,
+                    size: data.len() as u64,
+                }],
+            }],
+        };
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let root = Digest::of_bytes(&manifest_bytes);
+
+        // CAS holds the manifest + its chunk; the AC is left EMPTY (no RefRecord).
+        let store = FakeStore::new();
+        store.cas_put_raw(d, bytes);
+        store.cas_put_raw(root, manifest_bytes);
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::from_manifest_digest(root);
+        let report = hydrate(&dest, &store, &cache, &opts).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("bin/rustc")).unwrap(),
+            data,
+            "materialised content"
+        );
+        assert_eq!(
+            std::fs::metadata(dest.join("bin/rustc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "exec bit preserved"
+        );
+        assert_eq!(report.files, 1);
+        assert_eq!(
+            report.root, root,
+            "report echoes the requested manifest digest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1c: a manifest-digest hydrate is self-verifying — if the CAS bytes at
+    // the requested key do NOT hash to it, the pre-parse integrity check rejects.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn hydrate_by_manifest_digest_rejects_mismatched_bytes() {
+        // The digest of the REAL manifest bytes, but seed the CAS at that key
+        // with different (tampered) bytes.
+        let (root, _real) = make_chunk(b"the real manifest bytes");
+        let store = FakeStore::new();
+        store.cas_put_raw(root, b"tampered-not-the-manifest".to_vec());
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::from_manifest_digest(root);
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::Integrity { .. }),
+            "mismatched manifest bytes must be rejected as Integrity, got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
