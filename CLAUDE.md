@@ -9,7 +9,9 @@ content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + ten
 (never `x-corelink-tenant-id`). Config is env-driven (`CLW_ENDPOINT/CLW_TENANT/CLW_TOKEN/CLW_REF_DOMAIN`),
 no config file required. Single human owner = Gustavo (stakeholder + approver).
 
-**Status: SHIPPED — v0.1.0 is live (open beta, 2026-06-18).** `brew install humanguardrail/clw/clw`.
+**Status: SHIPPED — v0.1.5 is live (open beta; v0.1.0 launched 2026-06-18, v0.1.5 cut 2026-07-06).**
+`brew install humanguardrail/clw/clw`. v0.1.5 ships `clw hydrate --manifest-digest` (#153, the W6
+content-addressed-hydrate deliverable that unblocks the runners' CF-native check-host image).
 
 ## Build / test / gate
 - The repo gate is `bash verify.sh` (FULL) or `bash verify.sh --scoped [base]` (change-scoped fast lane).
