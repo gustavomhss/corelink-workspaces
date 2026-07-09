@@ -103,7 +103,11 @@ impl Governor {
     /// under the lock so the available-permit read and the `target`/`debt`
     /// writes form a single consistent transaction.
     fn on_throttle(&self) {
-        let mut state = self.state.lock().expect("governor lock poisoned");
+        // Poison-tolerant: recover the inner guard if a previous holder panicked.
+        // The state is just AIMD counters/timestamps — a slightly stale counter is
+        // harmless, and recovering here stops a one-shot panic from cascading into
+        // a process-wide request abort (every CAS/AC call would else `.expect`-panic).
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let new = (state.target / 2).max(1);
         if new < state.target {
             let mut to_reclaim = state.target - new;
@@ -124,7 +128,7 @@ impl Governor {
     /// Record a success; after a run of [`AIMD_INCREASE_AFTER_SUCCESSES`],
     /// additively increase the target by one toward the ceiling — never beyond.
     fn on_success(&self) {
-        let mut state = self.state.lock().expect("governor lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.successes += 1;
         if state.successes >= AIMD_INCREASE_AFTER_SUCCESSES as usize && state.target < self.ceiling
         {
@@ -137,7 +141,7 @@ impl Governor {
     /// Current target window size — for tests/observability.
     #[cfg(test)]
     fn target(&self) -> usize {
-        self.state.lock().expect("governor lock poisoned").target
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).target
     }
 }
 
@@ -155,7 +159,7 @@ impl Drop for GovernorPermit {
         };
         // Pay down shrink-debt first: forget this permit instead of returning it.
         // The decision and the decrement happen together under the lock.
-        let mut state = self.gov.state.lock().expect("governor lock poisoned");
+        let mut state = self.gov.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.debt > 0 {
             state.debt -= 1;
             drop(state);
@@ -2995,6 +2999,41 @@ mod rate_limit_tests {
             gov.target(),
             8,
             "additive increase is capped at the ceiling"
+        );
+    }
+
+    /// LOW-governor-poison regression: a panic while holding the governor lock
+    /// poisons the `Mutex`. With the pre-fix `.expect("governor lock poisoned")`
+    /// EVERY subsequent governor op would panic on `.lock()` — a one-shot panic
+    /// cascading into a process-wide CAS/AC request abort. Poison-tolerant
+    /// recovery (`unwrap_or_else(|e| e.into_inner())`) must degrade instead:
+    /// after the lock is poisoned, `on_throttle` / `on_success` / `target`
+    /// still SUCCEED (do not panic). RED-on-revert: restoring the `.expect(...)`
+    /// makes every assertion below panic.
+    #[test]
+    fn governor_lock_poison_is_tolerated_not_cascaded() {
+        let gov = std::sync::Arc::new(super::Governor::new(8));
+
+        // Poison the mutex: a spawned thread panics while holding the state lock.
+        let g = std::sync::Arc::clone(&gov);
+        let handle = std::thread::spawn(move || {
+            let _guard = g.state.lock().expect("first lock never poisoned");
+            panic!("intentional panic while holding the governor lock (poisons it)");
+        });
+        assert!(handle.join().is_err(), "the poisoning thread should panic");
+        // Sanity: the mutex is now genuinely poisoned.
+        assert!(
+            gov.state.lock().is_err(),
+            "the governor mutex must be poisoned after the holder panicked"
+        );
+
+        // The fix: every governor op recovers the inner guard instead of panicking.
+        gov.on_throttle(); // would `.expect`-panic pre-fix
+        gov.on_success(); // would `.expect`-panic pre-fix
+        let t = gov.target(); // would `.expect`-panic pre-fix
+        assert!(
+            (1..=8).contains(&t),
+            "governor still functions after poison recovery; target in [1,8], got {t}"
         );
     }
 

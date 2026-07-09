@@ -46,17 +46,19 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
     // not a candidate. The reverse order (mark, then list blobs) would sweep a
     // concurrently-pushed ref's blobs as orphans — live-data loss.
     //
-    // RESIDUAL (documented, not closed client-side): two distinct skew cases can
-    // turn a live blob into a false orphan, both bounded by dry-run-by-default and
-    // the store's last-write-wins semantics:
+    // RESIDUAL (documented, not closed client-side): one skew case can still turn
+    // a live blob into a false orphan, bounded by dry-run-by-default and the
+    // store's last-write-wins semantics:
     //   1. A push whose blobs were already in CAS before T0 but whose ref write
     //      lands AFTER the mark read can still have those blobs swept.
-    //   2. A ref whose record GETs 404 mid-mark (see `compute_live_set`) is
-    //      SKIPPED. That is usually a benign concurrent `rm`, but it can ALSO be
-    //      AC replica-lag / read-after-write skew (the ref exists but a lagging
-    //      replica answered 404). In that case the ref contributes nothing to the
-    //      live set and its blobs become false orphans, deletable under `--yes`.
-    // The fully-correct fix for both is a server-side GC lease/epoch (a
+    // The M10 case — a ref whose record GETs 404 mid-mark (AC replica-lag /
+    // read-after-write skew, the ref exists but a lagging replica answered 404) —
+    // is NO LONGER a residual: `compute_live_set` now ABORTS the whole prune with
+    // a `live_set_incomplete` error rather than skipping the ref (which would have
+    // swept its still-referenced blobs as false orphans under `--yes`). We cannot
+    // read the ref, so we cannot know which blobs it protects; the only safe action
+    // is to refuse to sweep and re-run when reads are consistent.
+    // The fully-correct fix for residual (1) is a server-side GC lease/epoch (a
     // corelink-server item). Until then `prune` is dry-run-by-default: run it in a
     // low-write window, review the dry-run first, and rely on last-write-wins (a
     // concurrent re-push restores any blob a prune raced) to bound the exposure.
@@ -205,26 +207,30 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
 /// the live set is INCOMPLETE — proceeding would sweep that ref's live blobs as
 /// false orphans. We therefore ABORT the whole mark with a `live_set_incomplete`
 /// error that NAMES the offending ref, rather than returning a partial set. A ref
-/// that 404s on its record GET mid-walk is SKIPPED (it contributes nothing), not
-/// treated as corruption — aborting on every concurrent `rm` would be too brittle.
-/// CAVEAT: that 404 is USUALLY a benign concurrent `rm`, but it can ALSO be AC
+/// that 404s on its record GET mid-walk ALSO aborts (M10): a 404 makes the live
+/// set NOT provably complete, and we cannot read the ref to learn which blobs it
+/// protects. The 404 is USUALLY a benign concurrent `rm`, but it can ALSO be AC
 /// replica-lag / read-after-write skew (the ref still exists; a lagging replica
-/// answered 404). In the skew case the ref's blobs become false orphans, so the
-/// skip is NOT unconditionally safe — the exposure is bounded by dry-run-by-default
-/// and the store's last-write-wins (a re-push restores a raced blob). See the
-/// RESIDUAL note in `run` for the full skew model.
+/// answered 404) — in which case SKIPPING it would sweep its still-referenced
+/// blobs as false orphans under `--yes` (live-data loss). Because we cannot tell
+/// the two apart from a 404 alone, the fail-safe action is to refuse to sweep and
+/// re-run when reads are consistent. See the RESIDUAL note in `run`.
 async fn compute_live_set<C: AcTransport + CasTransport>(
     client: &C,
 ) -> Result<HashSet<Digest>, ClwError> {
     let mut live = HashSet::new();
 
     for key in AcTransport::list_refs(client).await? {
-        // A ref whose record GETs 404 mid-walk contributes nothing, so it is
-        // skipped. USUALLY a benign concurrent `rm`; can also be AC replica-lag
-        // (read-after-write skew), in which case its blobs become false orphans —
-        // bounded by dry-run-default + last-write-wins (see the RESIDUAL note in `run`).
+        // FAIL-SAFE (M10): a ref that `list_refs` enumerated but whose record GET
+        // returns 404 mid-mark makes the computed live set NOT provably complete.
+        // We CANNOT read the ref, so we cannot know which blobs it protects. Under
+        // read-after-write / AC replica lag the ref STILL EXISTS on the primary (a
+        // lagging replica answered 404), so skipping it would omit its still-
+        // referenced blobs from the live set and `prune --yes` would sweep them as
+        // false orphans — live-data loss. The only safe action is to refuse to
+        // sweep: ABORT the whole mark (deletes NOTHING) and name the offending ref.
         let Some(bytes) = AcTransport::get(client, &key).await? else {
-            continue;
+            return Err(live_set_incomplete_lagging_replica(&key.to_hex()));
         };
         // From here on, ANY failure to resolve this ref to a parsed manifest
         // means the live set is incomplete: abort and NAME the ref. Pruning on a
@@ -300,6 +306,23 @@ fn live_set_incomplete(ref_label: &str, why: &str) -> ClwError {
     ))
 }
 
+/// Build the fail-safe abort (M10) for a ref that `list_refs` enumerated but
+/// whose record GET returned 404 mid-mark. Under read-after-write / AC replica
+/// lag the ref still exists on the primary while a lagging replica answers 404,
+/// so its still-referenced blobs must NOT be swept as false orphans. Since the
+/// ref is unreadable we cannot know which blobs it protects — the only safe
+/// action is to refuse to sweep and re-run when reads are consistent. Carries the
+/// `live set is incomplete` token so the caller's fail-safe branch catches it and
+/// deletes nothing.
+fn live_set_incomplete_lagging_replica(ref_label: &str) -> ClwError {
+    ClwError::Message(format!(
+        "refusing to prune: the live set is incomplete — ref '{ref_label}' read returned 404 \
+         mid-mark, so the set of reachable blobs cannot be computed in full. A lagging replica \
+         may still reference its blobs (read-after-write skew), which would then be swept as \
+         false orphans. NOTHING was deleted. Re-run prune when reads are consistent."
+    ))
+}
+
 /// True if the error is the fail-safe incomplete-live-set abort raised by
 /// [`compute_live_set`] for an unresolvable ref.
 fn is_live_set_incomplete(err: &ClwError) -> bool {
@@ -347,6 +370,11 @@ mod tests {
     struct FakeStore {
         cas: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
         ac: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        // Ref keys that `list_refs` REPORTS but that `AcTransport::get` 404s on
+        // (they are absent from `ac`) — simulates read-after-write / AC replica
+        // lag: the ref was enumerated on the primary but a lagging replica answers
+        // 404 on its record GET.
+        lagging_ref_keys: Arc<Mutex<Vec<Digest>>>,
     }
 
     #[async_trait::async_trait]
@@ -389,7 +417,11 @@ mod tests {
             Ok(())
         }
         async fn list_refs(&self) -> ClwResult<Vec<Digest>> {
-            Ok(self.ac.lock().unwrap().keys().copied().collect())
+            let mut keys: Vec<Digest> = self.ac.lock().unwrap().keys().copied().collect();
+            // Lagging-replica keys are enumerated but NOT in `ac`, so a subsequent
+            // `get` 404s (returns None) — the read-after-write skew of M10.
+            keys.extend(self.lagging_ref_keys.lock().unwrap().iter().copied());
+            Ok(keys)
         }
     }
 
@@ -516,6 +548,78 @@ mod tests {
         assert!(
             is_live_set_incomplete(&err),
             "neither-RefRecord-nor-RunRecord bytes must abort as incomplete, got: {err:?}"
+        );
+    }
+
+    // M10 — a ref that `list_refs` enumerated but whose record GET 404s mid-mark
+    // (AC replica lag / read-after-write skew) must ABORT the live-set mark, NOT be
+    // silently skipped. Skipping omits the ref's still-referenced blobs from the
+    // live set, so they appear as orphans and `prune --yes` DELETES them — live-data
+    // loss. Since the ref is unreadable we cannot know which blobs it protects, so
+    // the only safe action is to refuse to sweep. RED-on-revert: restoring the old
+    // `continue` skip makes `compute_live_set` return Ok (a partial live set), so
+    // `expect_err` below fails; and `run` reaches its delete loop and sweeps the
+    // protected blob.
+    #[tokio::test]
+    async fn lagging_replica_404_ref_aborts_prune_and_deletes_nothing() {
+        let store = FakeStore::default();
+
+        // A blob a still-live-but-lagging ref would protect. Under the old skip it
+        // is absent from the live set → an orphan → `prune --yes` would delete it.
+        let protected = Digest::of_bytes(b"still-referenced by a lagging ref");
+        CasTransport::put(
+            &store,
+            &protected,
+            b"still-referenced by a lagging ref".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        // The ref EXISTS on the primary (list_refs reports it) but a lagging replica
+        // answers 404 on its record GET (absent from `ac`).
+        let lagging_key = Digest::of_bytes(b"lagging-ref-key");
+        store.lagging_ref_keys.lock().unwrap().push(lagging_key);
+
+        // Drive the REAL mark phase. A 404 mid-mark must ABORT, not return a partial
+        // (skipped) live set.
+        let err = compute_live_set(&store)
+            .await
+            .expect_err("a 404 mid-mark must abort as 'live set incomplete', not skip");
+
+        // It is the fail-safe abort the caller catches to delete NOTHING: `run` only
+        // reaches its delete loop when `compute_live_set` returns Ok, so this Err
+        // means `prune --yes` deletes no blob.
+        assert!(
+            is_live_set_incomplete(&err),
+            "404 mid-mark must abort as incomplete, got: {err:?}"
+        );
+
+        // The error is actionable: names the ref, flags the lagging-replica cause,
+        // the 404, that nothing was deleted, and the re-run guidance.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&lagging_key.to_hex()),
+            "must name the offending ref: {msg}"
+        );
+        assert!(msg.contains("404"), "must state the 404: {msg}");
+        assert!(
+            msg.to_lowercase().contains("replica"),
+            "must flag the lagging-replica cause: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("nothing was deleted"),
+            "must state nothing was deleted: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("re-run"),
+            "must give re-run guidance: {msg}"
+        );
+
+        // Concretely, no blob was swept: `compute_live_set` does not delete, and its
+        // abort stops `run` before the delete loop, so the protected blob survives.
+        assert!(
+            CasTransport::exists(&store, &protected).await.unwrap(),
+            "the protected blob must NOT be deleted under replica lag"
         );
     }
 

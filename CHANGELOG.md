@@ -1,6 +1,60 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] — 5-angle adversarial audit remediation
+
+> A ruthless 5-lens audit (correctness · security · robustness · performance · honesty) of the shipped
+> binary, then a fix wave under independent cold review per change. No CRITICAL: the integrity core
+> (digest-verify-before-write, path/symlink containment, the exit-125 contract) held. The fixes below
+> close the real HIGH/MED/LOW findings in producer bookkeeping, the `run` child lifecycle, and
+> concurrency shape. All additive under the CLI-surface freeze — no flag/behavior/exit-code contract broken.
+
+### Security
+- **`clw run` no longer leaks the CAS credential into the untrusted child's environment.** The child is
+  spawned with the credential-bearing vars (`CLW_TOKEN` / `CORELINK_TOKEN` / `CLW_CRED_TICKET` /
+  `CLW_LEASE_ID` / `CLW_FABRIC_ENDPOINT` and namesakes) stripped, so untrusted CI code can no longer read
+  the bearer token/ticket from its env. Non-secret config (`CLW_ENDPOINT`/`CLW_TENANT`/…) and `PATH`/`HOME`
+  are preserved so builds still run. (HIGH.)
+- **`clw doctor` / `clw auth whoami` / `clw auth login` redact embedded endpoint userinfo.** An endpoint
+  configured as `https://user:secret@host` no longer prints its `user:secret@` userinfo in text or `--json`
+  — including the support-bundle output meant to be pasted into a ticket. Redaction takes the *last*
+  authority `@`, so a password that itself contains `@` cannot leak. The real endpoint is still stored to
+  config unchanged; only the echo is redacted. (MED.)
+- **Cache blobs are owner-only.** Cache blob files are created `0600` and the cache tree is hardened to
+  `0700` on every init (not only via `auth login`/`init`), so a snapshot/hydrate-only user on a shared host
+  no longer exposes workspace content to other local uids. (LOW.)
+
+### Fixed
+- **`clw snapshot` can no longer publish an unrestorable snapshot.** Each File's `size` and the manifest
+  `total_size` are now derived from the actual chunked bytes (Σ chunk sizes), not walk-time metadata — so a
+  file that changes size between the directory walk and the read can no longer yield a manifest whose
+  `total_size` disagrees with its chunks and is rejected by *every* future `hydrate`. The manifest digest is
+  unchanged for unchanged input. (HIGH.)
+- **`clw run` no longer hangs forever on a backgrounded grandchild.** A child that leaves a daemon or
+  `make -j` sub-job holding the stdout/stderr pipe (e.g. `sh -c 'svc & exit 0'`) no longer wedges clw: once
+  the direct child exits, a bounded drain grace collects the child's real output and stops. Fast and
+  cap-exceeded paths unchanged. (HIGH.)
+- **`clw prune` no longer sweeps live blobs under replica lag.** A ref whose record 404s mid-mark (a lagging
+  replica) makes the live-set provably incomplete; prune now aborts and deletes nothing in both dry-run and
+  `--yes`, with an actionable, re-runnable error, instead of treating that ref's blobs as orphans. (MED.)
+- **`clw snapshot --force` re-run is idempotent.** A lost-ACK retry of the create-only ref PUT that 409s is
+  reconciled by reading the existing ref: identical content is an idempotent success; only a genuine
+  difference surfaces the `--force` guidance — removing the spurious "workspace already exists" on a
+  brand-new name. (MED.)
+- **`clw hydrate` fsyncs each file before its rename** (durability against a torn file on power loss),
+  surfaces a real permission/IO error on the destination instead of a misleading "not empty", and removes
+  its temp file on a mid-write failure. (MED/LOW.)
+- **The AIMD request governor tolerates a poisoned lock** (recovers the guard) instead of cascading a single
+  panic into a process-wide request abort. (LOW.)
+- **Exit-code contract hardened** (per `docs/CLI-SURFACE-EXIT-FREEZE.md`): a panic during `clw run` setup now
+  surfaces the reserved `125` (child-never-ran), not a raw `101`; a child killed by clw for oversized output
+  maps to a distinct `137` (SIGKILL), never the reserved `125`; neither is cached. (LOW.)
+
+### Performance
+- **`clw snapshot` uploads chunks with global concurrency across files** (one shared semaphore) instead of
+  one-file-at-a-time, so a tree of many small files finally parallelizes; the manifest digest is
+  schedule-independent (byte-identical), and repeated chunks are de-duplicated within a run. (HIGH.)
+- **`clw hydrate` fetches a file's chunks concurrently and in order**, so a workspace of a few large blobs
+  (e.g. the runner's toolchain image) no longer downloads chunk-by-chunk at 1-deep. (MED.)
 
 ## [0.1.5] — content-addressed hydrate by manifest digest (2026-07-06)
 
@@ -45,9 +99,11 @@
   advisory 2026-06-25). Lockfile-only; keeps the release supply-chain gate green on the patched release.
 
 ### Added
-- **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an atomic
-  rm-then-write within the one command (vs the manual `rm`-then-snapshot, where a crash between the two
-  leaves no ref). Re-snapshotting *identical* content needs neither — see Changed.
+- **`clw snapshot --force`** — replace an existing workspace name whose content differs, via an rm-then-write
+  within the one command. (Correction: this is a sub-second window, **not** atomic — a crash between the rm
+  and the write can still leave no ref, the same failure as the manual `rm`-then-snapshot, just narrower.
+  The Unreleased section adds an idempotent-409 recovery for the lost-ACK retry case.) Re-snapshotting
+  *identical* content needs neither — see Changed.
 - **C2c credential-source: single-use cred-ticket redemption for untrusted runner boots (#165).** When a
   runner ref-domain (`CLW_REF_DOMAIN=runner`) is injected with a `CLW_CRED_TICKET` + `CLW_LEASE_ID` +
   `CLW_FABRIC_ENDPOINT` instead of a static `CLW_TOKEN`, clw redeems the ticket ONCE at trusted boot

@@ -240,16 +240,29 @@ where
     // 1. Safety: dest must not exist or be empty.
     // ------------------------------------------------------------------
     if dest.exists() {
-        // Allow an *empty* directory; reject anything else.
-        let is_empty = dest.is_dir()
-            && std::fs::read_dir(dest)
-                .map(|mut rd| rd.next().is_none())
-                .unwrap_or(false);
-        if !is_empty {
+        // Allow an *empty* directory; reject anything else. A real read_dir
+        // failure (permission denied, transient IO error on `dest`) must
+        // surface AS an IO/permission error — NOT be silently collapsed into
+        // "destination not empty", which would misreport the cause. The old
+        // `.map(...).unwrap_or(false)` swallowed exactly that error.
+        if !dest.is_dir() {
             return Err(ClwError::Io(std::io::Error::new(
                 ErrorKind::AlreadyExists,
                 "destination not empty",
             )));
+        }
+        // `?` propagates a genuine open/permission error on `dest`.
+        let mut rd = std::fs::read_dir(dest)?;
+        match rd.next() {
+            None => {} // genuinely-empty directory — proceed.
+            Some(Ok(_)) => {
+                return Err(ClwError::Io(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "destination not empty",
+                )));
+            }
+            // An IO error surfacing mid-enumeration is a real error too.
+            Some(Err(e)) => return Err(ClwError::Io(e)),
         }
     }
 
@@ -331,13 +344,14 @@ where
     // bypass (tiny declared total, huge real chunks). Reject before any FS work.
     //
     // V1 (audit pass-2): the STRICT equality is correct and must NOT be relaxed.
-    // By construction in the producer (clw-snapshot `build_manifest_local` /
-    // `snapshot`), `total_size` is `Σ File.size` over File entries only, and each
-    // File's `size` equals the sum of its chunk sizes because the chunks tile that
-    // file's content byte-for-byte (chunk_bytes / chunk_stream). Symlink and Dir
-    // entries contribute nothing to either side (they have no chunks AND are not
-    // added to total_size). Hence `total_size == Σ ChunkRef.size` exactly for any
-    // legitimate manifest, so `!=` can never spuriously reject a well-formed one.
+    // The producer (clw-snapshot) sets each `File.size` FROM the summed sizes of
+    // that file's chunks, and sets the manifest `total_size` FROM the sum of those
+    // per-file sizes over File entries only — so both figures are DERIVED from the
+    // same chunk sizes rather than measured independently. Symlink and Dir entries
+    // contribute nothing to either side (they have no chunks AND are not added to
+    // total_size). Hence `total_size == Σ ChunkRef.size` holds exactly for any
+    // legitimately-produced manifest, so `!=` can never spuriously reject a
+    // well-formed one; a divergence is a genuine tamper/inconsistency signal.
     if manifest.total_size != real_total_bytes {
         return Err(ClwError::InvalidManifest(format!(
             "manifest total_size ({}) disagrees with the sum of its chunk sizes ({real_total_bytes}); \
@@ -383,48 +397,56 @@ where
 
     // ------------------------------------------------------------------
     // 3b. Files — bounded concurrency via buffer_unordered.
+    //
+    // LOW (2× manifest RAM): borrow the File entries straight out of
+    // `manifest.entries` instead of cloning each `path` + `chunks` Vec into an
+    // owned `file_entries`. The clone doubled peak RSS on a huge manifest (every
+    // ChunkRef duplicated alongside the parsed manifest). The stream is driven to
+    // completion below, before `manifest` is dropped, so borrowing is sound —
+    // nothing is spawned onto another task.
     // ------------------------------------------------------------------
-    let file_entries: Vec<_> = manifest
-        .entries
-        .iter()
-        .filter_map(|e| {
-            if let Entry::File {
-                path,
-                mode,
-                size,
-                chunks,
-            } = e
-            {
-                Some((path.clone(), *mode, *size, chunks.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
     let dest_arc = Arc::new(dest.to_path_buf());
     let bfc = Arc::clone(&bytes_from_cache);
     let bfd = Arc::clone(&bytes_downloaded);
     let fc = Arc::clone(&files_count);
+    // Same knob hydrate uses across files, threaded down for per-file chunk
+    // concurrency (M9).
+    let concurrency = opts.concurrency;
 
-    // Build a stream of futures — one per file.
+    // Build a stream of futures — one per file, borrowing from `manifest`.
     // Each future returns (bytes_from_cache, bytes_downloaded) for that file.
-    let stream =
-        futures::stream::iter(file_entries.into_iter().map(|(path, mode, _size, chunks)| {
-            let dest_arc = Arc::clone(&dest_arc);
-            let bfc = Arc::clone(&bfc);
-            let bfd = Arc::clone(&bfd);
-            let fc = Arc::clone(&fc);
-            async move {
-                let (from_cache, downloaded) =
-                    materialize_file(dest_arc.as_ref(), &path, mode, &chunks, client, cache)
-                        .await?;
-                bfc.fetch_add(from_cache, std::sync::atomic::Ordering::Relaxed);
-                bfd.fetch_add(downloaded, std::sync::atomic::Ordering::Relaxed);
-                fc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok::<(), ClwError>(())
-            }
-        }));
+    let stream = futures::stream::iter(manifest.entries.iter().filter_map(|e| {
+        if let Entry::File {
+            path, mode, chunks, ..
+        } = e
+        {
+            Some((path.as_str(), *mode, chunks.as_slice()))
+        } else {
+            None
+        }
+    }))
+    .map(|(path, mode, chunks)| {
+        let dest_arc = Arc::clone(&dest_arc);
+        let bfc = Arc::clone(&bfc);
+        let bfd = Arc::clone(&bfd);
+        let fc = Arc::clone(&fc);
+        async move {
+            let (from_cache, downloaded) = materialize_file(
+                dest_arc.as_ref(),
+                path,
+                mode,
+                chunks,
+                concurrency,
+                client,
+                cache,
+            )
+            .await?;
+            bfc.fetch_add(from_cache, std::sync::atomic::Ordering::Relaxed);
+            bfd.fetch_add(downloaded, std::sync::atomic::Ordering::Relaxed);
+            fc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<(), ClwError>(())
+        }
+    });
 
     // Drive the stream with bounded concurrency.
     let mut buffered = stream.buffer_unordered(opts.concurrency);
@@ -486,6 +508,34 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Internal: RAII cleanup for the per-file temp
+//
+// A mid-file error (disk-full, a transport error on a LATER chunk, an integrity
+// mismatch) must not leave a half-written `.clw-tmp-*` stray under `dest`. This
+// guard removes the temp on any early return; on the success path we `disarm` it
+// after the temp has been renamed into its final place (so the rename target is
+// never touched).
+// ---------------------------------------------------------------------------
+struct TmpFileGuard {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TmpFileGuard {
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            // Best-effort: cleanup failure must not mask the original error.
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal: materialise one file
 //
 // Returns (bytes_from_cache, bytes_downloaded) tallied across all chunks.
@@ -496,6 +546,7 @@ async fn materialize_file<C>(
     rel_path: &str,
     mode: u32,
     chunks: &[clw_types::ChunkRef],
+    concurrency: usize,
     client: &C,
     cache: &LocalCache,
 ) -> Result<(u64, u64)>
@@ -525,13 +576,34 @@ where
         let tid = std::thread::current().id();
         parent.join(format!(".clw-tmp-{tid:?}-{nanos}-{seq}"))
     };
+    // LOW (temp cleanup): arm a drop-guard so any early return below removes the
+    // partially-written temp instead of leaking a `.clw-tmp-*` stray.
+    let mut tmp_guard = TmpFileGuard {
+        path: Some(tmp_path.clone()),
+    };
     let mut bytes_from_cache: u64 = 0;
     let mut bytes_downloaded: u64 = 0;
     {
         use std::io::Write as _;
         let mut f = std::fs::File::create(&tmp_path)?;
-        for chunk in chunks {
-            let (data, from_cache) = fetch_chunk(chunk.digest, client, cache).await?;
+        // M9: fetch this file's chunks with BOUNDED concurrency, but consume the
+        // results IN ORDER so the sequential in-offset writes stay byte-exact.
+        // `buffered(N)` keeps up to N fetches in flight (memory bounded — never a
+        // `collect` of the whole file) yet yields them in the chunk order, so a
+        // workspace of a FEW LARGE files no longer downloads at 1-deep. The
+        // concurrency knob is the same one hydrate uses across files.
+        let mut fetches = futures::stream::iter(chunks.iter().map(|chunk| {
+            let digest = chunk.digest;
+            let size = chunk.size;
+            async move {
+                let (data, from_cache) = fetch_chunk(digest, client, cache).await?;
+                Ok::<(Vec<u8>, bool, Digest, u64), ClwError>((data, from_cache, digest, size))
+            }
+        }))
+        .buffered(concurrency.max(1));
+
+        while let Some(res) = fetches.next().await {
+            let (data, from_cache, digest, size) = res?;
             // FIX F1 (integrity): the per-chunk digest is already re-verified in
             // fetch_chunk, but a chunk's ACTUAL byte length is never checked against
             // its DECLARED `ChunkRef.size`. The disk-fill budget (pass 2c) sums the
@@ -541,25 +613,39 @@ where
             // chunk. (Digest verification alone does NOT make this redundant: it
             // proves the bytes hash to `chunk.digest`, but the manifest's own
             // `ChunkRef.size` can still disagree with those bytes' length.)
-            if data.len() as u64 != chunk.size {
+            if data.len() as u64 != size {
                 return Err(ClwError::InvalidManifest(format!(
                     "chunk {} for file {rel_path:?} returned {} byte(s) but the manifest \
                      declares {} byte(s); refusing to hydrate a length-mismatched chunk",
-                    chunk.digest.to_hex(),
+                    digest.to_hex(),
                     data.len(),
-                    chunk.size
+                    size
                 )));
             }
             if from_cache {
-                bytes_from_cache += chunk.size;
+                bytes_from_cache += size;
             } else {
-                bytes_downloaded += chunk.size;
+                bytes_downloaded += size;
             }
             f.write_all(&data)?;
         }
         f.flush()?;
+        // M7 (durability): flush only reaches the page cache. fsync the data
+        // blocks BEFORE the rename so a power loss cannot leave the final-named
+        // file readable-but-zero/stale (hydrate never re-hashes on read, so a torn
+        // file would be silently trusted). sync_all covers data + metadata.
+        f.sync_all()?;
     }
     std::fs::rename(&tmp_path, &abs)?;
+    // The temp has been renamed into place — nothing to clean up.
+    tmp_guard.disarm();
+    // M7 (durability): best-effort fsync of the parent directory so the rename
+    // itself is durable (the new dir entry survives a crash). Some platforms /
+    // filesystems return an error for a directory fsync (e.g. Windows cannot fsync
+    // a directory handle opened this way); that is non-fatal, so ignore it.
+    if let Ok(dir) = std::fs::File::open(&parent) {
+        let _ = dir.sync_all();
+    }
     // SECURITY (M1.7): mask to permission bits only. An untrusted manifest must
     // not be able to create setuid/setgid/sticky files — strip everything above
     // the low 9 permission bits (0o777).
@@ -1855,4 +1941,234 @@ mod tests {
         expected.extend_from_slice(&b2);
         assert_eq!(std::fs::read(dest.join("multi.bin")).unwrap(), expected);
     }
+
+    // -----------------------------------------------------------------------
+    // Test 12 (M9): a multi-chunk file fetches its chunks with BOUNDED
+    // CONCURRENCY but writes them IN ORDER. The CAS below has INVERTED per-chunk
+    // latency (earlier chunks are SLOWER), so under an *unordered* buffer the
+    // later chunks would complete — and be written — first, scrambling the file.
+    // A byte-exact concat match proves the ordered `buffered` stream preserved
+    // offset order. RED-on-revert: swapping `buffered` → `buffer_unordered`
+    // reorders the writes and this concat assertion fails.
+    // -----------------------------------------------------------------------
+
+    /// A CAS fake that sleeps a per-digest delay before returning bytes, so chunk
+    /// completion order can be forced to DIFFER from submission order.
+    struct DelayStore {
+        cas: Mutex<HashMap<Digest, (Vec<u8>, u64)>>, // digest -> (bytes, delay_ms)
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for DelayStore {
+        async fn exists(&self, digest: &Digest) -> Result<bool> {
+            Ok(self.cas.lock().unwrap().contains_key(digest))
+        }
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            let (bytes, delay) = self
+                .cas
+                .lock()
+                .unwrap()
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))?;
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            Ok(bytes)
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            self.cas.lock().unwrap().insert(*digest, (bytes, 0));
+            Ok(())
+        }
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().unwrap().remove(digest);
+            Ok(())
+        }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().unwrap().keys().copied().collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn multichunk_file_fetches_concurrent_but_writes_in_order() {
+        const N: usize = 8;
+        // Distinct per-chunk payloads so ANY reorder is detectable in the concat.
+        let payloads: Vec<Vec<u8>> = (0..N)
+            .map(|i| format!("<<chunk-{i:02}-distinct-payload>>").into_bytes())
+            .collect();
+
+        let store = DelayStore {
+            cas: Mutex::new(HashMap::new()),
+        };
+        let mut chunks = Vec::new();
+        let mut expected = Vec::new();
+        for (i, p) in payloads.iter().enumerate() {
+            let d = Digest::of_bytes(p);
+            // INVERT latency: earlier chunks are SLOWER, so under an unordered
+            // buffer the later chunks would complete (and be written) FIRST.
+            let delay_ms = ((N - i) as u64) * 10;
+            store.cas.lock().unwrap().insert(d, (p.clone(), delay_ms));
+            chunks.push(ChunkRef {
+                digest: d,
+                size: p.len() as u64,
+            });
+            expected.extend_from_slice(p);
+        }
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path();
+
+        // Concurrency >= N so every chunk is in flight at once (max reorder pressure).
+        let (from_cache, downloaded) =
+            materialize_file(dest, "multi.bin", 0o644, &chunks, N + 4, &store, &cache)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("multi.bin")).unwrap(),
+            expected,
+            "chunks must be written in manifest order despite inverted fetch latency"
+        );
+        assert_eq!(from_cache, 0, "all chunks were cache misses");
+        assert_eq!(downloaded, expected.len() as u64, "all bytes downloaded");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 13 (LOW dest-guard): a real read_dir/permission error on `dest` must
+    // surface AS an IO/permission error — NOT be misreported as "destination not
+    // empty" (the old `.unwrap_or(false)` collapsed the two). Unix-only: we make
+    // `dest` mode-000 so opendir returns PermissionDenied. If the process can
+    // still read it (e.g. running as root, which bypasses perms) the guard cannot
+    // observe the error, so we skip.
+    // -----------------------------------------------------------------------
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_dest_surfaces_io_error_not_not_empty() {
+        let store = FakeStore::new();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root bypasses permission bits — the guard can't fail; restore + skip.
+        if std::fs::read_dir(&dest).is_ok() {
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        // Restore perms so the TempDir can clean up regardless of the outcome.
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match err {
+            ClwError::Io(ref e) => {
+                assert_eq!(
+                    e.kind(),
+                    ErrorKind::PermissionDenied,
+                    "a read_dir permission error must surface as PermissionDenied, got: {e}"
+                );
+                assert!(
+                    !e.to_string().contains("destination not empty"),
+                    "an IO/permission error must NOT be misreported as 'destination not empty': {e}"
+                );
+            }
+            other => panic!("expected ClwError::Io(PermissionDenied), got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14 (LOW temp-cleanup): a mid-file failure (a LATER chunk missing from
+    // CAS) must leave NO `.clw-tmp-*` stray under `dest`. We seed a two-chunk file
+    // but only the FIRST chunk, so the second fetch fails after the temp already
+    // holds chunk one — the drop-guard must remove it on the error path.
+    // RED-on-revert: dropping the guard leaks the temp and this scan finds it.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn mid_file_failure_leaves_no_tmp_stray() {
+        let (d1, b1) = make_chunk(b"first-chunk-bytes");
+        let second = b"second-chunk-never-seeded".as_ref();
+        let (d2, _b2) = make_chunk(second);
+        let declared = (b1.len() + second.len()) as u64;
+
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: declared,
+            entries: vec![Entry::File {
+                path: "big.bin".into(),
+                mode: 0o644,
+                size: declared,
+                chunks: vec![
+                    ChunkRef {
+                        digest: d1,
+                        size: b1.len() as u64,
+                    },
+                    ChunkRef {
+                        digest: d2,
+                        size: second.len() as u64,
+                    },
+                ],
+            }],
+        };
+
+        // Build the store inline: manifest + ref + ONLY the first chunk.
+        let store = FakeStore::new();
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let manifest_digest = Digest::of_bytes(&manifest_bytes);
+        store.cas_put_raw(manifest_digest, manifest_bytes.clone());
+        store.cas_put_raw(d1, b1.clone());
+        let record = RefRecord {
+            name: "test-ws".into(),
+            root: manifest_digest,
+            manifest_size: manifest_bytes.len() as u64,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "0.1.0".into(),
+        };
+        store.ac_put_raw(clw_types::ref_key("test-ws"), record.to_bytes().unwrap());
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let err = hydrate(&dest, &store, &cache, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::NotFound(_)),
+            "expected NotFound for the unseeded second chunk, got: {err}"
+        );
+
+        fn has_tmp_stray(dir: &Path) -> bool {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                if e.file_name().to_string_lossy().starts_with(".clw-tmp-") {
+                    return true;
+                }
+                if e.file_type().unwrap().is_dir() && has_tmp_stray(&e.path()) {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(
+            !has_tmp_stray(&dest),
+            "a mid-file failure must leave no .clw-tmp-* stray under dest"
+        );
+        assert!(
+            !dest.join("big.bin").exists(),
+            "the failed file must not be materialised"
+        );
+    }
+
+    // Note (M7 fsync durability): the `sync_all()` before rename + the best-effort
+    // parent-directory fsync harden hydrate against a torn file on power loss.
+    // That is a crash/power-loss durability property and is NOT observable from an
+    // in-process unit test (nothing here can drop write-back cache blocks while
+    // keeping rename metadata). The `full_hydrate_*`, `hydrate_rerun_heals_*`, and
+    // `multichunk_*` tests assert the file materialises byte-exactly; we honestly
+    // do NOT fake a power-loss assertion for the fsync itself.
 }

@@ -50,7 +50,9 @@ fn build_report_json(cfg: &ResolvedConfig) -> String {
         "config_file": config_file,
         "config_exists": config_exists,
         "config_mode": config_mode,
-        "endpoint": c.endpoint,
+        // M8: strip any embedded `user:pass@` userinfo before echoing the endpoint
+        // (doctor output is meant to be pasted into support tickets).
+        "endpoint": crate::redact_endpoint_for_display(&c.endpoint),
         "tenant": redact_present(&c.tenant),
         "tenant_value": if c.tenant.is_empty() { None } else { Some(c.tenant.clone()) },
         // NEVER print the token value — presence only.
@@ -95,7 +97,11 @@ fn build_report(cfg: &ResolvedConfig) -> String {
     }
 
     // --- resolved config (redacted) ----------------------------------------
-    out.push_str(&format!("endpoint:       {}\n", c.endpoint));
+    // M8: redact any embedded userinfo secret from the endpoint before printing.
+    out.push_str(&format!(
+        "endpoint:       {}\n",
+        crate::redact_endpoint_for_display(&c.endpoint)
+    ));
     out.push_str(&format!("tenant:         {}\n", redact_present(&c.tenant)));
     if !c.tenant.is_empty() {
         out.push_str(&format!("tenant value:   {}\n", c.tenant));
@@ -317,6 +323,48 @@ mod tests {
     fn redact_present_maps_correctly() {
         assert_eq!(redact_present(""), "<unset>");
         assert_eq!(redact_present("x"), "<set>");
+    }
+
+    /// A config whose endpoint smuggles a `user:pass@` credential.
+    fn cfg_with_userinfo_endpoint() -> ResolvedConfig {
+        ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://user:s3cret@host.example.com/v1".to_string(),
+                tenant: "acme-tenant".to_string(),
+                token: "tok".to_string(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+            ref_domain: clw_types::RefDomain::User,
+            broker: None,
+            ref_domain_invalid: None,
+        }
+    }
+
+    // M8 — a `CLW_ENDPOINT=https://user:s3cret@host` must NOT leak its embedded
+    // userinfo secret into the doctor text report (which is pasted into tickets).
+    #[test]
+    fn report_redacts_endpoint_userinfo() {
+        let report = build_report(&cfg_with_userinfo_endpoint());
+        assert!(
+            !report.contains("s3cret") && !report.contains("user:"),
+            "doctor report must NOT leak endpoint userinfo, got:\n{report}"
+        );
+        assert!(
+            report.contains("<redacted>@host.example.com"),
+            "endpoint userinfo must be redacted, got:\n{report}"
+        );
+    }
+
+    // M8 — same invariant for `doctor --json`.
+    #[test]
+    fn json_report_redacts_endpoint_userinfo() {
+        let report = build_report_json(&cfg_with_userinfo_endpoint());
+        assert!(
+            !report.contains("s3cret") && !report.contains("user:"),
+            "doctor --json must NOT leak endpoint userinfo, got:\n{report}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(v["endpoint"], "https://<redacted>@host.example.com/v1");
     }
 
     #[test]

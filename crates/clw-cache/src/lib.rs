@@ -93,17 +93,30 @@ impl LocalCache {
     /// call so that subsequent operations never need to mkdir at write time.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
+        let blobs = root.join("blobs");
         // Pre-create all 256 shard directories.
         for i in 0u16..=255 {
             let shard = format!("{:02x}", i);
-            fs::create_dir_all(root.join("blobs").join(&shard))?;
+            fs::create_dir_all(blobs.join(&shard))?;
         }
-        // Workspace content is private: keep the cache root owner-only (0700).
+        // Workspace content is private: harden the whole cache tree (root + blobs
+        // + every shard dir) to owner-only (0700) on EVERY init — not only via the
+        // config writers. A user who only ever runs snapshot/hydrate (never `auth
+        // login`/`init`, which is where `~/.clw` normally gets hardened) would
+        // otherwise leave the cache tree at the umask default (0755), letting
+        // another local uid read `~/.clw/cache/blobs/**`. `create_dir_all` above
+        // uses umask-derived perms, so we tighten explicitly here.
         // Best-effort — ignore the error on exotic filesystems that reject chmod.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+            let private = fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(&root, private.clone());
+            let _ = fs::set_permissions(&blobs, private.clone());
+            for i in 0u16..=255 {
+                let shard = format!("{:02x}", i);
+                let _ = fs::set_permissions(blobs.join(&shard), private.clone());
+            }
         }
 
         let cache = Self {
@@ -442,11 +455,19 @@ fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let name = format!("{TMP_PREFIX}{pid}-{tid:?}-{nanos}-{seq}");
         let path = dir.join(&name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        // Create the temp file owner-only (0600) on unix so the committed blob it
+        // becomes (via atomic rename, which preserves mode) is never group/world
+        // readable — even if the containing dir's 0700 hardening was defeated. The
+        // umask can only clear bits, and 0600 has no group/other bits, so the file
+        // lands at exactly 0600 regardless of the caller's umask.
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
             Ok(file) => return Ok(NamedTmpFile { file, path }),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 last_err = Some(e);
@@ -516,6 +537,53 @@ mod tests {
             mode & 0o077,
             0,
             "cache root must not be group/world accessible"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LOW-cache-perms: a committed blob file is owner-only (0600) and the cache
+    // root is 0700 — so a snapshot/hydrate-only user (who never runs `auth
+    // login`/`init`) does NOT leak content-addressed workspace file content to
+    // another local uid. Without the fix, blob temp files inherit the umask
+    // default (typically 0644, world-readable) and the root stays 0755.
+    // -----------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn put_blob_is_0600_and_cache_root_is_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        // Start from a deliberately loose root mode so the assertion proves `new`
+        // tightens it rather than merely inheriting a private TempDir.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+
+        let data = b"secret content-addressed workspace bytes";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        // The committed blob must be owner-only 0600 (no group/other bits).
+        let blob = cache.blob_path(&d);
+        let blob_mode = fs::metadata(&blob).unwrap().permissions().mode();
+        assert_eq!(
+            blob_mode & 0o777,
+            0o600,
+            "committed blob must be owner-only 0600, got {:o}",
+            blob_mode & 0o777
+        );
+        assert_eq!(
+            blob_mode & 0o077,
+            0,
+            "committed blob must not be group/world readable"
+        );
+
+        // The cache root must be hardened to 0700 on the snapshot/hydrate path.
+        let root_mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(
+            root_mode & 0o777,
+            0o700,
+            "cache root must be owner-only 0700, got {:o}",
+            root_mode & 0o777
         );
     }
 

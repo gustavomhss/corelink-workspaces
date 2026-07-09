@@ -290,6 +290,42 @@ fn exit_err(err: &ClwError) -> ! {
     std::process::exit(2);
 }
 
+/// Redact any embedded `user:pass@` userinfo from an endpoint string before it is
+/// printed to the user.
+///
+/// SECURITY (info-hygiene, M8): a misconfigured `CLW_ENDPOINT=https://user:s3cret@host`
+/// carries an embedded secret in its URL userinfo. `doctor`, `auth whoami`, and
+/// `auth login` all ECHO the resolved endpoint (text and `--json`), and `doctor`
+/// output is explicitly meant to be pasted into support tickets — so the userinfo
+/// must be stripped to `<redacted>` before display. Mirrors clw-client's
+/// network-plaintext-guard redactor; kept local here because that helper is private
+/// (replicating the tiny strip avoids opening a cross-crate seam). Best-effort,
+/// never panics. The stored/dialed endpoint is unaffected — only what is echoed.
+/// (The `CLW_TOKEN` PAT travels in the Authorization header, never the URL.)
+#[must_use]
+pub(crate) fn redact_endpoint_for_display(ep: &str) -> String {
+    let trimmed = ep.trim();
+    // Strip a leading `scheme://userinfo@` when the `@` precedes any path separator
+    // (so it is genuinely authority userinfo, not a later `@` in the path/query).
+    if let Some(scheme_end) = trimmed.find("://") {
+        let after = &trimmed[scheme_end + 3..];
+        let slash = after.find('/').unwrap_or(after.len());
+        // Take the LAST `@` WITHIN the authority (before any path). The password may
+        // itself contain an unencoded `@` (e.g. `user:p@ss@host`), so the userinfo
+        // ends at the final authority `@`, not the first — using the first `@` would
+        // leak the password tail. A `@` that appears only in the path is not authority
+        // userinfo and must not trigger redaction (rfind over `after[..slash]` == None).
+        if let Some(at) = after[..slash].rfind('@') {
+            return format!(
+                "{}://<redacted>@{}",
+                &trimmed[..scheme_end],
+                &after[at + 1..]
+            );
+        }
+    }
+    ep.to_string()
+}
+
 /// Produce a user-actionable error message for any `ClwError`.
 ///
 /// Falls back to the `Display` impl for errors that are already clear.
@@ -458,6 +494,28 @@ async fn main() {
     // no ANSI today, so this currently only documents/guarantees the contract.
     let _color = color_enabled(cli.no_color);
 
+    // LOW (docs/CLI-SURFACE-EXIT-FREEZE.md): a PANIC during `clw run` setup/dispatch
+    // is a clw-INTERNAL failure where the child NEVER ran. The default panic handler
+    // aborts the process with 101, which the runner classifies as neither a child
+    // exit code nor the reserved 125 → mis-attributed. Install a panic hook (run
+    // path only) that prints the normal panic message and then exits the RESERVED
+    // 125, so a clw-internal panic is surfaced exactly like every other "child never
+    // ran" failure and is never confused with a code the wrapped child returned.
+    if matches!(cli.command, Commands::Run(_)) {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            std::process::exit(subcmds::run::CLW_RUN_INTERNAL_NOT_RUN);
+        }));
+        // Test-only seam (debug builds only, never in a release binary): drive a
+        // clw-internal panic on the run dispatch path so the exit-125 mapping has a
+        // RED-on-revert end-to-end regression (see tests/e2e.rs).
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CLW_TEST_INTERNAL_PANIC").is_some() {
+            panic!("test-injected clw-internal panic on the run dispatch path");
+        }
+    }
+
     let result = dispatch(cli.command, resolved, cli.json, cli.concurrency).await;
     if let Err(e) = result {
         // `run` subcommand propagates child exit code differently (handled in subcmd).
@@ -504,6 +562,46 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The endpoint redactor must never leak userinfo for ANY authority shape — the
+    // cold review caught that a first-`@` scan leaked a password containing `@`.
+    #[test]
+    fn redact_endpoint_never_leaks_userinfo_for_any_authority_shape() {
+        // password containing an unencoded `@` — the regression vector (first-`@` leaked `ss:word`)
+        let r = redact_endpoint_for_display("https://user:p@ss:word@host");
+        assert_eq!(r, "https://<redacted>@host");
+        assert!(
+            !r.contains("ss:word") && !r.contains("user:"),
+            "leaked: {r}"
+        );
+        // canonical cases
+        assert_eq!(
+            redact_endpoint_for_display("https://user:s3cret@host"),
+            "https://<redacted>@host"
+        );
+        assert_eq!(
+            redact_endpoint_for_display("https://user:s3cret@host/v1"),
+            "https://<redacted>@host/v1"
+        );
+        assert_eq!(
+            redact_endpoint_for_display("https://s3cret@host"),
+            "https://<redacted>@host"
+        );
+        // IPv6 literal, with and without userinfo
+        assert_eq!(
+            redact_endpoint_for_display("https://user:pw@[::1]:8080"),
+            "https://<redacted>@[::1]:8080"
+        );
+        assert_eq!(
+            redact_endpoint_for_display("https://[::1]:8080"),
+            "https://[::1]:8080"
+        );
+        // an `@` only in the PATH is not authority userinfo — must NOT be redacted
+        assert_eq!(
+            redact_endpoint_for_display("https://host/path@thing"),
+            "https://host/path@thing"
+        );
+    }
 
     // FROZEN-CONTRACT REGRESSION (docs/CLI-SURFACE-EXIT-FREEZE.md): a `clw run` that
     // fails during config/identity resolution (before the child runs) must map to the

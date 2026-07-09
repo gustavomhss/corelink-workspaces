@@ -106,7 +106,9 @@ fn build_login_summary_json(cfg: &ResolvedConfig, wrote: &std::path::Path) -> se
     json!({
         "logged_in": true,
         "wrote": wrote.display().to_string(),
-        "endpoint": c.endpoint,
+        // M8: echo the endpoint with any embedded `user:pass@` userinfo stripped —
+        // the STORED value (in the 0600 file) keeps the real endpoint the user set.
+        "endpoint": crate::redact_endpoint_for_display(&c.endpoint),
         "tenant": c.tenant,
         // NEVER the value — presence only.
         "token": redact_present(&c.token),
@@ -143,7 +145,12 @@ fn login(cfg: &ResolvedConfig, json: bool) -> Result<(), ClwError> {
         println!("{}", build_login_summary_json(cfg, &path));
     } else {
         eprintln!("logged in — wrote identity to {}", path.display());
-        eprintln!("  endpoint: {}", c.endpoint);
+        // M8: redact any embedded userinfo secret from the echoed endpoint (the
+        // stored value in the 0600 file is left as the user configured it).
+        eprintln!(
+            "  endpoint: {}",
+            crate::redact_endpoint_for_display(&c.endpoint)
+        );
         eprintln!("  tenant:   {}", c.tenant);
         eprintln!("  token:    {}", redact_present(&c.token));
     }
@@ -284,7 +291,8 @@ fn confirm_clear(path: &std::path::Path) -> Result<bool, ClwError> {
 fn build_whoami_json(cfg: &ResolvedConfig) -> serde_json::Value {
     let c = &cfg.clw_config;
     json!({
-        "endpoint": c.endpoint,
+        // M8: strip any embedded `user:pass@` userinfo from the echoed endpoint.
+        "endpoint": crate::redact_endpoint_for_display(&c.endpoint),
         "tenant": c.tenant,
         // NEVER the value — presence only.
         "token": redact_present(&c.token),
@@ -313,7 +321,10 @@ fn whoami(cfg: &ResolvedConfig, json: bool) {
     if json {
         println!("{}", build_whoami_json(cfg));
     } else {
-        println!("endpoint: {}", or_not_configured(&c.endpoint));
+        // M8: redact any embedded userinfo secret before echoing the endpoint,
+        // while still flagging an unset endpoint as `<not configured>`.
+        let endpoint = crate::redact_endpoint_for_display(&c.endpoint);
+        println!("endpoint: {}", or_not_configured(&endpoint));
         println!("tenant:   {}", or_not_configured(&c.tenant));
         println!("token:    {}", redact_present(&c.token));
     }
@@ -417,6 +428,49 @@ mod tests {
         // And an unset token must redact to <unset>.
         let empty = cfg_with("");
         assert_eq!(build_whoami_json(&empty)["token"], "<unset>");
+    }
+
+    /// A config whose endpoint smuggles a `user:pass@` credential.
+    fn cfg_with_userinfo_endpoint() -> ResolvedConfig {
+        ResolvedConfig {
+            clw_config: Config {
+                endpoint: "https://user:s3cret@host.example.com/v1".to_string(),
+                tenant: "acme-tenant".to_string(),
+                token: "tok".to_string(),
+                cache_dir: PathBuf::from("/tmp/clw-cache"),
+            },
+            ref_domain: clw_types::RefDomain::User,
+            broker: None,
+            ref_domain_invalid: None,
+        }
+    }
+
+    // M8 — `auth whoami --json` must NOT leak an embedded endpoint userinfo secret.
+    #[test]
+    fn whoami_json_redacts_endpoint_userinfo() {
+        let out = build_whoami_json(&cfg_with_userinfo_endpoint());
+        let s = out.to_string();
+        assert!(
+            !s.contains("s3cret") && !s.contains("user:"),
+            "whoami JSON must NOT leak endpoint userinfo, got: {s}"
+        );
+        assert_eq!(out["endpoint"], "https://<redacted>@host.example.com/v1");
+    }
+
+    // M8 — `auth login --json` must NOT leak an embedded endpoint userinfo secret
+    // (the stored config keeps the real endpoint; only the echo is redacted).
+    #[test]
+    fn login_json_summary_redacts_endpoint_userinfo() {
+        let out = build_login_summary_json(
+            &cfg_with_userinfo_endpoint(),
+            std::path::Path::new("/tmp/config.toml"),
+        );
+        let s = out.to_string();
+        assert!(
+            !s.contains("s3cret") && !s.contains("user:"),
+            "login JSON must NOT leak endpoint userinfo, got: {s}"
+        );
+        assert_eq!(out["endpoint"], "https://<redacted>@host.example.com/v1");
     }
 
     // login summary must never leak the token — asserted on the REAL pure function

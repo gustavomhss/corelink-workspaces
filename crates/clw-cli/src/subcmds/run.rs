@@ -83,6 +83,30 @@ const JSON_NOT_APPLICABLE_HINT: &str =
 /// reserved code — a single source of truth for the frozen value.
 pub const CLW_RUN_INTERNAL_NOT_RUN: i32 = 125;
 
+/// Exit code for a `clw run` whose child DID run but was KILLED BY clw because its
+/// captured output exceeded the CAS blob cap (`ClwError::TooLarge`). This is a
+/// DISTINCT clw-error exit — deliberately NOT the reserved [`CLW_RUN_INTERNAL_NOT_RUN`]
+/// (125) "child never ran" sentinel, because here the child ran to the point clw had
+/// to terminate it. clw kills the oversized child with SIGKILL, so we surface the
+/// POSIX 128+signal convention for a SIGKILL (`128 + 9 = 137`) — the same convention
+/// `clw-run` uses for any signal-killed child — which is a truthful "the child was
+/// killed by SIGKILL" signal, plainly separate from the 125 wrapper-never-ran code.
+/// Like every non-zero `clw run` outcome it is NEVER cached (clw-run only stores on a
+/// clean exit 0, and this is an error return that never reaches memoization).
+pub const CLW_RUN_OUTPUT_TOO_LARGE: i32 = 137;
+
+/// Map a `run_memoized` failure to the `clw run` exit code. The child NEVER ran →
+/// the reserved [`CLW_RUN_INTERNAL_NOT_RUN`] (125); the child RAN but clw killed it
+/// for exceeding the output cap ([`ClwError::TooLarge`]) → the distinct
+/// [`CLW_RUN_OUTPUT_TOO_LARGE`] (137). Pure so the frozen mapping is unit-tested
+/// without driving a real child through `std::process::exit`.
+fn run_err_exit_code(e: &ClwError) -> i32 {
+    match e {
+        ClwError::TooLarge { .. } => CLW_RUN_OUTPUT_TOO_LARGE,
+        _ => CLW_RUN_INTERNAL_NOT_RUN,
+    }
+}
+
 pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // P6: `run` has no JSON form — it proxies the child's stdout/stderr verbatim,
     // so a global `--json` would be silently ignored. Emit a one-line stderr hint
@@ -114,9 +138,21 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
     {
         Ok(outcome) => outcome,
         Err(e) => {
-            // clw-internal: child NOT run. Reserved code, NOT a child exit, NOT cached.
-            eprintln!("[clw] internal error — child not run: {e}");
-            std::process::exit(CLW_RUN_INTERNAL_NOT_RUN);
+            // Two distinct clw-error exits (see `run_err_exit_code`):
+            //   * TooLarge — the child DID run but clw killed it for exceeding the
+            //     output cap → 137 (SIGKILL), NOT the reserved 125 child-never-ran
+            //     sentinel, so the runner does not mis-classify a real killed child.
+            //   * everything else — clw-internal, the child NEVER ran → reserved 125.
+            // Both are error returns that never reached memoization, so NOT cached.
+            match &e {
+                ClwError::TooLarge { size, cap } => {
+                    eprintln!(
+                        "[clw] child output exceeded the cap ({size} bytes > {cap}); child killed"
+                    );
+                }
+                _ => eprintln!("[clw] internal error — child not run: {e}"),
+            }
+            std::process::exit(run_err_exit_code(&e));
         }
     };
 
@@ -184,6 +220,39 @@ mod tests {
         assert_eq!(
             CLW_RUN_INTERNAL_NOT_RUN, 125,
             "the runner contract pins clw-internal (child-not-run) at exit 125"
+        );
+    }
+
+    // LOW — oversized output is a child that RAN and was killed by clw, NOT a
+    // child-never-ran failure. Its exit must be DISTINCT from the reserved 125
+    // sentinel. RED-on-revert: mapping TooLarge back to CLW_RUN_INTERNAL_NOT_RUN
+    // (125) makes both assertions below fail.
+    #[test]
+    fn oversized_output_maps_to_distinct_non_125_exit() {
+        let too_large = ClwError::TooLarge {
+            size: (5 * 1024 * 1024) + 1,
+            cap: 5 * 1024 * 1024,
+        };
+        let code = run_err_exit_code(&too_large);
+        assert_ne!(
+            code, CLW_RUN_INTERNAL_NOT_RUN,
+            "a child that RAN but was killed for oversized output must NOT surface \
+             the reserved 125 child-never-ran sentinel"
+        );
+        assert_eq!(
+            code, CLW_RUN_OUTPUT_TOO_LARGE,
+            "oversized output must map to the distinct clw-error exit (137)"
+        );
+        assert_eq!(
+            CLW_RUN_OUTPUT_TOO_LARGE, 137,
+            "SIGKILL convention (128 + 9)"
+        );
+
+        // Any OTHER error is the child-never-ran path → the reserved 125.
+        assert_eq!(
+            run_err_exit_code(&ClwError::Config("bad".into())),
+            CLW_RUN_INTERNAL_NOT_RUN,
+            "a non-TooLarge (child-never-ran) error keeps the reserved 125 code"
         );
     }
 }

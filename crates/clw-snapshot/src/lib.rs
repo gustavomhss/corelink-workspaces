@@ -5,6 +5,7 @@
 //! manifest itself, and writes a mutable `RefRecord` in the AC namespace so
 //! the workspace can be hydrated later.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,12 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clw_cache::LocalCache;
 use clw_chunk::{chunk_bytes, chunk_stream, to_chunk_refs};
-use clw_manifest::{walk, WalkedEntry};
+use clw_manifest::{walk, WalkedEntry, WalkedFile};
 use clw_types::{
     ref_key_in, AcTransport, CasTransport, ChunkRef, ClwError, Digest, Entry, Manifest, RefDomain,
     RefRecord, Result, CAS_BLOB_CAP_BYTES, MANIFEST_VERSION,
 };
 use futures::stream::{self, StreamExt};
+use tokio::sync::{Mutex, Semaphore};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -103,15 +105,46 @@ const STREAM_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 /// performed (i.e. the chunk was missing), so the caller can advance the
 /// `chunks_uploaded` counter. This preserves the existing dedupe behaviour:
 /// `exists` is consulted and `put` happens only on a miss.
+///
+/// H4 (global upload concurrency): a permit is acquired from the shared
+/// `sem` before any cache/network work, so the number of chunk uploads in
+/// flight is bounded GLOBALLY across every file — not per-file. Because every
+/// file's chunks contend on the same semaphore, a tree of many small files
+/// (one chunk each) now parallelises up to `concurrency`, where before the
+/// outer per-file `for` serialised them.
+///
+/// LOW (per-run dedup): `seen` is the set of chunk digests already handled this
+/// snapshot. A digest already present is skipped entirely — no cache write, no
+/// remote `exists`/`put` — so vendored/duplicated files that repeat the same
+/// chunk pay the round-trip only once. The check+insert is done under the lock
+/// so two concurrent tasks for the same digest can't both proceed; whichever
+/// wins the insert does the upload (and it completes before the snapshot moves
+/// on to the manifest, since all chunk tasks are awaited first).
 async fn upload_chunk<C>(
     client: &C,
     cache: &LocalCache,
+    sem: &Semaphore,
+    seen: &Mutex<HashSet<Digest>>,
     digest: &Digest,
     data: Vec<u8>,
 ) -> Result<bool>
 where
     C: CasTransport,
 {
+    // LOW: per-run dedup — skip a digest already handled this snapshot.
+    {
+        let mut set = seen.lock().await;
+        if !set.insert(*digest) {
+            return Ok(false);
+        }
+    }
+
+    // H4: bound in-flight uploads GLOBALLY (across files), not per file.
+    let _permit = sem
+        .acquire()
+        .await
+        .map_err(|e| ClwError::Transport(e.to_string()))?;
+
     // Local cache: temp-file + atomic rename(2); fast enough to call directly.
     cache.put(digest, &data)?;
 
@@ -123,6 +156,98 @@ where
         CasTransport::put(client, digest, data).await?;
         Ok(true)
     }
+}
+
+/// Chunk one file and upload its chunks, returning its manifest [`Entry::File`].
+///
+/// H1 (size truth): the entry's `size` is the sum of the `ChunkRef.size`s that
+/// were ACTUALLY produced from the read bytes — NOT the walk-time metadata size.
+/// If the file changed size between walk and read, the manifest still satisfies
+/// `entry.size == Σ chunk sizes` by construction, so a later hydrate cannot
+/// hard-reject on `total_size != Σ ChunkRef.size`. `mode` still comes from walk.
+///
+/// H4: every chunk upload contends on the shared `sem`, so uploads parallelise
+/// globally when the caller drives multiple files concurrently. Large files are
+/// still streamed one chunk at a time (peak ~one chunk's bytes resident per
+/// in-flight large file); small files chunk in memory then drop their bytes.
+async fn process_file<C>(
+    client: &C,
+    cache: &LocalCache,
+    sem: &Semaphore,
+    seen: &Mutex<HashSet<Digest>>,
+    counter: &AtomicU64,
+    concurrency: usize,
+    f: WalkedFile,
+) -> Result<Entry>
+where
+    C: CasTransport,
+{
+    // TOCTOU NOTE (audit Low, accepted for v0.1): the walker classified `f.abs`
+    // as a regular file with `follow_links(false)`, but the reads below follow
+    // symlinks. A concurrent hostile writer on a SHARED checkout could swap the
+    // path; this race is OUT OF the v0.1 threat model (single-operator local
+    // tool). Deferred hardening: O_NOFOLLOW open + fstat-after-open.
+    let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
+        // ---- small file: in-memory fast path -----------------------------
+        let abs = f.abs.clone();
+        let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
+            .await
+            .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+
+        let chunks_raw = chunk_bytes(&data);
+        let chunk_refs = to_chunk_refs(&chunks_raw);
+
+        // Upload THIS file's chunks; each contends on the GLOBAL semaphore, so
+        // the real parallelism ceiling is `sem`'s permit count regardless of
+        // how many files are in flight. `data` drops at the end of the block.
+        let results: Vec<Result<()>> = stream::iter(chunks_raw.iter().map(|c| {
+            let bytes = data[c.offset as usize..(c.offset + c.len) as usize].to_vec();
+            let digest = c.digest;
+            async move {
+                if upload_chunk(client, cache, sem, seen, &digest, bytes).await? {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+        for r in results {
+            r?;
+        }
+
+        chunk_refs
+    } else {
+        // ---- large file: stream, one chunk's bytes at a time -------------
+        let abs = f.abs.clone();
+        let file = tokio::task::spawn_blocking(move || std::fs::File::open(&abs))
+            .await
+            .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+
+        let mut chunk_refs: Vec<ChunkRef> = Vec::new();
+        for item in chunk_stream(file) {
+            let sc = item.map_err(|e| clw_types::ClwError::Transport(e.to_string()))?;
+            // Preserve file byte-order in the manifest (H4 preservation (a)).
+            chunk_refs.push(ChunkRef {
+                digest: sc.digest,
+                size: sc.len,
+            });
+            if upload_chunk(client, cache, sem, seen, &sc.digest, sc.data).await? {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        chunk_refs
+    };
+
+    // H1: derive `size` from the bytes we ACTUALLY chunked, not walk metadata.
+    let size: u64 = chunk_refs.iter().map(|c| c.size).sum();
+    Ok(Entry::File {
+        path: f.rel,
+        mode: f.mode,
+        size,
+        chunks: chunk_refs,
+    })
 }
 
 /// Return `true` if `rel` (a manifest-relative path) has a basename or
@@ -178,6 +303,37 @@ fn check_manifest_blob_fits(manifest_bytes_len: usize) -> Result<()> {
     Ok(())
 }
 
+/// M6: does a create-only AC ref PUT error look like a 409/AlreadyExists
+/// conflict? The real HTTP transport maps a 409 to `ClwError::Http { status:
+/// 409, .. }`; a fake/create-only transport may instead signal it in a
+/// `Transport`/`Message` string. Match both so the idempotent-retry recovery
+/// fires regardless of which layer produced the conflict.
+fn is_conflict(e: &ClwError) -> bool {
+    match e {
+        ClwError::Http { status: 409, .. } => true,
+        ClwError::Transport(m) | ClwError::Message(m) => {
+            let l = m.to_ascii_lowercase();
+            l.contains("409") || l.contains("already exists") || l.contains("conflict")
+        }
+        _ => false,
+    }
+}
+
+/// M6: is the ref that already OCCUPIES the key equivalent to the one we were
+/// about to write? Byte-equality is the strict case; otherwise a semantic match
+/// on `root` + `manifest_size` (the fields that make a ref restore the same
+/// workspace) counts — created-at/parent may legitimately differ across a
+/// lost-ACK retry. A corrupt/unparseable occupant is NOT equivalent.
+fn existing_ref_matches(existing_bytes: &[u8], want_bytes: &[u8], want: &RefRecord) -> bool {
+    if existing_bytes == want_bytes {
+        return true;
+    }
+    match RefRecord::from_bytes(existing_bytes) {
+        Ok(cur) => cur.root == want.root && cur.manifest_size == want.manifest_size,
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // build_manifest_local
 // ---------------------------------------------------------------------------
@@ -229,11 +385,17 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
                     refs
                 };
 
-                total_size += f.size;
+                // H1: derive size from the ACTUAL chunked bytes (Σ ChunkRef.size),
+                // not walk metadata, so this stays byte-identical to `snapshot`'s
+                // manifest even under a walk/read size divergence — the
+                // content-addressed `hydrate --manifest-digest` path relies on the
+                // two agreeing.
+                let size: u64 = chunk_refs.iter().map(|c| c.size).sum();
+                total_size += size;
                 entries.push(Entry::File {
                     path: f.rel,
                     mode: f.mode,
-                    size: f.size,
+                    size,
                     chunks: chunk_refs,
                 });
             }
@@ -281,114 +443,77 @@ where
     //
     // Memory is kept bounded: we NEVER buffer the whole workspace's chunk
     // bytes. Small files take the in-memory fast path (their chunks are
-    // uploaded with bounded concurrency, then their bytes are dropped before
-    // moving on); large files are streamed so at most one chunk's bytes are
-    // resident at a time. Only the small `ChunkRef`s and the counters survive
-    // across files. Streaming and in-memory chunking are dedupe-identical, so
-    // the resulting manifest/digest is independent of which path each file
-    // took.
-    let mut entries: Vec<Entry> = Vec::with_capacity(walked.len());
-    let mut total_size: u64 = 0;
-    let mut chunks_total: u64 = 0;
-    let mut files_count: u64 = 0;
+    // uploaded, then their bytes are dropped); large files are streamed so at
+    // most one chunk's bytes are resident per in-flight large file. Streaming
+    // and in-memory chunking are dedupe-identical, so the resulting
+    // manifest/digest is independent of which path each file took.
+    //
+    // H4 (global upload concurrency): file processing is driven concurrently
+    // (`buffer_unordered`), and every chunk upload contends on ONE shared
+    // `Semaphore`. So a tree of many small files (one chunk each) now saturates
+    // `concurrency` uploads globally, where before the per-file `for` awaited
+    // each file's chunks before starting the next (zero cross-file
+    // parallelism). Scheduling is order-INDEPENDENT: each file is tagged with
+    // its walk index and re-sorted below, so the manifest — and thus its digest
+    // — is byte-identical to the old serial output for identical input.
+    let concurrency = opts.concurrency.max(1);
 
+    // ONE semaphore shared by every chunk upload across every file (H4).
+    let sem = Arc::new(Semaphore::new(concurrency));
+    // Per-run chunk-digest dedup set (LOW): a digest is uploaded once per run.
+    let seen: Arc<Mutex<HashSet<Digest>>> = Arc::new(Mutex::new(HashSet::new()));
     // Shared across all files so `chunks_uploaded` aggregates the whole tree.
     let uploaded_counter = Arc::new(AtomicU64::new(0));
 
-    for we in walked {
-        match we {
-            WalkedEntry::File(f) => {
-                // TOCTOU NOTE (audit Low, accepted for v0.1): the walker classified
-                // `f.abs` as a regular file with `follow_links(false)`, but the reads
-                // below (`std::fs::read` for the small path, `File::open` for the
-                // streaming path) FOLLOW symlinks. Between the walk's classification
-                // and these opens, a concurrent hostile writer on a SHARED checkout
-                // could replace `f.abs` with a symlink and make snapshot ingest
-                // out-of-workspace bytes. This race is OUT OF the v0.1 threat model:
-                // `clw` is a single-operator local tool, and a hostile concurrent
-                // writer to the operator's own working tree is not something v0.1
-                // defends against. The proper fix (cross-platform O_NOFOLLOW open +
-                // fstat-after-open confirming the opened inode matches the regular
-                // file we classified) is deliberately deferred as tracked hardening
-                // rather than a silent assumption; mirrored in clw-manifest's walk.
-                let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
-                    // ---- small file: in-memory fast path -------------------
-                    let abs = f.abs.clone();
-                    let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
-                        .await
-                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
-
-                    let chunks_raw = chunk_bytes(&data);
-                    let chunk_refs = to_chunk_refs(&chunks_raw);
-                    chunks_total += chunks_raw.len() as u64;
-
-                    // Upload THIS file's chunks (bounded concurrency), then let
-                    // `data` / the per-chunk copies drop at the end of the block.
-                    let concurrency = opts.concurrency.max(1);
-                    let results: Vec<Result<()>> = stream::iter(chunks_raw.into_iter().map(|c| {
-                        let counter = Arc::clone(&uploaded_counter);
-                        // Copy out this chunk's bytes (bounded by CHUNK_MAX_BYTES).
-                        let bytes = data[c.offset as usize..(c.offset + c.len) as usize].to_vec();
-                        async move {
-                            if upload_chunk(client, cache, &c.digest, bytes).await? {
-                                counter.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(())
-                        }
-                    }))
-                    .buffer_unordered(concurrency)
-                    .collect()
-                    .await;
-                    for r in results {
-                        r?;
+    // Process files (and pass symlinks/dirs through) concurrently, tagging each
+    // with its walk index so we can restore walk order for the manifest.
+    let indexed: Vec<(usize, WalkedEntry)> = walked.into_iter().enumerate().collect();
+    let results: Vec<Result<(usize, Entry)>> =
+        stream::iter(indexed.into_iter().map(|(idx, we)| {
+            let sem = Arc::clone(&sem);
+            let seen = Arc::clone(&seen);
+            let counter = Arc::clone(&uploaded_counter);
+            async move {
+                let entry = match we {
+                    WalkedEntry::File(f) => {
+                        process_file(client, cache, &sem, &seen, &counter, concurrency, f).await?
                     }
-
-                    chunk_refs
-                } else {
-                    // ---- large file: stream, one chunk's bytes at a time ----
-                    // Open the handle on the blocking pool (mirrors the
-                    // `std::fs::read` pattern); chunking + uploads then proceed
-                    // sequentially so peak memory stays at ~one chunk.
-                    let abs = f.abs.clone();
-                    let file = tokio::task::spawn_blocking(move || std::fs::File::open(&abs))
-                        .await
-                        .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
-
-                    let mut chunk_refs: Vec<ChunkRef> = Vec::new();
-                    for item in chunk_stream(file) {
-                        let sc = item.map_err(|e| clw_types::ClwError::Transport(e.to_string()))?;
-                        chunks_total += 1;
-                        chunk_refs.push(ChunkRef {
-                            digest: sc.digest,
-                            size: sc.len,
-                        });
-                        if upload_chunk(client, cache, &sc.digest, sc.data).await? {
-                            uploaded_counter.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    chunk_refs
+                    WalkedEntry::Symlink { rel, target } => Entry::Symlink { path: rel, target },
+                    WalkedEntry::EmptyDir { rel } => Entry::Dir { path: rel },
                 };
+                Ok::<(usize, Entry), ClwError>((idx, entry))
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
 
-                total_size += f.size;
-                files_count += 1;
+    // Restore walk order: the manifest (and its digest) MUST be independent of
+    // the concurrent upload schedule.
+    let mut indexed_entries: Vec<(usize, Entry)> = Vec::with_capacity(results.len());
+    for r in results {
+        indexed_entries.push(r?);
+    }
+    indexed_entries.sort_by_key(|(i, _)| *i);
+    let entries: Vec<Entry> = indexed_entries.into_iter().map(|(_, e)| e).collect();
 
-                entries.push(Entry::File {
-                    path: f.rel,
-                    mode: f.mode,
-                    size: f.size,
-                    chunks: chunk_refs,
-                });
-            }
-            WalkedEntry::Symlink { rel, target } => {
-                entries.push(Entry::Symlink { path: rel, target });
-            }
-            WalkedEntry::EmptyDir { rel } => {
-                entries.push(Entry::Dir { path: rel });
-            }
+    // --- 3. Assemble manifest -----------------------------------------------
+    //
+    // H1: derive `total_size` (and the per-entry sizes, done in `process_file`)
+    // from the chunk sizes we ACTUALLY produced. `total_size == Σ ChunkRef.size`
+    // now holds BY CONSTRUCTION, so a walk/read size divergence can no longer
+    // yield a manifest that every future hydrate hard-rejects.
+    let mut total_size: u64 = 0;
+    let mut chunks_total: u64 = 0;
+    let mut files_count: u64 = 0;
+    for e in &entries {
+        if let Entry::File { size, chunks, .. } = e {
+            total_size += *size;
+            chunks_total += chunks.len() as u64;
+            files_count += 1;
         }
     }
 
-    // --- 3. Assemble manifest -----------------------------------------------
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         total_size,
@@ -496,7 +621,28 @@ where
     if opts.force && raw_present {
         AcTransport::delete(client, &rk).await?;
     }
-    AcTransport::put(client, &rk, ref_record.to_bytes()?).await?;
+    let ref_bytes = ref_record.to_bytes()?;
+    // M6 (idempotent 409): the create-only PUT can 409 spuriously — a retried
+    // PUT after a LOST ACK re-hits the now-occupied key (or an eventual-
+    // consistency gap let step-6's GET miss a ref that a prior run already
+    // wrote). On a conflict, GET the occupant: if it already IS what we meant to
+    // write (same root + manifest_size, or byte-equal), the write is a no-op
+    // SUCCESS. Only a genuinely DIFFERENT occupant is a real conflict — re-raise
+    // the original error so the CLI still renders the "already exists — re-run
+    // with --force" guidance. This does NOT weaken `--force`: force already
+    // deleted any present ref above, so reaching here under force + conflict
+    // means a concurrent writer, and an identical one is still a safe no-op.
+    let mut unchanged = false;
+    match AcTransport::put(client, &rk, ref_bytes.clone()).await {
+        Ok(()) => {}
+        Err(e) if is_conflict(&e) => match AcTransport::get(client, &rk).await? {
+            Some(cur) if existing_ref_matches(&cur, &ref_bytes, &ref_record) => {
+                unchanged = true;
+            }
+            _ => return Err(e),
+        },
+        Err(e) => return Err(e),
+    }
 
     // --- 8. Return report ---------------------------------------------------
     Ok(SnapshotReport {
@@ -506,7 +652,7 @@ where
         chunks_total,
         chunks_uploaded,
         secret_warnings,
-        unchanged: false,
+        unchanged,
     })
 }
 
@@ -1057,5 +1203,412 @@ mod tests {
             "clean tree should have no secret warnings, got {:?}",
             report.secret_warnings
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H1 (size truth): Entry::File.size derives from the bytes we ACTUALLY
+    // chunked (Σ ChunkRef.size), NOT the walk-time metadata size. Proven by
+    // handing `process_file` a WalkedFile with a deliberately WRONG `size`; the
+    // returned entry must reflect the real byte length on BOTH the in-memory and
+    // the streaming path. RED-on-revert: restoring `size: f.size` fails this.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn file_entry_size_derives_from_chunked_bytes_not_walk_metadata() {
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let sem = Semaphore::new(4);
+        let seen = Mutex::new(HashSet::new());
+        let counter = AtomicU64::new(0);
+
+        let tmp = TempDir::new().unwrap();
+
+        // --- small (in-memory) path: bogus size stays under the threshold. ---
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, b"hello snapshot").unwrap(); // 14 bytes
+        let wf_small = WalkedFile {
+            abs: small.clone(),
+            rel: "small.txt".into(),
+            mode: 0o644,
+            size: 1, // WRONG on purpose (real is 14); still <= threshold → small path
+        };
+        let entry = process_file(&client, &cache, &sem, &seen, &counter, 4, wf_small)
+            .await
+            .unwrap();
+        if let Entry::File { size, chunks, .. } = entry {
+            let sum: u64 = chunks.iter().map(|c| c.size).sum();
+            assert_eq!(size, 14, "small-path size must be the real byte length");
+            assert_eq!(size, sum, "size must equal Σ chunk sizes (H1 invariant)");
+            assert_ne!(size, 1, "size must NOT be the bogus walk-metadata size");
+        } else {
+            panic!("expected a File entry");
+        }
+
+        // --- large (streaming) path: bogus size ABOVE the threshold forces the
+        // stream path even though the real file is tiny (no huge file needed). --
+        let big = tmp.path().join("big.dat");
+        std::fs::write(&big, vec![7u8; 100]).unwrap(); // 100 bytes
+        let wf_big = WalkedFile {
+            abs: big.clone(),
+            rel: "big.dat".into(),
+            mode: 0o644,
+            size: STREAM_THRESHOLD_BYTES + 1, // WRONG (real is 100) → forces streaming path
+        };
+        let entry = process_file(&client, &cache, &sem, &seen, &counter, 4, wf_big)
+            .await
+            .unwrap();
+        if let Entry::File { size, chunks, .. } = entry {
+            let sum: u64 = chunks.iter().map(|c| c.size).sum();
+            assert_eq!(size, 100, "stream-path size must be the real byte length");
+            assert_eq!(size, sum, "size must equal Σ chunk sizes (H1 invariant)");
+            assert_ne!(
+                size,
+                STREAM_THRESHOLD_BYTES + 1,
+                "size must NOT be the bogus walk-metadata size"
+            );
+        } else {
+            panic!("expected a File entry");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // H1 (whole-manifest observable): the hydrate invariant
+    // `total_size == Σ ChunkRef.size` (and per-file `size == Σ its chunks`)
+    // holds by construction on a real multi-file, multi-chunk snapshot. This is
+    // the nearest observable of the end-to-end invariant; the RED-on-revert
+    // proof is the process_file test above (a real walk/read size divergence is
+    // a TOCTOU race not reproducible deterministically in-process).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn manifest_total_size_equals_sum_of_all_chunk_sizes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        build_tree(root); // multi-file; big.bin is multi-chunk
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-h1");
+        let report = snapshot(root, &client, &cache, &opts).await.unwrap();
+
+        let cas = client.cas.lock().await;
+        let manifest = Manifest::from_bytes(cas.get(&report.root).unwrap()).unwrap();
+        let mut grand: u64 = 0;
+        for e in &manifest.entries {
+            if let Entry::File { size, chunks, .. } = e {
+                let sum: u64 = chunks.iter().map(|c| c.size).sum();
+                assert_eq!(*size, sum, "each File.size must equal Σ its chunk sizes");
+                grand += sum;
+            }
+        }
+        assert_eq!(
+            manifest.total_size, grand,
+            "total_size must equal Σ ALL ChunkRef.size (hydrate invariant)"
+        );
+        assert_eq!(report.bytes_total, grand);
+    }
+
+    // -----------------------------------------------------------------------
+    // H4 (global concurrency, digest stability): with uploads driven
+    // concurrently across files, the manifest — and its digest — MUST be
+    // byte-identical to the sequential `build_manifest_local` output for the
+    // same input (walk order preserved, schedule-independent). RED-on-revert:
+    // dropping the index-tag + re-sort lets completion order leak into the
+    // manifest and the bytes/digest diverge.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn manifest_digest_is_stable_across_concurrent_upload_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Many small files (1 chunk each) exercise cross-file scheduling…
+        for i in 0..25u32 {
+            std::fs::write(root.join(format!("f{i:03}.txt")), format!("payload-{i}")).unwrap();
+        }
+        // …plus a multi-chunk big file.
+        let big: Vec<u8> = (0u32..=(1024 * 1024 + 100))
+            .map(|i| (i.wrapping_mul(0x9e37_79b9u32)) as u8)
+            .collect();
+        std::fs::write(root.join("big.bin"), &big).unwrap();
+
+        let expected = build_manifest_local(root).await.unwrap();
+        let expected_bytes = expected.canonical_bytes().unwrap();
+        let expected_digest = expected.digest().unwrap();
+
+        // Two independent runs at the default concurrency (8) must both
+        // reproduce the manifest byte-for-byte.
+        for _ in 0..2 {
+            let cache_dir = TempDir::new().unwrap();
+            let cache = LocalCache::new(cache_dir.path()).unwrap();
+            let client = FakeTransport::default();
+            let opts = SnapshotOptions::new("ws-h4");
+            let report = snapshot(root, &client, &cache, &opts).await.unwrap();
+            assert_eq!(
+                report.root, expected_digest,
+                "digest must match the sequential build regardless of upload schedule"
+            );
+            let cas = client.cas.lock().await;
+            let got = cas.get(&report.root).unwrap();
+            assert_eq!(
+                got, &expected_bytes,
+                "manifest bytes must be identical (walk order preserved)"
+            );
+        }
+
+        // Entries stay in sorted path order regardless of upload completion order.
+        let paths: Vec<&str> = expected.entries.iter().map(|e| e.path()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(
+            paths, sorted,
+            "manifest entries must stay in sorted path order"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LOW (per-run dedup): a chunk digest repeated across files is handled ONCE
+    // per run. To make this a DETERMINISTIC RED-on-revert we use a CAS whose
+    // `exists` ALWAYS misses and that COUNTS every `put` — so the ONLY thing
+    // that can prevent the 2nd/3rd identical chunk from re-uploading is the
+    // in-run `seen` set. WITH the fix: exactly one content PUT + one counted
+    // upload. WITHOUT it: three of each.
+    // -----------------------------------------------------------------------
+
+    /// CAS that never reports a blob present (`exists` → false) and counts every
+    /// PUT. AC is a normal in-memory map so the snapshot still completes.
+    #[derive(Clone, Default)]
+    struct AlwaysMissCas {
+        cas: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        ac: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        puts: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for AlwaysMissCas {
+        async fn exists(&self, _digest: &Digest) -> Result<bool> {
+            Ok(false) // never present → the ONLY dedup is the in-run `seen` set
+        }
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            self.cas
+                .lock()
+                .await
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.cas.lock().await.insert(*digest, bytes);
+            Ok(())
+        }
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().await.remove(digest);
+            Ok(())
+        }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for AlwaysMissCas {
+        async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {
+            Ok(self.ac.lock().await.get(key).cloned())
+        }
+        async fn put(&self, key: &Digest, value: Vec<u8>) -> Result<()> {
+            self.ac.lock().await.insert(*key, value);
+            Ok(())
+        }
+        async fn delete(&self, key: &Digest) -> Result<()> {
+            self.ac.lock().await.remove(key);
+            Ok(())
+        }
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            Ok(self.ac.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn per_run_dedup_uploads_repeated_chunk_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Three vendored copies with byte-identical content → same chunk digest.
+        for name in ["a.txt", "vendor/b.txt", "vendor/nested/c.txt"] {
+            let p = root.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"identical vendored payload").unwrap();
+        }
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = AlwaysMissCas::default();
+        let opts = SnapshotOptions::new("ws-dedup");
+        let report = snapshot(root, &client, &cache, &opts).await.unwrap();
+
+        assert_eq!(report.files, 3, "three files snapshotted");
+        // The repeated chunk is counted as uploaded exactly once.
+        assert_eq!(
+            report.chunks_uploaded, 1,
+            "the repeated chunk must be uploaded exactly once per run"
+        );
+        // Exactly one content PUT + one manifest PUT = two remote PUTs total.
+        // (Without the `seen` set this would be 3 content PUTs + 1 manifest = 4.)
+        assert_eq!(
+            client.puts.load(Ordering::SeqCst),
+            2,
+            "one content chunk + one manifest blob should be PUT"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6 (idempotent 409): a create-only ref PUT can 409 spuriously (a retried
+    // PUT after a lost ACK, or an eventual-consistency gap that let step-6's GET
+    // miss a ref a prior run already wrote). If the occupant already IS what we
+    // meant to write, that is an idempotent SUCCESS; only a genuinely DIFFERENT
+    // occupant is a real conflict.
+    // -----------------------------------------------------------------------
+
+    /// AC that ALWAYS 409s on PUT and reveals the occupant only AFTER the first
+    /// GET (step-6 sees nothing → no no-op short-circuit; the M6 recovery GET
+    /// then reads it). CAS is a normal in-memory map.
+    #[derive(Clone)]
+    struct Idem409Ac {
+        cas: Arc<Mutex<HashMap<Digest, Vec<u8>>>>,
+        stored: Arc<Vec<u8>>,
+        get_calls: Arc<AtomicU64>,
+    }
+
+    impl Idem409Ac {
+        fn new(stored: Vec<u8>) -> Self {
+            Self {
+                cas: Arc::new(Mutex::new(HashMap::new())),
+                stored: Arc::new(stored),
+                get_calls: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for Idem409Ac {
+        async fn exists(&self, digest: &Digest) -> Result<bool> {
+            Ok(self.cas.lock().await.contains_key(digest))
+        }
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            self.cas
+                .lock()
+                .await
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            self.cas.lock().await.insert(*digest, bytes);
+            Ok(())
+        }
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().await.remove(digest);
+            Ok(())
+        }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().await.keys().copied().collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for Idem409Ac {
+        async fn get(&self, _key: &Digest) -> Result<Option<Vec<u8>>> {
+            let n = self.get_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(None) // step-6 GET: no ref visible yet
+            } else {
+                Ok(Some((*self.stored).clone())) // M6 recovery GET: the occupant
+            }
+        }
+        async fn put(&self, _key: &Digest, _value: Vec<u8>) -> Result<()> {
+            // Occupied key → the create-only server 409s (real transport shape).
+            Err(ClwError::Http {
+                status: 409,
+                context: "PUT ac".into(),
+            })
+        }
+        async fn delete(&self, _key: &Digest) -> Result<()> {
+            Ok(())
+        }
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_409_identical_ref_is_success() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"idempotent").unwrap();
+
+        // Learn the manifest digest + size this tree WILL produce.
+        let manifest = build_manifest_local(root).await.unwrap();
+        let want_root = manifest.digest().unwrap();
+        let want_size = manifest.canonical_bytes().unwrap().len() as u64;
+
+        // A byte-DIFFERENT occupant (different created_at) that nonetheless
+        // restores the SAME workspace (same root + manifest_size).
+        let occupant = RefRecord {
+            name: "ws-idem".into(),
+            root: want_root,
+            manifest_size: want_size,
+            created_at_unix: 1,
+            parent: None,
+            tool_version: "test".into(),
+        };
+        let client = Idem409Ac::new(occupant.to_bytes().unwrap());
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let opts = SnapshotOptions::new("ws-idem");
+
+        let report = snapshot(root, &client, &cache, &opts)
+            .await
+            .expect("an identical occupant on a 409 must be an idempotent SUCCESS");
+        assert_eq!(report.root, want_root);
+        assert!(
+            report.unchanged,
+            "idempotent 409 recovery reports unchanged"
+        );
+        assert!(
+            client.get_calls.load(Ordering::SeqCst) >= 2,
+            "M6 must GET the occupant after the 409"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_409_differing_ref_errors() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"idempotent").unwrap();
+
+        // Occupant restores a DIFFERENT workspace → a genuine conflict.
+        let occupant = RefRecord {
+            name: "ws-idem".into(),
+            root: Digest::of_bytes(b"some-other-root"),
+            manifest_size: 999,
+            created_at_unix: 1,
+            parent: None,
+            tool_version: "test".into(),
+        };
+        let client = Idem409Ac::new(occupant.to_bytes().unwrap());
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let opts = SnapshotOptions::new("ws-idem");
+
+        let res = snapshot(root, &client, &cache, &opts).await.map(|_| ());
+        match res {
+            Err(ClwError::Http { status: 409, .. }) => {}
+            other => {
+                panic!("a DIFFERING occupant on a 409 must surface the conflict, got: {other:?}")
+            }
+        }
     }
 }

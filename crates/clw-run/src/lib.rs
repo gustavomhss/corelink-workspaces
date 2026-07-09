@@ -36,6 +36,32 @@ use std::path::Path;
 
 pub const RUN_KEY_DOMAIN: &str = "clw/run/v3/";
 
+/// H3 (credential leak): the credential-bearing environment variables that `clw`
+/// itself reads (see `clw-cli/src/config.rs`) and that MUST be stripped from the
+/// UNTRUSTED child's environment before it is spawned. Without this the child
+/// (arbitrary CI code) inherits the CAS bearer token / redemption ticket and can
+/// exfiltrate it for cross-tenant theft.
+///
+/// The list mirrors every secret `clw` resolves: the PAT (`CLW_TOKEN` and its
+/// CoreLink-wide `CORELINK_TOKEN` alias) and the C2c credential-broker inputs
+/// (`CLW_CRED_TICKET` = the single-use redemption auth, `CLW_LEASE_ID`,
+/// `CLW_FABRIC_ENDPOINT`). The `CORELINK_*` namesakes of the broker vars are
+/// stripped defensively too (clw reads only the `CLW_*` spellings today, but a
+/// stray `CORELINK_*` credential in the ambient env must not reach the child
+/// either). We strip ONLY these secrets — NOT `env_clear()` — so the child keeps
+/// its `PATH`/`HOME`/locale and the non-secret `CLW_*` config (`CLW_ENDPOINT`,
+/// `CLW_TENANT`, `CLW_REF_DOMAIN`, `CLW_CACHE_DIR`) a build may legitimately need.
+const SECRET_ENV_VARS: &[&str] = &[
+    "CLW_TOKEN",
+    "CORELINK_TOKEN",
+    "CLW_CRED_TICKET",
+    "CORELINK_CRED_TICKET",
+    "CLW_LEASE_ID",
+    "CORELINK_LEASE_ID",
+    "CLW_FABRIC_ENDPOINT",
+    "CORELINK_FABRIC_ENDPOINT",
+];
+
 pub struct RunOptions {
     pub inputs: Vec<String>,
     pub command: Vec<String>,
@@ -415,7 +441,22 @@ impl CapErr {
 /// fixed-size blocks and aborts with [`CapErr::TooLarge`] the moment the buffer
 /// would exceed `cap`, so we never retain more than ~`cap` + one block of bytes.
 /// A `None` pipe (stream not captured) yields an empty buffer.
-async fn read_capped<R>(reader: Option<R>, cap: usize) -> std::result::Result<Vec<u8>, CapErr>
+///
+/// H2 (backgrounded-grandchild hang): the read races a `stop` signal. Normally we
+/// read to EOF; but a grandchild that inherited the pipe's write end (e.g.
+/// `sh -c 'sleep 300 & exit 0'`, or a build spawning a daemon) keeps that write
+/// end OPEN after the direct child exits, so EOF NEVER comes and an unbounded read
+/// would wedge forever. The caller therefore arms a BOUNDED post-exit grace and
+/// flips `stop`; on `stop` we return whatever we have BUFFERED so far (the output
+/// the child actually wrote before exiting — it was already readable, so it is in
+/// `buf` by the time the grace elapses) instead of blocking on an EOF that a
+/// still-living orphan will never deliver. Returning drops the reader, closing our
+/// read end → the orphaned writer gets SIGPIPE on its next write.
+async fn read_capped<R>(
+    reader: Option<R>,
+    cap: usize,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<Vec<u8>, CapErr>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -426,17 +467,28 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let mut block = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut block).await.map_err(CapErr::Io)?;
-        if n == 0 {
-            break;
+        tokio::select! {
+            res = reader.read(&mut block) => {
+                let n = res.map_err(CapErr::Io)?;
+                if n == 0 {
+                    break; // clean EOF — the write end closed.
+                }
+                let projected = buf.len() as u64 + n as u64;
+                if projected > cap as u64 {
+                    // Stop reading immediately; the caller will kill the child. We do
+                    // NOT keep extending `buf`, so memory stays bounded at ~cap + one
+                    // block.
+                    return Err(CapErr::TooLarge(projected));
+                }
+                buf.extend_from_slice(&block[..n]);
+            }
+            _ = stop.changed() => {
+                // Post-exit grace elapsed while EOF is still outstanding (a grandchild
+                // holds the write end). Stop draining and return what the child already
+                // wrote — do NOT wait for an EOF that will never arrive.
+                break;
+            }
         }
-        let projected = buf.len() as u64 + n as u64;
-        if projected > cap as u64 {
-            // Stop reading immediately; the caller will kill the child. We do NOT
-            // keep extending `buf`, so memory stays bounded at ~cap + one block.
-            return Err(CapErr::TooLarge(projected));
-        }
-        buf.extend_from_slice(&block[..n]);
     }
     Ok(buf)
 }
@@ -497,12 +549,20 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // --- MISS: execute the command ---
     // Diagnostic channel (M5.1): cache miss + key on stderr.
     tracing::debug!(key = %key.to_hex(), hit = false, "run cache miss; executing");
-    let mut child = tokio::process::Command::new(&opts.command[0])
+    let mut command = tokio::process::Command::new(&opts.command[0]);
+    command
         .args(&opts.command[1..])
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+    // H3 (credential leak): strip clw's secret-bearing env vars so the UNTRUSTED
+    // child cannot read the CAS bearer token / redemption ticket and exfiltrate it.
+    // We remove ONLY the known secrets (NOT env_clear) so PATH/HOME/locale and the
+    // non-secret CLW_* config survive for the build. See `SECRET_ENV_VARS`.
+    for var in SECRET_ENV_VARS {
+        command.env_remove(var);
+    }
+    let mut child = command.spawn()?;
 
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
     // child output first. `wait_with_output` reads ALL of stdout/stderr into memory
@@ -511,25 +571,53 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // ceiling (CAS_BLOB_CAP_BYTES) and KILL the child the moment either exceeds it.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    // CRITICAL (deadlock-safe): read BOTH streams concurrently, and the MOMENT
-    // either exceeds the cap, KILL the child and RETURN immediately — do NOT wait
-    // for the other stream.
+    // CRITICAL (deadlock- AND hang-safe): read BOTH streams concurrently while ALSO
+    // observing the DIRECT child's exit in the SAME `select!`. Two failure modes are
+    // guarded here:
     //
-    // A plain `join!` here DEADLOCKS: when one `read_capped` returns (cap blown)
-    // and stops draining its pipe, the child blocks on its next write to that
-    // now-unread pipe (the OS pipe buffer fills), starving the OTHER reader, which
-    // never sees EOF — `join!` never completes and there is no timeout.
+    // 1. Cap-blow DEADLOCK. A plain `join!` DEADLOCKS: when one `read_capped` returns
+    //    (cap blown) and stops draining its pipe, the child blocks on its next write
+    //    to that now-unread pipe (the OS pipe buffer fills), starving the OTHER
+    //    reader, which never sees EOF. So the MOMENT either stream exceeds the cap we
+    //    KILL the child and RETURN immediately — never awaiting the other stream.
+    //    Returning drops both read futures, closing our read ends → any orphaned
+    //    writer gets SIGPIPE. We reap the direct child to avoid a zombie.
     //
-    // And we must not even *await* the surviving stream after a blow: the killed
-    // process may have leaked the pipe to a still-running grandchild (e.g.
-    // `sh -c "yes & yes 1>&2"`, or a `make` sub-job) that keeps the write end open,
-    // so that read would never EOF either. Returning drops both read futures, which
-    // closes our read ends → any orphaned writer gets SIGPIPE and dies. We reap the
-    // direct child to avoid a zombie; orphans reparent to init.
-    let mut stdout_fut = std::pin::pin!(read_capped(stdout_pipe, CAS_BLOB_CAP_BYTES));
-    let mut stderr_fut = std::pin::pin!(read_capped(stderr_pipe, CAS_BLOB_CAP_BYTES));
+    // 2. Grandchild HANG (H2). Draining only until BOTH streams EOF wedges FOREVER
+    //    when a backgrounded grandchild inherited the pipe write end (e.g.
+    //    `sh -c 'sleep 300 & exit 0'`, or a build spawning a daemon / a `make`
+    //    sub-job): the direct child exits but the write end stays open, so EOF never
+    //    comes and there is no timeout. We therefore watch `child.wait()` in the
+    //    select too; once the DIRECT child has exited we arm a BOUNDED post-exit
+    //    drain grace, and if a stream still has not EOF'd when the grace elapses we
+    //    signal the readers (via `stop_tx`) to return what they have BUFFERED and
+    //    stop. Dropping the read futures then closes our read ends → the orphan gets
+    //    SIGPIPE. The child's real output (written before it exited) was already
+    //    readable, so it is still captured; only a never-arriving orphan-held EOF is
+    //    abandoned. The grace only ever DELAYS the grandchild case — in the normal
+    //    path both streams EOF the instant the child's write end closes, so the loop
+    //    breaks with no wait and the fast path is not regressed.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut stdout_fut = std::pin::pin!(read_capped(
+        stdout_pipe,
+        CAS_BLOB_CAP_BYTES,
+        stop_rx.clone()
+    ));
+    let mut stderr_fut = std::pin::pin!(read_capped(stderr_pipe, CAS_BLOB_CAP_BYTES, stop_rx));
     let mut stdout_res: Option<std::result::Result<Vec<u8>, CapErr>> = None;
     let mut stderr_res: Option<std::result::Result<Vec<u8>, CapErr>> = None;
+    // The direct child's exit status, observed via the select so a grandchild holding
+    // the pipe can no longer wedge us waiting for an EOF that never comes.
+    let mut status: Option<std::process::ExitStatus> = None;
+    // Bounded post-exit drain grace: how long we keep collecting already-buffered
+    // output after the DIRECT child exits before abandoning an outstanding EOF. A few
+    // seconds is ample — the child's own output is already readable the moment it
+    // exits; the grace only bounds the wait for a grandchild-held EOF that never
+    // arrives. Disabled (`grace_armed = false`) until the child actually exits.
+    const POST_EXIT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+    let grace = tokio::time::sleep(POST_EXIT_DRAIN_GRACE);
+    tokio::pin!(grace);
+    let mut grace_armed = false;
     loop {
         tokio::select! {
             r = &mut stdout_fut, if stdout_res.is_none() => {
@@ -550,20 +638,34 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
                 }
                 stderr_res = Some(r);
             }
+            s = child.wait(), if status.is_none() => {
+                status = Some(s?);
+                // Direct child has exited — arm the bounded grace. If the streams do
+                // not EOF within it, a grandchild is holding the write end; we then
+                // stop draining rather than hang.
+                grace.as_mut().reset(tokio::time::Instant::now() + POST_EXIT_DRAIN_GRACE);
+                grace_armed = true;
+            }
+            _ = &mut grace, if grace_armed && (stdout_res.is_none() || stderr_res.is_none()) => {
+                // Grace elapsed after the direct child exited with a stream still not
+                // EOF'd (grandchild holds the pipe). Tell the readers to return their
+                // buffered bytes; the read arms then complete and the loop breaks.
+                let _ = stop_tx.send(true);
+                grace_armed = false; // one-shot
+            }
         }
-        if stdout_res.is_some() && stderr_res.is_some() {
+        // Done once BOTH streams have yielded AND the direct child has been reaped.
+        if stdout_res.is_some() && stderr_res.is_some() && status.is_some() {
             break;
         }
     }
     let stdout = stdout_res
-        .expect("loop breaks only when both are Some")
+        .expect("loop breaks only when both streams are Some")
         .map_err(CapErr::into_clw)?;
     let stderr = stderr_res
-        .expect("loop breaks only when both are Some")
+        .expect("loop breaks only when both streams are Some")
         .map_err(CapErr::into_clw)?;
-
-    // Both streams drained; now wait for the process to exit.
-    let status = child.wait().await?;
+    let status = status.expect("loop breaks only when the child has been reaped");
     // A signal-killed child has no exit code; map it to the POSIX 128+signal
     // convention so the propagated process exit is meaningful (e.g. SIGTERM → 143)
     // instead of -1, which `process::exit` truncates to a useless 255.
@@ -579,6 +681,14 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     };
 
     // --- Memoize only on success (output is already within cap by construction) ---
+    // We cache iff the DIRECT child exited 0. This holds even when the H2 post-exit
+    // grace fired (a grandchild kept the pipe open): `status` is the direct child's
+    // OWN exit, and the bytes we buffered are exactly what it wrote BEFORE exiting
+    // (its output is readable the instant it exits, so it is already in `buf` when the
+    // grace elapses) — abandoning a never-arriving orphan-held EOF does NOT truncate
+    // the child's result. A cap-blow or a non-zero/signal exit never reaches here (the
+    // former returns `TooLarge` above; the latter fails the `== 0` guard), so a torn
+    // or unsuccessful run is never cached as a complete success.
     if exit_code == 0 {
         let stdout_digest = Digest::of_bytes(&stdout);
         let stderr_digest = Digest::of_bytes(&stderr);
@@ -1738,6 +1848,110 @@ mod tests {
         assert_ne!(
             key_before, key_after,
             "in-place tool upgrade must invalidate the key (no stale replay)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H2 (backgrounded-grandchild hang): the direct child `sh` backgrounds a LONG
+    // `sleep` that INHERITS the stdout/stderr pipe write ends, then exits 0. The old
+    // drain loop waited for BOTH pipes to EOF — which cannot happen until the orphan
+    // `sleep` (300s) dies — so run_memoized wedged forever with no timeout. The fix
+    // observes the DIRECT child's exit in the select and applies a bounded post-exit
+    // drain grace, so run_memoized must RETURN promptly. We wrap it in a wall-clock
+    // timeout well under the sleep so a regression FAILS LOUDLY (times out) instead
+    // of hanging the whole test binary.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + backgrounded `sleep`
+    #[tokio::test]
+    async fn backgrounded_grandchild_does_not_wedge_run() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                // Background a long sleep (inherits the pipes) then exit 0.
+                "sleep 300 & exit 0".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_memoized(cwd, &store, &opts),
+        )
+        .await;
+
+        let outcome = res
+            .expect(
+                "run_memoized must RETURN despite a backgrounded grandchild holding the \
+                 pipe (H2 hang regression), not time out",
+            )
+            .expect("run must succeed");
+        assert_eq!(outcome.exit_code, 0, "the direct child exited 0");
+        assert!(
+            outcome.stdout.is_empty(),
+            "the child wrote no stdout of its own"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H3 (credential leak): the CAS bearer token / redemption ticket must be
+    // STRIPPED from the untrusted child's environment before spawn, so arbitrary CI
+    // code cannot exfiltrate it. We set the secret vars (a recognizable value) plus a
+    // NON-secret CLW_* marker in the parent env, run `sh -c env`, and assert the
+    // secret is ABSENT from the child's env dump while the non-secret marker survives
+    // (proving we stripped the secrets specifically, not env_clear()d wholesale).
+    // RED-on-revert: dropping the env_remove loop lets `CLW_TOKEN` reach the child →
+    // the secret appears in the dump → the absence assertion fails.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + `env`
+    #[tokio::test]
+    async fn secret_env_is_stripped_from_child() {
+        const SECRET: &str = "clw_h3_secret_value_9f3a_DEADBEEF";
+        const NONSECRET: &str = "clw_h3_endpoint_marker_9f3a";
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // Seed every credential-bearing var with the same recognizable secret, plus a
+        // non-secret CLW_* marker that must be preserved.
+        for var in SECRET_ENV_VARS {
+            std::env::set_var(var, SECRET);
+        }
+        std::env::set_var("CLW_ENDPOINT", NONSECRET);
+
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec!["/bin/sh".to_string(), "-c".to_string(), "env".to_string()],
+            env_keys: vec![],
+        };
+        let outcome = run_memoized(cwd, &store, &opts).await.unwrap();
+
+        // Restore the process-global env before asserting (a failed assert must not
+        // leave the secret set for other tests).
+        for var in SECRET_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        std::env::remove_var("CLW_ENDPOINT");
+
+        let dump = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            !dump.contains(SECRET),
+            "credential-bearing env vars must be STRIPPED from the untrusted child (H3); \
+             the child's env dump unexpectedly contained the secret"
+        );
+        assert!(
+            dump.contains(NONSECRET),
+            "a non-secret CLW_* var must still reach the child (no wholesale env_clear)"
         );
     }
 }

@@ -1169,6 +1169,139 @@ fn auth_whoami_prints_tenant_not_token() {
 }
 
 // ---------------------------------------------------------------------------
+// M8: endpoint userinfo must NEVER leak in doctor / auth whoami (text + --json).
+//
+// A misconfigured `CLW_ENDPOINT=https://user:s3cret@host` smuggles a secret in
+// the URL userinfo. doctor/whoami ECHO the resolved endpoint, and doctor output
+// is meant to be pasted into support tickets — so the userinfo must be stripped
+// to `<redacted>` on every output surface. These drive the REAL binary.
+// ---------------------------------------------------------------------------
+
+/// An endpoint carrying an embedded `user:pass@` credential whose secret must
+/// never survive to any user-facing output surface.
+const ENDPOINT_WITH_USERINFO: &str =
+    "https://alice:s3cret-endpoint-DO-NOT-LEAK@host.example.com/v1";
+/// The embedded secret + userinfo fragments that must never appear verbatim.
+const ENDPOINT_SECRET: &str = "s3cret-endpoint-DO-NOT-LEAK";
+
+#[test]
+fn doctor_redacts_endpoint_userinfo_text_and_json() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    for args in [vec!["doctor"], vec!["--json", "doctor"]] {
+        let out = Command::cargo_bin("clw")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("CLW_ENDPOINT", ENDPOINT_WITH_USERINFO)
+            .env("CLW_TENANT", TEST_TENANT)
+            .env("CLW_TOKEN", SECRET_TOKEN)
+            .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(out.status.code(), Some(0), "doctor {args:?} must exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            !stdout.contains(ENDPOINT_SECRET) && !stderr.contains(ENDPOINT_SECRET),
+            "doctor {args:?} must NOT leak the endpoint secret, got:\n{stdout}{stderr}"
+        );
+        // The `user:pass@` userinfo (host-local user part included) must be gone.
+        assert!(
+            !stdout.contains("alice:") && !stdout.contains("alice@"),
+            "doctor {args:?} must strip the endpoint userinfo, got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("<redacted>@host.example.com"),
+            "doctor {args:?} must show the redacted endpoint, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn whoami_redacts_endpoint_userinfo_text_and_json() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    for args in [vec!["auth", "whoami"], vec!["--json", "auth", "whoami"]] {
+        let out = Command::cargo_bin("clw")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("CLW_ENDPOINT", ENDPOINT_WITH_USERINFO)
+            .env("CLW_TENANT", TEST_TENANT)
+            .env("CLW_TOKEN", SECRET_TOKEN)
+            .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert_eq!(out.status.code(), Some(0), "whoami {args:?} must exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            !stdout.contains(ENDPOINT_SECRET) && !stderr.contains(ENDPOINT_SECRET),
+            "whoami {args:?} must NOT leak the endpoint secret, got:\n{stdout}{stderr}"
+        );
+        assert!(
+            !stdout.contains("alice:") && !stdout.contains("alice@"),
+            "whoami {args:?} must strip the endpoint userinfo, got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("<redacted>@host.example.com"),
+            "whoami {args:?} must show the redacted endpoint, got:\n{stdout}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LOW (docs/CLI-SURFACE-EXIT-FREEZE.md): a PANIC during `clw run` setup/dispatch
+// is a clw-INTERNAL "child never ran" failure — it must exit the RESERVED 125,
+// NOT the default panic exit 101 (which the runner mis-classifies). The binary
+// carries a debug-only, env-gated panic injection on the run dispatch path so
+// this contract has a RED-on-revert regression (revert the main.rs panic hook
+// and the exit becomes 101).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_dispatch_panic_exits_reserved_125_not_101() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("HOME", home.path())
+        // A resolvable identity so config resolution SUCCEEDS and we reach the
+        // dispatch path (no network call is made — the panic fires first).
+        .env("CLW_ENDPOINT", "https://host.example.com")
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        // Debug-only seam: force a clw-internal panic on the run dispatch path.
+        .env("CLW_TEST_INTERNAL_PANIC", "1")
+        .args([
+            "run",
+            "--input",
+            input.path().to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a clw-internal panic on the run dispatch path must exit the reserved 125, not 101, got: {:?}",
+        out.status.code()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 10: ls_unconfigured_fails_cleanly
 // ---------------------------------------------------------------------------
 
