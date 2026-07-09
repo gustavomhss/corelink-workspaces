@@ -14,21 +14,25 @@ no config file required. Single human owner = Gustavo (stakeholder + approver).
 content-addressed-hydrate deliverable that unblocks the runners' CF-native check-host image).
 
 ## Build / test / gate
-- The repo gate is `bash verify.sh` (FULL) or `bash verify.sh --scoped [base]` (change-scoped fast lane).
-  `gates.sh` runs fmt/clippy/test/deny lanes.
+- The repo gate is `bash scripts/gates.sh` (FULL) or `bash scripts/gates.sh --scoped [base]` (change-scoped
+  fast lane). It runs fmt/clippy/test/deny(+windows-cross) lanes. (There is no root `verify.sh`.)
 - On the self-hosted CI Mac, the toolchain is ISOLATED (a shared rustup-nuke happens) — use
   `CARGO_HOME=$HOME/.clw-ci-rust/cargo RUSTUP_HOME=$HOME/.clw-ci-rust/rustup $HOME/.clw-ci-rust/cargo/bin/cargo`.
   Pinned `RUST_TOOLCHAIN` (currently 1.91.1). Cross-builds use cargo-zigbuild (ziglang in an isolated venv).
 
 ## Repo conventions (enforced — do not relearn the hard way)
 - **DCO: commit with `-s`** (sign-off gate blocks otherwise). Conventional Commits for titles.
-- **Tiered flow:** tiny self-verified docs/≤50 LOC → direct to main is OK; anything bigger or
-  agent-authored → short-lived branch → PR → independent cold review → squash-merge. ~1 PR in flight.
+- **Flow (main is branch-protected — no direct-to-main):** as of 2026-07-09 `main` requires the `gates` +
+  `dco` status checks GREEN and enforces admins, force-push/deletion blocked, linear history. So EVERYTHING
+  goes: short-lived branch → PR → independent cold review → **squash-merge on green**. No approval-review is
+  required (the cold review is the gate, not the GitHub button), so the TechLead self-merges once checks pass.
+  Run the FULL gate LOCALLY first, then merge. ~1 PR in flight.
 - **Never force-push / history-rewrite on main.** The destructive-guard blocks the agent from force-push
   (a human runs it out-of-band) → prefer fresh-branch / add-a-commit. Never `--no-verify`. Don't commit
   telemetry/state (`.techlead/`, `__pycache__`, audit logs) — the git-hygiene-guard blocks it.
-- **The owner merges via GitHub; the local clone goes stale** → always `git fetch` + diff `origin/main`
-  before assuming. Trust the repo over any in-context/pre-compaction summary.
+- **The TechLead owns merge/approval end-to-end** (owner delegated: "prs, merge etc sao responsabilidade
+  sua, revisar, aprovar/reprovar, pedir review independente"). The local clone still goes stale → always
+  `git fetch` + diff `origin/main` before assuming. Trust the repo over any in-context/pre-compaction summary.
 
 ## Release (proven end-to-end)
 - Tag `v*` triggers `.github/workflows/release.yml`: preflight → conformance → 5-target build+sign
