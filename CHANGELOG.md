@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased] — 5-angle adversarial audit remediation
+## [Unreleased]
+
+## [0.1.6] — 5-angle adversarial audit remediation (2026-07-09)
 
 > A ruthless 5-lens audit (correctness · security · robustness · performance · honesty) of the shipped
 > binary, then a fix wave under independent cold review per change. No CRITICAL: the integrity core
