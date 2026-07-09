@@ -10,3 +10,6 @@
 .pass2-findings.json
 # Agent worktrees (cold-review isolation) — transient, never tracked.
 .claude/worktrees/
+
+# Ephemeral cross-TL courier correspondence (audit trail kept on disk, not tracked)
+docs/handoff/
