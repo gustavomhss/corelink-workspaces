@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.7] — external/escaping-symlink snapshot fidelity (2026-07-10)
+
 ### Fixed
 - **`clw snapshot` no longer fails an entire tree over one external symlink.** A symlink whose target is
   absolute or escapes the workspace (e.g. a stray `node_modules/.bin/x -> /usr/local/bin/x`) used to

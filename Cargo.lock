@@ -303,7 +303,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clw-cache"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clw-types",
  "criterion",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "clw-chunk"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clw-types",
  "criterion",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "clw-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "clw-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "clw-types",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "clw-conformance"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clw-cache",
  "clw-client",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "clw-hydrate"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "clw-cache",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "clw-integration-tests"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clw-cache",
  "clw-client",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "clw-manifest"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clw-types",
  "criterion",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "clw-run"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "blake3",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "clw-snapshot"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "clw-cache",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "clw-types"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "blake3",
