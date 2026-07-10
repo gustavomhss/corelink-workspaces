@@ -83,6 +83,12 @@ pub struct SnapshotReport {
     /// field is purely advisory so the CLI can warn the user. Empty when no
     /// entry matched.
     pub secret_warnings: Vec<String>,
+    /// Human strings (`"rel -> target"`) for symlinks that were SKIPPED because
+    /// their target points OUTSIDE the workspace (absolute or `..`-escaping) and
+    /// so is un-representable/un-restorable. These are NOT in the manifest — the
+    /// tree snapshotted fine otherwise. Advisory only, mirrors `secret_warnings`;
+    /// the CLI lists them so the user knows exactly which links were dropped.
+    pub skipped_external_symlinks: Vec<String>,
     /// True when the name already pointed at this EXACT root: the snapshot was a
     /// no-op (no ref write). The CLI reports "already up to date" instead of a
     /// misleading 409 / a redundant overwrite.
@@ -405,6 +411,11 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
             WalkedEntry::EmptyDir { rel } => {
                 entries.push(Entry::Dir { path: rel });
             }
+            // A symlink whose target escapes the workspace produces NO manifest
+            // entry (kept in lockstep with `snapshot`), so a manifest built here
+            // never carries an external/escaping symlink and its digest matches
+            // the one `snapshot` produced for the same tree.
+            WalkedEntry::SkippedExternalSymlink { .. } => {}
         }
     }
 
@@ -465,9 +476,25 @@ where
     // Shared across all files so `chunks_uploaded` aggregates the whole tree.
     let uploaded_counter = Arc::new(AtomicU64::new(0));
 
+    // Partition off symlinks whose target escapes the workspace: they produce NO
+    // manifest `Entry` (their bytes aren't in the snapshot, so they can't be
+    // restored) and are collected as advisory warnings instead. The manifest
+    // therefore never carries an external/escaping symlink. Everything else
+    // (files/dirs/contained symlinks) flows through the concurrent pipeline.
+    let mut skipped_external_symlinks: Vec<String> = Vec::new();
+    let mut representable: Vec<WalkedEntry> = Vec::with_capacity(walked.len());
+    for we in walked {
+        match we {
+            WalkedEntry::SkippedExternalSymlink { rel, target } => {
+                skipped_external_symlinks.push(format!("{rel} -> {target}"));
+            }
+            other => representable.push(other),
+        }
+    }
+
     // Process files (and pass symlinks/dirs through) concurrently, tagging each
     // with its walk index so we can restore walk order for the manifest.
-    let indexed: Vec<(usize, WalkedEntry)> = walked.into_iter().enumerate().collect();
+    let indexed: Vec<(usize, WalkedEntry)> = representable.into_iter().enumerate().collect();
     let results: Vec<Result<(usize, Entry)>> =
         stream::iter(indexed.into_iter().map(|(idx, we)| {
             let sem = Arc::clone(&sem);
@@ -480,6 +507,10 @@ where
                     }
                     WalkedEntry::Symlink { rel, target } => Entry::Symlink { path: rel, target },
                     WalkedEntry::EmptyDir { rel } => Entry::Dir { path: rel },
+                    // Skimmed off above; the stream never sees an external symlink.
+                    WalkedEntry::SkippedExternalSymlink { .. } => unreachable!(
+                        "external symlinks are partitioned out before the upload stream"
+                    ),
                 };
                 Ok::<(usize, Entry), ClwError>((idx, entry))
             }
@@ -589,6 +620,7 @@ where
                 chunks_total,
                 chunks_uploaded,
                 secret_warnings,
+                skipped_external_symlinks,
                 unchanged: true,
             });
         }
@@ -652,6 +684,7 @@ where
         chunks_total,
         chunks_uploaded,
         secret_warnings,
+        skipped_external_symlinks,
         unchanged,
     })
 }
@@ -1610,5 +1643,64 @@ mod tests {
                 panic!("a DIFFERING occupant on a 409 must surface the conflict, got: {other:?}")
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Option C — a tree containing a symlink whose target ESCAPES the workspace
+    // (absolute `/etc/passwd`) must SUCCEED: the escaping link is skipped (and
+    // reported), the manifest contains the normal file but NO symlink entry for
+    // it, and the security invariant holds — no external symlink is ever in the
+    // manifest. RED-on-revert: restoring the walk's
+    // `validate_symlink_target_contained(..)?` `?` makes `walk` (and thus this
+    // snapshot) error instead of skipping.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_skips_external_symlink_and_reports_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-external-symlink");
+
+        let report = snapshot(root, &client, &cache, &opts)
+            .await
+            .expect("an external symlink must NOT fail the whole snapshot");
+
+        // The escaping link is reported as skipped, listing its path -> target.
+        assert_eq!(
+            report.skipped_external_symlinks,
+            vec!["link -> /etc/passwd".to_string()],
+            "the external symlink must be reported as skipped, got {:?}",
+            report.skipped_external_symlinks
+        );
+
+        // The built manifest carries the normal file but NO symlink entry for
+        // `link` — the security invariant: the manifest never contains an
+        // external/escaping symlink.
+        let cas = client.cas.lock().await;
+        let manifest = Manifest::from_bytes(cas.get(&report.root).unwrap()).unwrap();
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::File { path, .. } if path == "real.txt")),
+            "the normal file must be in the manifest: {:?}",
+            manifest.entries
+        );
+        assert!(
+            !manifest
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::Symlink { path, .. } if path == "link")),
+            "the manifest must NEVER contain the external symlink: {:?}",
+            manifest.entries
+        );
+        assert_eq!(report.files, 1, "only the one real file is counted");
     }
 }

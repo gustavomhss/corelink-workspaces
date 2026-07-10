@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`clw snapshot` no longer fails an entire tree over one external symlink.** A symlink whose target is
+  absolute or escapes the workspace (e.g. a stray `node_modules/.bin/x -> /usr/local/bin/x`) used to
+  hard-fail the whole snapshot; it is now **skipped with an explicit per-link warning** (path → target) and
+  the rest of the tree snapshots normally. Such a link points OUTSIDE the workspace — its target isn't in the
+  snapshot and couldn't be restored meaningfully — so skipping it is correct. The containment model is
+  UNCHANGED and strict: `validate_symlink_target_contained` is untouched, the manifest can never contain an
+  escaping symlink, hydrate is unchanged, and intra-workspace relative symlinks (`bin/x -> ../src/x`) are
+  still recorded. (Closes the last deferred LOW from the 5-angle audit; security cold-reviewed.)
+
 ## [0.1.6] — 5-angle adversarial audit remediation (2026-07-09)
 
 > A ruthless 5-lens audit (correctness · security · robustness · performance · honesty) of the shipped

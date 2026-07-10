@@ -341,6 +341,19 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
                         let entry_rel = format!("{}/{}", rel, norm_sep(&dir_rel));
                         input_pairs.push([entry_rel, "emptydir".to_string()]);
                     }
+                    clw_manifest::WalkedEntry::SkippedExternalSymlink {
+                        rel: sym_rel,
+                        target,
+                    } => {
+                        // A symlink whose target escapes the workspace is un-snapshottable
+                        // (snapshot skips it), but for a `run` INPUT-cache key its
+                        // presence/target must still move the key — anchor it path-and-
+                        // target-bearing so a build that depends on such a link appearing,
+                        // disappearing, or being repointed does not get a false cache hit.
+                        let entry_rel = format!("{}/{}", rel, norm_sep(&sym_rel));
+                        input_pairs
+                            .push([entry_rel, format!("external-symlink:{}", norm_sep(&target))]);
+                    }
                 }
             }
         } else {

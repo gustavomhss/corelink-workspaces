@@ -24,8 +24,23 @@ pub struct WalkedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalkedEntry {
     File(WalkedFile),
-    Symlink { rel: String, target: String },
-    EmptyDir { rel: String },
+    Symlink {
+        rel: String,
+        target: String,
+    },
+    EmptyDir {
+        rel: String,
+    },
+    /// A symlink whose TARGET is un-representable in the manifest — absolute,
+    /// or a `..`-escape that leaves the workspace root. Its target is OUTSIDE the
+    /// snapshot, so it cannot be meaningfully restored anyway. Recorded here (not
+    /// as a real `Symlink`, and NOT an error) so `snapshot` can SKIP it with a
+    /// warning instead of hard-failing the whole tree. The manifest therefore
+    /// never contains an external/escaping symlink — containment stays strict.
+    SkippedExternalSymlink {
+        rel: String,
+        target: String,
+    },
 }
 
 impl WalkedEntry {
@@ -34,6 +49,7 @@ impl WalkedEntry {
             WalkedEntry::File(f) => &f.rel,
             WalkedEntry::Symlink { rel, .. } => rel,
             WalkedEntry::EmptyDir { rel } => rel,
+            WalkedEntry::SkippedExternalSymlink { rel, .. } => rel,
         }
     }
 }
@@ -138,13 +154,22 @@ pub fn walk(root: &Path) -> Result<Vec<WalkedEntry>> {
                 })?
                 .replace(std::path::MAIN_SEPARATOR, "/");
             // FIX 3: validate the entry's OWN rel path too (not just the target),
-            // so an unrepresentable symlink path fails fast at walk time.
+            // so an unrepresentable symlink path fails fast at walk time. A bad LINK
+            // PATH (its own filename) is genuinely unrepresentable and rare — still a
+            // hard error.
             clw_types::validate_rel_path(&rel)?;
             // Resolve the target against the LINK's location and allow `..` that
-            // stays inside the workspace (real projects have e.g. `bin/x -> ../src/x`);
-            // reject only a target that escapes the root / is otherwise unrepresentable.
-            clw_types::validate_symlink_target_contained(&rel, &target)?;
-            entries.push(WalkedEntry::Symlink { rel, target });
+            // stays inside the workspace (real projects have e.g. `bin/x -> ../src/x`).
+            // An escaping/absolute/otherwise-unrepresentable TARGET points OUTSIDE the
+            // workspace, so its bytes aren't in the snapshot and it cannot be restored
+            // anyway — record it as SKIPPED (not an error, and NOT a real Symlink) so
+            // the rest of the tree snapshots fine. The validator stays STRICT: a target
+            // it rejects is NEVER emitted as a `Symlink`, so the manifest can never
+            // carry an external/escaping symlink.
+            match clw_types::validate_symlink_target_contained(&rel, &target) {
+                Ok(()) => entries.push(WalkedEntry::Symlink { rel, target }),
+                Err(_) => entries.push(WalkedEntry::SkippedExternalSymlink { rel, target }),
+            }
         } else if file_type.is_dir() {
             // FIX 3: validate Dir entry paths at walk time — the SAME point symlink
             // targets are validated — so a path `validate_rel_path` will reject
@@ -359,6 +384,7 @@ mod tests {
                 WalkedEntry::File(f) => f.rel.as_str(),
                 WalkedEntry::Symlink { rel, .. } => rel.as_str(),
                 WalkedEntry::EmptyDir { rel } => rel.as_str(),
+                WalkedEntry::SkippedExternalSymlink { rel, .. } => rel.as_str(),
             })
             .collect();
 
@@ -385,6 +411,7 @@ mod tests {
                 WalkedEntry::File(f) => f.rel.as_str(),
                 WalkedEntry::Symlink { rel, .. } => rel.as_str(),
                 WalkedEntry::EmptyDir { rel } => rel.as_str(),
+                WalkedEntry::SkippedExternalSymlink { rel, .. } => rel.as_str(),
             })
             .collect();
 
@@ -413,6 +440,7 @@ mod tests {
                 WalkedEntry::File(f) => f.rel.as_str(),
                 WalkedEntry::Symlink { rel, .. } => rel.as_str(),
                 WalkedEntry::EmptyDir { rel } => rel.as_str(),
+                WalkedEntry::SkippedExternalSymlink { rel, .. } => rel.as_str(),
             })
             .collect();
 
@@ -437,6 +465,7 @@ mod tests {
                 WalkedEntry::File(f) => f.rel.as_str(),
                 WalkedEntry::Symlink { rel, .. } => rel.as_str(),
                 WalkedEntry::EmptyDir { rel } => rel.as_str(),
+                WalkedEntry::SkippedExternalSymlink { rel, .. } => rel.as_str(),
             })
             .collect();
 
@@ -481,6 +510,77 @@ mod tests {
             assert_eq!(rel, "link.txt");
             assert_eq!(target, "target.txt");
         }
+    }
+
+    // Option C — a symlink whose TARGET is ABSOLUTE (escapes the workspace) must
+    // NOT hard-fail the walk: it is recorded as `SkippedExternalSymlink` while the
+    // rest of the tree (a normal file) walks fine. The manifest never carries it.
+    // RED-on-revert: restoring the `validate_symlink_target_contained(..)?` `?`
+    // turns this into an `Err`, failing the assertion (and the snapshot test below).
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_external_symlink_keeps_rest() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("real.txt"), b"content").unwrap();
+        // Absolute target → escapes the workspace, un-representable.
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+
+        let entries = walk(root).expect("an external symlink must NOT fail the whole walk");
+
+        // The normal file is still present as a File entry.
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, WalkedEntry::File(f) if f.rel == "real.txt")),
+            "the normal file must still be walked: {entries:?}"
+        );
+        // The escaping symlink is recorded as SKIPPED — NOT as a real Symlink.
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                WalkedEntry::SkippedExternalSymlink { rel, target }
+                    if rel == "link" && target == "/etc/passwd"
+            )),
+            "the external symlink must be recorded as SkippedExternalSymlink: {entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, WalkedEntry::Symlink { rel, .. } if rel == "link")),
+            "an escaping symlink must NEVER be emitted as a real Symlink: {entries:?}"
+        );
+    }
+
+    // REGRESSION GUARD — an INTRA-workspace relative symlink (`bin/x -> ../src/x`)
+    // stays inside the root, so it is STILL a normal `Symlink` entry, NOT skipped.
+    // This proves the skip fires only for escaping/absolute targets.
+    #[cfg(unix)]
+    #[test]
+    fn walk_intra_workspace_symlink_still_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src").join("x"), b"real").unwrap();
+        // `bin/x -> ../src/x` resolves to `src/x`, which stays inside the workspace.
+        std::os::unix::fs::symlink("../src/x", root.join("bin").join("x")).unwrap();
+
+        let entries = walk(root).unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                WalkedEntry::Symlink { rel, target }
+                    if rel == "bin/x" && target == "../src/x"
+            )),
+            "an intra-workspace symlink must stay a normal Symlink entry: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(
+                |e| matches!(e, WalkedEntry::SkippedExternalSymlink { rel, .. } if rel == "bin/x")
+            ),
+            "an intra-workspace symlink must NOT be skipped: {entries:?}"
+        );
     }
 
     #[test]

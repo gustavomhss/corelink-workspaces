@@ -104,6 +104,23 @@ pub async fn run(
         eprintln!("Add them to a .clwignore file to exclude them from future snapshots.");
     }
 
+    // Non-fatal note: symlinks whose target points OUTSIDE the workspace (absolute
+    // or `..`-escaping) can't be represented in — or restored from — the snapshot,
+    // so they were SKIPPED rather than failing the whole tree. List each so the
+    // user knows exactly which links were dropped. stderr only (keeps --json stdout
+    // clean); does not change the exit code.
+    if !report.skipped_external_symlinks.is_empty() {
+        eprintln!(
+            "note: {} symlink(s) point outside the workspace and were SKIPPED (their target \
+             is not in the snapshot, so they cannot be represented or restored) — the rest of \
+             the tree snapshotted fine:",
+            report.skipped_external_symlinks.len()
+        );
+        for link in &report.skipped_external_symlinks {
+            eprintln!("  - {link}");
+        }
+    }
+
     if json {
         let out = json!({
             "name": args.name,
@@ -113,6 +130,7 @@ pub async fn run(
             "chunks_total": report.chunks_total,
             "chunks_uploaded": report.chunks_uploaded,
             "unchanged": report.unchanged,
+            "skipped_external_symlinks": report.skipped_external_symlinks,
         });
         println!("{out}");
     } else if report.unchanged {
