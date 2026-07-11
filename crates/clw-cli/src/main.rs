@@ -335,6 +335,16 @@ pub fn actionable_error(err: &ClwError) -> String {
         ClwError::Auth => {
             "authentication failed — check CLW_TOKEN or add token to ~/.clw/config.toml".to_string()
         }
+        // HTTP 402 (Payment Required) has exactly one meaning on the CoreLink
+        // backend (ADR-0068): the tenant hit its monthly usage quota / plan
+        // $-ceiling. This is a billing/plan wall on the account, NOT a clw bug or
+        // a server fault — so say so and give the word-actionable next step.
+        ClwError::Http { status: 402, .. } => {
+            "monthly usage quota reached (HTTP 402 Payment Required) — this is a plan/billing limit \
+             on your CoreLink account, not a clw error; contact your CoreLink account owner to raise \
+             the monthly quota or upgrade the plan"
+                .to_string()
+        }
         // NotFound at the top-level prints the raw digest — subcommands override
         // this with workspace-name context before returning to main.
         _ => err.to_string(),
@@ -1131,6 +1141,28 @@ mod tests {
         assert!(
             msg.contains("authentication failed"),
             "auth error must say 'authentication failed', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn actionable_error_402_is_quota_actionable_not_raw_display() {
+        let err = ClwError::Http {
+            status: 402,
+            context: "PUT https://cas.example/v1/cas/abc".to_string(),
+        };
+        let msg = actionable_error(&err);
+        // Names it as a quota/plan/billing wall (RED-on-revert: without the new
+        // 402 arm this falls to `_ => err.to_string()`, which is the raw
+        // "HTTP 402 from …" Display string and contains none of these).
+        assert!(
+            msg.contains("quota"),
+            "402 error must name it a quota limit (the raw HTTP Display has no such token), got: {msg}"
+        );
+        // And it must NOT be the bare Display string the user finds cryptic.
+        assert_ne!(
+            msg,
+            err.to_string(),
+            "402 error must be rewritten, not the raw HTTP Display string"
         );
     }
 

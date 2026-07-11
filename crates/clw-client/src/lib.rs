@@ -9,7 +9,7 @@ use clw_types::{AcTransport, CasTransport, ClwError, Config, Digest, Result, CAS
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,31 @@ use tokio::sync::Semaphore;
 const MAX_ATTEMPTS: u32 = 6;
 /// Sleep durations between attempt 1→2 and 2→3.
 const RETRY_SLEEP_MS: [u64; 5] = [200, 800, 2_000, 5_000, 10_000];
+
+/// Default OVERALL per-operation deadline (seconds) across ALL retry attempts.
+///
+/// Without an overall bound a black-hole backend (accepts the connection but
+/// never answers) hangs one op for up to `MAX_ATTEMPTS`×120s + backoff ≈ 12 min —
+/// the user perceives an indefinite hang during a partial outage. 300s (5 min) is
+/// generous: a single request's own timeout is 120s < 300s, so a legitimately-slow
+/// large op still completes, while a hang is cut off with an actionable error.
+const DEFAULT_OP_DEADLINE_SECS: u64 = 300;
+
+/// Resolve the overall per-op deadline (seconds) from a raw `CLW_OP_DEADLINE_SECS`
+/// value. Unset / empty / unparseable / `0` → [`DEFAULT_OP_DEADLINE_SECS`]; an
+/// explicit positive value overrides (so a user with legitimately-slow large ops
+/// can raise it). Pure over its input so the parse is unit-testable without env.
+fn resolve_op_deadline_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_OP_DEADLINE_SECS)
+}
+
+/// Read the overall per-op deadline (seconds) from the `CLW_OP_DEADLINE_SECS`
+/// environment knob, mirroring how the other `CLW_*` knobs are read.
+fn op_deadline_secs() -> u64 {
+    resolve_op_deadline_secs(std::env::var("CLW_OP_DEADLINE_SECS").ok().as_deref())
+}
 
 /// Default concurrency ceiling when constructed via [`HttpClient::new`].
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
@@ -272,7 +297,28 @@ impl HttpClient {
         F: Fn(Arc<AtomicU64>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        // Read the overall per-op deadline knob once, then run the bounded loop.
+        self.with_retry_bounded(op, op_deadline_secs()).await
+    }
+
+    /// [`with_retry`](Self::with_retry) with an explicit overall deadline in
+    /// seconds — the testable seam so a short deadline can be injected without the
+    /// process-global `CLW_OP_DEADLINE_SECS` env. Adds an OVERALL upper bound ON TOP
+    /// of the existing per-attempt / `MAX_ATTEMPTS` / 429-AIMD / Retry-After logic
+    /// (which is otherwise unchanged): a black-hole backend can no longer hang one
+    /// op for the full `MAX_ATTEMPTS`×120s + backoff budget.
+    async fn with_retry_bounded<F, Fut, T>(&self, op: F, op_deadline_secs: u64) -> Result<T>
+    where
+        F: Fn(Arc<AtomicU64>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         const NONE: u64 = u64::MAX;
+        // OVERALL deadline for this operation across every attempt + backoff sleep.
+        let deadline = Instant::now() + Duration::from_secs(op_deadline_secs);
+        // Set when we stop because the deadline was reached (before an attempt, in a
+        // backoff sleep, or a per-attempt timeout elapse) rather than exhausting the
+        // MAX_ATTEMPTS budget — drives the actionable deadline error below.
+        let mut hit_deadline = false;
         let mut last_err: Option<ClwError> = None;
         // Per-request Retry-After hint (raw delta-seconds; NONE sentinel = absent).
         // Created fresh for this call so no two requests share a slot.
@@ -302,14 +348,44 @@ impl HttpClient {
                     let jitter = if base > 0 { nanos % (base / 2 + 1) } else { 0 };
                     base + jitter
                 };
+                // Cap the backoff by the time left before the overall deadline so a
+                // sleep never parks us PAST it; if the deadline is already reached,
+                // stop rather than sleep + start another doomed attempt.
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                if remaining_ms == 0 {
+                    hit_deadline = true;
+                    break;
+                }
+                let sleep_ms = sleep_ms.min(remaining_ms);
                 // Diagnostic channel (M5.1): one event per backoff so support can
                 // see attempt count + sleep without it touching user-facing stdout.
                 tracing::debug!(attempt, sleep_ms, "retry backoff before next attempt");
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
+            // Enforce the overall deadline per attempt: don't start another attempt
+            // once it is reached, and bound this attempt's future by the time left so
+            // a black-hole backend can't hang the whole op. A `timeout` elapse means
+            // the deadline itself was hit (`remaining` counts down to it) → stop.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                hit_deadline = true;
+                break;
+            }
             // Hold one governor permit for the lifetime of this attempt.
             let _permit = self.governor.acquire().await;
-            match op(Arc::clone(&slot)).await {
+            let attempt_result = match tokio::time::timeout(remaining, op(Arc::clone(&slot))).await
+            {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    // The overall deadline elapsed mid-attempt. Counts as a retryable
+                    // transport-timeout, but the deadline is now reached → stop.
+                    hit_deadline = true;
+                    break;
+                }
+            };
+            match attempt_result {
                 Ok(v) => {
                     self.governor.on_success();
                     return Ok(v);
@@ -342,6 +418,16 @@ impl HttpClient {
                     }
                 }
             }
+        }
+        // Deadline reached (black-hole / unresponsive backend) BEFORE the
+        // MAX_ATTEMPTS budget ran out: surface an actionable, deadline-specific
+        // error rather than a bare timeout — the op exceeded its overall bound.
+        if hit_deadline {
+            return Err(ClwError::Transport(format!(
+                "operation exceeded the {op_deadline_secs}s overall deadline (CLW_OP_DEADLINE_SECS) — \
+                 the CoreLink backend may be unavailable or unresponsive; raise CLW_OP_DEADLINE_SECS \
+                 if your operations are legitimately slow"
+            )));
         }
         // On exhaustion, rewrite a final 429's context so the message
         // distinguishes a transient backpressure throttle from a plan/quota
@@ -2603,6 +2689,87 @@ mod tests {
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1, "401 must not be retried");
+    }
+
+    // -------------------------------------------------------------------------
+    // Overall per-op deadline (CLW_OP_DEADLINE_SECS) — WP-DEADLINE
+    // -------------------------------------------------------------------------
+
+    /// The env knob parses to the default when unset/empty/`0`/garbage, and an
+    /// explicit positive value overrides. Pure over its input, so no env race.
+    #[test]
+    fn op_deadline_env_parsing_defaults_and_overrides() {
+        assert_eq!(DEFAULT_OP_DEADLINE_SECS, 300);
+        assert_eq!(resolve_op_deadline_secs(None), DEFAULT_OP_DEADLINE_SECS);
+        assert_eq!(resolve_op_deadline_secs(Some("")), DEFAULT_OP_DEADLINE_SECS);
+        // 0 → default (explicitly specified: "0 or unset → default").
+        assert_eq!(
+            resolve_op_deadline_secs(Some("0")),
+            DEFAULT_OP_DEADLINE_SECS
+        );
+        assert_eq!(
+            resolve_op_deadline_secs(Some("not-a-number")),
+            DEFAULT_OP_DEADLINE_SECS
+        );
+        // Explicit positive values override (raise it for legitimately-slow ops).
+        assert_eq!(resolve_op_deadline_secs(Some("30")), 30);
+        assert_eq!(resolve_op_deadline_secs(Some("  900  ")), 900);
+    }
+
+    /// RED-on-revert: a black-hole backend (accepts the connection but never
+    /// answers) must be cut off by the OVERALL deadline instead of hanging the
+    /// full `MAX_ATTEMPTS`×120s + backoff (~720s) budget. Each attempt here "hangs"
+    /// 30s (>> the 1s injected deadline) then would return a retryable transport
+    /// error; with the deadline, the op returns an actionable deadline error in
+    /// ~1s. Without the deadline (revert), the loop would run every attempt for
+    /// ~180s+ and never carry a deadline message — so this test goes RED.
+    #[tokio::test]
+    async fn op_deadline_bounds_a_hanging_backend() {
+        let client = make_client("https://corelink-api.humangr.com".into());
+        let start = std::time::Instant::now();
+        let res: Result<()> = client
+            .with_retry_bounded(
+                |_slot| async move {
+                    // Model "accepts but never answers": sleep well past the deadline.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Err::<(), _>(ClwError::Transport("still hanging".into()))
+                },
+                1, // 1-second overall deadline (injected seam, no env race)
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a hanging backend must surface an overall-deadline error");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ClwError::Transport(_)),
+            "the deadline error must be a Transport error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("deadline") && msg.contains("CLW_OP_DEADLINE_SECS"),
+            "the error must name the overall deadline + the knob, got: {msg}"
+        );
+        assert!(
+            msg.contains("unavailable") || msg.contains("unresponsive"),
+            "the error must be actionable about the backend, got: {msg}"
+        );
+        // Bounded wall-clock: cut off by the ~1s deadline, FAR under the 6×120s budget.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "op must be bounded by the deadline, not the full retry budget; took {elapsed:?}"
+        );
+    }
+
+    /// A normal op that completes well under the deadline is UNCHANGED: the
+    /// overall deadline is an additional upper bound, never a floor. Here a fast
+    /// success returns immediately even with a generous 300s deadline.
+    #[tokio::test]
+    async fn op_deadline_does_not_perturb_a_fast_success() {
+        let client = make_client("https://corelink-api.humangr.com".into());
+        let out: Result<u32> = client
+            .with_retry_bounded(|_slot| async move { Ok(42u32) }, 300)
+            .await;
+        assert_eq!(out.unwrap(), 42);
     }
 
     // -------------------------------------------------------------------------

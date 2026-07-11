@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+- **A quota-exceeded (HTTP 402) failure now shows an actionable message instead of a cryptic HTTP error.**
+  When a tenant crosses its monthly usage quota / plan $-ceiling, the backend returns 402; clw now says
+  "monthly usage quota reached … this is a plan/billing limit on your CoreLink account, not a clw error;
+  contact your CoreLink account owner to raise the monthly quota or upgrade the plan" instead of a bare
+  `HTTP 402 from PUT …` that reads like a server fault. (Prod-breakage audit — the wall a real paying
+  customer hits.)
+- **Every backend operation is now bounded by an overall deadline, so an unresponsive backend fails in
+  bounded time instead of hanging ~12 minutes.** A new `CLW_OP_DEADLINE_SECS` knob (default **300s**) caps
+  the total wall-clock across the retry budget: each attempt is wrapped in a timeout, backoff is capped to
+  the remaining budget, and on exhaustion clw returns a clear "operation exceeded the Ns deadline — the
+  CoreLink backend may be unavailable" error. A black-hole backend (accepts the connection but never
+  responds) previously ran 6 × 120s + backoff with no overall bound. The 429-AIMD / Retry-After / 5xx retry
+  behavior is unchanged; a normal or legitimately-slow single request is unaffected.
+
 ## [0.1.7] — external/escaping-symlink snapshot fidelity (2026-07-10)
 
 ### Fixed
