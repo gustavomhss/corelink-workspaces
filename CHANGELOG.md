@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.9] — 402 upgrade link + macOS Gatekeeper doc (2026-07-11)
+
 ### Changed
 - **The 402 quota-exceeded message now links the upgrade page.** Following the actionable 402 message added
   in 0.1.8, it now points the user straight at `https://corelink-admin.humangr.com/en/pricing` to self-serve

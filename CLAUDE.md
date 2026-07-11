@@ -9,7 +9,7 @@ content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + ten
 (never `x-corelink-tenant-id`). Config is env-driven (`CLW_ENDPOINT/CLW_TENANT/CLW_TOKEN/CLW_REF_DOMAIN`),
 no config file required. Single human owner = Gustavo (stakeholder + approver).
 
-**Status: SHIPPED — v0.1.8 is live (open beta; v0.1.0 launched 2026-06-18).**
+**Status: SHIPPED — v0.1.9 is live (open beta; v0.1.0 launched 2026-06-18).**
 `brew install humanguardrail/clw/clw`. v0.1.6 (2026-07-09) shipped the 5-angle adversarial-audit
 remediation (4 HIGH + 6 MED + LOW cluster — `run` PAT-env-leak, `run` grandchild-hang, unrestorable
 snapshot, snapshot global concurrency, endpoint-userinfo redaction, prune replica-lag fail-safe, …).
