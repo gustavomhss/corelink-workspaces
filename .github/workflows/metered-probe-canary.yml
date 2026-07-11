@@ -1,0 +1,80 @@
+# Metered-probe canary — the SECOND canary lane (prod-breakage #2 residual).
+#
+# The main conformance-canary runs as the comped ($1M) CI tenant, so it can NEVER 402 —
+# it is structurally blind to the per-tenant $-ceiling enforcement (ADR-0068). THIS lane
+# runs as a dedicated synthetic probe tenant with a low explicit $0.50/mo ceiling, drives
+# it OVER the ceiling, and asserts the 402 boundary actually fires in prod. If the ceiling
+# ever stops enforcing (a real over-quota tenant could then overspend), this goes RED.
+#
+# Mechanism (server-confirmed): $0.001/CAS-op, debited in 16-op lease chunks
+# (LeasedQuotaStore, D1 accrue amortised 16:1). Budget $0.50 = 500_000 micro-USD ÷ $0.001
+# = ~500 writes to trip. Worst-case overshoot is one lease ($0.016). The atomic
+# `UPDATE … WHERE accrued+delta<=budget` refuses the lease that would cross the ceiling.
+# accrued resets on the ~monthly cycle, so most runs after the first monthly trip 402 on
+# write #1 (the tenant is already at the wall); only the first run per cycle does ~500.
+#
+# Weekly (not daily) to bound the synthetic write load. The probe tenant is dedicated to
+# this lane; a $0.50/cycle spend on it is the point.
+
+name: metered-probe-canary
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"   # Mondays 12:00 UTC (offset from conformance-canary 13:00 + deadman 16:00)
+  workflow_dispatch:
+
+concurrency:
+  group: metered-probe-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: metered probe — assert the $-ceiling 402 fires
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      EP: https://corelink-api.humangr.com
+      PROBE_TENANT: ${{ secrets.CLW_PROBE_TENANT }}
+      PROBE_TOKEN: ${{ secrets.CLW_PROBE_TOKEN }}
+    steps:
+      - name: install blake3 (CAS content-address)
+        run: pip install --quiet blake3
+
+      - name: drive the probe over its $0.50 ceiling and assert the 402 boundary
+        run: |
+          set -uo pipefail
+          if [ -z "${PROBE_TOKEN:-}" ] || [ -z "${PROBE_TENANT:-}" ]; then
+            echo "::error::CLW_PROBE_TENANT/TOKEN unset — a missing probe cred must FAIL this canary (a silent skip would defeat the purpose)."
+            exit 1
+          fi
+          b3() { python3 -c "import blake3,sys; print(blake3.blake3(sys.stdin.buffer.read()).hexdigest())"; }
+          got402=0
+          # budget 500_000 / 1_000-per-op = ~500 writes; bound at 560 (margin). SEQUENTIAL —
+          # parallel process-substitution delivers empty bodies (blake3 != url digest => 422),
+          # which is a harness artifact, not the metering. One PUT at a time is clean.
+          for i in $(seq 1 560); do
+            c="clw-metered-probe-$(date -u +%s%N)-${i}-${RANDOM}"
+            d="$(printf '%s' "$c" | b3)"
+            code="$(printf '%s' "$c" | curl -s -m 20 -o /dev/null -w '%{http_code}' \
+                     -X PUT --data-binary @- \
+                     -H "Authorization: Bearer ${PROBE_TOKEN}" \
+                     "${EP}/v1/cas/${PROBE_TENANT}/${d}")"
+            if [ "$code" = "402" ]; then
+              got402=1
+              echo "402 quota_exceeded at write ${i} — the per-tenant \$-ceiling ENFORCES in prod."
+              break
+            fi
+            case "$code" in
+              200|201) : ;;                        # accepted (or dedup) — keep going
+              429) sleep 1 ;;                       # rate-limit backpressure — brief backoff, retry the loop
+              *) echo "  write ${i}: unexpected HTTP ${code}" ;;
+            esac
+          done
+          if [ "$got402" != "1" ]; then
+            echo "::error::NO 402 in 560 writes against a \$0.50/mo tenant — the per-tenant \$-ceiling is NOT enforcing. A low-ceiling or runaway tenant could overspend. Investigate tenant_quota / the LeasedQuotaStore gate."
+            exit 1
+          fi
+          echo "metered-probe canary GREEN — the \$-ceiling 402 boundary is reachable and enforced."
