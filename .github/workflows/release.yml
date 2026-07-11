@@ -167,7 +167,15 @@ jobs:
             echo "::error::CI/conformance tenant is METERED (200, unmetered=false) — a release risks the conformance gate 402'ing. Raise its monthly_budget_usd_micros to \$1M before tagging."
             exit 1
           fi
-          echo "::warning::quota read-endpoint returned HTTP ${code} (transient/unavailable) — NOT blocking; the mandatory conformance gate is the backstop for a metered tenant."
+          case "$code" in
+            401|400)
+              # A definitive auth/tenant error (not a transient) means the secret is misconfigured
+              # — the guard is silently NOT asserting. Still don't block (conformance backstops a
+              # metered tenant), but make the ROT visible/distinct so it gets fixed.
+              echo "::warning::quota read-endpoint returned HTTP ${code} — CLW_CI_QUOTA_READ_KEY or CLW_CI_TENANT looks MISCONFIGURED (rotated/wrong); the unmetered pre-assert is NOT running. Conformance still backstops a metered tenant, but fix the secret so this guard works again." ;;
+            *)
+              echo "::warning::quota read-endpoint returned HTTP ${code} (transient/unavailable) — NOT blocking; the mandatory conformance gate is the backstop for a metered tenant." ;;
+          esac
           exit 0
 
       # gates.sh's FULL lane runs `cargo deny check` + `cargo audit` (no install

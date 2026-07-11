@@ -52,6 +52,8 @@ jobs:
           fi
           b3() { python3 -c "import blake3,sys; print(blake3.blake3(sys.stdin.buffer.read()).hexdigest())"; }
           got402=0
+          ok=0            # count of ACCEPTED (2xx) writes — a real metering gap needs many of these with no 402
+          last_bad=""     # last non-2xx status — points at availability/harness, not the ceiling
           # budget 500_000 / 1_000-per-op = ~500 writes; bound at 560 (margin). SEQUENTIAL —
           # parallel process-substitution delivers empty bodies (blake3 != url digest => 422),
           # which is a harness artifact, not the metering. One PUT at a time is clean.
@@ -68,13 +70,19 @@ jobs:
               break
             fi
             case "$code" in
-              200|201) : ;;                        # accepted (or dedup) — keep going
-              429) sleep 1 ;;                       # rate-limit backpressure — brief backoff, retry the loop
-              *) echo "  write ${i}: unexpected HTTP ${code}" ;;
+              200|201) ok=$((ok+1)) ;;              # accepted (or dedup) — a real charged write
+              429) sleep 1; last_bad=429 ;;         # rate-limit backpressure — brief backoff, retry the loop
+              *) echo "  write ${i}: unexpected HTTP ${code}"; last_bad="$code" ;;
             esac
           done
           if [ "$got402" != "1" ]; then
-            echo "::error::NO 402 in 560 writes against a \$0.50/mo tenant — the per-tenant \$-ceiling is NOT enforcing. A low-ceiling or runaway tenant could overspend. Investigate tenant_quota / the LeasedQuotaStore gate."
+            # Distinguish an AVAILABILITY/harness fault (few writes accepted) from a genuine
+            # metering gap (many writes accepted against a $0.50 tenant, yet no 402).
+            if [ "$ok" -lt 10 ]; then
+              echo "::error::metered-probe: only ${ok} of the attempted writes were accepted (last non-2xx: HTTP ${last_bad:-none}) — this looks like a backend AVAILABILITY or harness fault, NOT a \$-ceiling gap. Check corelink-api reachability + the probe cred/digest path FIRST."
+            else
+              echo "::error::metered-probe: ${ok} writes ACCEPTED against a \$0.50/mo tenant with NO 402 — the per-tenant \$-ceiling is NOT enforcing (a runaway/low-ceiling tenant could overspend). Investigate tenant_quota / the LeasedQuotaStore gate."
+            fi
             exit 1
           fi
           echo "metered-probe canary GREEN — the \$-ceiling 402 boundary is reachable and enforced."
