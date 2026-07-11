@@ -706,18 +706,42 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
         let stdout_digest = Digest::of_bytes(&stdout);
         let stderr_digest = Digest::of_bytes(&stderr);
 
-        // Best-effort: ignore errors storing (the outcome is still valid).
-        let _ = CasTransport::put(client, &stdout_digest, stdout.clone()).await;
-        let _ = CasTransport::put(client, &stderr_digest, stderr.clone()).await;
-
         let record = RunRecord {
             exit_code,
             stdout: stdout_digest,
             stderr: stderr_digest,
         };
-        if let Ok(record_bytes) = serde_json::to_vec(&record) {
-            let _ = AcTransport::put(client, &key, record_bytes).await;
-        }
+        let record_bytes = serde_json::to_vec(&record).ok();
+
+        // Post-success cache write. The child ALREADY exited 0, so these three
+        // stores are pure best-effort caching (a store failure is IGNORED — the
+        // outcome is still valid). Two hazards, both closed here:
+        //   * SERIAL cost — three awaited `with_retry` stores, each with its own
+        //     ~300 s op-deadline, sum to ~15 min if the backend goes black-hole
+        //     AFTER the child passed. So run them CONCURRENTLY (`join!`): the phase
+        //     is bounded by the SLOWEST single store, not the sum.
+        //   * UNBOUNDED wait — a black-hole backend still stalls each concurrent
+        //     store for its full op-deadline. So cap the WHOLE phase with one SHORT
+        //     grace: on timeout the cache write is simply skipped and we still
+        //     return the correct exit 0. A best-effort cache write must never
+        //     materially delay an already-successful run.
+        const STORE_PHASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let _ = tokio::time::timeout(STORE_PHASE_DEADLINE, async {
+            tokio::join!(
+                async {
+                    let _ = CasTransport::put(client, &stdout_digest, stdout.clone()).await;
+                },
+                async {
+                    let _ = CasTransport::put(client, &stderr_digest, stderr.clone()).await;
+                },
+                async {
+                    if let Some(bytes) = record_bytes {
+                        let _ = AcTransport::put(client, &key, bytes).await;
+                    }
+                },
+            );
+        })
+        .await;
     }
 
     Ok(RunOutcome {
@@ -1910,6 +1934,125 @@ mod tests {
         assert!(
             outcome.stdout.is_empty(),
             "the child wrote no stdout of its own"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX #2: the post-success best-effort store phase must NOT materially delay an
+    // already-successful run. A transport that black-holes AFTER the child exits 0
+    // used to hang `clw run` for up to 3×op-deadline (~15 min) because the three
+    // stores (stdout CAS, stderr CAS, AC record) ran SERIALLY, each awaited. The fix
+    // runs them CONCURRENTLY and caps the whole phase with STORE_PHASE_DEADLINE (30 s).
+    //
+    // Observable coverage & its limit: we drive the REAL `run_memoized` against a
+    // transport whose every `put` sleeps, and assert (in real wall-clock) that the
+    // successful run returns in ~ONE store's time, not the sum of three — the direct
+    // signature of concurrency. The 30 s deadline itself is NOT exercised as a timer
+    // here: doing so in real time means a ~30 s test, and tokio's paused virtual
+    // clock (`start_paused`) needs the `test-util` feature, whose enabling lives in
+    // Cargo.toml — outside this WP's owner-file set. The timeout wrapper is therefore
+    // verified by construction (see `STORE_PHASE_DEADLINE` in the source); this test
+    // pins the concurrency, which is what makes the phase bounded by one op.
+    // -----------------------------------------------------------------------
+
+    /// A transport whose every `put` (CAS and AC) blocks for `put_delay` before
+    /// delegating to an in-memory `FakeStore` — a stand-in for a slow/black-hole
+    /// backend on writes AFTER the child already succeeded. `get`/`exists` stay fast
+    /// + empty so `run_memoized` takes the cache-MISS path and executes the child.
+    #[derive(Clone)]
+    struct SlowPutStore {
+        inner: FakeStore,
+        put_delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for SlowPutStore {
+        async fn exists(&self, digest: &Digest) -> Result<bool> {
+            CasTransport::exists(&self.inner, digest).await
+        }
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            CasTransport::get(&self.inner, digest).await
+        }
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            tokio::time::sleep(self.put_delay).await;
+            CasTransport::put(&self.inner, digest, bytes).await
+        }
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            CasTransport::delete(&self.inner, digest).await
+        }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            CasTransport::list_blobs(&self.inner).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for SlowPutStore {
+        async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {
+            AcTransport::get(&self.inner, key).await
+        }
+        async fn put(&self, key: &Digest, value: Vec<u8>) -> Result<()> {
+            tokio::time::sleep(self.put_delay).await;
+            AcTransport::put(&self.inner, key, value).await
+        }
+        async fn delete(&self, key: &Digest) -> Result<()> {
+            AcTransport::delete(&self.inner, key).await
+        }
+        async fn list_refs(&self) -> Result<Vec<Digest>> {
+            AcTransport::list_refs(&self.inner).await
+        }
+    }
+
+    // FIX #2 — CONCURRENT + BOUNDED-BY-ONE-OP. Each of the three post-success stores
+    // (stdout CAS, stderr CAS, AC record) blocks for 3 s. Run CONCURRENTLY the phase
+    // is bounded by the slowest SINGLE store (~3 s); run SERIALLY (the pre-fix code)
+    // it takes ~9 s (3×3 s). We drive the REAL `run_memoized` and assert the
+    // successful run returns in well under 3× the per-store sleep, and still yields
+    // exit 0 with its output intact + memoized. RED-on-revert: restoring the three
+    // serial awaited stores makes the phase ~9 s → the `< 6 s` wall-clock bound fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_phase_is_concurrent_not_serial_after_success() {
+        const PUT_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = SlowPutStore {
+            inner: FakeStore::default(),
+            put_delay: PUT_DELAY,
+        };
+
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf hi".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        let start = std::time::Instant::now();
+        let outcome = run_memoized(cwd, &store, &opts).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.exit_code, 0, "the child succeeded");
+        assert_eq!(
+            outcome.stdout, b"hi",
+            "the child's output is returned intact"
+        );
+        // Concurrent ⇒ ~1×PUT_DELAY (+ trivial child); serial ⇒ ~3×PUT_DELAY. A bound
+        // at 2×PUT_DELAY cleanly separates the two while leaving generous CI slack.
+        assert!(
+            elapsed < 2 * PUT_DELAY,
+            "the best-effort store phase must run concurrently (~{PUT_DELAY:?}), \
+             not ~3× serial; took {elapsed:?}"
+        );
+        // The three stores completed (well within the 30 s deadline) → memoized.
+        let stored = AcTransport::get(&store, &outcome.key).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "a within-deadline success must be memoized (all three stores completed)"
         );
     }
 

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+- **The per-op deadline now actually bounds a queued op under load.** `CLW_OP_DEADLINE_SECS` previously did
+  not cover `governor.acquire()` (the permit wait was un-timed) and re-used a stale pre-acquire `remaining`,
+  so under 429/AIMD permit contention a single op could run far past its deadline (~40 min for a 300 s
+  deadline). The acquire is now bounded by the deadline and `remaining` is recomputed after it, so total
+  per-op wall-clock (acquire + request) is bounded by the deadline. (Found by an adversarial re-audit.)
+- **`clw run` no longer hangs ~15 min AFTER a build already succeeded.** On success clw stores the
+  stdout/stderr/record to the backend best-effort; these were three SERIAL stores (each with the full op
+  deadline), so a backend that went unresponsive post-success stalled the (already-passed) run for up to
+  ~15 min. The stores now run concurrently under a short 30 s phase deadline — a slow/unresponsive backend
+  simply skips the cache write and the correct exit code returns promptly.
+- **`clw run` surfaces the actionable 402 quota message.** The run path printed the raw `HTTP 402 from …`
+  Display, bypassing the plan/billing/upgrade message — on the exact surface (a runner driving `clw run`)
+  the 402 message was built for. It now routes through the actionable message (exit code unchanged).
+- **A huge `CLW_OP_DEADLINE_SECS` no longer panics.** The value is clamped (≤ 24 h) so building the deadline
+  can't overflow `Instant + Duration`.
+
 ## [0.1.9] — 402 upgrade link + macOS Gatekeeper doc (2026-07-11)
 
 ### Changed

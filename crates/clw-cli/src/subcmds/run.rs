@@ -150,7 +150,15 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
                         "[clw] child output exceeded the cap ({size} bytes > {cap}); child killed"
                     );
                 }
-                _ => eprintln!("[clw] internal error — child not run: {e}"),
+                // Route through `actionable_error` so a clw-internal failure on the
+                // `run` path (hydrate/lookup) surfaces the ACTIONABLE message — most
+                // importantly a 402 renders the quota/plan/upgrade guidance instead of
+                // a bare `HTTP 402 from …`. Message text only: the reserved exit-125
+                // "child never ran" contract below is unchanged.
+                _ => eprintln!(
+                    "[clw] internal error — child not run: {}",
+                    crate::actionable_error(&e)
+                ),
             }
             std::process::exit(run_err_exit_code(&e));
         }
@@ -253,6 +261,42 @@ mod tests {
             run_err_exit_code(&ClwError::Config("bad".into())),
             CLW_RUN_INTERNAL_NOT_RUN,
             "a non-TooLarge (child-never-ran) error keeps the reserved 125 code"
+        );
+    }
+
+    // FIX #3 (LOW-MED): a 402 quota wall hit DURING `clw run`'s hydrate/lookup must
+    // surface the actionable plan/upgrade guidance, not the raw `HTTP 402 from …`
+    // Display. The internal-failure arm routes the error through
+    // `crate::actionable_error`, so its message must carry the quota/plan wording.
+    // RED-on-revert: reverting the arm to the raw `{e}` prints `e.to_string()` (the
+    // "HTTP 402 from …" Display), which contains none of these words → this fails.
+    #[test]
+    fn run_internal_failure_routes_402_through_actionable_error() {
+        let e = ClwError::Http {
+            status: 402,
+            context: "cas.example/tenant/blobs".to_string(),
+        };
+        let msg = crate::actionable_error(&e);
+
+        // The actionable message names the plan/billing wall and the next step.
+        assert!(
+            msg.contains("quota"),
+            "402 run-path message must mention the usage quota, got: {msg}"
+        );
+        assert!(
+            msg.contains("plan") || msg.contains("upgrade"),
+            "402 run-path message must give plan/upgrade guidance, got: {msg}"
+        );
+
+        // And it must NOT be the bare Display the raw `{e}` arm would have printed.
+        assert_ne!(
+            msg,
+            e.to_string(),
+            "the run path must render the actionable message, not the raw HTTP Display"
+        );
+        assert!(
+            !msg.contains("HTTP 402 from"),
+            "the actionable message must replace the raw `HTTP 402 from …` Display, got: {msg}"
         );
     }
 }

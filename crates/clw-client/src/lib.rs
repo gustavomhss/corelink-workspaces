@@ -29,13 +29,23 @@ const RETRY_SLEEP_MS: [u64; 5] = [200, 800, 2_000, 5_000, 10_000];
 /// large op still completes, while a hang is cut off with an actionable error.
 const DEFAULT_OP_DEADLINE_SECS: u64 = 300;
 
+/// Upper bound on the resolved per-op deadline (seconds). 24h is far beyond any
+/// legitimate single op, and it caps a hostile / fat-fingered `CLW_OP_DEADLINE_SECS`
+/// so `Instant::now() + Duration::from_secs(resolved)` can never overflow-panic
+/// (`overflow when adding duration to instant`). DEFAULT < MAX, so the default is
+/// unaffected.
+const MAX_OP_DEADLINE_SECS: u64 = 86_400;
+
 /// Resolve the overall per-op deadline (seconds) from a raw `CLW_OP_DEADLINE_SECS`
 /// value. Unset / empty / unparseable / `0` → [`DEFAULT_OP_DEADLINE_SECS`]; an
 /// explicit positive value overrides (so a user with legitimately-slow large ops
-/// can raise it). Pure over its input so the parse is unit-testable without env.
+/// can raise it) but is clamped to [`MAX_OP_DEADLINE_SECS`] so an absurd value can't
+/// overflow the deadline `Instant`. Pure over its input so the parse is
+/// unit-testable without env.
 fn resolve_op_deadline_secs(raw: Option<&str>) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
+        .map(|s| s.min(MAX_OP_DEADLINE_SECS))
         .unwrap_or(DEFAULT_OP_DEADLINE_SECS)
 }
 
@@ -373,8 +383,27 @@ impl HttpClient {
                 hit_deadline = true;
                 break;
             }
-            // Hold one governor permit for the lifetime of this attempt.
-            let _permit = self.governor.acquire().await;
+            // Hold one governor permit for the lifetime of this attempt. Bound the
+            // acquire itself by the overall deadline: under 429-induced AIMD
+            // window-shrink the permit can be contended, and an un-timed acquire
+            // would queue outside any deadline coverage (a single op's wall-clock
+            // could reach ~acquire_wait + deadline). A `timeout` elapse here means
+            // the deadline was hit while waiting for a permit → stop.
+            let _permit = match tokio::time::timeout(remaining, self.governor.acquire()).await {
+                Ok(p) => p,
+                Err(_elapsed) => {
+                    hit_deadline = true;
+                    break;
+                }
+            };
+            // RECOMPUTE the remaining budget AFTER the (possibly slow) acquire so the
+            // op timeout reflects the time actually left, not the pre-acquire snapshot.
+            // Net: acquire + op together are bounded by the overall deadline.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                hit_deadline = true;
+                break;
+            }
             let attempt_result = match tokio::time::timeout(remaining, op(Arc::clone(&slot))).await
             {
                 Ok(r) => r,
@@ -2716,6 +2745,37 @@ mod tests {
         assert_eq!(resolve_op_deadline_secs(Some("  900  ")), 900);
     }
 
+    /// RED-on-revert (FIX #4): an absurdly-large `CLW_OP_DEADLINE_SECS` must clamp
+    /// to `MAX_OP_DEADLINE_SECS` rather than pass through — the raw value would make
+    /// `Instant::now() + Duration::from_secs(raw)` panic (`overflow when adding
+    /// duration to instant`). Without the `.min(MAX_OP_DEADLINE_SECS)` clamp the raw
+    /// value passes the `> 0` filter and this assert goes RED (and the deadline
+    /// construction below panics).
+    #[test]
+    fn op_deadline_clamps_absurd_value_and_never_overflows() {
+        assert_eq!(MAX_OP_DEADLINE_SECS, 86_400);
+        // The overflow trigger from the audit: ~9e18 seconds.
+        let resolved = resolve_op_deadline_secs(Some("9000000000000000000"));
+        assert_eq!(
+            resolved, MAX_OP_DEADLINE_SECS,
+            "an absurd value must clamp to the 24h cap, not pass through"
+        );
+        // A value already under the cap is untouched; a value equal to the cap stays.
+        assert_eq!(
+            resolve_op_deadline_secs(Some("86400")),
+            MAX_OP_DEADLINE_SECS
+        );
+        assert_eq!(
+            resolve_op_deadline_secs(Some("100000")),
+            MAX_OP_DEADLINE_SECS
+        );
+        assert_eq!(resolve_op_deadline_secs(Some("42")), 42);
+        // Constructing the deadline with the clamped value must NOT panic — this is
+        // the exact expression `with_retry_bounded` uses. With the raw value it would
+        // overflow-panic; with the clamp it is a valid instant far in the future.
+        let _deadline = Instant::now() + Duration::from_secs(resolved);
+    }
+
     /// RED-on-revert: a black-hole backend (accepts the connection but never
     /// answers) must be cut off by the OVERALL deadline instead of hanging the
     /// full `MAX_ATTEMPTS`×120s + backoff (~720s) budget. Each attempt here "hangs"
@@ -2770,6 +2830,61 @@ mod tests {
             .with_retry_bounded(|_slot| async move { Ok(42u32) }, 300)
             .await;
         assert_eq!(out.unwrap(), 42);
+    }
+
+    /// RED-on-revert (FIX #1): the overall deadline must bound the TOTAL per-op
+    /// wall-clock = permit-acquire wait + op run, not `acquire_wait + deadline`.
+    /// A single-permit governor models the 429-induced AIMD window-shrink where an
+    /// op must queue for a contended permit. We pre-hold the only permit for 3s
+    /// (>> the 1s deadline) then release it. With the fix, the acquire is bounded by
+    /// the deadline so the op surfaces a deadline error at ~1s. On revert the acquire
+    /// is un-timed: it waits the full 3s, THEN the STALE pre-acquire `remaining`
+    /// grants a further ~1s op-timeout, for ~4s total — well past the deadline. The
+    /// `< 2s` bound cleanly separates the fixed (~1s) from the reverted (~4s) path.
+    #[tokio::test]
+    async fn op_deadline_bounds_a_contended_governor_acquire() {
+        // Concurrency 1 → exactly one permit, so we can pre-hold it to force the op
+        // to queue on `acquire` (the AIMD-shrunk-window contention scenario).
+        let client =
+            HttpClient::with_concurrency(test_config("https://corelink-api.humangr.com".into()), 1)
+                .unwrap();
+
+        // Hold the only permit for 3s (past the 1s deadline), then release it.
+        let permit = client.governor.acquire().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            drop(permit);
+        });
+
+        let start = std::time::Instant::now();
+        let res: Result<()> = client
+            .with_retry_bounded(
+                |_slot| async move {
+                    // Would run long IF it ever got a permit — but the deadline must
+                    // fire first, while the op is still queued on the acquire.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok::<(), ClwError>(())
+                },
+                1, // 1-second overall deadline
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        let err =
+            res.expect_err("a deadline reached while waiting for a permit must surface an error");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ClwError::Transport(_))
+                && msg.contains("deadline")
+                && msg.contains("CLW_OP_DEADLINE_SECS"),
+            "must be the actionable overall-deadline error, got: {err:?}"
+        );
+        // Bounded TOTAL wall-clock: acquire wait + op ≤ ~deadline. RED-on-revert: the
+        // un-timed acquire (~3s) + stale op-timeout (~1s) overshoots to ~4s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "total wall-clock must be bounded by the deadline, not acquire_wait + deadline; took {elapsed:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
