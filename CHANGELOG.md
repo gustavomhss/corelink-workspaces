@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.10] — adversarial re-audit fixes (op-deadline + run-store hang + run-402) (2026-07-11)
+
 ### Fixed
 - **The per-op deadline now actually bounds a queued op under load.** `CLW_OP_DEADLINE_SECS` previously did
   not cover `governor.acquire()` (the permit wait was un-timed) and re-used a stale pre-acquire `remaining`,
