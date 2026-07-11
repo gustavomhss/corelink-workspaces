@@ -1,0 +1,57 @@
+# Dead-man's-switch for the conformance-canary.
+#
+# The canary (conformance-canary.yml) goes RED when prod regresses — but a canary that
+# NEVER RUNS (a broken schedule, a disabled workflow, an Actions outage) produces NO run
+# and therefore NO red: a SILENT blind spot. This job runs on its own schedule and FAILS
+# loudly if the canary hasn't reported a fresh SUCCESS recently — converting "the canary
+# silently stopped" into a visible red workflow (which GitHub emails repo watchers about).
+#
+# Independent safety net for prod-breakage finding #4 (prod-health monitoring must not be
+# able to go dark unnoticed).
+
+name: canary-deadman
+
+on:
+  # A few hours after the canary's 13:00 UTC schedule, so a same-day canary has finished.
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  deadman:
+    name: canary freshness dead-man's-switch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Max age of the newest completed canary run before we call it stale.
+      MAX_AGE_HOURS: "26"
+    steps:
+      - name: assert the canary reported a fresh success
+        run: |
+          set -euo pipefail
+          latest=$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow conformance-canary.yml \
+            -L 15 --json createdAt,conclusion,status \
+            --jq 'map(select(.status=="completed")) | sort_by(.createdAt) | last // {}')
+          created=$(echo "$latest" | jq -r '.createdAt // empty')
+          concl=$(echo "$latest" | jq -r '.conclusion // empty')
+          if [ -z "$created" ]; then
+            echo "::error::DEAD-MAN'S-SWITCH: no completed conformance-canary run found at all — the canary is not running. Prod-health monitoring is DARK."
+            exit 1
+          fi
+          now=$(date -u +%s)
+          then=$(date -u -d "$created" +%s)
+          age_h=$(( (now - then) / 3600 ))
+          if [ "$age_h" -gt "${MAX_AGE_HOURS}" ]; then
+            echo "::error::DEAD-MAN'S-SWITCH: the newest conformance-canary run is ${age_h}h old (> ${MAX_AGE_HOURS}h) — the scheduled canary has stopped reporting (silent blind spot). Check the canary workflow + the schedule."
+            exit 1
+          fi
+          if [ "$concl" != "success" ]; then
+            echo "::error::DEAD-MAN'S-SWITCH: the newest conformance-canary run (${age_h}h ago) concluded '${concl}', not success — live prod may be broken. See the canary run."
+            exit 1
+          fi
+          echo "OK — newest conformance-canary run is ${age_h}h old and succeeded."
