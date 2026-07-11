@@ -134,6 +134,42 @@ jobs:
             exit 1
           fi
 
+      # Assert the CI/conformance tenant is UNMETERED before build/publish, so a future
+      # low `tenant_quota` row can't silently re-block the mandatory conformance gate
+      # (the 402 that blocked v0.1.6-rc.1). Reads the server's least-privilege quota
+      # endpoint. LENIENT on endpoint transients — fail ONLY on a definitive "metered"
+      # answer; the mandatory conformance gate remains the backstop, so a flaky read
+      # never false-blocks a release. Skips (green) if the key isn't provisioned.
+      - name: assert CI tenant is unmetered (quota read-endpoint)
+        env:
+          CLW_CI_QUOTA_READ_KEY: ${{ secrets.CLW_CI_QUOTA_READ_KEY }}
+          CLW_CI_TENANT: ${{ secrets.CLW_CI_TENANT }}
+          CLW_CI_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CLW_CI_QUOTA_READ_KEY:-}" ]; then
+            echo "::warning::CLW_CI_QUOTA_READ_KEY unset — skipping the unmetered assertion (the mandatory conformance gate still 402s a metered tenant)."
+            exit 0
+          fi
+          ep="${CLW_CI_ENDPOINT:-https://corelink-api.humangr.com}"
+          resp="$(curl -s -m 15 -w '\n%{http_code}' -H "x-corelink-internal-auth: ${CLW_CI_QUOTA_READ_KEY}" "${ep}/_internal/tenant/${CLW_CI_TENANT}/quota" || true)"
+          code="$(printf '%s' "$resp" | tail -1)"
+          body="$(printf '%s' "$resp" | head -1)"
+          if [ "$code" = "404" ]; then
+            echo "no quota row (404) => inherits the \$1M default => unmetered. OK."
+            exit 0
+          fi
+          if [ "$code" = "200" ]; then
+            if printf '%s' "$body" | grep -q '"unmetered":true'; then
+              echo "CI tenant unmetered (200, unmetered=true). OK."
+              exit 0
+            fi
+            echo "::error::CI/conformance tenant is METERED (200, unmetered=false) — a release risks the conformance gate 402'ing. Raise its monthly_budget_usd_micros to \$1M before tagging."
+            exit 1
+          fi
+          echo "::warning::quota read-endpoint returned HTTP ${code} (transient/unavailable) — NOT blocking; the mandatory conformance gate is the backstop for a metered tenant."
+          exit 0
+
       # gates.sh's FULL lane runs `cargo deny check` + `cargo audit` (no install
       # guard) and a windows-gnu cross-CHECK whose `ring` C build needs the mingw-w64
       # cross-CC — provision them on the ephemeral runner (prebuilt = no slow compile),
