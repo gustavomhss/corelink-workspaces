@@ -37,9 +37,11 @@ env:
 jobs:
   canary:
     name: live conformance canary (prod)
-    # Self-hosted Mac (clw-mac-1): GitHub-hosted Actions minutes are currently
-    # exhausted, so the self-hosted runner is the only working lane.
-    runs-on: [self-hosted, macOS, X64]
+    # GitHub-hosted: prod-health monitoring must NOT depend on the single self-hosted
+    # Mac (a dead box = a SILENT blind spot — a scheduled canary that never runs
+    # produces no red). The canary is a network test against live prod, so any hosted
+    # OS works; ubuntu-latest is the cheapest reliable lane.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       # CI service identity for the live conformance suite (same secrets as
@@ -51,16 +53,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # On the self-hosted Mac the shared-host "rustup-nuke" can break the rustup
-      # PROXY (~/.cargo/bin/cargo → rustup), so we do NOT rely on `rustup show`.
-      # Instead put the pinned toolchain's OWN bin (cargo+rustc, installed under the
-      # rust-toolchain.toml channel) directly on PATH — proxy-independent.
-      - name: put pinned Rust toolchain on PATH (rust-toolchain.toml channel)
+      # GitHub-hosted ubuntu ships rustup; install the pinned rust-toolchain.toml
+      # channel explicitly (minimal profile) so the suite builds against the same
+      # toolchain the gate/release use.
+      - name: install pinned Rust toolchain (rust-toolchain.toml channel)
         run: |
           CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          BIN="$HOME/.rustup/toolchains/${CH}-x86_64-apple-darwin/bin"
-          test -x "$BIN/cargo" || { echo "pinned toolchain $CH is not installed on the runner at $BIN — run 'rustup toolchain install $CH' on clw-mac-1"; exit 1; }
-          echo "$BIN" >> "$GITHUB_PATH"
+          rustup toolchain install "$CH" --profile minimal
+          rustup default "$CH"
 
       # The canary REQUIRES the live cases to actually run: a missing PAT (or an
       # unreachable/unavailable endpoint) must FAIL loudly, never green-skip.
