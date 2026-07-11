@@ -28,6 +28,19 @@ brew install humanguardrail/clw/clw
 clw --version
 ```
 
+> **macOS — a raw browser download is Gatekeeper-blocked (the binary is not yet
+> Apple-notarized).** `brew` and the `curl | sh` installer below both strip the
+> quarantine attribute for you, so prefer those. If you download the `*-apple-darwin`
+> asset directly from the Releases page and macOS says *"cannot be opened because the
+> developer cannot be verified"*, clear the quarantine after verifying the signature
+> ([§4](#4-verify-the-download-per-platform)):
+>
+> ```sh
+> xattr -d com.apple.quarantine ./clw-*-apple-darwin   # or: right-click → Open
+> ```
+> (Developer-ID signing + notarization is planned post-launch — this recovery is only
+> needed for the direct-download path.)
+
 That's it — brew resolves the right binary for your OS/arch, verifies its SHA-256,
 and (on macOS) installs a **formula** binary that is **not** Gatekeeper-quarantined,
 so it runs with no "unidentified developer" prompt. **Prefer brew on macOS** for

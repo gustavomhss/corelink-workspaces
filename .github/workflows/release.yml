@@ -779,7 +779,7 @@ jobs:
             gh release create "v${VERSION}" release/* \
               --repo HumanGuardrail/clw-releases \
               --title "clw v${VERSION}" \
-              --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed." \
+              --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed. macOS: a direct browser download is Gatekeeper-blocked (binary not yet Apple-notarized) — install via 'brew' or install.sh (both strip quarantine), or run 'xattr -d com.apple.quarantine <asset>' after verifying the signature. See docs/INSTALL.md." \
               ${PRERELEASE_FLAG}
           fi
           echo "published release/ -> HumanGuardrail/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"

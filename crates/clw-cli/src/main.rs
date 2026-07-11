@@ -342,7 +342,7 @@ pub fn actionable_error(err: &ClwError) -> String {
         ClwError::Http { status: 402, .. } => {
             "monthly usage quota reached (HTTP 402 Payment Required) — this is a plan/billing limit \
              on your CoreLink account, not a clw error; contact your CoreLink account owner to raise \
-             the monthly quota or upgrade the plan"
+             the monthly quota, or upgrade your plan at https://corelink-admin.humangr.com/en/pricing"
                 .to_string()
         }
         // NotFound at the top-level prints the raw digest — subcommands override
@@ -1157,6 +1157,11 @@ mod tests {
         assert!(
             msg.contains("quota"),
             "402 error must name it a quota limit (the raw HTTP Display has no such token), got: {msg}"
+        );
+        // And it points the user at the upgrade/pricing page to self-serve the fix.
+        assert!(
+            msg.contains("corelink-admin.humangr.com/en/pricing"),
+            "402 error must link the upgrade/pricing page, got: {msg}"
         );
         // And it must NOT be the bare Display string the user finds cryptic.
         assert_ne!(

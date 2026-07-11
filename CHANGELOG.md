@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+- **The 402 quota-exceeded message now links the upgrade page.** Following the actionable 402 message added
+  in 0.1.8, it now points the user straight at `https://corelink-admin.humangr.com/en/pricing` to self-serve
+  the plan change, instead of only telling them to contact their account owner.
+
+### Docs
+- **Documented the macOS Gatekeeper recovery for a direct browser download.** The binary is not yet
+  Apple-notarized (planned post-launch); `brew` and `install.sh` strip quarantine, but a raw asset downloaded
+  from the Releases page is Gatekeeper-blocked. `docs/INSTALL.md` and the auto-generated release notes now
+  show the `xattr -d com.apple.quarantine` / right-click-Open recovery.
+
 ## [0.1.8] — prod-breakage hardening: actionable 402 + bounded op deadline (2026-07-11)
 
 ### Fixed
