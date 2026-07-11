@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.8] — prod-breakage hardening: actionable 402 + bounded op deadline (2026-07-11)
+
 ### Fixed
 - **A quota-exceeded (HTTP 402) failure now shows an actionable message instead of a cryptic HTTP error.**
   When a tenant crosses its monthly usage quota / plan $-ceiling, the backend returns 402; clw now says
