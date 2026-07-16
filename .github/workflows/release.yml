@@ -416,7 +416,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
-            echo "::warning::macOS signing secrets absent — SKIPPING sign+notarize (dry-run)."
+            # WAIVED-OPEN by design (do NOT make this fail-closed like the minisign
+            # steps): macOS Developer-ID + notarization is deferred per the CLAUDE.md
+            # owner waiver (no Apple Developer account yet), so these secrets are
+            # INTENTIONALLY absent on every real release — a fail-closed guard here
+            # would break every release. When the owner provisions the cert, apply the
+            # same `prerelease == false` fail-closed guard the minisign steps use.
+            echo "::warning::macOS signing secrets absent — SKIPPING sign+notarize (deferred per owner waiver; brew/install.sh strip quarantine)."
             exit 0
           fi
           # Real Developer ID codesign + notarize of a notarized ZIP (DISTRIBUTION.md (c)).
@@ -486,7 +492,12 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${AZURE_TENANT_ID:-}" ]; then
-            echo "::warning::Windows signing credentials absent — SKIPPING Authenticode sign (dry-run)."
+            # WAIVED-OPEN by design (do NOT make this fail-closed like the minisign
+            # steps): Windows Authenticode via Azure Trusted Signing is deferred per the
+            # CLAUDE.md owner waiver (no Azure signing account yet), so these secrets are
+            # INTENTIONALLY absent on every real release. When the owner provisions the
+            # account, apply the same `prerelease == false` fail-closed guard.
+            echo "::warning::Windows signing credentials absent — SKIPPING Authenticode sign (deferred per owner waiver)."
             exit 0
           fi
           # Real Authenticode via Azure Trusted Signing, driven by the dotnet `sign`
@@ -522,7 +533,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::minisign secret absent — SKIPPING Linux signature (dry-run)."
+            # FAIL-CLOSED on a REAL release (same posture as the signed-checksums step):
+            # the per-binary .minisig is the signature-of-record, so a real vX.Y.Z MUST
+            # NOT ship an unsigned Linux binary. rc/prerelease tags keep the dry-run skip.
+            if [ "${{ needs.preflight.outputs.prerelease }}" = "false" ]; then
+              echo "::error::minisign secret absent on a REAL release tag — refusing to ship an UNSIGNED Linux binary. Provision MINISIGN_SECRET_KEY before tagging a real version."
+              exit 1
+            fi
+            echo "::warning::minisign secret absent — SKIPPING Linux signature (rc/prerelease dry-run only)."
             exit 0
           fi
           # Real minisign detached signature -> dist/${ASSET}.minisig.
@@ -745,7 +763,16 @@ jobs:
           echo "---- SHA256SUMS ----"
           cat SHA256SUMS
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::minisign secret absent — SHA256SUMS left UNSIGNED (dry-run)."
+            # FAIL-CLOSED on a REAL release (mirror of the conformance guard at the
+            # `validate tag is semver` / live-conformance step): SHA256SUMS.minisig is
+            # the cross-platform signature-of-record, so a real vX.Y.Z MUST NOT publish
+            # unsigned checksums (and still bump the brew formula) just because the key
+            # is absent/rotated-away. rc/prerelease tags keep the dry-run skip.
+            if [ "${{ needs.preflight.outputs.prerelease }}" = "false" ]; then
+              echo "::error::minisign secret absent on a REAL release tag — refusing to publish UNSIGNED SHA256SUMS (the signature-of-record). Provision MINISIGN_SECRET_KEY before tagging a real version."
+              exit 1
+            fi
+            echo "::warning::minisign secret absent — SHA256SUMS left UNSIGNED (rc/prerelease dry-run only)."
             exit 0
           fi
           # Sign the checksum file itself -> SHA256SUMS.minisig (the cross-platform
