@@ -831,10 +831,14 @@ pub async fn redeem_cred_ticket(
     }
 
     // Parse via Value to avoid coupling to a serde-derive feature; extract `cas_pat`.
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| ClwError::Transport(format!("cred-ticket response read error: {e}")))?;
+    // Size-cap the body (every OTHER body read in this crate goes through
+    // `read_body_capped`; this one used a raw `.text()` with no ceiling): a buggy or
+    // hostile fabric endpoint answering a small request with a multi-GB body would
+    // otherwise OOM the client at runner boot. The 30s request timeout bounds TIME but
+    // not SIZE — a fast link can deliver an arbitrarily large body inside 30s.
+    let bytes = read_body_capped(resp, CRED_TICKET_CAP_BYTES).await?;
+    let text = String::from_utf8(bytes)
+        .map_err(|e| ClwError::Transport(format!("cred-ticket response utf8 error: {e}")))?;
     let body: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| ClwError::Transport(format!("cred-ticket response parse error: {e}")))?;
     let pat = body
@@ -846,6 +850,13 @@ pub async fn redeem_cred_ticket(
         })?;
     Ok(pat.to_string())
 }
+
+/// Size ceiling for the cred-ticket redemption response body. The response is a tiny
+/// JSON envelope carrying one `cas_pat` (a PAT is a few hundred bytes at most), so
+/// 64 KiB is orders of magnitude above any legitimate response while bounding a
+/// buggy/hostile fabric endpoint that would otherwise stream an unbounded body into
+/// memory at runner boot (the 30s request timeout bounds time, not size).
+const CRED_TICKET_CAP_BYTES: usize = 64 * 1024;
 
 /// Generous ceiling for a single list page (D-7/D-8): ≤1000 small JSON items per
 /// page, so 16 MiB is orders of magnitude above any legitimate page while still
@@ -1479,6 +1490,32 @@ mod tests {
             .await
             .expect("redeem should succeed");
         assert_eq!(pat, "per-job-pat-abc");
+    }
+
+    #[tokio::test]
+    async fn redeem_oversize_body_is_size_capped() {
+        // A 200 whose body exceeds CRED_TICKET_CAP_BYTES must be rejected (size-capped),
+        // not slurped into memory — a buggy/hostile fabric endpoint can't OOM the client
+        // at runner boot. (The 30s request timeout bounds time, not size.)
+        let server = MockServer::start().await;
+        let huge = "a".repeat(CRED_TICKET_CAP_BYTES + 1);
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/l/cas-cred"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "l", "t")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::TooLarge { cap, .. } => {
+                assert_eq!(
+                    cap, CRED_TICKET_CAP_BYTES as u64,
+                    "capped at the cred-ticket ceiling"
+                )
+            }
+            other => panic!("expected TooLarge (size cap), got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -106,6 +106,26 @@ pub struct SnapshotReport {
 /// so the manifest/digest is unaffected by which path a file takes.
 const STREAM_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Guard the small-file in-memory fast path against a TOCTOU size-growth. That path is
+/// selected on the WALK-TIME size (`f.size`), but the `std::fs::read` returns the file's
+/// CURRENT bytes. If the file grew past the stream threshold between walk and read (or the
+/// path was swapped for a large one), a full in-memory read would defeat the threshold and
+/// — multiplied by the upload concurrency — could exhaust memory. Fail loudly (a
+/// user-facing `Message`, not a mislabeled transport error) rather than slurp it.
+fn guard_small_file_size(f: &WalkedFile, read_len: usize) -> Result<()> {
+    if read_len as u64 > STREAM_THRESHOLD_BYTES {
+        return Err(ClwError::Message(format!(
+            "snapshot: '{}' grew from {} to {} bytes during the operation (exceeds the \
+             {}-byte stream threshold); re-run the snapshot",
+            f.abs.display(),
+            f.size,
+            read_len,
+            STREAM_THRESHOLD_BYTES
+        )));
+    }
+    Ok(())
+}
+
 /// Upload one chunk: write it into the local cache, then PUT it to the remote
 /// CAS only if it is not already present. Returns `true` iff a remote PUT was
 /// performed (i.e. the chunk was missing), so the caller can advance the
@@ -188,17 +208,20 @@ async fn process_file<C>(
 where
     C: CasTransport,
 {
-    // TOCTOU NOTE (audit Low, accepted for v0.1): the walker classified `f.abs`
-    // as a regular file with `follow_links(false)`, but the reads below follow
-    // symlinks. A concurrent hostile writer on a SHARED checkout could swap the
-    // path; this race is OUT OF the v0.1 threat model (single-operator local
-    // tool). Deferred hardening: O_NOFOLLOW open + fstat-after-open.
+    // TOCTOU NOTE (audit Low): the walker classified `f.abs` as a regular file with
+    // `follow_links(false)`, but the reads below follow symlinks. A concurrent hostile
+    // writer on a SHARED checkout could swap the path. The CONTENT-swap correctness angle
+    // is out of the v0.1 threat model (single-operator local tool; deferred hardening:
+    // O_NOFOLLOW open + fstat-after-open). The MEMORY-size angle IS guarded: the small-file
+    // branch below rejects a file that grew past the stream threshold between walk and read
+    // (`guard_small_file_size`), so a mid-operation growth can't OOM instead of streaming.
     let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
         // ---- small file: in-memory fast path -----------------------------
         let abs = f.abs.clone();
         let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
             .await
             .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+        guard_small_file_size(&f, data.len())?;
 
         let chunks_raw = chunk_bytes(&data);
         let chunk_refs = to_chunk_refs(&chunks_raw);
@@ -371,6 +394,8 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
                     let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
                         .await
                         .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
+                    // Same TOCTOU size-growth guard as `snapshot` (see the note there).
+                    guard_small_file_size(&f, data.len())?;
 
                     let chunks_raw = chunk_bytes(&data);
                     to_chunk_refs(&chunks_raw)
@@ -1302,6 +1327,45 @@ mod tests {
             );
         } else {
             panic!("expected a File entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn small_path_rejects_file_grown_past_threshold() {
+        // TOCTOU size-growth: the walk-time size says "small" (selects the in-memory fast
+        // path), but the file on disk is actually larger than the stream threshold. The
+        // guard must REJECT it (a user-facing Message), not slurp the whole thing into RAM.
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let sem = Semaphore::new(4);
+        let seen = Mutex::new(HashSet::new());
+        let counter = AtomicU64::new(0);
+        let tmp = TempDir::new().unwrap();
+
+        let grown = tmp.path().join("grown.bin");
+        std::fs::write(&grown, vec![0u8; STREAM_THRESHOLD_BYTES as usize + 1]).unwrap();
+        let wf = WalkedFile {
+            abs: grown.clone(),
+            rel: "grown.bin".into(),
+            mode: 0o644,
+            size: 1, // WRONG-small on purpose → selects the in-memory fast path
+        };
+        let err = process_file(&client, &cache, &sem, &seen, &counter, 4, wf)
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Message(m) => {
+                assert!(
+                    m.contains("grew"),
+                    "expected a size-growth message, got: {m}"
+                );
+                assert!(
+                    m.contains("re-run"),
+                    "message should be actionable, got: {m}"
+                );
+            }
+            other => panic!("expected a Message size-growth rejection, got {other:?}"),
         }
     }
 
