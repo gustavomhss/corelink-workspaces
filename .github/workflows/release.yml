@@ -185,7 +185,7 @@ jobs:
       - name: install cargo-deny + cargo-audit (prebuilt)
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny@0.19.8,cargo-audit
+          tool: cargo-deny@0.19.8,cargo-audit@0.22.2
       - name: install mingw-w64 (windows-gnu cross-CC for ring's C build)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 

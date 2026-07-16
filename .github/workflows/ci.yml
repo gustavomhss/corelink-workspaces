@@ -40,7 +40,7 @@ jobs:
       - name: install cargo-deny + cargo-audit (prebuilt)
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny@0.19.8,cargo-audit
+          tool: cargo-deny@0.19.8,cargo-audit@0.22.2
       # The windows-gnu cross-CHECK in gates.sh compiles `ring`'s C build script,
       # which needs the mingw-w64 cross-CC. On the Mac it comes from brew.
       - name: ensure mingw-w64 (windows-gnu cross-CC for ring's C build)

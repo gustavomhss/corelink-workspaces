@@ -54,7 +54,11 @@ cargo fmt --all -- --check
 
 if [ "$SCOPE" = "full" ]; then
   echo "FULL lane: whole workspace"
-  cargo clippy --workspace --all-targets -- -D warnings
+  # --all-features so feature-gated code (e.g. clw-conformance's `live` feature) is
+  # held to the SAME -D warnings bar. clippy only type-checks/lints, so compiling the
+  # `live` path here needs no network. (test stays default-features — see below — so
+  # the live suite is not RUN without a backend.)
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo test --workspace
   # Supply-chain gates are a whole-workspace concern — full lane only.
   # INVARIANT: this is the only lane that runs them, so their inputs (Cargo.lock,
@@ -78,7 +82,11 @@ if [ "$SCOPE" = "full" ]; then
     # FAILURE, never a silent skip — otherwise an advisory could ship unchecked. Try to
     # provision it; if that fails, fail loudly with an ::error:: rather than skip.
     echo "cargo-audit not installed in CI — installing (the advisory gate is mandatory here)"
-    if ! cargo install cargo-audit --locked; then
+    # Pin the TOOL version (matches the install-action pin in ci.yml/release.yml) for
+    # reproducibility — a behavior-changed cargo-audit release can't silently alter the
+    # gate. The advisory DB is fetched fresh at run time regardless, so freshness of
+    # advisories is unaffected by pinning the binary.
+    if ! cargo install cargo-audit --version 0.22.2 --locked; then
       echo "::error::cargo-audit is unavailable in CI and could not be installed — refusing to skip the supply-chain advisory gate"
       exit 1
     fi
@@ -86,28 +94,39 @@ if [ "$SCOPE" = "full" ]; then
   else
     echo "cargo-audit not installed — CI provisions it; skipping locally"
   fi
-  # Cross-platform COMPILE gate. CI runs on a Linux (ubuntu) GitHub-hosted runner,
-  # which natively compiles the entire `cfg(unix)` path; the one cfg-DIVERGENT target
-  # — Windows (`cfg(windows)` vs `cfg(unix)`) — is cross-CHECKED here (a `cargo check`,
-  # type-check only, so no cross-linker/CC is needed) so Windows breakage is caught on
-  # main without a native Windows runner. Per-OS NATIVE release binaries (Linux/macOS/
-  # Windows) are built by release.yml's matrix on their respective hosted runners.
-  # Set CLW_SKIP_CROSS=1 for fast local iteration; CI/main must NOT skip it.
-  if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
-    echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
-    rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 || true
-    cargo check --workspace --target x86_64-pc-windows-gnu
-  else
-    echo "CLW_SKIP_CROSS=1 — skipping cross-compile gate (local fast path only)"
-  fi
 else
   echo "SCOPED lane: crates [${SCOPE}]"
+  # A `test -p <changed>` compiles the changed crate's DEPENDENCIES (downward) but not
+  # its DEPENDENTS (upward) — so a change to a low-level crate (e.g. clw-snapshot) would
+  # never exercise clw-cli / clw-integration-tests, letting a cross-crate regression pass
+  # the required PR gate green (caught only by main's post-merge full lane). Close that:
+  # always fold in the SINK crates where the whole graph converges, so any crate change
+  # is tested through its top-level consumers too. (main is always full-lane regardless.)
+  # Union the changed crates with the sink crates, de-duped by NAME (a change to
+  # clw-cli / clw-integration-tests must not pass `-p` for it twice).
+  crate_set="$(printf '%s\n' $SCOPE clw-cli clw-integration-tests | sort -u | tr '\n' ' ')"
   pkgs=""
-  for c in $SCOPE; do pkgs="$pkgs -p $c"; done
+  for c in $crate_set; do pkgs="$pkgs -p $c"; done
   # shellcheck disable=SC2086
-  cargo clippy $pkgs --all-targets -- -D warnings
+  cargo clippy $pkgs --all-targets --all-features -- -D warnings
   # shellcheck disable=SC2086
   cargo test $pkgs
+fi
+
+# Cross-platform COMPILE gate — UNIVERSAL tripwire (runs in BOTH lanes). CI runs on a
+# Linux (ubuntu) GitHub-hosted runner, which natively compiles the entire `cfg(unix)`
+# path; the one cfg-DIVERGENT target — Windows (`cfg(windows)` vs `cfg(unix)`) — is
+# cross-CHECKED here (a `cargo check`, type-check only, so no cross-linker/CC is needed)
+# so Windows breakage is caught at PR time, not only on main's post-merge full lane
+# (a `#[cfg(windows)]` break inside a scoped-lane crate change used to slip the required
+# gate). Per-OS NATIVE release binaries are built by release.yml's matrix.
+# Set CLW_SKIP_CROSS=1 for fast local iteration; CI/main must NOT skip it.
+if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
+  echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
+  rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 || true
+  cargo check --workspace --target x86_64-pc-windows-gnu
+else
+  echo "CLW_SKIP_CROSS=1 — skipping cross-compile gate (local fast path only)"
 fi
 
 # ---------------------------------------------------------------------------
