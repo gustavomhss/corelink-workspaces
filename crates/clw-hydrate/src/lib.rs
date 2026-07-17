@@ -1065,6 +1065,8 @@ mod tests {
     // lookup (the content-addressed seam behind `clw hydrate --manifest-digest`,
     // e.g. a runner hydrating `toolchain_ref = <digest>`).
     // -----------------------------------------------------------------------
+    // Asserts the unix exec bit via PermissionsExt::mode(); gate to unix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hydrate_by_manifest_digest_needs_no_ref() {
         let data = b"toolchain-payload".as_ref();

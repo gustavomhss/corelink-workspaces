@@ -823,6 +823,10 @@ mod tests {
     // a symlink, and an empty directory.
     // -----------------------------------------------------------------------
 
+    // Builds a fixture tree containing a unix symlink (`link.txt`), so every
+    // test that uses it is unix-only. Gated to unix (Windows symlink creation
+    // needs privileges + the manifest would omit the symlink entry).
+    #[cfg(unix)]
     fn build_tree(root: &Path) {
         use std::fs;
 
@@ -846,6 +850,7 @@ mod tests {
     // Test 1: full pipeline on a tempdir tree
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn full_pipeline_basic() {
         let tmp = TempDir::new().unwrap();
@@ -905,6 +910,7 @@ mod tests {
     // Test 2: second snapshot of unchanged tree → chunks_uploaded == 0
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn second_snapshot_unchanged_no_uploads() {
         let tmp = TempDir::new().unwrap();
@@ -957,6 +963,7 @@ mod tests {
     // Test 3: changed one file → only its chunks uploaded; lineage correct
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn third_snapshot_changed_file() {
         let tmp = TempDir::new().unwrap();
@@ -1008,6 +1015,7 @@ mod tests {
     // Test 4: build_manifest_local digest matches snapshot() root
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn build_manifest_local_matches_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -1243,6 +1251,7 @@ mod tests {
         assert_eq!(rec.parent, None);
     }
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn snapshot_clean_tree_no_warnings() {
         let tmp = TempDir::new().unwrap();
@@ -1378,6 +1387,7 @@ mod tests {
     // a TOCTOU race not reproducible deterministically in-process).
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
     #[tokio::test]
     async fn manifest_total_size_equals_sum_of_all_chunk_sizes() {
         let tmp = TempDir::new().unwrap();
