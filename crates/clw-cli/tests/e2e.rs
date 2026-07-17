@@ -1975,6 +1975,67 @@ async fn erase_yes_confirmed_empties_both_stores() {
     );
 }
 
+// `clw erase` WITHOUT --yes is rail #1 of the most destructive verb: it MUST be a
+// dry run — report the blast radius and delete NOTHING. A regression that made
+// erase delete-on-default would be catastrophic and, until this test, invisible.
+#[tokio::test]
+async fn erase_dry_run_default_reports_blast_radius_and_deletes_nothing() {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink(&server, true).await;
+
+    let cache = TempDir::new().unwrap();
+    let _s1 = snapshot_tiny(&server.uri(), cache.path(), "e2e-erase-dryrun-1");
+    let _s2 = snapshot_tiny(&server.uri(), cache.path(), "e2e-erase-dryrun-2");
+    let refs_before = ac.lock().unwrap().len();
+    let blobs_before = cas.lock().unwrap().len();
+    assert!(refs_before > 0 && blobs_before > 0);
+
+    // Human mode: announces a DRY RUN, exits 0, deletes nothing.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .arg("erase")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dry-run erase exits 0, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("DRY RUN"),
+        "erase without --yes must announce a dry run, got:\n{stdout}"
+    );
+    assert_eq!(
+        ac.lock().unwrap().len(),
+        refs_before,
+        "dry-run erase must delete NO ref"
+    );
+    assert_eq!(
+        cas.lock().unwrap().len(),
+        blobs_before,
+        "dry-run erase must delete NO blob"
+    );
+
+    // --json mode: the documented dry-run shape, and STILL deletes nothing.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "erase"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("erase --json must emit valid JSON");
+    assert_eq!(v["dry_run"], serde_json::json!(true));
+    assert_eq!(v["refs"], serde_json::json!(refs_before));
+    assert_eq!(v["blobs"], serde_json::json!(blobs_before));
+    assert_eq!(
+        ac.lock().unwrap().len(),
+        refs_before,
+        "json dry-run still deletes nothing"
+    );
+    assert_eq!(cas.lock().unwrap().len(), blobs_before);
+}
+
 // ---------------------------------------------------------------------------
 // Power-user acceptance regressions (the v0.1.2 fixes).
 //

@@ -565,6 +565,93 @@ mod tests {
         assert!(rendered.contains("2 ref(s) + 0 blob(s)"));
     }
 
+    // A server whose enumeration NEVER converges to empty: every `list_refs`/
+    // `list_blobs` keeps returning a "ghost" the delete can't clear (a server-side
+    // enumeration fault, or a concurrent writer re-creating data). This is the
+    // adversarial input behind the GDPR Art.17 truthfulness guarantee.
+    struct NeverEmptiesTransport {
+        ghost_ref: Digest,
+        ghost_blob: Digest,
+        ref_deletes: Mutex<usize>,
+        blob_deletes: Mutex<usize>,
+    }
+    impl NeverEmptiesTransport {
+        fn new() -> Self {
+            Self {
+                ghost_ref: Digest::of_bytes(b"stuck-ref"),
+                ghost_blob: Digest::of_bytes(b"stuck-blob"),
+                ref_deletes: Mutex::new(0),
+                blob_deletes: Mutex::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl AcTransport for NeverEmptiesTransport {
+        async fn get(&self, _k: &Digest) -> ClwResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put(&self, _k: &Digest, _v: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _k: &Digest) -> ClwResult<()> {
+            *self.ref_deletes.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn list_refs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(vec![self.ghost_ref]) // never empties
+        }
+    }
+    #[async_trait::async_trait]
+    impl CasTransport for NeverEmptiesTransport {
+        async fn exists(&self, _d: &Digest) -> ClwResult<bool> {
+            Ok(false)
+        }
+        async fn get(&self, d: &Digest) -> ClwResult<Vec<u8>> {
+            Err(ClwError::NotFound(*d))
+        }
+        async fn put(&self, _d: &Digest, _b: Vec<u8>) -> ClwResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _d: &Digest) -> ClwResult<()> {
+            *self.blob_deletes.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn list_blobs(&self) -> ClwResult<Vec<Digest>> {
+            Ok(vec![self.ghost_blob]) // never empties
+        }
+    }
+
+    // GDPR Art.17 guarantee (the detection half of "fail loud if not empty"): when
+    // enumeration never converges to empty, `erase_with_verification` must NOT spin
+    // forever — it bounds at MAX_PASSES and reports the tenant is STILL NOT empty.
+    // That non-empty outcome is exactly what makes `run()` fail loud (exit non-zero,
+    // `complete:false`) instead of recording a completed erasure while PII remains.
+    #[tokio::test]
+    async fn erase_that_never_empties_bounds_at_max_passes_and_reports_not_empty() {
+        let client = NeverEmptiesTransport::new();
+        let ref_keys = vec![client.ghost_ref];
+        let blobs = vec![client.ghost_blob];
+
+        let outcome = erase_with_verification(&client, ref_keys, blobs)
+            .await
+            .expect("a never-empty enumeration is not a transport error — it verifies non-empty");
+
+        // Bounded: exactly MAX_PASSES (3) passes — it does not loop forever.
+        assert_eq!(
+            outcome.passes, 3,
+            "the verify loop must bound at MAX_PASSES on a never-converging store, not spin"
+        );
+        // Reports remaining > 0 → this is what drives run()'s loud INCOMPLETE error.
+        assert!(
+            outcome.remaining_refs > 0,
+            "a never-converging enumeration must report remaining refs (drives fail-loud)"
+        );
+        assert!(outcome.remaining_blobs > 0, "…and remaining blobs");
+        // Deletes were attempted every pass (idempotently), never silently skipped.
+        assert!(*client.ref_deletes.lock().unwrap() >= 3);
+        assert!(*client.blob_deletes.lock().unwrap() >= 3);
+    }
+
     #[test]
     fn confirm_tenant_flag_must_match_exactly() {
         assert!(confirm_tenant("acme", Some("acme")).unwrap());
