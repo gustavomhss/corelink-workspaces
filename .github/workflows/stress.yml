@@ -32,7 +32,9 @@ jobs:
     timeout-minutes: 90
     env:
       CLW_STRESS_BIG_BYTES: "2147483648" # 2 GiB single file
-      CLW_STRESS_FILES: "100000"         # 100k files
+      CLW_STRESS_FILES: "25000"          # near the SUPPORTED ceiling (single-blob manifest,
+                                         # 5 MiB cap ≈ 32k files) — must round-trip
+      CLW_STRESS_FILES_OVERCAP: "40000"  # OVER the ceiling — must fail cleanly (InvalidManifest)
       CLW_STRESS_DEPTH: "500"            # deep nesting
       CLW_STRESS_WIDE: "20000"           # wide fan-out in one dir
       CLW_STRESS_CONC: "64"              # 64-way concurrent flows

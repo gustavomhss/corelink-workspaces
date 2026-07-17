@@ -244,6 +244,41 @@ async fn many_files_roundtrip() {
     }
 }
 
+/// The OTHER side of the file-count boundary: a workspace with TOO MANY entries to fit
+/// the single-blob manifest (5 MiB CAS cap, ~162 B/entry ⇒ ~32k files) must fail with a
+/// CLEAN, actionable `InvalidManifest` — never a crash/hang/corruption. `many_files_*`
+/// proves the supported max works; this proves overflowing it degrades gracefully.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "stress: run via stress.yml or `--ignored`"]
+async fn too_many_files_over_manifest_cap_fails_cleanly() {
+    let n = env_usize("CLW_STRESS_FILES_OVERCAP", 40_000); // ~162 B/entry × 40k ≈ 6.5 MiB > 5 MiB cap
+    let store_dir = TempDir::new().unwrap();
+    let store = DiskTransport::new(store_dir.path());
+    let src = TempDir::new().unwrap();
+    for i in 0..n {
+        let sub = src.path().join(format!("d{:04}", i / 1000));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("f{i}.txt")), b"x").unwrap();
+    }
+    let cache = TempDir::new().unwrap();
+    let lc = LocalCache::new(cache.path()).unwrap();
+    let res = clw_snapshot::snapshot(
+        src.path(),
+        &store,
+        &lc,
+        &clw_snapshot::SnapshotOptions::new("stress-overcap"),
+    )
+    .await;
+    match res {
+        Err(clw_types::ClwError::InvalidManifest(m)) => assert!(
+            m.contains("manifest") && (m.contains("cap") || m.contains("too many")),
+            "over-cap must be a clear, actionable manifest error, got: {m}"
+        ),
+        Err(other) => panic!("expected a clean InvalidManifest over-cap failure, got: {other:?}"),
+        Ok(_) => panic!("a workspace over the single-blob manifest cap must FAIL, not succeed"),
+    }
+}
+
 /// A deep + wide tree must round-trip (deep nesting + a wide fan-out dir).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "stress: run via stress.yml or `--ignored`"]
