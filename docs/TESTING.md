@@ -16,9 +16,11 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 | **Coverage** | `.github/workflows/coverage.yml` | every PR + push-main + dispatch | how much code a test actually executes | report-only → floor (Phase 1b) → required (1c) |
 | **Fuzz** | `.github/workflows/fuzz.yml` | nightly + dispatch | the untrusted-input parsers never panic/UB on arbitrary bytes | **yes — a crash is red** |
 | **Mutation** | `.github/workflows/mutation.yml` | weekly + dispatch | the tests actually *kill* injected faults (not just run) | report-only → follow-on blocks new survivors |
+| **Round-trip (property)** | `crates/clw-integration-tests/tests/roundtrip_prop.rs` | every PR (32 cases) + weekly exhaustive (2000) | `snapshot→hydrate` is byte-identical on ARBITRARY trees | gate test — red on any fidelity break |
+| **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
 
-All three run on github-hosted `ubuntu-latest` (like the canaries) and are **additive** — they do not
-touch the required `gates`/`dco` checks.
+They run on github-hosted `ubuntu-latest` (like the canaries) and are **additive** — they do not
+touch the required `gates`/`dco` checks (except the round-trip property test, which runs inside the gate).
 
 ## Coverage (`cargo-llvm-cov`)
 Measures total line coverage on the whole workspace (default-features — the `live` conformance suite is
@@ -60,6 +62,23 @@ cargo mutants --workspace            # or -p clw-types to scope
 **Follow-on ratchet**: triage the survivors (critical crates first — `clw-types`, `clw-manifest`,
 `clw-hydrate`, `clw-client`: the untrusted-input, containment, atomicity and retry/cap logic), add tests
 that kill them, then flip mutation to `--in-diff` per-PR blocking on any **new** survivor.
+
+## E2E round-trip + stress (Phase 2)
+`crates/clw-integration-tests/tests/roundtrip_prop.rs` is a **property-based** lifecycle test: proptest
+generates arbitrary workspace trees (varied unicode/space names, nested dirs, empty + multi-byte files,
+exec bits, in-tree symlinks) and asserts `snapshot→hydrate` is byte-identical with structure + mode +
+symlink target preserved. It runs in the gate at 32 cases; the stress lane cranks `PROPTEST_CASES=2000`.
+
+`crates/clw-integration-tests/tests/stress.rs` holds the `#[ignore]`d **scale** scenarios (GB file, 100k
+files, deep+wide tree, N-way concurrency) run by `stress.yml` at aggressive magnitude via env
+(`CLW_STRESS_BIG_BYTES` / `_FILES` / `_DEPTH` / `_WIDE` / `_CONC`). Both use in-process/disk-backed stores
+(no HTTP, no quota). Run locally:
+```
+cargo test -p clw-integration-tests --test stress -- --ignored          # moderate defaults
+CLW_STRESS_FILES=100000 cargo test -p clw-integration-tests --test stress -- --ignored --nocapture
+```
+Fault-injection / chaos E2E (5xx/429/corrupt-body/mid-op-401, large round-trip, concurrency) already lives
+in `tests/adversarial.rs` and runs in the gate.
 
 ## The done-line
 "Working as it should" = the required gate green **and** coverage ≥ floor (ratcheting) **and** the fuzz

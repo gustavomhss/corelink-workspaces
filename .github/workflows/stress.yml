@@ -1,0 +1,59 @@
+# Stress lane — run the scale/stress E2E at AGGRESSIVE magnitude.
+#
+# Part of the Phase-2 (exhaustive E2E) test-rigor set. The `#[ignore]`d stress tests in
+# clw-integration-tests are too slow for the per-PR gate; this runs them WEEKLY at real
+# magnitude (2 GiB file, 100k files, deep+wide tree, 64-way concurrency) plus the
+# property round-trip at a high case count. A crash / hang / OOM / mismatch goes RED.
+#
+# github-hosted ubuntu; --release so the 2 GiB xorshift + chunking + hydrate finish in
+# time; --test-threads=1 so the heavy scenarios don't run at once and blow disk/RAM.
+
+name: stress
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # weekly Monday 02:00 UTC (offset from mutation 04:00 + the canaries)
+  workflow_dispatch:
+
+concurrency:
+  group: stress
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The two heavy workloads run as SEPARATE jobs so each gets its own generous budget
+  # (a shared 60-min budget risked a spurious timeout-red — the property sweep alone can
+  # be 30-50 min on a shared ubuntu runner).
+  scale:
+    name: scale scenarios (2GiB / 100k / deep-wide / 64-way)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CLW_STRESS_BIG_BYTES: "2147483648" # 2 GiB single file
+      CLW_STRESS_FILES: "100000"         # 100k files
+      CLW_STRESS_DEPTH: "500"            # deep nesting
+      CLW_STRESS_WIDE: "20000"           # wide fan-out in one dir
+      CLW_STRESS_CONC: "64"              # 64-way concurrent flows
+    steps:
+      - uses: actions/checkout@v4
+      - name: install pinned toolchain
+        run: rustup show
+      # Serial (--test-threads=1): the 2 GiB + 100k scenarios must not run simultaneously
+      # (disk peak ~6 GiB each), so they don't exhaust the runner's disk.
+      - name: scale/stress scenarios (--ignored, aggressive env)
+        run: cargo test -p clw-integration-tests --test stress --release -- --ignored --nocapture --test-threads=1
+
+  property:
+    name: exhaustive property round-trip (2000 cases)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PROPTEST_CASES: "2000"
+    steps:
+      - uses: actions/checkout@v4
+      - name: install pinned toolchain
+        run: rustup show
+      - name: property round-trip — exhaustive
+        run: cargo test -p clw-integration-tests --test roundtrip_prop --release
