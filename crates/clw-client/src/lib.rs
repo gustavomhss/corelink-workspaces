@@ -1535,6 +1535,60 @@ mod tests {
         }
     }
 
+    // 410 exercises the uniform non-2xx arm, but the distinct fail-closed codes the
+    // C2c contract calls out — 401 (bad ticket) and 404 (unknown lease) — had no
+    // dedicated assertion. Pin them so a future refactor that special-cases one code
+    // can't regress the fail-closed guarantee.
+    #[tokio::test]
+    async fn redeem_401_bad_ticket_is_fail_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/lease-bad/cas-cred"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "lease-bad", "wrong-ticket")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => assert!(m.contains("401"), "expected HTTP 401, got: {m}"),
+            other => panic!("expected Transport fail-closed on 401, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redeem_404_unknown_lease_is_fail_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/lease-unknown/cas-cred"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = redeem_cred_ticket(&server.uri(), "lease-unknown", "tkt")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(m) => assert!(m.contains("404"), "expected HTTP 404, got: {m}"),
+            other => panic!("expected Transport fail-closed on 404, got {other:?}"),
+        }
+    }
+
+    // An unreachable fabric (connection refused) must ALSO fail closed — a redeem
+    // transport error is a hard error at runner boot, never a fall-through. Uses a
+    // loopback port that passes the plaintext gate but has nothing listening.
+    #[tokio::test]
+    async fn redeem_transport_error_is_fail_closed() {
+        let err = redeem_cred_ticket("http://127.0.0.1:1", "lease-1", "tkt")
+            .await
+            .unwrap_err();
+        match err {
+            ClwError::Transport(_) => {}
+            other => {
+                panic!("expected a Transport fail-closed on an unreachable fabric, got {other:?}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn redeem_200_missing_cas_pat_is_error() {
         let server = MockServer::start().await;
