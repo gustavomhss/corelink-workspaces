@@ -1,0 +1,72 @@
+# Live-journeys suite — a REAL USER, in PROD, exercised by feature/journey.
+#
+# `crates/clw-conformance/tests/live_journeys.rs` drives the real clw APIs against
+# live prod for the journeys that ONLY a real backend proves: cross-snapshot dedup
+# counters, a warming cache across real fetches, and a shared tenant used by TWO
+# identities (a "team").
+#
+# Relationship to conformance-canary.yml: the daily canary already runs the WHOLE
+# `cargo test -p clw-conformance --features live` suite, so the single-identity
+# journeys (dedup, warm-cache) run there too. THIS lane exists to additionally wire
+# the SECOND identity (CLW_TOKEN_B) so the team-share journey actually executes in
+# CI — the canary doesn't provide a second PAT, so team-share soft-skips there.
+#
+# Like the canary, this sets CLW_CONFORMANCE_REQUIRE=1 so a skip (missing primary
+# cred / an unavailable endpoint) FAILS loudly. The team journey soft-skips (never
+# a require-fail) if CLW_TOKEN_B is absent, so the lane still passes with just the
+# primary PAT.
+
+name: live-journeys
+
+on:
+  # Weekly — the single-identity journeys are already covered daily by the canary;
+  # this cadence is for the two-identity team journey + on-demand runs.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: live-journeys
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  journeys:
+    name: live journeys (prod, real user)
+    # GitHub-hosted: a network test against prod; no dependency on the self-hosted Mac.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned Rust toolchain (rust-toolchain.toml channel)
+        run: |
+          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          rustup toolchain install "$CH" --profile minimal
+          rustup default "$CH"
+
+      - name: live-journeys suite (clw-conformance --features live, REQUIRE=1)
+        env:
+          # The suite reads CLW_TOKEN/CLW_TENANT/CLW_ENDPOINT — map the CI service
+          # identity onto those names (same wiring as the conformance canary).
+          CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+          CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
+          CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+          # SECOND identity on the SAME tenant for the team-share journey. Optional:
+          # when absent, only the team journey soft-skips (the lane still passes).
+          CLW_TOKEN_B: ${{ secrets.CLW_CI_TOKEN_B }}
+          # REQUIRE=1: a skip of the PRIMARY-cred journeys is a hard failure.
+          CLW_CONFORMANCE_REQUIRE: "1"
+        run: |
+          set -euo pipefail
+          if [ -z "${CLW_TOKEN:-}" ]; then
+            echo "::error::CLW_CI_TOKEN absent — the live-journeys lane REQUIRES the primary PAT (CLW_CONFORMANCE_REQUIRE=1). Provision the CI service PAT secret."
+            exit 1
+          fi
+          if [ -z "${CLW_TOKEN_B:-}" ]; then
+            echo "::warning::CLW_CI_TOKEN_B absent — the two-identity team-share journey will soft-skip. Provision a second PAT on the same tenant to exercise it."
+          fi
+          echo "Running live journeys against prod (REQUIRE=1 — a primary-cred skip is a hard failure)."
+          cargo test -p clw-conformance --features live --test live_journeys
