@@ -9,12 +9,17 @@ content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + ten
 (never `x-corelink-tenant-id`). Config is env-driven (`CLW_ENDPOINT/CLW_TENANT/CLW_TOKEN/CLW_REF_DOMAIN`),
 no config file required. Single human owner = Gustavo (stakeholder + approver).
 
-**Status: SHIPPED — v0.1.10 is live (open beta; v0.1.0 launched 2026-06-18).**
-`brew install humanguardrail/clw/clw`. v0.1.6 (2026-07-09) shipped the 5-angle adversarial-audit
-remediation (4 HIGH + 6 MED + LOW cluster — `run` PAT-env-leak, `run` grandchild-hang, unrestorable
-snapshot, snapshot global concurrency, endpoint-userinfo redaction, prune replica-lag fail-safe, …).
-v0.1.7 (2026-07-10) closes the last deferred LOW (external-symlink snapshot fidelity). v0.1.5 shipped
-`clw hydrate --manifest-digest` (#153). **`main` is branch-protected (`gates`+`dco` required, enforce_admins).**
+**Status: SHIPPED — v0.1.11 is live (open beta; v0.1.0 launched 2026-06-18).**
+`brew install humanguardrail/clw/clw`. v0.1.11 (2026-07-13) is a stabilization wave from a 5-angle
+hidden-debt sweep (core code was clean; the recurring debt lived in the GATE layer): signing is now
+FAIL-CLOSED on real releases (a real `vX.Y.Z` with the minisign secret absent hard-fails instead of
+publishing unsigned + bumping brew — #182); the PR scoped-lane no longer has coverage holes (tests
+now include the sink crates clw-cli/clw-integration-tests, the windows-gnu cross-check is a UNIVERSAL
+tripwire in both lanes, clippy runs `--all-features` — #183); the last two size-unbounded reads are
+capped (cred-ticket body + snapshot small-file fast-path — #184); `cargo-audit` pinned `@0.22.2`.
+v0.1.6 (2026-07-09) shipped the 5-angle adversarial-audit remediation (4 HIGH + 6 MED + LOW cluster).
+v0.1.7 (2026-07-10) closes the external-symlink LOW. v0.1.5 shipped `clw hydrate --manifest-digest`
+(#153). **`main` is branch-protected (`gates`+`dco` required, enforce_admins).**
 
 ## Build / test / gate
 - The repo gate is `bash scripts/gates.sh` (FULL) or `bash scripts/gates.sh --scoped [base]` (change-scoped
