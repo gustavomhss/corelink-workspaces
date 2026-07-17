@@ -72,15 +72,23 @@ jobs:
             echo ""
             echo "**Total line coverage: ${PCT}%**"
             echo ""
-            echo "Posture: measure -> ratchet -> gate. Phase 1b will set a floor at floor(baseline) and fail on a drop."
+            echo "Posture: measure -> ratchet -> gate. Floor is active (Phase 1b); a drop below it fails this check."
             echo ""
             echo '```'
             cat coverage-summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          # PHASE 1b (follow-on) — uncomment + set the floor once the baseline is known:
-          #   FLOOR=NN
-          #   awk "BEGIN{exit !(${PCT} < ${FLOOR})}" && { echo "::error::coverage ${PCT}% < floor ${FLOOR}%"; exit 1; } || true
+          # PHASE 1b — floor ACTIVE. Baseline measured 88.82% line coverage (2026-07-17,
+          # PR #187); floor set ~0.8% below at 88. Deterministic (same tests => same %),
+          # so this is a hard ratchet, not flaky. Ratchet it UP as coverage improves.
+          # (This check is not yet required at branch-protection — Phase 1c promotes it
+          # once it has run green on main a few times.)
+          FLOOR=88
+          if awk "BEGIN{exit !(${PCT} < ${FLOOR})}"; then
+            echo "::error::coverage ${PCT}% dropped below the floor of ${FLOOR}% — add tests for the new code, or raise the case with the reviewer"
+            exit 1
+          fi
+          echo "coverage ${PCT}% >= floor ${FLOOR}% — OK"
 
       - name: upload coverage artifacts (lcov + json + summary)
         uses: actions/upload-artifact@v4
