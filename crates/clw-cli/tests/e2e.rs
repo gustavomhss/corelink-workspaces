@@ -3309,3 +3309,339 @@ async fn resnapshot_identical_is_noop_and_force_replaces() {
         "after --force the ref must be present (re-created)"
     );
 }
+
+// ===========================================================================
+// Validation-gap closure batch — flags/journeys/errors previously covered only at
+// parse/unit/lib level, now driven through the REAL binary end-to-end.
+// ===========================================================================
+
+/// `hydrate --manifest-digest <root>` round-trips content-addressed by the manifest
+/// digest (the v0.1.5 headline feature #153) — was only parse/unit/lib-tested.
+#[tokio::test]
+async fn hydrate_manifest_digest_roundtrips_byte_identical() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"digest-hydrate payload").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "md-ws",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "snapshot must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("snapshot --json stdout");
+    let root = v["root"]
+        .as_str()
+        .expect("root digest in --json")
+        .to_string();
+
+    let dest = TempDir::new().unwrap();
+    let outp = dest.path().join("out");
+    clw_cmd(&server.uri(), cache.path())
+        .args([
+            "hydrate",
+            outp.to_str().unwrap(),
+            "--manifest-digest",
+            &root,
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(outp.join("f.txt")).unwrap(),
+        b"digest-hydrate payload"
+    );
+}
+
+/// `hydrate --manifest-digest <valid-but-absent>` → clean, actionable failure (not a crash).
+#[tokio::test]
+async fn hydrate_manifest_digest_absent_fails_cleanly() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+    let absent = "0".repeat(64);
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "hydrate",
+            dest.path().join("out").to_str().unwrap(),
+            "--manifest-digest",
+            &absent,
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an absent manifest digest must fail");
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("not found") || err.contains("manifest") || err.contains("404"),
+        "must be an actionable not-found, got: {err}"
+    );
+}
+
+/// `hydrate --manifest-digest zzz` (malformed) → clean InvalidDigest before any request.
+#[test]
+fn hydrate_manifest_digest_malformed_rejected() {
+    let cache = TempDir::new().unwrap();
+    let dest = TempDir::new().unwrap();
+    let out = clw_cmd("http://127.0.0.1:1", cache.path())
+        .args([
+            "hydrate",
+            dest.path().join("out").to_str().unwrap(),
+            "--manifest-digest",
+            "zzz",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a malformed digest must fail");
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("digest") || err.contains("hex"),
+        "must name the invalid digest, got: {err}"
+    );
+}
+
+/// `run --env FOO` folds FOO's VALUE into the memoization key: a changed value MISSES
+/// (re-runs with the new value) rather than replaying the cached one. Was parse-only.
+#[tokio::test]
+async fn run_env_var_value_busts_the_cache_key() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"x").unwrap();
+
+    let run = |val: &str| {
+        clw_cmd(&server.uri(), cache.path())
+            .env("FOO", val)
+            .args([
+                "run",
+                "--input",
+                src.path().to_str().unwrap(),
+                "--env",
+                "FOO",
+                "--",
+                "sh",
+                "-c",
+                "printf %s \"$FOO\"",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let a1 = run("alpha");
+    assert!(a1.status.success());
+    assert_eq!(a1.stdout, b"alpha", "first run reflects FOO=alpha");
+    // Same value -> cache HIT (stored stdout replayed; the child does NOT re-run).
+    let a2 = run("alpha");
+    assert!(
+        String::from_utf8_lossy(&a2.stderr).contains("cache hit"),
+        "an unchanged --env value must hit the cache, stderr: {}",
+        String::from_utf8_lossy(&a2.stderr)
+    );
+    // A CHANGED --env value must bust the key: if FOO were NOT in the key this would be a
+    // cache HIT replaying "alpha". Getting "beta" proves the value is folded into the key.
+    let b1 = run("beta");
+    assert_eq!(
+        b1.stdout, b"beta",
+        "a changed --env value must miss the cache and re-run (not replay the cached output)"
+    );
+}
+
+/// `clw run` with a child emitting > the 5 MiB output cap aborts with the reserved
+/// oversized exit code 137 — the frozen exit-contract leg, previously only unit-mapped.
+#[tokio::test]
+async fn run_oversized_child_output_exits_137() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"x").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "run",
+            "--input",
+            src.path().to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            "head -c 6291456 /dev/zero", // 6 MiB > 5 MiB cap
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "oversized child output must exit the reserved 137, got {:?} (stderr: {})",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `rm --name x --ref-key y` — the clap `conflicts_with` rejection (ls/hydrate had a
+/// both-together test; rm only had the neither-case).
+#[test]
+fn rm_name_and_ref_key_together_conflict() {
+    let cache = TempDir::new().unwrap();
+    let out = clw_cmd("http://127.0.0.1:1", cache.path())
+        .args(["rm", "--name", "x", "--ref-key", &"0".repeat(64), "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "both --name and --ref-key must be rejected"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("cannot be used with") || err.contains("conflict"),
+        "must be a clap conflict error, got: {err}"
+    );
+}
+
+/// A tenant with a path separator (`a/b`) is rejected cleanly (InvalidTenant), never sent.
+#[test]
+fn invalid_tenant_with_slash_rejected_cleanly() {
+    let cache = TempDir::new().unwrap();
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("CLW_ENDPOINT", "http://127.0.0.1:1")
+        .env("CLW_TENANT", "a/b")
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an invalid tenant must fail");
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("tenant"),
+        "must name the tenant problem, got: {err}"
+    );
+}
+
+/// `snapshot --concurrency N` (non-default) threads through and round-trips — the flag's
+/// value path was parse-only.
+#[tokio::test]
+async fn snapshot_concurrency_flag_nondefault_roundtrips() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    build_source_tree(src.path());
+    clw_cmd(&server.uri(), cache.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "conc-ws",
+            "--concurrency",
+            "2",
+        ])
+        .assert()
+        .success();
+    let dest = TempDir::new().unwrap();
+    let outp = dest.path().join("out");
+    clw_cmd(&server.uri(), cache.path())
+        .args([
+            "hydrate",
+            outp.to_str().unwrap(),
+            "--name",
+            "conc-ws",
+            "--concurrency",
+            "3",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(outp.join("small.txt")).unwrap(),
+        b"hello e2e test",
+        "a non-default --concurrency must still round-trip byte-identical"
+    );
+}
+
+/// `snapshot --ref-domain runner` uses the runner keyspace (flag form; previously only the
+/// `CLW_REF_DOMAIN=runner` env form was tested).
+#[tokio::test]
+async fn snapshot_ref_domain_flag_uses_runner_keyspace() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"runner-domain").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "rd-ws",
+            "--ref-domain",
+            "runner",
+        ])
+        .assert()
+        .success();
+    let runner_key = clw_types::ref_key_in(clw_types::RefDomain::Runner, "rd-ws").to_hex();
+    let user_key = ref_key_hex("rd-ws");
+    let store = ac.lock().unwrap();
+    assert!(
+        store.contains_key(&runner_key),
+        "ref must land under the RUNNER keyspace"
+    );
+    assert!(
+        !store.contains_key(&user_key),
+        "ref must NOT land under the default user keyspace"
+    );
+}
+
+/// `clw auth rotate` (human output) directs the user to re-login — no silent no-op.
+/// (v1 has no one-step rotate; it prints guidance. Needs a resolved config to dispatch,
+/// so provide the env; rotate itself makes no network call.)
+#[test]
+fn auth_rotate_directs_to_login() {
+    let cache = TempDir::new().unwrap();
+    let out = clw_cmd("http://127.0.0.1:1", cache.path())
+        .args(["auth", "rotate"])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        combined.contains("login"),
+        "rotate must direct to `clw auth login`, got: {combined}"
+    );
+}
+
+/// A corrupt `~/.clw/config.toml` must not block an env-configured op (warn + fall back).
+#[tokio::test]
+async fn corrupt_config_file_does_not_block_env_configured_op() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".clw")).unwrap();
+    std::fs::write(home.path().join(".clw/config.toml"), b"not valid toml {{{").unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"y").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path().to_str().unwrap())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", "cc-ws"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a corrupt config file must not block an env-configured op: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
