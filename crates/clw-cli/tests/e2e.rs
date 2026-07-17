@@ -3645,3 +3645,122 @@ async fn corrupt_config_file_does_not_block_env_configured_op() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ===========================================================================
+// C2c cred-ticket redemption (CLW_CRED_TICKET) — the runner's single-use credential
+// path. Previously only the classifier was unit-tested; now driven end-to-end through
+// the real binary against a mock fabric endpoint + CAS/AC.
+// ===========================================================================
+
+/// Happy path: a network command with CLW_CRED_TICKET (no CLW_TOKEN) redeems the ticket
+/// at the fabric endpoint, receives a cas_pat, and uses it for the operation.
+#[tokio::test]
+async fn cred_ticket_redeem_happy_path_snapshots() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await; // CAS/AC accept `Bearer test-pat`
+                                                           // Fabric redeem route returns cas_pat = TEST_PAT so the CAS mock then accepts it.
+    Mock::given(method("POST"))
+        .and(path_regex(r"/v1/leases/.*/cas-cred$"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!(r#"{{"cas_pat":"{TEST_PAT}"}}"#)),
+        )
+        .mount(&server)
+        .await;
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"cred-ticket payload").unwrap();
+    let cache = TempDir::new().unwrap();
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .env("CLW_REF_DOMAIN", "runner")
+        .env("CLW_FABRIC_ENDPOINT", server.uri())
+        .env("CLW_LEASE_ID", "lease-1")
+        .env("CLW_CRED_TICKET", "the-ticket")
+        .env_remove("CLW_TOKEN")
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", "ct-ws"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "redeem + snapshot with a cred ticket (no PAT) must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Fail-closed: CLW_CRED_TICKET set but CLW_LEASE_ID missing → clean Config error, no redeem.
+#[test]
+fn cred_ticket_missing_lease_id_fails_closed() {
+    let cache = TempDir::new().unwrap();
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("CLW_ENDPOINT", "http://127.0.0.1:1")
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .env("CLW_REF_DOMAIN", "runner")
+        .env("CLW_FABRIC_ENDPOINT", "http://127.0.0.1:1")
+        .env("CLW_CRED_TICKET", "the-ticket")
+        .env_remove("CLW_LEASE_ID")
+        .env_remove("CLW_TOKEN")
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a cred ticket without a lease id must fail closed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("CLW_LEASE_ID"),
+        "must name the missing lease id, got: {err}"
+    );
+}
+
+/// Fail-closed: a burned/invalid ticket (fabric 410) surfaces a clean error and NEVER
+/// falls back to a PAT (there is none in the runner ref-domain).
+#[tokio::test]
+async fn cred_ticket_fabric_410_fails_closed() {
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/v1/leases/.*/cas-cred$"))
+        .respond_with(ResponseTemplate::new(410))
+        .mount(&server)
+        .await;
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"x").unwrap();
+    let cache = TempDir::new().unwrap();
+    let out = Command::cargo_bin("clw")
+        .unwrap()
+        .env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .env("CLW_REF_DOMAIN", "runner")
+        .env("CLW_FABRIC_ENDPOINT", server.uri())
+        .env("CLW_LEASE_ID", "lease-1")
+        .env("CLW_CRED_TICKET", "burned")
+        .env_remove("CLW_TOKEN")
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "ct-burned",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a burned ticket (fabric 410) must fail closed, never succeed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("410")
+            || err.contains("cred")
+            || err.contains("redemption")
+            || err.contains("ticket"),
+        "must surface a clean cred-ticket redemption failure, got: {err}"
+    );
+}
