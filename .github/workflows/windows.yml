@@ -1,0 +1,51 @@
+# Windows RUNTIME lane — validate what was compile-only.
+#
+# The gate cross-CHECKS windows-gnu (`cargo check` on ubuntu), and release.yml BUILDS the
+# windows-gnu binary — but until now NO workflow ever RAN `cargo test` on Windows, so every
+# Windows-specific runtime path (backslash / drive-letter / NTFS-ADS rejection at hydrate,
+# the constant 0o644 mode, the symlink copy-fallback) shipped validated by compile + unix
+# unit tests only. This runs the workspace test suite natively on Windows.
+#
+# Uses the GNU toolchain to match the SHIPPED windows-gnu binary (the GH Windows image ships
+# mingw-w64 for ring's C build). The unix-only test files (`#![cfg(unix)]`: clw-cli e2e,
+# roundtrip_prop) self-exclude; this exercises the cross-platform + windows-specific paths.
+#
+# NOT yet a required check — it runs on push-to-main + dispatch while the Windows runtime is
+# brought to green; promote to pull_request once stable.
+
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: [".github/workflows/windows.yml", "crates/**", "Cargo.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: windows runtime (cargo test, gnu)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned gnu toolchain (matches the shipped windows-gnu binary)
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.91.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          rustup default 1.91.1-x86_64-pc-windows-gnu
+          rustc -vV
+
+      - name: cargo test (validate the Windows RUNTIME — previously compile-only)
+        run: cargo test --workspace

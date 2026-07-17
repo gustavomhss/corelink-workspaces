@@ -1675,6 +1675,9 @@ mod tests {
     // file lands. Files-first guarantees the real directory wins.
     // -----------------------------------------------------------------------
 
+    // Unix asserts real symlink semantics (read_link → target). On Windows there are no
+    // unprivileged symlinks, so hydrate copies instead — asserted by its sibling below.
+    #[cfg(unix)]
     #[tokio::test]
     async fn regular_files_materialized_before_symlinks() {
         let data = b"inner-file-data";
@@ -1724,6 +1727,57 @@ mod tests {
             std::fs::read(&link).unwrap(),
             data,
             "symlink resolves to the already-materialised file"
+        );
+    }
+
+    /// Windows counterpart: there are no unprivileged symlinks on Windows, so hydrate
+    /// materialises a symlink entry as a COPY of the (already-materialised) target — a
+    /// documented, non-silent divergence. Assert the entry is a REGULAR FILE (not a link)
+    /// carrying the target's bytes. (Surfaced by the Windows runtime lane; validates the
+    /// `materialize_symlink_as_copy` path the unix test can't exercise.)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn symlink_materialized_as_copy_on_windows() {
+        let data = b"inner-file-data";
+        let (d, bytes) = make_chunk(data);
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![
+                Entry::Symlink {
+                    path: "mylink".into(),
+                    target: "sub/inner.txt".into(),
+                },
+                Entry::File {
+                    path: "sub/inner.txt".into(),
+                    mode: 0o644,
+                    size: data.len() as u64,
+                    chunks: vec![ChunkRef {
+                        digest: d,
+                        size: data.len() as u64,
+                    }],
+                },
+            ],
+        };
+
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+        hydrate(&dest, &store, &cache, &HydrateOptions::new("test-ws"))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(dest.join("sub/inner.txt")).unwrap(), data);
+        let link = dest.join("mylink");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "on Windows the symlink entry is materialised as a COPY, not a link"
+        );
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            data,
+            "the copy carries the target's bytes"
         );
     }
 
