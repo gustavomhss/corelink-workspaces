@@ -2220,6 +2220,150 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Test 15 (base case): an EMPTY snapshot — a manifest with ZERO entries — is
+    // a legal empty workspace. hydrate must CREATE the destination and report
+    // files=0 / bytes_total=0, NOT trip the dest-empty guard or error on the
+    // empty entry list. Previously untested (the empty-snapshot journey gap).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn empty_snapshot_hydrates_to_empty_dest() {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![],
+        };
+        // No chunks referenced — setup_store seeds only the manifest blob + ref.
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+
+        let opts = HydrateOptions::new("test-ws");
+        let report = hydrate(&dest, &store, &cache, &opts).await.unwrap();
+
+        assert!(
+            dest.is_dir(),
+            "an empty snapshot must still create the dest"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "the materialised dest of an empty snapshot must be empty"
+        );
+        assert_eq!(report.files, 0, "no file entries");
+        assert_eq!(report.bytes_total, 0, "no declared bytes");
+        assert_eq!(report.bytes_from_cache, 0);
+        assert_eq!(report.bytes_downloaded, 0);
+        assert_eq!(report.root, {
+            let mb = manifest.canonical_bytes().unwrap();
+            Digest::of_bytes(&mb)
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 16 (containment defense-in-depth): hydrate re-validates every entry
+    // path with its OWN `validate_rel_path` re-check, so a hostile path that
+    // somehow bypassed `Manifest::from_bytes` is STILL rejected before any
+    // filesystem work. That re-check LOOKS redundant precisely because
+    // `from_bytes` (via `validate_canonical`) blocks a hostile path first on the
+    // whole-hydrate path — so it is unreachable through `hydrate()`. We exercise
+    // the internal `materialize_file` guard directly (same seam the concurrency
+    // test uses) with in-code hostile paths (absolute + `..` escapes) it would
+    // otherwise never see. RED-on-revert: deleting the `validate_rel_path(rel_path)?`
+    // line in `materialize_file` lets these paths reach `dest.join(..)` and escape.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn materialize_file_re_rejects_hostile_rel_path() {
+        let store = FakeStore::new();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Absolute, single `..`, and an interior `..` that escapes the root.
+        for hostile in ["/etc/clw-escape", "../escape.txt", "a/../../b"] {
+            let err = materialize_file(&dest, hostile, 0o644, &[], 4, &store, &cache)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ClwError::InvalidManifest(_)),
+                "hostile path {hostile:?} must be rejected by hydrate's own re-check, got: {err:?}"
+            );
+        }
+
+        // The guard fires before any FS work, so nothing escaped the destination.
+        assert!(
+            !dest_dir.path().join("escape.txt").exists(),
+            "a `..` path must not have written outside dest"
+        );
+        assert!(
+            std::fs::read_dir(&dest).unwrap().next().is_none(),
+            "no partial output under dest for a rejected path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 17 (mid-WRITE IO cleanup): the fetch-side failure path is covered by
+    // `mid_file_failure_leaves_no_tmp_stray`; this covers the WRITE side. A file's
+    // chunk is fully fetched + written to the per-file temp, then the FINAL
+    // rename fails because a directory already occupies the destination name
+    // (`rename(file, dir)` → an IO error on unix). The drop-guard must remove the
+    // `.clw-tmp-*` temp and the IO error must surface. RED-on-revert: dropping the
+    // TmpFileGuard leaks the written temp and this scan finds it.
+    // -----------------------------------------------------------------------
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mid_write_io_failure_leaves_no_tmp_stray_and_surfaces_io() {
+        let (d, bytes) = make_chunk(b"payload-that-actually-gets-written");
+        let store = FakeStore::new();
+        store.cas_put_raw(d, bytes.clone());
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().to_path_buf();
+
+        // Occupy the destination file name with a NON-EMPTY directory: the temp
+        // is created + written first (dest is writable), and only the trailing
+        // rename onto this name fails — exercising the post-write cleanup.
+        let blocker = dest.join("f.bin");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("resident"), b"keep-me").unwrap();
+
+        let chunks = vec![ChunkRef {
+            digest: d,
+            size: bytes.len() as u64,
+        }];
+        let err = materialize_file(&dest, "f.bin", 0o644, &chunks, 4, &store, &cache)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ClwError::Io(_)),
+            "a failed rename after the write must surface as an IO error, got: {err:?}"
+        );
+
+        // The write-side failure must have cleaned up its temp: NO stray remains.
+        fn has_tmp_stray(dir: &Path) -> bool {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                if e.file_name().to_string_lossy().starts_with(".clw-tmp-") {
+                    return true;
+                }
+            }
+            false
+        }
+        assert!(
+            !has_tmp_stray(&dest),
+            "a mid-write IO failure must leave no .clw-tmp-* stray under dest"
+        );
+        // The pre-existing directory entry is untouched by the failed materialise.
+        assert!(
+            blocker.join("resident").exists(),
+            "the failed materialise must not disturb the resident dir entry"
+        );
+    }
+
     // Note (M7 fsync durability): the `sync_all()` before rename + the best-effort
     // parent-directory fsync harden hydrate against a torn file on power loss.
     // That is a crash/power-loss durability property and is NOT observable from an

@@ -1991,6 +1991,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cas_get_streaming_body_without_content_length_rejected() {
+        // Journey gap (transport/reliability): the oversized test above uses honest
+        // `set_body_bytes` (Content-Length present) so it trips the EARLY
+        // `content_length()` check in `read_body_capped`. This drives the OTHER,
+        // untested branch — the STREAMING running-ceiling. A `Transfer-Encoding:
+        // chunked` response carries NO Content-Length (verified: reqwest reports
+        // `content_length() == None`), so the early check is skipped and only the
+        // per-chunk projected-size ceiling stands between an oversized body and the
+        // allocation. A chunked body over `CAS_BLOB_CAP_BYTES` must still be refused
+        // as `TooLarge`. NON-VACUOUS: without the streaming cap the whole body would
+        // buffer and the post-buffer BLAKE3 check would surface `Integrity`, not
+        // `TooLarge` — so `TooLarge` is the signal that the streaming ceiling fired.
+        let server = MockServer::start().await;
+        let (digest, _) = digest_and_bytes();
+        let oversized = vec![0u8; CAS_BLOB_CAP_BYTES + 1];
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+
+        Mock::given(method("GET"))
+            .and(path(&path_str))
+            // `transfer-encoding: chunked` ⇒ hyper omits Content-Length ⇒ the early
+            // `content_length()` short-circuit cannot fire; the body streams.
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(oversized),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::get(&client, &digest).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { size, cap } if cap == CAS_BLOB_CAP_BYTES as u64 && size > cap),
+            "a chunked (no Content-Length) oversized body must trip the STREAMING cap as TooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_page_over_16mib_cap_rejected() {
+        // Journey gap (transport/reliability): a single list page whose body exceeds
+        // `LIST_PAGE_CAP_BYTES` (16 MiB) must be refused as `TooLarge` before the JSON
+        // is ever parsed, so a hostile/buggy server cannot OOM the client with one
+        // giant page. Honest Content-Length ⇒ the early check in `read_body_capped`
+        // fires. NON-VACUOUS: without the cap the 16 MiB+1 of junk would reach
+        // `serde_json` and surface a `Transport` parse error, not `TooLarge`.
+        let server = MockServer::start().await;
+        let huge = vec![b'a'; LIST_PAGE_CAP_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/v1/cas/test-tenant"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(huge))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = CasTransport::list_blobs(&client).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == LIST_PAGE_CAP_BYTES as u64),
+            "an over-cap (>16 MiB) list page must be refused as TooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cas_get_other_status_returns_http_error() {
         let server = MockServer::start().await;
         let (digest, _) = digest_and_bytes();
@@ -3611,6 +3673,147 @@ mod rate_limit_tests {
         assert!(
             gov.sem.available_permits() <= CEILING,
             "final live permits exceeded ceiling"
+        );
+    }
+
+    /// AIMD end-to-end WIRING: a real 429 flowing through `with_retry` must SHRINK
+    /// the client's live governor target via the
+    /// `matches!(e, Http{429}) => on_throttle()` call. The other AIMD tests drive
+    /// `Governor` in isolation; none prove the transport actually calls it. Here we
+    /// read `client.governor.target()` before and after a 429-then-200 PUT: it must
+    /// halve from the ceiling (8 → 4). NON-VACUOUS: delete the `on_throttle()` call
+    /// in `with_retry` and the target stays at 8, failing the post-assertion.
+    #[tokio::test]
+    async fn real_429_shrinks_governor_target_end_to_end() {
+        let server = MockServer::start().await;
+        let bytes = b"aimd-wiring-blob".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        // First attempt 429 (no Retry-After ⇒ fast 200ms ladder rung), then 200.
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::with_concurrency(config_for(&server), 8).unwrap();
+        assert_eq!(client.governor.target(), 8, "starts at the ceiling");
+        CasTransport::put(&client, &digest, bytes)
+            .await
+            .expect("429-then-200 must succeed");
+        // The single 429 multiplicatively halved the live window; the trailing 200 is
+        // one success (< AIMD_INCREASE_AFTER_SUCCESSES) so it does not grow it back.
+        assert_eq!(
+            client.governor.target(),
+            4,
+            "a real 429 through with_retry must halve the governor target (wiring), got {}",
+            client.governor.target()
+        );
+    }
+
+    /// Retry-After in HTTP-DATE form must be IGNORED (ladder fallback), not honored
+    /// and not an error: `record_retry_after` only parses integer delta-seconds, so a
+    /// `Retry-After: <http-date>` leaves the slot absent and the fixed ladder drives
+    /// the backoff. NON-VACUOUS via timing: the first ladder rung is 200ms, but a
+    /// wrongly-honored 2099 date would parse to a huge value and clamp to the LONGEST
+    /// rung (10s). The retry must happen (≥150ms) yet finish well under that clamp.
+    #[tokio::test]
+    async fn retry_after_http_date_form_is_ignored_falls_back_to_ladder() {
+        let server = MockServer::start().await;
+        let bytes = b"retry-after-date-blob".to_vec();
+        let digest = Digest::of_bytes(&bytes);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "Wed, 21 Oct 2099 07:28:00 GMT"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/v1/cas/t1/[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(config_for(&server)).unwrap();
+        let start = std::time::Instant::now();
+        CasTransport::put(&client, &digest, bytes)
+            .await
+            .expect("an HTTP-date Retry-After must be ignored and the ladder used (no error)");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "the 429 must still be retried via the ladder (first rung 200ms), elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "an HTTP-date Retry-After must NOT be honored as a long delay (would clamp to the 10s rung); elapsed {elapsed:?}"
+        );
+    }
+
+    /// Transport-error retry EXHAUSTION: a retryable transport error
+    /// (`is_retryable(Transport) == true`) must be retried the full `MAX_ATTEMPTS`
+    /// budget and then surface the error — previously covered only indirectly via a
+    /// CLI e2e. Driven through the testable `with_retry_bounded` seam with an op that
+    /// always returns a `Transport` error and a generous overall deadline (300s ≫ the
+    /// ~18s backoff ladder), so the loop terminates by exhausting MAX_ATTEMPTS, not
+    /// the deadline. The full backoff ladder runs (~18s), but cargo runs tests in
+    /// parallel so it overlaps the existing `retry_persistent_500s` ladder rather
+    /// than adding serial wall-time; pausing the clock to skip it would need tokio's
+    /// `test-util` feature (a Cargo.toml change, out of scope here). NON-VACUOUS: if
+    /// `Transport` were not retryable the op would be called exactly ONCE, so asserting
+    /// the call count equals `MAX_ATTEMPTS` (and the original transport error — not a
+    /// deadline error — surfaces) proves the retry path fired to exhaustion.
+    #[tokio::test]
+    async fn transport_error_retried_to_exhaustion_surfaces_error() {
+        let client = HttpClient::with_concurrency(
+            Config {
+                endpoint: "https://unused.example.com".into(),
+                tenant: "t1".into(),
+                token: "t".into(),
+                cache_dir: std::env::temp_dir(),
+            },
+            4,
+        )
+        .unwrap();
+
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let calls_for_op = std::sync::Arc::clone(&calls);
+        let res: Result<()> = client
+            .with_retry_bounded(
+                move |_slot| {
+                    let calls_for_op = std::sync::Arc::clone(&calls_for_op);
+                    async move {
+                        calls_for_op.fetch_add(1, Ordering::SeqCst);
+                        Err(ClwError::Transport("simulated connect failure".to_string()))
+                    }
+                },
+                300,
+            )
+            .await;
+
+        let err = res.unwrap_err();
+        // The ORIGINAL transport error surfaces (not the deadline message) ⇒ we
+        // exhausted MAX_ATTEMPTS rather than tripping the overall deadline.
+        assert!(
+            matches!(err, ClwError::Transport(ref m) if m.contains("simulated connect failure")),
+            "a retryable transport error must surface after MAX_ATTEMPTS exhaustion, got {err:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_ATTEMPTS as u64,
+            "a transport error must be retried the full MAX_ATTEMPTS budget"
         );
     }
 }

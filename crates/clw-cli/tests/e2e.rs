@@ -3976,3 +3976,394 @@ async fn cred_ticket_fabric_410_fails_closed() {
         "must surface a clean cred-ticket redemption failure, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 journey-map gap fills (docs/TEST-JOURNEY-MAP.md, Tier-3 items 11+12):
+// the `--json` shapes never driven e2e (`ls --name`, `status`, `logout` no-op),
+// `status` error→exit-2, plus the NO_COLOR / RUST_LOG env knobs and the
+// external-symlink SKIP at the CLI boundary (the library path is unit-tested).
+// ---------------------------------------------------------------------------
+
+/// `clw --json ls --name <NAME>` (the SINGLE-ref lookup) must emit the ratified
+/// object shape `{name, root, created_at_unix, parent, files, bytes}` with values
+/// that match the known one-file fixture — not merely that the keys exist. Only
+/// the human-mode `ls --name` was driven e2e before this.
+#[tokio::test]
+async fn ls_json_name_single_ref_shape() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-lsjson-name";
+    // snapshot_tiny writes exactly one file holding `payload for {ws}`.
+    let _src = snapshot_tiny(&server.uri(), cache.path(), ws);
+    let expected_bytes = format!("payload for {ws}").len() as u64;
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "ls", "--name", ws])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "ls --json --name must exit 0");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("ls --json --name stdout must be valid JSON");
+
+    assert_eq!(
+        parsed.get("name").and_then(|v| v.as_str()),
+        Some(ws),
+        "ls --json --name must echo the looked-up name, got: {parsed}"
+    );
+    // root: a 64-hex digest.
+    let root = parsed
+        .get("root")
+        .and_then(|v| v.as_str())
+        .expect("ls --json --name must carry a root string");
+    assert_eq!(
+        root.len(),
+        64,
+        "root must be a 64-hex digest, got: {parsed}"
+    );
+    assert!(
+        root.chars().all(|c| c.is_ascii_hexdigit()),
+        "root must be lowercase hex, got: {parsed}"
+    );
+    // created_at_unix: an integer epoch.
+    assert!(
+        parsed
+            .get("created_at_unix")
+            .and_then(|v| v.as_u64())
+            .is_some(),
+        "created_at_unix must be an integer epoch, got: {parsed}"
+    );
+    // parent: null for a FIRST snapshot (no lineage).
+    assert!(
+        parsed.get("parent").is_some_and(serde_json::Value::is_null),
+        "a first snapshot's parent must be JSON null, got: {parsed}"
+    );
+    // files/bytes must match the one-file fixture EXACTLY.
+    assert_eq!(
+        parsed.get("files").and_then(|v| v.as_u64()),
+        Some(1),
+        "ls --json --name must count the 1 fixture file, got: {parsed}"
+    );
+    assert_eq!(
+        parsed.get("bytes").and_then(|v| v.as_u64()),
+        Some(expected_bytes),
+        "ls --json --name bytes must equal the fixture payload length, got: {parsed}"
+    );
+}
+
+/// Two things the audit flagged as e2e-untested for `status`:
+///   (a) `--json` emits the object shape `{clean, added, removed, changed}`, and
+///   (b) a lookup of an ABSENT ref is a config-independent error that exits the
+///       generic `2` (not the `0`=clean / `1`=dirty diff codes).
+#[tokio::test]
+async fn status_json_shape_and_absent_ref_exits_2() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-status-json";
+
+    // Snapshot a tree, then a same-tree status is CLEAN.
+    let src = TempDir::new().unwrap();
+    build_source_tree(src.path());
+    clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+
+    // (a) --json clean shape.
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "--json",
+            "status",
+            src.path().to_str().unwrap(),
+            "--name",
+            ws,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean status --json must exit 0"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("status --json stdout must be valid JSON");
+    assert_eq!(
+        parsed.get("clean").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "a same-tree status must report clean:true, got: {parsed}"
+    );
+    for key in ["added", "removed", "changed"] {
+        let arr = parsed
+            .get(key)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("status --json must carry '{key}' array, got: {parsed}"));
+        assert!(
+            arr.is_empty(),
+            "a clean status must have an empty '{key}', got: {parsed}"
+        );
+    }
+
+    // (b) status of an ABSENT ref → generic fatal exit 2 (not 0/1).
+    let out_absent = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "status",
+            src.path().to_str().unwrap(),
+            "--name",
+            "no-such-workspace",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out_absent.status.code(),
+        Some(2),
+        "status of an absent ref must exit 2 (error), not 0/1, got: {:?}\nstderr={}",
+        out_absent.status.code(),
+        String::from_utf8_lossy(&out_absent.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out_absent.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "an absent-ref status must fail cleanly, not panic, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("no-such-workspace") || stderr.to_lowercase().contains("not found"),
+        "the error must name the missing workspace, got:\n{stderr}"
+    );
+}
+
+/// `clw --json auth logout` is a NO-OP when there is nothing to remove — and its
+/// no-op shape is deliberately `{removed:[], note}` with NO `file` key (the `file`
+/// key appears ONLY when something was actually removed, via `report_removed`).
+/// Both no-op branches are exercised: no config file at all, and a config file
+/// that carries no `token` line.
+#[test]
+fn logout_json_noop_shapes_omit_file_key() {
+    // Branch 1: no config file (empty HOME) → note "no config file".
+    let home_missing = TempDir::new().unwrap();
+    let out = clw_clean_env(home_missing.path())
+        .args(["--json", "auth", "logout"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "logout --json must exit 0 (no-op)"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("logout --json stdout must be valid JSON");
+    assert_eq!(
+        parsed
+            .get("removed")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(0),
+        "no-config logout must report removed:[], got: {parsed}"
+    );
+    assert!(
+        parsed.get("note").and_then(|v| v.as_str()).is_some(),
+        "no-op logout must carry a 'note', got: {parsed}"
+    );
+    assert!(
+        parsed.get("file").is_none(),
+        "a no-op logout must NOT carry a 'file' key (that appears only on real removal), got: {parsed}"
+    );
+
+    // Branch 2: a config file WITHOUT a token line → note "no token set".
+    let home_notoken = TempDir::new().unwrap();
+    let clw_dir = home_notoken.path().join(".clw");
+    std::fs::create_dir_all(&clw_dir).unwrap();
+    std::fs::write(
+        clw_dir.join("config.toml"),
+        format!("endpoint = \"https://example.com\"\ntenant = \"{TEST_TENANT}\"\n"),
+    )
+    .unwrap();
+    let out2 = clw_clean_env(home_notoken.path())
+        .args(["--json", "auth", "logout"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "no-token logout --json must exit 0"
+    );
+    let parsed2: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out2.stdout).trim())
+            .expect("logout --json stdout must be valid JSON");
+    assert_eq!(
+        parsed2
+            .get("removed")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(0),
+        "no-token logout must report removed:[], got: {parsed2}"
+    );
+    assert!(
+        parsed2.get("file").is_none(),
+        "a no-token no-op logout must NOT carry a 'file' key, got: {parsed2}"
+    );
+    // The pre-existing config (no token) is untouched.
+    let after = std::fs::read_to_string(clw_dir.join("config.toml")).unwrap();
+    assert!(
+        after.contains(TEST_TENANT),
+        "a no-op logout must not scrub the existing (token-less) config, got:\n{after}"
+    );
+}
+
+/// `NO_COLOR=1` must suppress ANSI color everywhere. Drives a stderr-emitting
+/// command (`snapshot -v`, which logs a `tracing::info!` line) with `NO_COLOR=1`
+/// and asserts the stderr stream carries no ESC (0x1b) byte.
+///
+/// Boundary note: an assert_cmd subprocess pipes stderr, so it is already
+/// non-TTY (a second, independent reason clw disables color); this test locks the
+/// NO_COLOR contract at the CLI boundary but cannot, without a pty, isolate the
+/// env knob from the non-TTY gate. The `-v` guarantees there IS stderr content to
+/// inspect, so the assertion is over a non-empty stream, not a vacuous one.
+#[tokio::test]
+async fn no_color_env_produces_no_ansi_on_stderr() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"no-color body").unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("NO_COLOR", "1")
+        .args([
+            "-v",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "e2e-no-color",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "snapshot -v must succeed, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "snapshot -v must emit at least one diagnostic line on stderr"
+    );
+    assert!(
+        !out.stderr.contains(&0x1b),
+        "NO_COLOR=1 must yield ZERO ANSI escape (0x1b) bytes on stderr, got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `RUST_LOG` must OVERRIDE the `-v`/`-q` verbosity knobs. A `run` with `-q`
+/// (ERROR-only) would normally suppress the DEBUG-level "run cache miss;
+/// executing" diagnostic — but `RUST_LOG=debug` wins, so that line reappears on
+/// stderr even under `-q`. A control run with `-q` alone confirms the line is
+/// absent, so the assertion is genuinely discriminating (not vacuous).
+#[tokio::test]
+async fn rust_log_overrides_quiet_emits_debug() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("in.txt"), b"rust-log input").unwrap();
+
+    // The DEBUG diagnostic emitted by clw-run on a cache miss (distinct from the
+    // human-facing "cache miss" line the run subcommand always prints). Each run
+    // uses a UNIQUE command so its cache key differs — the run-memo record lives in
+    // the shared mock CAS, so a repeated identical command would be a HIT, not a
+    // miss.
+    const DEBUG_LINE: &str = "run cache miss; executing";
+
+    let run_with = |extra: &[(&str, &str)], cache: &std::path::Path, echo: &str| {
+        let mut cmd = clw_cmd(&server.uri(), cache);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.current_dir(work.path())
+            .args([
+                "-q", "run", "--input", "in.txt", "--", "/bin/sh", "-c", echo,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    // Control: `-q` alone → the DEBUG diagnostic is suppressed (ERROR level).
+    let cache_ctl = TempDir::new().unwrap();
+    let ctl = run_with(&[], cache_ctl.path(), "echo ctl");
+    assert!(ctl.status.success(), "control run must succeed");
+    let ctl_stderr = String::from_utf8_lossy(&ctl.stderr);
+    assert!(
+        !ctl_stderr.contains(DEBUG_LINE),
+        "with -q alone the DEBUG cache-miss diagnostic must be suppressed, got:\n{ctl_stderr}"
+    );
+
+    // RUST_LOG=debug wins over -q → the DEBUG diagnostic reappears (a UNIQUE
+    // command makes this a genuine miss, not a hit of the control's record).
+    let cache_dbg = TempDir::new().unwrap();
+    let dbg = run_with(&[("RUST_LOG", "debug")], cache_dbg.path(), "echo dbg");
+    assert!(dbg.status.success(), "RUST_LOG run must succeed");
+    let dbg_stderr = String::from_utf8_lossy(&dbg.stderr);
+    assert!(
+        dbg_stderr.contains(DEBUG_LINE),
+        "RUST_LOG=debug must override -q and emit the DEBUG cache-miss diagnostic, got:\n{dbg_stderr}"
+    );
+}
+
+/// External-symlink SKIP through the CLI boundary: a tree carrying an
+/// absolute-target (workspace-escaping) symlink must `snapshot` with exit 0, the
+/// stderr must NAME the skipped link, and the resulting snapshot must contain NO
+/// symlink entry — proven by a fresh-cache hydrate where the link never
+/// materializes while the regular file round-trips. The library path is
+/// unit-tested (clw-snapshot); this locks the CLI seam.
+#[tokio::test]
+async fn snapshot_external_symlink_skipped_through_cli() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws = "e2e-external-symlink";
+
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("keep.txt"), b"in-tree content").unwrap();
+    // An ABSOLUTE target escapes the workspace: it cannot be represented in — nor
+    // restored from — the snapshot, so it must be SKIPPED (target need not exist).
+    std::os::unix::fs::symlink("/etc/hostname", src.path().join("outlink")).unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an external symlink must NOT fail the snapshot, got: {:?}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("SKIPPED") && stderr.contains("outlink"),
+        "stderr must NAME the skipped external symlink 'outlink', got:\n{stderr}"
+    );
+
+    // The manifest carries NO symlink entry: a fresh-cache hydrate restores the
+    // in-tree file but the escaping link never materializes.
+    let cache_hyd = TempDir::new().unwrap();
+    let dest_tmp = TempDir::new().unwrap();
+    let dest = dest_tmp.path().join("out");
+    clw_cmd(&server.uri(), cache_hyd.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(dest.join("keep.txt")).unwrap(),
+        b"in-tree content",
+        "the in-tree file must round-trip through the snapshot"
+    );
+    assert!(
+        std::fs::symlink_metadata(dest.join("outlink")).is_err(),
+        "the external symlink must be absent from the hydrated tree (no manifest entry)"
+    );
+}

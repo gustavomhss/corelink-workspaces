@@ -677,6 +677,120 @@ mod tests {
         }
     }
 
+    // A non-UTF8 filename (a raw 0xFF byte, legal on unix) is un-representable in
+    // the '/'-separated UTF-8 manifest path space, so the walk must take the
+    // `InvalidManifest("non-utf8 path…")` branch rather than lossily transcode it.
+    #[cfg(unix)]
+    #[test]
+    fn walk_non_utf8_filename_is_invalid_manifest() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // `bad\xffname.txt` — a single unix filename with an invalid-UTF-8 byte.
+        let bad = OsStr::from_bytes(b"bad\xffname.txt");
+        // Some filesystems (APFS/HFS+ on macOS) enforce valid-UTF-8 filenames and
+        // reject this create with EILSEQ. Where the name can't be hosted, the walk
+        // branch is untestable HERE — skip cleanly. It is still exercised on ext4
+        // (the github-hosted linux coverage/fuzz lanes), where the create succeeds.
+        if fs::write(root.join(bad), b"data").is_err() {
+            return;
+        }
+
+        let err = walk(root).expect_err("a non-utf8 filename must fail the walk");
+        match err {
+            ClwError::InvalidManifest(msg) => assert!(
+                msg.contains("non-utf8 path"),
+                "error must name the non-utf8-path branch, got: {msg}"
+            ),
+            other => panic!("expected InvalidManifest, got: {other:?}"),
+        }
+    }
+
+    // Alternate ignore sources beyond a root `.gitignore`/`.clwignore` are honored
+    // by the walk: (a) a root `.ignore` file, (b) a NESTED (subdirectory)
+    // `.gitignore`, and (c) `.git/info/exclude`. Only-root-`.gitignore` was tested.
+    #[test]
+    fn walk_honors_dot_ignore_nested_gitignore_and_git_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // (a) root `.ignore` (an alternate ignore source, not `.gitignore`).
+        fs::write(root.join(".ignore"), "ign_by_dotignore.txt\n").unwrap();
+        fs::write(root.join("ign_by_dotignore.txt"), b"x").unwrap();
+
+        // (b) a NESTED `.gitignore` inside `sub/` ignoring a sibling file.
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub").join(".gitignore"), "ign_nested.txt\n").unwrap();
+        fs::write(root.join("sub").join("ign_nested.txt"), b"x").unwrap();
+        fs::write(root.join("sub").join("kept_nested.txt"), b"keep").unwrap();
+
+        // (c) `.git/info/exclude` (git's per-repo local exclude file).
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::write(
+            root.join(".git").join("info").join("exclude"),
+            "ign_by_gitexclude.txt\n",
+        )
+        .unwrap();
+        fs::write(root.join("ign_by_gitexclude.txt"), b"x").unwrap();
+
+        // A plain kept file at the root.
+        fs::write(root.join("kept.txt"), b"keep").unwrap();
+
+        let entries = walk(root).unwrap();
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel()).collect();
+
+        // Kept files survive.
+        assert!(rels.contains(&"kept.txt"), "kept.txt missing: {rels:?}");
+        assert!(
+            rels.contains(&"sub/kept_nested.txt"),
+            "sub/kept_nested.txt missing: {rels:?}"
+        );
+        // Each alternate ignore source excludes its target.
+        assert!(
+            !rels.contains(&"ign_by_dotignore.txt"),
+            "root .ignore must exclude ign_by_dotignore.txt: {rels:?}"
+        );
+        assert!(
+            !rels.contains(&"sub/ign_nested.txt"),
+            "a nested .gitignore must exclude sub/ign_nested.txt: {rels:?}"
+        );
+        assert!(
+            !rels.contains(&"ign_by_gitexclude.txt"),
+            ".git/info/exclude must exclude ign_by_gitexclude.txt: {rels:?}"
+        );
+    }
+
+    // `.git/` exclusion is UNCONDITIONAL and applies at ANY depth: a `.git`
+    // directory NESTED under a subdirectory (submodule-shaped) is skipped whole,
+    // regardless of ignore files. (Root `.git` is covered by `walk_git_dir_skipped`.)
+    #[test]
+    fn walk_nested_git_dir_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("sub").join(".git")).unwrap();
+        fs::write(
+            root.join("sub").join(".git").join("HEAD"),
+            b"ref: refs/heads/main",
+        )
+        .unwrap();
+        fs::write(root.join("sub").join(".git").join("config"), b"[core]").unwrap();
+        fs::write(root.join("sub").join("real.txt"), b"real").unwrap();
+
+        let entries = walk(root).unwrap();
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel()).collect();
+
+        assert!(
+            rels.contains(&"sub/real.txt"),
+            "sub/real.txt missing: {rels:?}"
+        );
+        assert!(
+            !rels.iter().any(|r| r.contains(".git")),
+            "no nested .git entries should appear: {rels:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // diff tests
     // -----------------------------------------------------------------------

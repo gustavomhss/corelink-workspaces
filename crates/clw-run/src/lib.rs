@@ -2143,4 +2143,299 @@ mod tests {
             "a non-secret CLW_* var must still reach the child (no wholesale env_clear)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Journey gap (stderr byte-replay on a HIT): every other hit test asserts
+    // ONLY stdout. A command that writes DISTINCT bytes to BOTH streams, run
+    // twice, must replay the child's stderr BYTE-IDENTICAL on the second (hit)
+    // call — and it must be the child's own stderr, not mixed with stdout or a
+    // clw banner. RED-on-regression: dropping/mangling `record.stderr` on the
+    // replay path makes the second stderr differ from the first.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + stream redirection (Windows port: M2)
+    #[tokio::test]
+    async fn hit_replays_stderr_byte_identical() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // Distinct, recognizable payloads on each stream so a mix-up is visible.
+        let opts = || RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf 'OUT-abc'; printf 'ERR-xyz' 1>&2".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        // First call: miss — the child runs, both streams captured.
+        let o1 = run_memoized(cwd, &store, &opts()).await.unwrap();
+        assert!(!o1.hit, "first call must be a miss");
+        assert_eq!(o1.stdout, b"OUT-abc", "stdout captured on the miss");
+        assert_eq!(o1.stderr, b"ERR-xyz", "stderr captured on the miss");
+
+        // Second call: identical opts → HIT. The replayed stderr must be
+        // byte-identical to the child's own stderr, distinct from stdout.
+        let o2 = run_memoized(cwd, &store, &opts()).await.unwrap();
+        assert!(o2.hit, "second identical call must be a hit");
+        assert_eq!(
+            o2.stderr, b"ERR-xyz",
+            "the child's stderr must be replayed byte-identical on a cache hit"
+        );
+        assert_eq!(o2.stdout, b"OUT-abc", "stdout also replayed byte-identical");
+        assert_eq!(
+            o1.stderr, o2.stderr,
+            "hit stderr == miss stderr (byte-exact)"
+        );
+        assert_ne!(
+            o2.stdout, o2.stderr,
+            "the two streams stay DISTINCT on replay (stderr is not the stdout blob)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Journey gap (ignored-file invisible to the key): `clw run --help` promises
+    // that `.gitignore`/`.clwignore`'d files under a declared input DIR do not
+    // affect memoization. `walk` runs with `require_git(false)`, so a `.gitignore`
+    // is honored even without a `.git` dir. Changing ONLY an ignored file must NOT
+    // move the key — it stays a hit. RED-on-regression: if the walk stopped
+    // honoring ignores, the changed ignored file would bust the key (a miss).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn gitignored_file_is_invisible_to_the_key() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir(cwd.join("proj")).unwrap();
+        // The .gitignore names an ignored file; a tracked file is the real input.
+        std::fs::write(cwd.join("proj/.gitignore"), b"ignored.txt\n").unwrap();
+        std::fs::write(cwd.join("proj/tracked.txt"), b"tracked").unwrap();
+        std::fs::write(cwd.join("proj/ignored.txt"), b"before").unwrap();
+
+        let store = FakeStore::default();
+        let opts = RunOptions {
+            inputs: vec!["proj".to_string()],
+            command: vec!["true".to_string()],
+            env_keys: vec![],
+        };
+
+        let o1 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(!o1.hit, "first call must be a miss");
+
+        // Change ONLY the .gitignore'd file (different length + content).
+        std::fs::write(cwd.join("proj/ignored.txt"), b"AFTER-changed-content").unwrap();
+
+        let o2 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert_eq!(
+            o1.key, o2.key,
+            "a .gitignore'd file must be INVISIBLE to the run key"
+        );
+        assert!(
+            o2.hit,
+            "changing an ignored file must still be a cache HIT (invisible to memoization)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Journey gap (undeclared-file stale replay — the by-design hermeticity
+    // boundary): a command that reads a file NOT passed via `--input` is OUTSIDE
+    // the key. Changing that file therefore yields a STALE HIT that replays the
+    // OLD output. This test LOCKS the documented v0.1 caveat (crate-level
+    // "Memoization contract" doc): the caller owns declaring every input; an
+    // undeclared read is not sandboxed and will replay stale.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + `cat` (Windows port: M2)
+    #[tokio::test]
+    async fn undeclared_file_change_is_a_stale_hit() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        // `declared.txt` is the ONLY declared input; `undeclared.txt` is read by
+        // the command but never passed via `--input`.
+        std::fs::write(cwd.join("declared.txt"), b"decl").unwrap();
+        std::fs::write(cwd.join("undeclared.txt"), b"before").unwrap();
+
+        let store = FakeStore::default();
+        let opts = RunOptions {
+            inputs: vec!["declared.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "cat undeclared.txt".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        let o1 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(!o1.hit, "first call must be a miss");
+        assert_eq!(o1.stdout, b"before", "the child read the undeclared file");
+
+        // Mutate the UNDECLARED file — nothing in the key changed.
+        std::fs::write(cwd.join("undeclared.txt"), b"AFTER").unwrap();
+
+        let o2 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert_eq!(
+            o1.key, o2.key,
+            "an undeclared file is NOT in the key (documented v0.1 boundary)"
+        );
+        assert!(
+            o2.hit,
+            "changing an undeclared file yields a (STALE) cache hit by design"
+        );
+        assert_eq!(
+            o2.stdout, b"before",
+            "STALE replay: the OLD output is served, not the changed file's new bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Journey gap (corrupt/unfetchable AC record → clean miss fallback): the
+    // replay path (`run_memoized`) must treat a record whose CAS blobs are GONE
+    // (a GC/eviction race deleted them) as a MISS and re-execute — never crash.
+    // We drive a real miss to populate the record + blobs, then delete the blobs
+    // and prove the next run RE-EXECUTES (side-effect marker) rather than erroring.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + `touch` side-effect (Windows port: M2)
+    #[tokio::test]
+    async fn ac_record_with_missing_blobs_falls_back_to_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // The command emits stdout AND writes a side-effect marker so we can see
+        // whether it actually re-executed on the second call.
+        let marker = cwd.join("ran.marker");
+        let cmd = format!("printf hi; touch {}", marker.to_str().unwrap());
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
+            env_keys: vec![],
+        };
+
+        // First run: miss → stores the AC record + its stdout/stderr CAS blobs.
+        let o1 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(!o1.hit, "first call must be a miss");
+        assert!(
+            AcTransport::get(&store, &o1.key).await.unwrap().is_some(),
+            "the run record must have been stored"
+        );
+
+        // Corrupt the cache: the AC record survives but its CAS blobs are GONE
+        // (eviction/GC race). The replay path can no longer fetch stdout/stderr.
+        for blob in CasTransport::list_blobs(&store).await.unwrap() {
+            CasTransport::delete(&store, &blob).await.unwrap();
+        }
+        std::fs::remove_file(&marker).unwrap();
+
+        // Next run: the record-present-but-blobs-missing case must fall through to
+        // a clean MISS (re-exec), NOT crash or replay garbage.
+        let o2 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(
+            !o2.hit,
+            "a record whose CAS blobs are gone must be a MISS, not a hit"
+        );
+        assert_eq!(o2.exit_code, 0);
+        assert_eq!(o2.stdout, b"hi", "the re-exec produced the real output");
+        assert!(
+            marker.exists(),
+            "the command must have RE-EXECUTED (clean miss fallback, no crash)"
+        );
+    }
+
+    // A record that is PRESENT but UNPARSEABLE (not a RunRecord — e.g. a truncated
+    // write or a collision with foreign bytes at the key) must likewise fall
+    // through to a miss (the `serde_json::from_slice::<RunRecord>` guard), re-exec,
+    // and then re-store a VALID record so the following call hits again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn corrupt_ac_record_falls_back_to_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf ok".to_string(),
+            ],
+            env_keys: vec![],
+        };
+
+        // Pre-seed the AC at THIS run's key with GARBAGE (not a RunRecord).
+        let key = compute_key(cwd, &opts).await.unwrap();
+        AcTransport::put(&store, &key, b"}{ not a run record at all".to_vec())
+            .await
+            .unwrap();
+
+        // The unparseable record must be treated as a MISS (re-exec), not a crash.
+        let o1 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(!o1.hit, "a corrupt/unparseable AC record must be a MISS");
+        assert_eq!(o1.exit_code, 0);
+        assert_eq!(o1.stdout, b"ok");
+
+        // The miss re-stored a VALID record over the garbage → the next call hits.
+        let o2 = run_memoized(cwd, &store, &opts).await.unwrap();
+        assert!(
+            o2.hit,
+            "after the miss re-stored a valid record, the next call must hit"
+        );
+        assert_eq!(o2.stdout, b"ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // Journey gap (stderr-alone oversize cap): the output ceiling must trip on a
+    // stream that floods STDERR even when stdout is quiet — prior coverage only
+    // had stdout-alone (`oversized_child_output_aborts_with_too_large`) and the
+    // dual-flood deadlock case. We emit > 5 MiB on stderr with a silent stdout and
+    // require `TooLarge`; nothing is memoized. Wrapped in a real timeout (like
+    // `dual_stream_flood_aborts_without_deadlock`) so a regression fails LOUDLY.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + `yes`/`head` + stderr redirection (Windows port: M2)
+    #[tokio::test]
+    async fn oversized_stderr_alone_aborts_with_too_large() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("in.txt"), b"x").unwrap();
+        let store = FakeStore::default();
+
+        // QUIET stdout; > 5 MiB piped to STDERR only (`1>&2` redirects head's
+        // stdout to stderr). `head -c` bounds the producer so the test terminates
+        // promptly even though our reader aborts the moment the cap trips.
+        let bytes = 6 * 1024 * 1024;
+        let cmd = format!("yes A | head -c {bytes} 1>&2");
+        let opts = RunOptions {
+            inputs: vec!["in.txt".to_string()],
+            command: vec!["/bin/sh".to_string(), "-c".to_string(), cmd],
+            env_keys: vec![],
+        };
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_memoized(cwd, &store, &opts),
+        )
+        .await;
+
+        let err = res
+            .expect("run_memoized must RETURN (no hang), not time out")
+            .unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { cap, .. } if cap == CAS_BLOB_CAP_BYTES as u64),
+            "oversized STDERR-alone must abort as TooLarge, got: {err:?}"
+        );
+
+        // A cap-blow aborts before memoization: nothing is stored for the key.
+        let key = compute_key(cwd, &opts).await.unwrap();
+        let stored = AcTransport::get(&store, &key).await.unwrap();
+        assert!(stored.is_none(), "an over-cap run must NOT be memoized");
+    }
 }

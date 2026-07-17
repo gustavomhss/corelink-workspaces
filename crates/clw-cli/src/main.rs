@@ -416,8 +416,29 @@ fn classify_resolve_failure(cmd: &Commands) -> ResolveFailure {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Windows' default MAIN-thread stack is 1 MiB (vs ~8 MiB on unix). The command
+    // dispatch below is one large async future (unoptimized in debug builds,
+    // especially), and `#[tokio::main]` would `block_on` it on the main thread —
+    // overflowing that 1 MiB stack on Windows (`thread 'main' has overflowed its
+    // stack`), crashing every invocation of a debug build. Run the runtime on a
+    // dedicated thread with an explicit, generous stack instead, so clw is robust in
+    // every build profile on every platform. (Caught by the portable Windows e2e.)
+    let handle = std::thread::Builder::new()
+        .name("clw-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("build the tokio runtime")
+                .block_on(run_main());
+        })
+        .expect("spawn the clw-main thread");
+    handle.join().expect("the clw-main thread panicked");
+}
+
+async fn run_main() {
     let cli = Cli::parse();
 
     // Bring up the diagnostic tracing layer (stderr only) before anything that

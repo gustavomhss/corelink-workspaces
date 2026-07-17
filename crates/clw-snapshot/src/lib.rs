@@ -907,6 +907,61 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Empty-tree base case: snapshotting an EMPTY workspace root (zero entries)
+    // must SUCCEED with a minimal manifest (0 files, total_size 0), a stable
+    // non-panicking root digest, and a written ref. The degenerate base case.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_empty_tree_succeeds_with_minimal_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path(); // brand-new tempdir: zero entries
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-empty");
+
+        let report = snapshot(root, &client, &cache, &opts)
+            .await
+            .expect("snapshotting an empty workspace must succeed, not panic/error");
+
+        // Report counters reflect the empty tree.
+        assert_eq!(report.files, 0, "empty tree has zero files");
+        assert_eq!(report.bytes_total, 0, "empty tree has zero bytes");
+        assert_eq!(report.chunks_total, 0, "empty tree has zero chunks");
+        assert_eq!(report.chunks_uploaded, 0, "no chunks to upload");
+        assert!(!report.unchanged, "the FIRST snapshot is a real write");
+        assert!(report.secret_warnings.is_empty());
+        assert!(report.skipped_external_symlinks.is_empty());
+
+        // The manifest blob is in CAS and decodes to a 0-file, 0-byte manifest.
+        let cas = client.cas.lock().await;
+        let manifest = Manifest::from_bytes(cas.get(&report.root).expect("manifest in CAS"))
+            .expect("the empty-tree manifest must decode");
+        assert!(manifest.entries.is_empty(), "empty tree → no entries");
+        assert_eq!(manifest.total_size, 0);
+        drop(cas);
+
+        // The root digest is STABLE/deterministic: the local-build path over the
+        // same empty tree yields the identical digest (no panic on the empty walk).
+        let manifest_local = build_manifest_local(root).await.unwrap();
+        assert_eq!(
+            manifest_local.digest().unwrap(),
+            report.root,
+            "empty-tree root digest must be stable across the two build paths"
+        );
+
+        // A ref was written and points at the empty-tree root, parent=None.
+        let rk = ref_key("ws-empty");
+        let ac = client.ac.lock().await;
+        let rec = RefRecord::from_bytes(ac.get(&rk).expect("ref must be written")).unwrap();
+        assert_eq!(rec.root, report.root);
+        assert_eq!(rec.name, "ws-empty");
+        assert!(rec.parent.is_none(), "first snapshot has no parent");
+    }
+
+    // -----------------------------------------------------------------------
     // Test 2: second snapshot of unchanged tree → chunks_uploaded == 0
     // -----------------------------------------------------------------------
 
