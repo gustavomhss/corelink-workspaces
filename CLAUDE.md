@@ -24,6 +24,10 @@ v0.1.7 (2026-07-10) closes the external-symlink LOW. v0.1.5 shipped `clw hydrate
 ## Build / test / gate
 - The repo gate is `bash scripts/gates.sh` (FULL) or `bash scripts/gates.sh --scoped [base]` (change-scoped
   fast lane). It runs fmt/clippy/test/deny(+windows-cross) lanes. (There is no root `verify.sh`.)
+- **Test-rigor lanes (make coverage PROVABLE, additive — NOT part of the required gate): see `docs/TESTING.md`.**
+  `coverage.yml` (llvm-cov, per-PR, measure→ratchet→gate), `fuzz.yml` (nightly cargo-fuzz on the clw-types
+  untrusted-input targets, crash=red), `mutation.yml` (weekly cargo-mutants, report-only→follow-on blocks
+  new survivors). All on github-hosted ubuntu.
 - On the self-hosted CI Mac, the toolchain is ISOLATED (a shared rustup-nuke happens) — use
   `CARGO_HOME=$HOME/.clw-ci-rust/cargo RUSTUP_HOME=$HOME/.clw-ci-rust/rustup $HOME/.clw-ci-rust/cargo/bin/cargo`.
   Pinned `RUST_TOOLCHAIN` (currently 1.91.1). Cross-builds use cargo-zigbuild (ziglang in an isolated venv).

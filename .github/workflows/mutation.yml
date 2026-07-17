@@ -1,0 +1,95 @@
+# Mutation lane — prove the 518 tests actually KILL bugs, not just execute.
+#
+# Part of the test-rigor wave. cargo-mutants injects small faults (mutants) and re-runs
+# the tests; a SURVIVING mutant = a change the suite failed to catch = a real test gap.
+# Coverage says "this line ran under a test"; mutation says "a test actually asserts on
+# it". They are complementary — this is the stronger signal.
+#
+# Whole-workspace (owner's choice: exhaustive), so it is SLOW — hence WEEKLY, and SHARDED
+# across a matrix so each shard finishes comfortably (and a slow shard can't wedge the rest).
+#
+# Report-only posture (Phase 1): upload the survivor report + summarize counts; do NOT
+# fail on survivors (a baseline always has some). A harness failure (the UNMUTATED tests
+# don't pass, bad args) DOES fail — that is a real break, not a metric. The follow-on
+# wave triages survivors (critical crates first), adds tests that kill them, then flips to
+# `--in-diff` per-PR blocking on any NEW survivor.
+#
+# Runs on github-hosted ubuntu.
+
+name: mutation
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # weekly Monday 04:00 UTC (offset from the daily/Mon-noon canaries)
+  workflow_dispatch:
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    name: cargo-mutants shard ${{ matrix.shard }}/6
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false   # each shard is independent; a survivor in one must not cancel the rest
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned toolchain
+        run: rustup show
+
+      - name: install cargo-mutants (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      # --shard k/6 splits the mutant list across the matrix. Report-only: survivors
+      # (exit 1) are EXPECTED for a baseline and must NOT fail the job; only a real
+      # harness fault (baseline tests fail / bad args, exit >= 2) fails it.
+      - name: cargo-mutants (workspace, shard ${{ matrix.shard }}/6, report-only)
+        run: |
+          set -uo pipefail
+          set +e
+          cargo mutants --workspace --shard "${{ matrix.shard }}/6"
+          code=$?
+          set -e
+          # cargo-mutants exit codes (mutants.rs/exit-codes): 0=clean, 2=SURVIVING mutants,
+          # 3=timeouts — all EXPECTED report-only baseline outcomes, must NOT fail the job.
+          # 1=bad args, 4=baseline (unmutated) tests already failed, 70=internal — those are
+          # REAL harness faults and MUST fail. (Default output dir is ./mutants.out.)
+          case "$code" in
+            0) echo "shard clean — no surviving mutants" ;;
+            2) echo "surviving mutants found (report-only baseline — expected)" ;;
+            3) echo "some mutants timed out (report-only — noted; may need --timeout tuning)" ;;
+            *) echo "::error::cargo-mutants harness fault (exit $code: 1=bad-args, 4=baseline-tests-failed, 70=internal) — must be fixed"; exit "$code" ;;
+          esac
+
+      - name: summarize this shard
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT="mutants.out"
+          {
+            echo "## Mutation shard ${{ matrix.shard }}/6"
+            for f in caught missed timeout unviable; do
+              n=0; [ -f "$OUT/$f.txt" ] && n=$(grep -c . "$OUT/$f.txt" 2>/dev/null || echo 0)
+              echo "- ${f}: ${n}"
+            done
+            echo ""
+            echo "'missed' = SURVIVORS (a real test gap). Triaged + killed in the follow-on wave (critical crates first)."
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: upload survivor report (shard ${{ matrix.shard }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/**
+          if-no-files-found: warn

@@ -1,0 +1,74 @@
+# Fuzz lane — actually RUN the cargo-fuzz harness that already exists but was dormant.
+#
+# Part of the test-rigor wave. The 4 targets under fuzz/ fuzz the UNTRUSTED-input
+# parsers/validators of clw-types (the path-escape / manifest-parse attack surface).
+# They were only runnable via the opt-in local lane; this schedules them so a crash
+# becomes a VISIBLE red instead of a latent bug.
+#
+# Blocking posture (unlike coverage/mutation): a crash ALWAYS fails the run — a panic
+# or sanitizer trip on arbitrary input is a real defect, not a ratchetable metric.
+#
+# cargo-fuzz REQUIRES nightly (-Z build-std / libFuzzer wiring); the workspace is
+# stable-pinned, and fuzz/ is a detached out-of-workspace package precisely so the
+# main stable gate never sees libfuzzer-sys. Runs on github-hosted ubuntu.
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # nightly 08:00 UTC (offset from conformance 13:00 / deadman 16:00 / metered Mon 12:00)
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false   # one crashing target must not hide the others' results
+      matrix:
+        target:
+          - fuzz_manifest_from_bytes
+          - fuzz_validate_rel_path
+          - fuzz_validate_symlink_target
+          - fuzz_digest_from_hex
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly toolchain (cargo-fuzz requires it)
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup component add --toolchain nightly rust-src   # -Z build-std needs rust-src
+
+      - name: install cargo-fuzz
+        # NOT a first-class taiki-e/install-action tool (its cargo-binstall fallback for
+        # cargo-fuzz is unreliable) — install deterministically from source. The cargo-fuzz
+        # CLI builds on stable; only RUNNING targets needs nightly (done below).
+        run: cargo install cargo-fuzz --locked
+
+      # 5 minutes per target. cargo-fuzz operates on the fuzz/ package (detached
+      # workspace at repo root); run from the repo root, which is where fuzz/ lives.
+      - name: fuzz ${{ matrix.target }} (5 min)
+        run: |
+          set -euo pipefail
+          cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time=300 -rss_limit_mb=4096
+
+      # On a crash the step above fails (set -e); capture the reproducing input +
+      # corpus so the failure is reproducible from the run artifacts.
+      - name: upload crash artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/**
+            fuzz/corpus/**
+          if-no-files-found: warn

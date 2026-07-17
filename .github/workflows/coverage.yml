@@ -1,0 +1,93 @@
+# Coverage lane — MEASURE test coverage so "is it tested?" stops being an opinion.
+#
+# Part of the test-rigor wave (make robustness PROVABLE). This lane is ADDITIVE: it
+# does NOT touch the required `gates`/`dco` checks or scripts/gates.sh. Posture is
+# MEASURE -> RATCHET -> GATE:
+#   * Phase 1a (now): REPORT-ONLY. Prints total line coverage + uploads lcov/HTML.
+#     Never fails the build — we first learn the real number.
+#   * Phase 1b (follow-on): set COVERAGE_FLOOR = floor(baseline) below and flip the
+#     final step to `exit 1` on a drop. Deterministic (same tests => same %), not flaky.
+#   * Phase 1c: promote to a required check once stable; ratchet the floor upward.
+#
+# Runs on github-hosted ubuntu (like the canaries) — clean ephemeral toolchain, no
+# self-hosted rustup-nuke. Default-features only: the clw-conformance `live` suite is
+# NEVER run here (no backend), matching the gate's `cargo test`.
+
+name: coverage
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: llvm-cov (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Materialize the pinned toolchain (rust-toolchain.toml = 1.91.1) + the
+      # instrumentation component llvm-cov needs.
+      - name: install pinned toolchain + llvm-tools
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - name: install cargo-llvm-cov (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Run the workspace tests ONCE with instrumentation (--no-report collects the
+      # profile), then emit lcov + JSON from the same run without re-testing.
+      # Default-features: the `live` conformance suite is not compiled/run (no backend).
+      - name: measure coverage (workspace, default-features)
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --workspace --no-report
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --json --output-path coverage.json
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+
+      # Extract the total line-coverage % (JSON is stable to parse vs the table).
+      # Report-only: print to the job summary. Phase 1b adds the floor comparison.
+      - name: report coverage % (report-only — Phase 1a)
+        run: |
+          set -euo pipefail
+          PCT="$(python3 -c "import json; d=json.load(open('coverage.json')); print(f\"{d['data'][0]['totals']['lines']['percent']:.2f}\")")"
+          echo "Total line coverage: ${PCT}%"
+          {
+            echo "## Coverage (report-only)"
+            echo ""
+            echo "**Total line coverage: ${PCT}%**"
+            echo ""
+            echo "Posture: measure -> ratchet -> gate. Phase 1b will set a floor at floor(baseline) and fail on a drop."
+            echo ""
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # PHASE 1b (follow-on) — uncomment + set the floor once the baseline is known:
+          #   FLOOR=NN
+          #   awk "BEGIN{exit !(${PCT} < ${FLOOR})}" && { echo "::error::coverage ${PCT}% < floor ${FLOOR}%"; exit 1; } || true
+
+      - name: upload coverage artifacts (lcov + json + summary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage.json
+            coverage-summary.txt
+          if-no-files-found: error
