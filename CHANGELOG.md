@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+## [0.1.11] — stabilization wave: gate-hole closure + last unbounded reads (2026-07-13)
+
+A quality-bar hardening wave from a 5-angle hidden-debt sweep. The core code was already
+clean (panics, error-swallow, doc-vs-code drift, supply-chain: all clean); the recurring
+debt lived in the **gate layer** — a hole there lets any future regression go green silently.
+This closes them so green means green.
+
+### Fixed
+- **Release signing is now fail-closed on real releases.** A real `vX.Y.Z` with the minisign
+  secret absent/rotated previously fell to `exit 0` with a buried warning — publishing
+  UNSIGNED `SHA256SUMS` + Linux binaries AND still bumping the Homebrew formula. Both minisign
+  steps now mirror the conformance guard: on a real (non-`-rc`) tag with the secret absent →
+  hard error + `exit 1`. rc/prerelease keeps the dry-run skip. (macOS/Windows signing stay
+  waived-open by design — those secrets are intentionally absent per the owner waiver.)
+- **The last two size-unbounded reads are capped.** `redeem_cred_ticket` (clw-client) read the
+  cred-ticket response with a raw `.text()` (no ceiling) — a buggy/hostile `CLW_FABRIC_ENDPOINT`
+  could OOM the client at runner boot; it now routes through `read_body_capped` (64 KiB, a PAT
+  envelope is <1 KiB). The snapshot small-file fast path chose the in-memory branch on the
+  walk-time size but read the current bytes; a file grown past the 16 MiB stream threshold
+  between walk and read is now rejected with an actionable message instead of being slurped
+  (both the upload and manifest paths).
+
+### Changed
+- **The PR fast-lane (`scripts/gates.sh` scoped lane) no longer has coverage holes.** Scoped
+  tests now include the sink crates (`clw-cli`, `clw-integration-tests`) so a cross-crate
+  regression in a low-level crate is caught at PR time, not only on main's post-merge full lane.
+  The windows-gnu cross-check is now a **universal tripwire** (both lanes), so a `#[cfg(windows)]`
+  break can't slip the required gate. clippy runs `--all-features` in both lanes so feature-gated
+  (`live`) code is held to the same `-D warnings` bar.
+- **`cargo-audit` is pinned** (`@0.22.2`, was floating) in CI + release + the gates fallback, so
+  a behavior-changed release can't silently alter the advisory gate; the advisory DB is still
+  fetched fresh, so advisory freshness is unaffected.
+
 ## [0.1.10] — adversarial re-audit fixes (op-deadline + run-store hang + run-402) (2026-07-11)
 
 ### Fixed
