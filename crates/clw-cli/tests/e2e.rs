@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use assert_cmd::Command;
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -2080,6 +2080,110 @@ async fn snapshot_warns_about_secret_looking_files_on_stderr() {
     assert!(
         stderr.contains(".clwignore"),
         "the warning must advise adding it to .clwignore, got:\n{stderr}"
+    );
+}
+
+// prune's mid-sweep failure path (`failed_at` + resumable, non-zero exit) had zero
+// coverage — a destructive partial-delete that must NOT be reported as success. A
+// live snapshot gives a non-empty live set (so the empty-live-set fail-safe doesn't
+// trip); one planted orphan's DELETE is forced to 500 via a higher-priority mock.
+#[tokio::test]
+async fn prune_reports_failed_at_and_does_not_sweep_on_a_mid_sweep_delete_failure() {
+    let server = MockServer::start().await;
+    let (cas, _ac) = mount_corelink(&server, true).await;
+
+    let cache = TempDir::new().unwrap();
+    let _s = snapshot_tiny(&server.uri(), cache.path(), "e2e-prune-midsweep");
+
+    // Plant a poison orphan (not referenced by any manifest) whose DELETE will 500.
+    let poison = "cd".repeat(32); // 64 hex
+    cas.lock()
+        .unwrap()
+        .insert(poison.clone(), b"poison orphan".to_vec());
+
+    // Higher-priority (lower number) override: DELETE of the poison digest → 500.
+    Mock::given(method("DELETE"))
+        .and(path(format!("/v1/cas/{TEST_TENANT}/{poison}")))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        // Cap the op deadline so the client's 5xx-retry ladder on the failing DELETE
+        // doesn't run the full ~18s; the outcome (fail + failed_at) is unchanged.
+        .env("CLW_OP_DEADLINE_SECS", "3")
+        .args(["--json", "prune", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "a mid-sweep DELETE failure must exit non-zero, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("prune --json must still emit JSON on a partial failure");
+    assert_eq!(v["dry_run"], serde_json::json!(false));
+    assert_eq!(
+        v["failed_at"],
+        serde_json::json!(poison),
+        "must report the exact digest it failed at (so the run is resumable)"
+    );
+    assert!(
+        cas.lock().unwrap().contains_key(&poison),
+        "the orphan whose delete failed must NOT be swept from CAS"
+    );
+}
+
+// erase's GDPR Art.17 fail-loud REPORTING path (exit non-zero, `complete:false`,
+// `remaining_refs`) end-to-end: an AC listing that never converges to empty (a
+// server enumeration fault) must make the binary FAIL, never record a completed
+// erasure while data remains. (#201 tested the detection at the unit level; this
+// pins the run()-level exit code + JSON shape through the real binary.)
+#[tokio::test]
+async fn erase_fails_loud_and_exits_nonzero_when_data_still_remains() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    // A ghost ref that the AC listing ALWAYS returns — even after erase deletes it
+    // — modelling a server-side enumeration fault / concurrent writer.
+    let ghost = "ef".repeat(32); // 64 hex
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/ac/{TEST_TENANT}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "refs": [{ "ref_key": ghost }],
+            "next_cursor": serde_json::Value::Null,
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let cache = TempDir::new().unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["--json", "erase", "--yes", "--confirm-tenant", TEST_TENANT])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "erase MUST exit non-zero when the tenant is not verified empty (GDPR Art.17), stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("erase --json must emit a structured incomplete-erasure record");
+    assert_eq!(
+        v["complete"],
+        serde_json::json!(false),
+        "erase must report complete:false when data remains"
+    );
+    assert!(
+        v["remaining_refs"].as_u64().unwrap_or(0) >= 1,
+        "erase must report the refs that still remain, got: {v}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("INCOMPLETE"),
+        "the loud error must name the erasure INCOMPLETE"
     );
 }
 
