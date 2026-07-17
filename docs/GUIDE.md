@@ -468,6 +468,7 @@ Examples: `clw completions bash > ~/.local/share/bash-completion/completions/clw
 | `CLW_TENANT` / `CORELINK_TENANT` | Tenant id (URL path + key namespace) | — (required) | Validated (rejects `/`, `..`, control chars). |
 | `CLW_TOKEN` / `CORELINK_TOKEN` | Bearer PAT | — (required) | Redacted everywhere. Not read on the C2c runner path. |
 | `CLW_CACHE_DIR` | Local blob cache | `~/.clw/cache` | No `CORELINK_` alias. |
+| `CLW_CACHE_BUDGET_BYTES` | Local cache eviction budget (bytes) | `8589934592` (8 GiB) | A raw byte count. Unset/`0`/invalid → default. Raise it for a working set > 8 GiB; lower it on a disk-tight machine. |
 | `CLW_REF_DOMAIN` | Ref keyspace | `user` | `user` \| `runner`; other values → exit 2. |
 | `CLW_OP_DEADLINE_SECS` | Overall per-op deadline (across all retries) | `300` (5 min) | Clamped to 24h; `0`/invalid → default. |
 | `CLW_CRED_TICKET` + `CLW_LEASE_ID` + `CLW_FABRIC_ENDPOINT` | C2c single-use runner credential trio | — | Only in `runner` ref-domain; ticket is redeemed once at boot. |
@@ -492,7 +493,7 @@ to split the workspace / trim inputs, not to reconfigure clw.)
 
 | Bound | Value | Effect when reached |
 |---|---|---|
-| **Local cache GC budget** | **8 GiB** | The `~/.clw/cache` self-evicts (LRU by mtime, checked once per 256 writes) back under 8 GiB. **No override exists** — a working set larger than 8 GiB will see warm blobs evicted. It's a cache (a miss just re-fetches), never data loss. |
+| **Local cache GC budget** | **8 GiB** (default) | The `~/.clw/cache` self-evicts (LRU by mtime, checked once per 256 writes) back under this ceiling. **Overridable via `CLW_CACHE_BUDGET_BYTES`** (raw byte count) — raise it for a working set larger than 8 GiB so warm blobs aren't evicted, or lower it on a disk-tight machine. It's a cache (a miss just re-fetches), never data loss. |
 | CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB. A manifest is one blob → a very large tree (~32k files, path-length dependent) fails up-front with "too many entries". `clw run` SIGKILLs a child exceeding 5 MiB on stdout *or* stderr → exit 137. |
 | Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time); a file that grows past 16 MiB *between* the directory walk and the read is rejected (not silently slurped). |
 | Hydrate resource caps | ≤ **1M** entries · **100k** symlinks · **1 TiB** total · **64M** total chunks · **16M** chunks/file | A manifest exceeding any of these aborts the hydrate before writing (anti-OOM / anti-disk-fill / anti-symlink-bomb), budgeted against the *real* summed sizes, not the attacker-declared `total_size`. |
@@ -623,8 +624,8 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **Warm content-addressed cache** (`~/.clw/cache`) — a sharded (256-way) L1 store; a hydrate serves chunks
   locally on later runs (`bytes_from_cache`).
 - **Self-healing** — every `get` re-hashes; a corrupt blob is removed and treated as a miss.
-- **GC-to-budget** — an 8 GiB default budget, LRU(mtime) eviction, checked once per 256 writes so `put`
-  stays cheap; in-flight `.tmp-*` files are excluded from the budget.
+- **GC-to-budget** — an 8 GiB default budget (override with `CLW_CACHE_BUDGET_BYTES`), LRU(mtime) eviction,
+  checked once per 256 writes so `put` stays cheap; in-flight `.tmp-*` files are excluded from the budget.
 - **Cache-format versioning** — a sentinel invalidates content safely on an upgrade (never a stale replay).
 - **Owner-only perms + cross-process safety** — cache tree 0700, blob files 0600; atomic writes; concurrent
   processes don't clobber each other's in-flight puts.

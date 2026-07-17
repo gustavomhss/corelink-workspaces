@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **`CLW_CACHE_BUDGET_BYTES` — the local cache eviction budget is now configurable.** The `~/.clw/cache`
+  GC budget was a hard-coded 8 GiB with no override, so a working set larger than 8 GiB silently evicted
+  warm blobs (a cache miss, never data loss, but an invisible performance cliff on large monorepos / many
+  parallel snapshots). It now reads a raw byte count from `CLW_CACHE_BUDGET_BYTES` (unset/`0`/invalid →
+  the 8 GiB default); raise it to keep a big working set warm, or lower it on a disk-tight machine. The
+  resolver is pure + unit-tested; `LocalCache::with_budget` stays the deterministic, env-independent path
+  for tests. Surfaced by the 2026-07-17 doc-vs-code audit.
+
 ### Tests / CI — test-rigor & E2E drive (make robustness PROVABLE)
 A robustness wave that makes test-adequacy *provable* rather than assumed. All lanes are **additive** —
 they do not touch the required `gates`/`dco` checks (except the round-trip property test, which runs in the

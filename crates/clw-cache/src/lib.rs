@@ -54,6 +54,34 @@ const VERSION_FILE: &str = ".clw-cache-version";
 /// still completes; we just evict the coldest blobs back under budget afterward.
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
+/// Name of the environment knob that overrides [`DEFAULT_CACHE_BUDGET_BYTES`].
+///
+/// A raw **byte count** (u64). A developer whose legitimate working set exceeds the
+/// 8 GiB default (large monorepos, many parallel snapshots) can raise it so the cache
+/// stops evicting warm blobs; a machine tight on disk can lower it. Mirrors how the
+/// other `CLW_*` knobs are read from the environment.
+pub const CACHE_BUDGET_ENV: &str = "CLW_CACHE_BUDGET_BYTES";
+
+/// Resolve the cache eviction budget (bytes) from a raw `CLW_CACHE_BUDGET_BYTES`
+/// value. Unset / empty / unparseable / `0` → [`DEFAULT_CACHE_BUDGET_BYTES`]; an
+/// explicit positive value overrides it verbatim (the eviction target is only ever
+/// *compared* against summed blob sizes, so there is no overflow to clamp — an
+/// intentionally small value simply means aggressive eviction, and eviction is a
+/// down-to-budget sweep *after* an op, never a write rejection, so even a tiny budget
+/// never breaks a snapshot/hydrate larger than it). Pure over its input so the parse
+/// is unit-testable without touching the environment.
+fn resolve_cache_budget_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_CACHE_BUDGET_BYTES)
+}
+
+/// Read the cache eviction budget (bytes) from the [`CACHE_BUDGET_ENV`] environment
+/// knob, mirroring how the other `CLW_*` knobs are read at use time.
+fn cache_budget_from_env() -> u64 {
+    resolve_cache_budget_bytes(std::env::var(CACHE_BUDGET_ENV).ok().as_deref())
+}
+
 /// How many `put`s may land between two budget checks. Walking all 256 shards to
 /// total the cache size on EVERY write would make `put` O(cache) — far too costly.
 /// We instead sweep once per this many writes; with the 8 GiB budget and realistic
@@ -91,6 +119,11 @@ impl LocalCache {
     ///
     /// Creates `<root>/blobs` and the 256 two-char shard directories on first
     /// call so that subsequent operations never need to mkdir at write time.
+    ///
+    /// The eviction budget is [`DEFAULT_CACHE_BUDGET_BYTES`] unless the
+    /// [`CACHE_BUDGET_ENV`] (`CLW_CACHE_BUDGET_BYTES`) knob overrides it. Tests that
+    /// need a deterministic budget use [`with_budget`](Self::with_budget), which sets
+    /// it explicitly and is unaffected by the environment.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let blobs = root.join("blobs");
@@ -121,7 +154,7 @@ impl LocalCache {
 
         let cache = Self {
             root,
-            budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
+            budget_bytes: cache_budget_from_env(),
             puts_since_gc: AtomicU64::new(0),
         };
         cache.check_format_version()?;
@@ -129,8 +162,9 @@ impl LocalCache {
     }
 
     /// Open a cache rooted at `root` with an explicit eviction `budget_bytes`
-    /// (used by tests to drive eviction without writing gigabytes). Production
-    /// callers use [`new`](Self::new), which applies [`DEFAULT_CACHE_BUDGET_BYTES`].
+    /// (used by tests to drive eviction without writing gigabytes, deterministically
+    /// and independent of the environment). Production callers use [`new`](Self::new),
+    /// which applies [`DEFAULT_CACHE_BUDGET_BYTES`] or the [`CACHE_BUDGET_ENV`] override.
     pub fn with_budget(root: impl Into<PathBuf>, budget_bytes: u64) -> Result<Self> {
         let mut cache = Self::new(root)?;
         cache.budget_bytes = budget_bytes;
@@ -514,6 +548,90 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = LocalCache::new(dir.path()).unwrap();
         (dir, cache)
+    }
+
+    // -----------------------------------------------------------------------
+    // CLW_CACHE_BUDGET_BYTES — the resolver (pure, no env) + one guarded wiring
+    // test proving `new()` actually reads the knob
+    // -----------------------------------------------------------------------
+    #[test]
+    fn cache_budget_unset_or_invalid_falls_back_to_default() {
+        // Unset, empty, whitespace, non-numeric, negative, and 0 all → default.
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("lots"),
+            Some("-1"),
+            Some("0"),
+        ] {
+            assert_eq!(
+                resolve_cache_budget_bytes(raw),
+                DEFAULT_CACHE_BUDGET_BYTES,
+                "raw {raw:?} should resolve to the default budget",
+            );
+        }
+    }
+
+    #[test]
+    fn cache_budget_positive_value_overrides_verbatim() {
+        // A raise (20 GiB) and a lower (100 MiB) are both honored exactly.
+        assert_eq!(
+            resolve_cache_budget_bytes(Some("21474836480")),
+            20 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(
+            resolve_cache_budget_bytes(Some("104857600")),
+            100 * 1024 * 1024
+        );
+        // Surrounding whitespace is trimmed before parsing.
+        assert_eq!(resolve_cache_budget_bytes(Some("  1024  ")), 1024);
+        // A value distinct from the default proves it isn't silently defaulting.
+        assert_ne!(
+            resolve_cache_budget_bytes(Some("1024")),
+            DEFAULT_CACHE_BUDGET_BYTES
+        );
+    }
+
+    /// Save/restore `CLW_CACHE_BUDGET_BYTES` around a test that mutates it, so the
+    /// process env is left as it was found (mirrors `config.rs`'s `HomeEnvGuard`).
+    struct BudgetEnvGuard(Option<std::ffi::OsString>);
+    impl BudgetEnvGuard {
+        fn new() -> Self {
+            Self(std::env::var_os(CACHE_BUDGET_ENV))
+        }
+    }
+    impl Drop for BudgetEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var(CACHE_BUDGET_ENV, v),
+                None => std::env::remove_var(CACHE_BUDGET_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn new_reads_the_budget_env_knob() {
+        // Proves the wiring: `new()` must actually resolve `CLW_CACHE_BUDGET_BYTES`,
+        // not hard-code the default (kills the `budget_bytes: DEFAULT` mutation).
+        // We use a LARGE distinctive value (12 GiB): even if the runner interleaves
+        // another `new()`-based test while the var is set, a 12 GiB budget triggers no
+        // eviction, so the leak is inert — and no other test reads/writes this var, so
+        // our own assertion is deterministic. The guard restores the env on drop.
+        const OVERRIDE: u64 = 12 * 1024 * 1024 * 1024; // 12 GiB, ≠ the 8 GiB default
+        let _guard = BudgetEnvGuard::new();
+        std::env::set_var(CACHE_BUDGET_ENV, OVERRIDE.to_string());
+
+        let dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(dir.path()).unwrap();
+        assert_eq!(
+            cache.budget_bytes, OVERRIDE,
+            "LocalCache::new must apply the CLW_CACHE_BUDGET_BYTES override, not the default",
+        );
+        assert_ne!(
+            cache.budget_bytes, DEFAULT_CACHE_BUDGET_BYTES,
+            "the override must be distinct from the default for this test to be meaningful",
+        );
     }
 
     // -----------------------------------------------------------------------
