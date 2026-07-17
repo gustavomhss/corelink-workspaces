@@ -1194,6 +1194,39 @@ mod tests {
         assert_eq!(key_a, key_a2, "same cwd must yield a stable key");
     }
 
+    // A command ARGUMENT change (command[1..], NOT the tool at command[0]) must bust
+    // the key. Every other command-key test varies command[0] (tool identity); this
+    // pins that the rest of the argument vector is in the key too — otherwise
+    // `mytool --flag=A` and `mytool --flag=B` would share a cache entry (a stale
+    // replay of the wrong result).
+    #[tokio::test]
+    async fn command_arg_change_yields_different_key() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("input.txt"), b"same-bytes").unwrap();
+
+        // Same tool (`true`) + identical inputs/cwd/env — ONLY the argument differs.
+        let with_arg = |arg: &str| RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            command: vec!["true".to_string(), arg.to_string()],
+            env_keys: vec![],
+        };
+
+        let key_a = compute_key(cwd, &with_arg("alpha")).await.unwrap();
+        let key_b = compute_key(cwd, &with_arg("beta")).await.unwrap();
+        assert_ne!(
+            key_a, key_b,
+            "changing a command ARGUMENT (not command[0]) must bust the memo key"
+        );
+
+        // Deterministic: the same argument vector yields the same key (no false miss).
+        let key_a2 = compute_key(cwd, &with_arg("alpha")).await.unwrap();
+        assert_eq!(
+            key_a, key_a2,
+            "same argument vector must yield a stable key"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test: env_keys — listed var change → different key; unlisted → same key
     // -----------------------------------------------------------------------

@@ -2036,6 +2036,53 @@ async fn erase_dry_run_default_reports_blast_radius_and_deletes_nothing() {
     assert_eq!(cas.lock().unwrap().len(), blobs_before);
 }
 
+// The snapshot secret-scan is user-facing SAFETY output: a secret-looking file is
+// UPLOADED (clw never silently drops data) but the CLI must WARN about it on stderr.
+// The library collects `secret_warnings`, but nothing asserted the binary actually
+// PRINTS them — a refactor could drop the whole warning block and every other test
+// stays green. This locks the observable warning.
+#[tokio::test]
+async fn snapshot_warns_about_secret_looking_files_on_stderr() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("app.rs"), b"fn main() {}").unwrap();
+    // A secret-looking file (captured, not ignored — no .gitignore here).
+    std::fs::write(src.path().join(".env"), b"API_KEY=super-secret\n").unwrap();
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args([
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            "e2e-secret-warn",
+        ])
+        .output()
+        .unwrap();
+
+    // Advisory, NOT blocking: the snapshot still succeeds (the file IS uploaded).
+    assert!(
+        out.status.success(),
+        "the secret-scan is advisory — snapshot must still succeed, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("WARNING") && stderr.contains("secret-looking"),
+        "the CLI must warn about the secret-looking file on stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(".env"),
+        "the warning must name the offending file, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(".clwignore"),
+        "the warning must advise adding it to .clwignore, got:\n{stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Power-user acceptance regressions (the v0.1.2 fixes).
 //
