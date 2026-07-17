@@ -337,6 +337,18 @@ fn check_manifest_blob_fits(manifest_bytes_len: usize) -> Result<()> {
 /// 409, .. }`; a fake/create-only transport may instead signal it in a
 /// `Transport`/`Message` string. Match both so the idempotent-retry recovery
 /// fires regardless of which layer produced the conflict.
+///
+/// SERVER CONTRACT (verified 2026-07-17 against the live AC PUT handler, cross-team
+/// with the corelink-server TL — `INV-AC-RESULT-HASH-IMMUTABLE`, universal for ALL
+/// PATs, NOT runner-scoped): a `PUT /v1/ac/{tenant}/{ref_key}` returns 201 for a
+/// brand-new ref key; 200 for a re-PUT of the SAME `RefRecord` (idempotent success,
+/// the store's atomic put-if-absent, no TOCTOU); and 409 "divergent body" ONLY when
+/// the key already exists with a DIFFERING value. So a normal (non-runner) PAT's
+/// lost-ACK re-snapshot of identical content lands as a plain 200 success — this
+/// `409`+same-occupant reconcile leg is therefore inert for normal PATs (it only
+/// fires under a runner create-only cred, which clw isn't). The divergent-overwrite
+/// 409 is what makes the `--force` guard and this reconcile sound as shipped;
+/// last-write-wins never happens on a divergent value for any PAT.
 fn is_conflict(e: &ClwError) -> bool {
     match e {
         ClwError::Http { status: 409, .. } => true,
