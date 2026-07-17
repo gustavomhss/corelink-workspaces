@@ -18,9 +18,12 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 | **Mutation** | `.github/workflows/mutation.yml` | weekly + dispatch | the tests actually *kill* injected faults (not just run) | report-only → follow-on blocks new survivors |
 | **Round-trip (property)** | `crates/clw-integration-tests/tests/roundtrip_prop.rs` | every PR (32 cases) + weekly exhaustive (2000) | `snapshot→hydrate` is byte-identical on ARBITRARY trees | gate test — red on any fidelity break |
 | **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
+| **Windows runtime** | `.github/workflows/windows.yml` | PR (crates/scripts) + push-main + dispatch | the workspace test suite RUNS on Windows (was compile-only) — path/mode/symlink-copy-fallback behavior | red on any Windows test failure |
+| **Shellcheck** | `.github/workflows/shellcheck.yml` | PR (scripts) + push-main + dispatch | the distribution + CI shell scripts (incl. the public `install.sh`) lint clean | red on any shellcheck warning |
 
-They run on github-hosted `ubuntu-latest` (like the canaries) and are **additive** — they do not
-touch the required `gates`/`dco` checks (except the round-trip property test, which runs inside the gate).
+They run on github-hosted runners and are **additive** — they do not touch the required `gates`/`dco`
+checks (except the round-trip property test, which runs inside the gate). The Windows lane runs on
+`windows-latest` (gnu toolchain, matching the shipped binary); everything else on `ubuntu-latest`.
 
 ## Coverage (`cargo-llvm-cov`)
 Measures total line coverage on the whole workspace (default-features — the `live` conformance suite is
