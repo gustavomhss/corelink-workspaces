@@ -47,6 +47,11 @@ jobs:
           rustup toolchain install "$CH" --profile minimal
           rustup default "$CH"
 
+      # The destructive erase/prune journeys spawn the real `clw` binary; build it so
+      # `clw_binary()` can locate target/debug/clw (else those journeys soft-skip).
+      - name: build the clw binary (for the destructive journeys)
+        run: cargo build -p clw-cli
+
       - name: live-journeys suite (clw-conformance --features live, REQUIRE=1)
         env:
           # The suite reads CLW_TOKEN/CLW_TENANT/CLW_ENDPOINT — map the CI service
@@ -57,7 +62,16 @@ jobs:
           # SECOND identity on the SAME tenant for the team-share journey. Optional:
           # when absent, only the team journey soft-skips (the lane still passes).
           CLW_TOKEN_B: ${{ secrets.CLW_CI_TOKEN_B }}
-          # REQUIRE=1: a skip of the PRIMARY-cred journeys is a hard failure.
+          # Extra-infra journeys, ALL optional (soft-skip when absent, lane still
+          # passes): the metered-quota 402 probe, the real-fabric cred-ticket, and the
+          # DESTRUCTIVE erase/prune throwaway tenant. Wire these to exercise them.
+          CLW_PROBE_TENANT: ${{ secrets.CLW_CI_PROBE_TENANT }}
+          CLW_PROBE_TOKEN: ${{ secrets.CLW_CI_PROBE_TOKEN }}
+          CLW_LIVE_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
+          CLW_LIVE_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
+          # REQUIRE=1: a skip of the PRIMARY-cred journeys is a hard failure. The
+          # extra-infra journeys use `soft_skip` (NOT skip_or_fail), so they never
+          # trip REQUIRE — the lane is green with just the primary PAT.
           CLW_CONFORMANCE_REQUIRE: "1"
         run: |
           set -euo pipefail
@@ -65,8 +79,7 @@ jobs:
             echo "::error::CLW_CI_TOKEN absent — the live-journeys lane REQUIRES the primary PAT (CLW_CONFORMANCE_REQUIRE=1). Provision the CI service PAT secret."
             exit 1
           fi
-          if [ -z "${CLW_TOKEN_B:-}" ]; then
-            echo "::warning::CLW_CI_TOKEN_B absent — the two-identity team-share journey will soft-skip. Provision a second PAT on the same tenant to exercise it."
-          fi
-          echo "Running live journeys against prod (REQUIRE=1 — a primary-cred skip is a hard failure)."
+          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — team-share journey soft-skips."
+          [ -z "${CLW_LIVE_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — destructive erase/prune journeys soft-skip (provision a throwaway tenant to exercise them)."
+          echo "Running live journeys against prod (REQUIRE=1 — a primary-cred skip is a hard failure; extra-infra journeys soft-skip)."
           cargo test -p clw-conformance --features live --test live_journeys

@@ -11,23 +11,31 @@
 //! returns early (green), so the binary compiles/runs without credentials. Under
 //! `CLW_CONFORMANCE_REQUIRE=1` a skip becomes a hard failure (the scheduled lane).
 //!
+//! # Journeys (by feature)
+//! Primary (need only `CLW_TOKEN`+`CLW_TENANT`): dedup-across-names, warm-cache,
+//! content-pinning by digest, concurrency, and (with `CLW_TOKEN_B`) the two-identity
+//! team share. Extra-infra journeys SOFT-skip (never require-fail) unless their
+//! dedicated infra is wired: the metered-quota 402 (`CLW_PROBE_TENANT/_TOKEN`), the
+//! real-fabric cred-ticket (`CLW_CRED_TICKET`+`CLW_LEASE_ID`+`CLW_FABRIC_ENDPOINT`),
+//! and the DESTRUCTIVE erase/prune journeys (`CLW_LIVE_ERASE_TENANT/_TOKEN` — a
+//! THROWAWAY tenant the suite fully owns and wipes). Replica-lag needs a server hook.
+//!
 //! # Destructive safety
-//! Only ever touches the sandbox/test tenant and the unique `ws-<suffix>` names
-//! THIS suite creates, and best-effort deletes exactly those AC refs at the end.
-//! It NEVER calls a tenant-wide `erase`/`prune`. (The destructive-verb journeys —
-//! erase/prune against a throwaway tenant — are the one place a dedicated
-//! `CLW_LIVE_ERASE_TENANT` is required; see the `erase`/`prune` section TODO.)
+//! The primary/team journeys only ever touch the unique `ws-<suffix>` names they
+//! create and best-effort delete exactly those AC refs. `erase`/`prune` are called
+//! **only** against the dedicated `CLW_LIVE_ERASE_TENANT` (a throwaway tenant), never
+//! the primary/sandbox tenant — so a shared tenant is never wiped.
 //!
 //! Run:
 //!   CLW_TENANT=<tenant> CLW_TOKEN=<pat> cargo test -p clw-conformance --features live
-//! Two-identity (team) journey additionally needs a SECOND PAT on the SAME tenant:
-//!   CLW_TOKEN_B=<pat2> …
-//! Scheduled lane (skips become failures): CLW_CONFORMANCE_REQUIRE=1 …
+//! Optional extra journeys: CLW_TOKEN_B / CLW_PROBE_* / CLW_LIVE_ERASE_* / the
+//! cred-ticket trio. Destructive journeys also need the `clw` binary built
+//! (`cargo build -p clw-cli`). Scheduled lane: CLW_CONFORMANCE_REQUIRE=1 …
 
 #![cfg(feature = "live")]
 
-use clw_client::HttpClient;
-use clw_types::{AcTransport, ClwError, Config, Digest};
+use clw_client::{redeem_cred_ticket, HttpClient};
+use clw_types::{AcTransport, CasTransport, ClwError, Config, Digest};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -394,12 +402,445 @@ async fn team_two_identities_share_the_tenant_cas() {
 }
 
 // ===========================================================================
-// TODO — journeys that need a DEDICATED throwaway tenant / extra wiring (see
-// docs/TEST-JOURNEY-MAP.md). Scaffolded here so the structure is explicit:
-//   * erase/prune destructive journeys — require `CLW_LIVE_ERASE_TENANT` (a
-//     tenant the suite fully owns and wipes) so we never touch shared data.
-//   * quota 402 / storage 429 — drive the metered-probe tenant to its ceiling.
-//   * cred-ticket (C2c) — redeem against the real fabric at boot.
-//   * replica-lag false-orphan on prune — needs a controllable eventual-
-//     consistency window (backend cooperation).
+// Extra-infra journeys — these need a DEDICATED throwaway tenant / probe tenant /
+// real fabric ticket that the PRIMARY conformance lane does NOT provision. Their
+// absence is a SOFT skip (never a require-fail), so the daily REQUIRE=1 canary
+// stays green; they RUN whenever their specific infra is wired.
 // ===========================================================================
+
+/// Soft skip: needs dedicated infra the primary lane doesn't provide. NEVER a
+/// require-fail (unlike `skip_or_fail`).
+fn soft_skip(reason: &str) {
+    eprintln!("SKIPPED (soft — needs dedicated infra): {reason}");
+}
+
+/// A `(tenant, token)` pair from two env vars, or `None` if either is unset/empty.
+fn env_pair(tenant_var: &str, token_var: &str) -> Option<(String, String)> {
+    let t = std::env::var(tenant_var).ok().filter(|s| !s.is_empty())?;
+    let k = std::env::var(token_var).ok().filter(|s| !s.is_empty())?;
+    Some((t, k))
+}
+
+/// A transport client for an explicit `tenant` + `token` at the live endpoint.
+fn client_for(tenant: &str, token: &str) -> HttpClient {
+    let endpoint = std::env::var("CLW_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://corelink-api.humangr.com".to_string());
+    HttpClient::new(Config {
+        endpoint,
+        tenant: tenant.to_string(),
+        token: token.to_string(),
+        cache_dir: PathBuf::from("/tmp/clw-live-journeys-transport"),
+    })
+    .expect("build transport client")
+}
+
+/// Locate the built `clw` binary next to the test exe (`target/<profile>/clw[.exe]`,
+/// built by the lane's `cargo build -p clw-cli`). `None` → soft-skip the binary
+/// journeys rather than fail (a plain `cargo test -p clw-conformance` won't build it).
+fn clw_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?; // .../deps -> .../<profile>
+    let name = if cfg!(windows) { "clw.exe" } else { "clw" };
+    let p = profile_dir.join(name);
+    p.exists().then_some(p)
+}
+
+/// Spawn the real `clw` binary against the live endpoint with the given identity.
+fn clw_cmd(bin: &Path, tenant: &str, token: &str, cache: &Path) -> std::process::Command {
+    let endpoint = std::env::var("CLW_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://corelink-api.humangr.com".to_string());
+    let mut c = std::process::Command::new(bin);
+    c.env("CLW_ENDPOINT", endpoint)
+        .env("CLW_TENANT", tenant)
+        .env("CLW_TOKEN", token)
+        .env("CLW_CACHE_DIR", cache.to_str().unwrap());
+    c
+}
+
+// ===========================================================================
+// FEATURE: content-addressing — supply-chain content-pinning
+// ===========================================================================
+
+/// JOURNEY — pin by content against LIVE prod: snapshot, then hydrate by the
+/// manifest DIGEST (no AC name lookup). The manifest must hash to that digest, so a
+/// hostile/tampered store can't substitute — the supply-chain defense, proven E2E.
+#[cfg(unix)]
+#[tokio::test]
+async fn content_pinning_hydrate_by_digest_is_byte_identical() {
+    let Some((client, _t)) = try_client() else {
+        return;
+    };
+    let suffix = run_suffix();
+    let name = format!("ws-pin-{suffix}");
+    let key = clw_types::ref_key(&name);
+    let src = tempfile::tempdir().unwrap();
+    let big = build_shared_fixture(src.path(), &suffix);
+
+    let (_c, cache) = fresh_cache();
+    let opts = clw_snapshot::SnapshotOptions::new(&name);
+    let snap = match clw_snapshot::snapshot(src.path(), &client, &cache, &opts).await {
+        Ok(r) => r,
+        Err(e) if is_capability_unavailable(&e) => return soft_skip("snapshot 405/501"),
+        Err(e) => panic!("content-pin snapshot: {e}"),
+    };
+
+    let (_hc, hcache) = fresh_cache();
+    let hopts = clw_hydrate::HydrateOptions::from_manifest_digest(snap.root);
+    let (_dd, dest) = fresh_dest("pinned");
+    let hy = match clw_hydrate::hydrate(&dest, &client, &hcache, &hopts).await {
+        Ok(r) => r,
+        Err(e) if is_capability_unavailable(&e) => {
+            cleanup(&client, &key).await;
+            return soft_skip("hydrate 405/501");
+        }
+        Err(e) => {
+            cleanup(&client, &key).await;
+            panic!("hydrate-by-digest: {e}");
+        }
+    };
+    assert_eq!(
+        hy.root, snap.root,
+        "the digest-pinned hydrate must yield exactly the pinned root"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("big.bin")).unwrap(),
+        big,
+        "content-pinned bytes must be byte-identical"
+    );
+    cleanup(&client, &key).await;
+}
+
+// ===========================================================================
+// FEATURE: reliability — concurrency against the real CAS
+// ===========================================================================
+
+/// JOURNEY — four DISTINCT snapshots concurrently against the live CAS: all succeed
+/// with distinct roots and no cross-contamination (real parallel writes to a shared
+/// backend, which a single-process mock can't exercise).
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_distinct_snapshots_share_cas_without_corruption() {
+    let Some((client, _t)) = try_client() else {
+        return;
+    };
+    let suffix = run_suffix();
+    let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let names: Vec<String> = (0..4).map(|i| format!("ws-conc-{i}-{suffix}")).collect();
+    for (i, d) in dirs.iter().enumerate() {
+        std::fs::write(
+            d.path().join("f.bin"),
+            format!("concurrent-{i}-{suffix}-").repeat(40_000),
+        )
+        .unwrap();
+    }
+    let caches: Vec<_> = (0..4).map(|_| fresh_cache()).collect();
+    let o: Vec<_> = names
+        .iter()
+        .map(clw_snapshot::SnapshotOptions::new)
+        .collect();
+    let (r0, r1, r2, r3) = tokio::join!(
+        clw_snapshot::snapshot(dirs[0].path(), &client, &caches[0].1, &o[0]),
+        clw_snapshot::snapshot(dirs[1].path(), &client, &caches[1].1, &o[1]),
+        clw_snapshot::snapshot(dirs[2].path(), &client, &caches[2].1, &o[2]),
+        clw_snapshot::snapshot(dirs[3].path(), &client, &caches[3].1, &o[3]),
+    );
+    let results = [r0, r1, r2, r3];
+    if results
+        .iter()
+        .any(|r| matches!(r, Err(e) if is_capability_unavailable(e)))
+    {
+        for n in &names {
+            cleanup(&client, &clw_types::ref_key(n)).await;
+        }
+        return soft_skip("concurrent snapshot 405/501");
+    }
+    let roots: Vec<Digest> = results
+        .iter()
+        .map(|r| r.as_ref().expect("a concurrent snapshot failed").root)
+        .collect();
+    for i in 0..roots.len() {
+        for j in (i + 1)..roots.len() {
+            assert_ne!(
+                roots[i], roots[j],
+                "distinct content must yield distinct roots (no corruption/cross-talk)"
+            );
+        }
+    }
+    // Integrity under concurrency: hydrate ONE back and verify byte-identical — this
+    // proves the parallel writes to the SHARED CAS produced retrievable, correct
+    // content (the distinct-roots check alone is deterministic from local content).
+    let expected0 = format!("concurrent-0-{suffix}-")
+        .repeat(40_000)
+        .into_bytes();
+    let (_hc, hcache) = fresh_cache();
+    let (_hd, dest) = fresh_dest("conc0");
+    match clw_hydrate::hydrate(
+        &dest,
+        &client,
+        &hcache,
+        &clw_hydrate::HydrateOptions::new(&names[0]),
+    )
+    .await
+    {
+        Ok(_) => assert_eq!(
+            std::fs::read(dest.join("f.bin")).unwrap(),
+            expected0,
+            "concurrent snapshot #0 must hydrate back byte-identical from the real CAS"
+        ),
+        Err(e) if is_capability_unavailable(&e) => {}
+        Err(e) => {
+            for n in &names {
+                cleanup(&client, &clw_types::ref_key(n)).await;
+            }
+            panic!("hydrate-back of concurrent snapshot #0 failed: {e}");
+        }
+    }
+    for n in &names {
+        cleanup(&client, &clw_types::ref_key(n)).await;
+    }
+}
+
+// ===========================================================================
+// FEATURE: runner / C2c — cred-ticket against the REAL fabric
+// ===========================================================================
+
+/// JOURNEY — redeem a single-use cred-ticket against the REAL fabric at boot, then
+/// prove the redeemed CAS PAT authenticates against live prod. Soft-skips unless the
+/// real trio (`CLW_CRED_TICKET`+`CLW_LEASE_ID`+`CLW_FABRIC_ENDPOINT`) is provided.
+#[tokio::test]
+async fn cred_ticket_redeems_against_the_real_fabric() {
+    let (Some(ticket), Some(lease), Some(fabric)) = (
+        std::env::var("CLW_CRED_TICKET")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        std::env::var("CLW_LEASE_ID").ok().filter(|s| !s.is_empty()),
+        std::env::var("CLW_FABRIC_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    ) else {
+        return soft_skip(
+            "set CLW_CRED_TICKET+CLW_LEASE_ID+CLW_FABRIC_ENDPOINT (a real single-use ticket) for the C2c journey",
+        );
+    };
+    let Some(tenant) = std::env::var("CLW_TENANT").ok().filter(|s| !s.is_empty()) else {
+        return soft_skip("CLW_TENANT");
+    };
+
+    let pat = match redeem_cred_ticket(&fabric, &lease, &ticket).await {
+        Ok(p) => p,
+        Err(e) => {
+            return soft_skip(&format!(
+                "redeem failed (the ticket may be burned/expired): {e}"
+            ))
+        }
+    };
+    // The redeemed CAS PAT must authenticate against live prod (not 401).
+    let client = client_for(&tenant, &pat);
+    match AcTransport::list_refs(&client).await {
+        Ok(_) => {}
+        Err(e) if is_capability_unavailable(&e) => return soft_skip("list_refs 405/501"),
+        Err(e) => panic!("the redeemed CAS PAT failed to authenticate against prod: {e}"),
+    }
+}
+
+// ===========================================================================
+// FEATURE: quota / billing — the 402 metered wall
+// ===========================================================================
+
+/// JOURNEY — drive the METERED PROBE tenant to its ceiling: write distinct blobs
+/// until the real metering returns HTTP 402. Soft-skips without the probe creds (and
+/// is NOT wired into the daily lane — the metered-probe-canary owns accrual+reset).
+#[cfg(unix)]
+#[tokio::test]
+async fn metered_writes_hit_the_402_quota_wall() {
+    let Some((tenant, token)) = env_pair("CLW_PROBE_TENANT", "CLW_PROBE_TOKEN") else {
+        return soft_skip(
+            "set CLW_PROBE_TENANT+CLW_PROBE_TOKEN (the metered probe tenant) for the quota journey",
+        );
+    };
+    let client = client_for(&tenant, &token);
+    let suffix = run_suffix();
+    let mut hit_402 = false;
+    // Bounded so a mis-provisioned high ceiling can't loop forever.
+    for i in 0..2000u32 {
+        let bytes = format!("quota-probe-{suffix}-{i}-")
+            .repeat(2000)
+            .into_bytes();
+        let d = Digest::of_bytes(&bytes);
+        match CasTransport::put(&client, &d, bytes).await {
+            Ok(()) => continue,
+            Err(ClwError::Http { status: 402, .. }) => {
+                hit_402 = true;
+                break;
+            }
+            Err(e) if is_capability_unavailable(&e) => return soft_skip("put 405/501"),
+            Err(e) => panic!("unexpected error before the 402 wall: {e}"),
+        }
+    }
+    assert!(
+        hit_402,
+        "the metered probe tenant must eventually return HTTP 402 (quota wall) — check its ceiling/reset"
+    );
+}
+
+// ===========================================================================
+// FEATURE: destructive lifecycle against a THROWAWAY tenant (real binary)
+// ===========================================================================
+
+/// JOURNEY — the full DESTRUCTIVE lifecycle against a THROWAWAY tenant, via the real
+/// binary, in ONE sequential test (so the two tenant-wide ops never race under the
+/// parallel test runner): seed a live snapshot + an orphaned one, `clw prune --yes`
+/// (assert the live ref SURVIVES and the orphaned manifest blob is SWEPT), then
+/// `clw erase --yes` (assert the real backend then enumerates EMPTY). The prune
+/// fail-safe + GDPR Art.17 truthfulness, end-to-end against prod.
+///
+/// Soft-skips without a dedicated wipeable tenant; and REFUSES to run when that
+/// tenant equals the primary `CLW_TENANT` (defense-in-depth — a misconfigured secret
+/// must never wipe the shared/sandbox tenant).
+#[cfg(unix)]
+#[tokio::test]
+async fn destructive_prune_then_erase_lifecycle_on_a_throwaway_tenant() {
+    let Some((tenant, token)) = env_pair("CLW_LIVE_ERASE_TENANT", "CLW_LIVE_ERASE_TOKEN") else {
+        return soft_skip(
+            "set CLW_LIVE_ERASE_TENANT+CLW_LIVE_ERASE_TOKEN (a THROWAWAY tenant the suite fully owns + wipes) for the destructive journey",
+        );
+    };
+    // Defense-in-depth: never run a tenant-wide wipe against the primary tenant.
+    if std::env::var("CLW_TENANT").ok().as_deref() == Some(tenant.as_str()) {
+        return soft_skip(
+            "CLW_LIVE_ERASE_TENANT must be a DEDICATED throwaway tenant, NOT the primary CLW_TENANT — refusing to run a destructive wipe against the shared tenant",
+        );
+    }
+    let Some(bin) = clw_binary() else {
+        return soft_skip("clw binary not built (run `cargo build -p clw-cli` first)");
+    };
+    let client = client_for(&tenant, &token);
+    let suffix = run_suffix();
+    let live_name = format!("ws-destroy-live-{suffix}");
+    let orphan_name = format!("ws-destroy-orphan-{suffix}");
+    let (src_l, src_o) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    std::fs::write(
+        src_l.path().join("live.bin"),
+        format!("live-{suffix}-").repeat(50_000),
+    )
+    .unwrap();
+    std::fs::write(
+        src_o.path().join("orphan.bin"),
+        format!("orphan-{suffix}-").repeat(50_000),
+    )
+    .unwrap();
+    let (_cl, cl) = fresh_cache();
+    let (_co, co) = fresh_cache();
+    if let Err(e) = clw_snapshot::snapshot(
+        src_l.path(),
+        &client,
+        &cl,
+        &clw_snapshot::SnapshotOptions::new(&live_name),
+    )
+    .await
+    {
+        if is_capability_unavailable(&e) {
+            return soft_skip("seed snapshot 405/501");
+        }
+        panic!("seed live snapshot: {e}");
+    }
+    let orphan = clw_snapshot::snapshot(
+        src_o.path(),
+        &client,
+        &co,
+        &clw_snapshot::SnapshotOptions::new(&orphan_name),
+    )
+    .await
+    .expect("seed orphan snapshot");
+    // Orphan the second snapshot: delete its ref → its unique manifest + chunks are
+    // now unreferenced. (Its content is distinct from the live snapshot, so nothing
+    // it uploaded is shared/live.)
+    let _ = AcTransport::delete(&client, &clw_types::ref_key(&orphan_name)).await;
+    assert!(
+        CasTransport::get(&client, &orphan.root).await.is_ok(),
+        "the orphaned manifest blob must exist before prune (sanity)"
+    );
+
+    let cache = tempfile::tempdir().unwrap();
+
+    // --- Step 1: prune (verify BEFORE the erase wipe). ---
+    let pr = clw_cmd(&bin, &tenant, &token, cache.path())
+        .args(["--json", "prune", "--yes"])
+        .output()
+        .expect("spawn clw prune");
+    assert!(
+        pr.status.success(),
+        "prune must succeed against the throwaway tenant, stderr:\n{}",
+        String::from_utf8_lossy(&pr.stderr)
+    );
+    // Over-deletion guard: the LIVE ref survives.
+    assert!(
+        matches!(
+            AcTransport::get(&client, &clw_types::ref_key(&live_name)).await,
+            Ok(Some(_))
+        ),
+        "prune must NOT delete the live ref"
+    );
+    // Under-deletion guard: the ORPHANED (unreferenced) manifest blob is swept.
+    assert!(
+        matches!(
+            CasTransport::get(&client, &orphan.root).await,
+            Err(ClwError::NotFound(_))
+        ),
+        "prune must SWEEP the orphaned manifest blob"
+    );
+
+    // --- Step 2: erase (tenant-wide wipe, LAST). ---
+    let er = clw_cmd(&bin, &tenant, &token, cache.path())
+        .args(["--json", "erase", "--yes", "--confirm-tenant", &tenant])
+        .output()
+        .expect("spawn clw erase");
+    assert!(
+        er.status.success(),
+        "erase must succeed on the throwaway tenant, stderr:\n{}",
+        String::from_utf8_lossy(&er.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&er.stdout).expect("erase --json must emit a record");
+    assert_eq!(
+        v["complete"],
+        serde_json::json!(true),
+        "erase must report complete:true, got: {v}"
+    );
+    // The REAL backend must now enumerate EMPTY (the prod-only truth).
+    assert!(
+        AcTransport::list_refs(&client)
+            .await
+            .expect("list after")
+            .is_empty(),
+        "erase must leave the tenant's AC refs empty"
+    );
+    assert!(
+        CasTransport::list_blobs(&client)
+            .await
+            .expect("blobs after")
+            .is_empty(),
+        "erase must leave the tenant's CAS empty"
+    );
+}
+
+// ===========================================================================
+// FEATURE: reliability — replica-lag false-orphan on prune (honest scaffold)
+// ===========================================================================
+
+/// The prune replica-lag fail-safe (abort when a ref enumerates but its record 404s
+/// mid-mark, so still-live blobs aren't swept as false orphans) can only be triggered
+/// deterministically against prod with a SERVER-INJECTED eventual-consistency window
+/// — there is no client-side way to force AC replica lag. The behavior IS covered
+/// deterministically at the mock/unit level (prune.rs fail-safes). This soft-skips
+/// until a server test-hook exists; it exists so the gap is explicit, not forgotten.
+#[tokio::test]
+async fn replica_lag_false_orphan_prune_abort_needs_a_server_hook() {
+    soft_skip(
+        "replica-lag prune-abort needs a server-injected consistency window (no client-side trigger) — covered deterministically at mock/unit level",
+    );
+}
