@@ -1,0 +1,34 @@
+# Shellcheck lane — lint the distribution + CI shell scripts.
+#
+# `scripts/install.sh` is the PUBLIC curl-pipe fallback a customer runs to install clw; a
+# broken script there is a real user hazard, and the release/gate scripts are load-bearing.
+# They were never shellcheck-gated. This runs shellcheck on all of scripts/*.sh.
+#
+# github-hosted ubuntu (shellcheck is preinstalled), additive — does not touch the
+# required gates/dco checks. Runs on PRs that touch scripts + push-to-main + dispatch.
+
+name: shellcheck
+
+on:
+  pull_request:
+    paths: ["scripts/**", ".github/workflows/shellcheck.yml"]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck scripts/*.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (warning level — errors + warnings fail)
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck -S warning scripts/*.sh
+          echo "all scripts/*.sh pass shellcheck"
