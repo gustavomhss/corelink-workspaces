@@ -483,6 +483,27 @@ Examples: `clw completions bash > ~/.local/share/bash-completion/completions/clw
 - Missing file → silent. Unreadable/typo'd/over-permissive file → a **warning** (and a `chmod 600` hint on
   unix) but clw **falls back** and does not fail. Writes are atomic (temp → fsync → rename), PAT-leak-safe.
 
+### Built-in limits & bounds (compile-time constants — *not* env-configurable)
+
+Beyond the env vars above, clw enforces a layer of hard-coded safety bounds. They are **not knobs** — you
+can't raise them with a flag or env var — but they are **user-visible**: several of them *abort an operation*
+with an actionable error, so they belong in any complete mental model of the tool. (If you hit one, the fix is
+to split the workspace / trim inputs, not to reconfigure clw.)
+
+| Bound | Value | Effect when reached |
+|---|---|---|
+| **Local cache GC budget** | **8 GiB** | The `~/.clw/cache` self-evicts (LRU by mtime, checked once per 256 writes) back under 8 GiB. **No override exists** — a working set larger than 8 GiB will see warm blobs evicted. It's a cache (a miss just re-fetches), never data loss. |
+| CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB. A manifest is one blob → a very large tree (~32k files, path-length dependent) fails up-front with "too many entries". `clw run` SIGKILLs a child exceeding 5 MiB on stdout *or* stderr → exit 137. |
+| Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time); a file that grows past 16 MiB *between* the directory walk and the read is rejected (not silently slurped). |
+| Hydrate resource caps | ≤ **1M** entries · **100k** symlinks · **1 TiB** total · **64M** total chunks · **16M** chunks/file | A manifest exceeding any of these aborts the hydrate before writing (anti-OOM / anti-disk-fill / anti-symlink-bomb), budgeted against the *real* summed sizes, not the attacker-declared `total_size`. |
+| `ls --all` / `prune` enumeration caps | **16 MiB** per page · **10M** keys total · **1M** pages · page size **1000** | A tenant enumeration that blows past 10M keys aborts with `TooLarge` rather than growing unbounded. |
+| HTTP timeouts | request **120s**, connect **10s** (cred-ticket redeem: **30s** / **10s**) | A single stalled request is abandoned at 120s; the overall-op deadline (`CLW_OP_DEADLINE_SECS`, default 300s) then decides whether to retry. This is why the 300s default ≈ a couple of full 120s attempts. |
+| Download body cap | **5 MiB**, streamed | A CAS GET body is read under a 5 MiB ceiling *before* the BLAKE3 check — a lying `Content-Length` can't OOM the client. |
+| Cred-ticket redeem body cap | **64 KiB** | The C2c redemption response is size-capped so a hostile fabric endpoint can't OOM the client at boot. |
+| 429 quota-vs-transient split | `Retry-After` **> 3600s** | A `Retry-After` over an hour is reported as a plan/quota ceiling (like a 402 wall); anything shorter is treated as transient backpressure (retry). |
+| `run` post-success cache store | **30s** phase deadline | The three cache stores after a successful `run` execute concurrently under a 30s box — a slow backend simply skips the cache write rather than delaying your exit. |
+| Retry policy | **6** attempts, ladder `[200ms, 800ms, 2s, 5s, 10s]` | Applies to connect/transport/5xx/429, capped by the remaining op deadline. AIMD concurrency: a 429 halves the in-flight window (floor 1); 8 straight successes grow it back toward `--concurrency` (default 8). |
+
 ---
 
 <a id="9-exit-codes"></a>
@@ -500,6 +521,31 @@ Examples: `clw completions bash > ~/.local/share/bash-completion/completions/clw
 | `125` | **Reserved** — `clw run` internal failure where **the child never ran** (substrate unreachable, bad config, hydrate/cache error, credential-redeem failure, or a panic on the run path). The runner treats this as `ClwFailed`, **never cached**. Prints `[clw] internal error — child not run: …`. |
 | `137` | `clw run`: the child **did run** but was SIGKILL'd for exceeding the **5 MiB** output cap. (`128+9`.) |
 | `128 + signal` | `clw run`: a signal-killed child (e.g. SIGTERM → 143) — passed through as the child's code. |
+| `255` | `clw run` fallback: a signal-killed child whose signal number can't be recovered, **and** the entire non-unix (Windows) abnormal-termination path (where signals don't exist). A runner watching a Windows child will see `255` for an abnormal exit. |
+
+Note on the collapse to `2`: off the `run`/`status` paths, **every** `ClwError` variant (see the taxonomy
+below) terminates via a single handler that exits `2`. So `Auth`, `Http`, `Integrity`, `InvalidTenant`,
+`Transport`, `Config`, … are all *exit 2* — the exit code alone doesn't tell you which; the **stderr message**
+does. On the `run` path they instead collapse to `125` (child never ran), except an oversized-output kill → `137`.
+
+**Error taxonomy** — the `ClwError` variants (source of truth: `clw-types`), the user-facing message you'll
+see on stderr, and where each terminates:
+
+| Variant | When | User-facing message (redacted) | Exit |
+|---|---|---|---|
+| `Auth` | 401/403, or missing token | actionable "not authenticated / check `CLW_TOKEN`" override | 2 (125 on run) |
+| `Http{status,context}` | any other non-2xx | the status + a redacted context; `402` gets the pricing-page override | 2 (125 on run) |
+| `NotFound(Digest)` | a CAS/AC key is absent | "not found: `<hex>`" | 2 (125 on run) |
+| `TooLarge{size,cap}` | a blob/body/enumeration over its cap | "… `<size>` exceeds cap `<cap>`" | 2 · **137** for the run output kill |
+| `Integrity{expected,actual}` | BLAKE3 mismatch on a GET/hydrate | "integrity check failed: expected `<hex>`, got `<hex>`" | 2 (125 on run) |
+| `InvalidDigest` | a hex id that isn't 64 lowercase hex | "invalid digest" | 2 |
+| `InvalidManifest` | manifest bytes fail canonical validation | "invalid manifest: `<why>`" | 2 |
+| `InvalidTenant` | tenant fails the path-injection validator | "invalid tenant: `<why>`" | 2 |
+| `Config` | unreadable/contradictory config or bad flag value | the specific config problem | 2 |
+| `Transport` | connect/timeout/TLS failure (after retries) | "transport error: `<redacted>`" | 2 (125 on run) |
+| `Io` | a filesystem error | the OS error + the path it happened on | 2 |
+| `Json` | a serialization/parse failure | the serde context | 2 |
+| `Message` | a catch-all with an explicit string | the message verbatim | 2 |
 
 **HTTP 402 is not an exit code** — it's the backend's "monthly usage quota / plan $-ceiling reached"
 status. clw maps it to an actionable message (pointing to the pricing page) but still exits `2` (or `125`
@@ -527,7 +573,9 @@ on the `run` path). It is a **billing** limit on your CoreLink account, not a cl
 - **Per-op deadline** `CLW_OP_DEADLINE_SECS` (default 300s, 24h clamp) bounds the *whole* operation across
   all retries — a black-hole backend can't hang clw.
 - **Retries:** up to 6 attempts, backoff ladder `[200ms, 800ms, 2s, 5s, 10s]`, on connect/transport/5xx/429,
-  capped by the remaining deadline; honors a server `Retry-After`.
+  capped by the remaining deadline; honors a server `Retry-After` **in its integer delta-seconds form**
+  (e.g. `Retry-After: 30`). The RFC-legal HTTP-date form is not parsed — clw silently falls back to the fixed
+  ladder for that request (it never errors on a date-form header).
 - **Adaptive concurrency (AIMD):** a 429 halves the in-flight window (floor 1); 8 consecutive successes
   grow it back toward the `--concurrency` ceiling (default 8).
 - **Output cap:** `clw run` SIGKILLs a child that exceeds **5 MiB on either stdout or stderr** (each stream is
@@ -556,7 +604,10 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **FastCDC content-defined chunking** (256 KiB / 1 MiB / 4 MiB, frozen) — position-independent boundaries.
 - **Cross-file & cross-snapshot dedup** — `exists`-before-`put`; only chunks not already in CAS are uploaded
   (`chunks_uploaded` < `chunks_total` shows the savings). A per-run de-dup set avoids re-handling a digest.
-- **Streaming for large files** (> 16 MiB) — chunked with at most one chunk resident in memory at a time.
+- **Streaming for large files** (> 16 MiB) — chunked with at most one chunk resident in memory at a time. The
+  small-file fast path re-checks the *actual read length* against the 16 MiB threshold, so a file that grows
+  past it between the walk and the read is rejected with an actionable error instead of being slurped (a TOCTOU
+  anti-OOM guard on both the upload and manifest paths).
 - **Global upload concurrency** — one shared semaphore across all files, so many small files saturate
   `--concurrency` instead of serializing.
 - **Concurrent, in-order chunk fetch on hydrate** — a few large blobs download in parallel, applied in order.
@@ -583,7 +634,10 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **Manifest re-verified before parse**; **each chunk's length verified** against its declared size.
 - **fsync-before-rename** on every hydrated file (+ a parent-dir fsync) — durable against a torn file on
   power loss (hydrate never re-hashes on read).
-- **Atomic writes** everywhere (temp-in-same-dir → fsync → rename).
+- **Atomic writes** (temp-in-same-dir → rename) on every write path. The **hydrate** path additionally
+  `fsync`s before the rename (durability, above); the **local cache** put deliberately does *not* fsync —
+  it's a disposable, self-healing store (a torn cache blob is re-hashed and discarded on the next `get`), so
+  paying the fsync cost per chunk would be wasted. So: *atomic rename everywhere; fsync on hydrate, not on the cache.*
 - **Size-truth guard** — a File's `size` and the manifest `total_size` derive from the bytes actually
   chunked, so an unrestorable snapshot can't be published.
 
@@ -611,17 +665,20 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 ### F · Reliability & transport
 - **Overall per-op deadline** (`CLW_OP_DEADLINE_SECS`, default 300s, 24h clamp) — bounds a whole operation
   across all retries; a black-hole backend fails cleanly.
-- **Bounded retries + `Retry-After`** — up to 6 attempts on connect/transport/5xx/429, honoring the server's
-  backoff hint, capped by the remaining deadline.
+- **Bounded retries + `Retry-After`** — up to 6 attempts on connect/transport/5xx/429, backoff ladder
+  `[200ms, 800ms, 2s, 5s, 10s]`, honoring the server's `Retry-After` **delta-seconds** hint (the HTTP-date
+  form is not parsed → fixed ladder), capped by the remaining deadline.
 - **AIMD adaptive concurrency** — a 429 halves the in-flight window (floor 1); 8 straight successes grow it
   back toward the `--concurrency` ceiling. The governor tolerates a poisoned lock.
-- **Pagination caps** — hard page-count + total-entry bounds so a hostile/buggy server cursor can't OOM `ls`/`prune`.
+- **Pagination caps** — 16 MiB per page, ≤ 10,000,000 total keys (then `TooLarge`), ≤ 1,000,000 pages
+  (page size 1000) — a hostile/buggy server cursor can't OOM `ls`/`prune`.
 - **Prune fail-safes** — abort on an unresolvable ref (replica-lag 404), refuse an empty-live-set-over-non-empty-CAS
   wipe (even in dry-run), and mark `run` memo blobs live so they're never orphaned; a mid-sweep failure resumes.
 - **Erase safety** — dry-run default + `--yes` + typed-tenant confirmation; delete-verify-repeat (≤ 3 passes);
   only claims success once the tenant is confirmed empty; a mid-delete failure is resumable.
 - **Bounded `run` output** — each of stdout/stderr capped at 5 MiB (child killed → exit 137); a backgrounded
-  grandchild that holds the pipe open is drained under a 2s grace; the post-success store is time-boxed.
+  grandchild that holds the pipe open is drained under a 2s grace; the post-success store is time-boxed to a
+  **30s** phase deadline (its three stores run concurrently; a slow backend just skips the cache write).
 - **Frozen exit-code contract** — child code verbatim, `125` reserved (child never ran), `137` oversized,
   `128+signal` — a stable surface a CI runner pins against.
 
@@ -773,6 +830,19 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
   never a partial release. *(Deferred, not yet live: macOS Developer-ID notarization, Windows Authenticode, and
   SLSA build-provenance attestation — the last is gated to public repos and waived while the source repo is
   private. The `install.sh` and `brew` paths strip the macOS quarantine attribute.)*
+- **Quality gates & supply-chain assurance.** Every PR/tag passes a gate that is more than "tests green":
+  **`cargo-deny`** (advisories + licenses + banned/duplicate deps + sources) and **`cargo-audit`** (RustSec
+  scan, `--deny unmaintained/unsound`, pinned `@0.22.2`) guard the dependency tree; a `bytes` version floor and
+  a committed `fuzz/Cargo.lock` lock the supply chain. Correctness is proven, not assumed, by additive lanes:
+  **in-tree fuzzing** of every untrusted-input parser (manifest / ref-record / run-record decode, `Digest::from_hex`,
+  the `validate_*` path/symlink checks — proptest, 1k cases/PR, 50k under `CLW_FUZZ_GATE=1`), a **coverage floor**
+  (≈ 88% line, per-PR, blocks a regression), **weekly mutation testing** (does a test actually *kill* an injected
+  fault), a **property round-trip** test (arbitrary trees snapshot→hydrate byte-identical), a **stress lane**
+  (GB file / 100k files / 64-way concurrency), a **Windows-runtime lane** (the suite actually *runs* on
+  `windows-latest`, not just compiles), and **shellcheck** over the shipped shell scripts. A **daily
+  live-conformance canary** runs the full prod round-trip against the real backend in honest mode. **Signing is
+  fail-closed:** a real `vX.Y.Z` with the minisign secret absent hard-errors (`exit 1`) instead of publishing
+  unsigned. (Details: `docs/TESTING.md`.)
 - **License & status.** Proprietary (`EULA.md`); not open source (all crates `publish = false`). Third-party
   attributions in `NOTICE`; disclosure policy in `SECURITY.md`. **Status: SHIPPED — open beta.** v0.1.0 launched
   2026-06-18; **current release v0.1.11**. Pre-1.0 there's no stability guarantee *except* the explicitly
@@ -987,7 +1057,7 @@ logged in — wrote identity to /Users/you/.clw/config.toml
 # logout (stderr): removed from /Users/you/.clw/config.toml: token
 # rotate (stderr): clw auth rotate: to rotate your token, run `clw auth login` with the new token…
 ```
-`--json`: login `{logged_in,wrote,endpoint,tenant,token}` · whoami `{endpoint,tenant,token}` · logout `{removed:[string],file}` · rotate `{rotated:false,action_required,note}`
+`--json`: login `{logged_in,wrote,endpoint,tenant,token}` · whoami `{endpoint,tenant,token}` · logout — on an actual removal `{removed:[string],file}`, but on a **no-op** (no config file / aborted / no token set) the shape is `{removed:[],note}` **with no `file` key** · rotate `{rotated:false,action_required,note}`
 
 ### prune / erase / rm / init
 ```
@@ -998,7 +1068,19 @@ logged in — wrote identity to /Users/you/.clw/config.toml
 # rm:              deleted ref 'myapp-dev'   |   no such ref 'x' (nothing to delete)
 # init (stderr):   wrote config to /Users/you/.clw/config.toml
 ```
-`--json`: prune `{dry_run,live,orphans?,would_delete?[],deleted?}` · erase `{dry_run,tenant,refs|refs_deleted,blobs|blobs_deleted,complete?}` · rm `{name|ref_key,deleted}` · init `{wrote,token}`. On a server capability regression (405/501) the JSON is `{error:"capability-unavailable",note}` + a non-zero exit.
+`--json`: prune `{dry_run,live,orphans?,would_delete?[],deleted?}` · erase `{dry_run,tenant,refs|refs_deleted,blobs|blobs_deleted,complete?}` · rm `{name|ref_key,deleted}` · init `{wrote,token}`.
+
+**Partial-failure & refusal shapes** (the JSON differs from the happy path — a runner must handle these):
+- **prune** — a mid-sweep failure adds `failed_at:"<hex>"`; a server capability regression (405/501) emits `{error:"capability-unavailable",note}`; a replica-lag unresolvable ref emits `{error:"live-set-incomplete",note}`; an empty-live-set-over-non-empty-CAS refusal emits `{error:"empty-live-set-refused",note}`. All with a non-zero exit.
+- **erase** — an incomplete verify adds `remaining_refs` + `remaining_blobs`; a mid-delete failure adds `note`; a pre-flight abort emits a different shape `{tenant, erased:false, note}` (the `erased` key appears only here).
+- **rm** — a declined/`--yes`-less confirmation emits `{ref, deleted:false, note}` (the `ref` and `note` keys are absent from the happy `{name|ref_key,deleted}` shape).
+
+### uninstall
+```
+# dry-run:   DRY RUN — would remove: ~/.clw (config+cache), the clw binary at <path>
+# --yes:     removed ~/.clw; removed clw binary at <path>   (or a copy-out hint if self-removal isn't possible)
+```
+`--json`: `{ dry_run, targets:[{path, existed, removed}], binary:{path, removed, remove_command} }`
 
 ---
 
@@ -1021,11 +1103,26 @@ The manifest is the on-the-wire representation of a workspace (source of truth: 
 { "kind":"symlink", "path":"<rel>", "target":"<string>" }
 { "kind":"dir",     "path":"<rel>" }          // ONLY for empty dirs; non-empty dirs are implied by file paths
 ```
-`mode` = unix permission bits (`420`=`0o644`, `493`=`0o755`); `size` must equal Σ `ChunkRef.size`; the concatenation of chunks (in list order) equals the file content.
+`mode` = unix permission bits (`420`=`0o644`, `493`=`0o755`). On snapshot the mode is masked to `0o777`
+(setuid/setgid/sticky are stripped, never recorded); on **Windows**, which has no unix mode, every file is
+recorded with a constant `0o644`. `size` must equal Σ `ChunkRef.size`; the concatenation of chunks (in list
+order) equals the file content.
 
-**ChunkRef:** `{ "digest":"<64-hex>", "size":<u64> }` — `size` must be `> 0` and `≤ 5 MiB`.
+**ChunkRef:** `{ "digest":"<64-hex>", "size":<u64> }`. By construction a chunk is `> 0` and `≤ 5 MiB` (the
+CAS blob cap). **Note on enforcement:** the manifest *parser* (`Manifest::from_bytes` → `validate_canonical`)
+does **not** range-check each `ChunkRef.size` field on its own. What is enforced instead, and where: the
+5 MiB ceiling is a **transport** guard (a PUT body >5 MiB is rejected pre-send; a GET body is streamed under
+a 5 MiB cap before hashing), and the size *relationship* is a **hydrate** guard (`File.size` must equal the
+sum of its chunk sizes, `total_size` must equal the summed real chunk bytes, and each fetched chunk's actual
+length is verified against its declared `size`). So a lying `size` field never survives a round-trip — but it
+is caught at hydrate/transport, not at manifest parse.
 
-**Path rules** (all entries): relative (no leading `/`), `/`-separated, no `.`/`..` component, valid UTF-8, non-empty.
+**Path rules** (all entries, enforced on parse of untrusted bytes): relative (no leading `/`), `/`-separated,
+no `.`/`..` component, non-empty, valid UTF-8, **and — on every platform — no backslash and no colon in any
+component** (rejecting a Windows drive-letter `C:` or NTFS alternate-data-stream `file:stream`). Symlink
+`target`s are additionally validated: relative, same backslash/colon rejection, and the target must resolve
+*within* the workspace — intra-workspace `..` is allowed (`bin/x -> ../src/y` accepted) but an escaping
+`../../x` is rejected. Producer and consumer share the validator, so an accepted manifest always hydrates.
 
 **Canonical form + digest.** Canonical bytes = compact JSON (no whitespace), fields in declaration order, **`entries` sorted ascending by path (byte order), all paths unique**. `manifest_digest = BLAKE3(canonical_bytes)`. Writers sort+dedup before hashing; readers validate order + uniqueness on parse.
 
@@ -1037,6 +1134,12 @@ The manifest is the on-the-wire representation of a workspace (source of truth: 
   "created_at_unix":<u64>, "parent":"<64-hex>|null", "tool_version":"<string>" }
 ```
 `ref_key(name) = BLAKE3("clw/ref/v1/" ‖ name)` (runner keyspace: `"clw/ref/runner/v1/"`). Concurrency is **last-write-wins** in v1 (the `parent` field is lineage only; compare-and-swap is a future MAY).
+
+**RunRecord** (the `clw run` memoization value, a first-class CAS object keyed by the input hash) — declaration order:
+```json
+{ "exit_code":<i32>, "stdout":"<64-hex>", "stderr":"<64-hex>" }
+```
+`stdout`/`stderr` are CAS digests of the captured streams (each ≤ 5 MiB). A `RunRecord` is stored **only when `exit_code == 0`** (a non-zero run is never cached). Its field set is deliberately disjoint from `RefRecord`, so the two can't be confused when fetched from the same CAS.
 
 **Transport.** CAS `GET|PUT|DELETE /v1/cas/{tenant}/{hash}` + `GET /v1/cas/{tenant}`; AC `GET|PUT|DELETE /v1/ac/{tenant}/{key}` + `GET /v1/ac/{tenant}`. Auth `Authorization: Bearer <PAT>`. Clients **must** verify `BLAKE3(body)` on every CAS GET (mismatch → `Integrity` error); a CAS PUT body must not exceed 5 MiB (else the server returns 413 / the client returns `TooLarge` pre-send).
 
@@ -1098,7 +1201,7 @@ Each target is **built natively on its own runner** (the release pipeline runs a
 
 **Status: SHIPPED — open beta.** v0.1.0 launched 2026-06-18; **current release v0.1.11**. Pre-1.0 there is no stability guarantee *except* the frozen v0.1.0 CLI contract (verbs, flag names, argument order, the `125` reserved run code, child-passthrough + cache-iff-0). A SemVer/stability charter + formal EOL policy land with 1.0.
 
-**Recently shipped:** content-addressed hydrate by digest (`--manifest-digest`, v0.1.5); the full ref lifecycle (`rm` / `ls --all` / `prune` / `erase`); GDPR Art.17 self-service erasure; the cross-platform Windows/Linux port (incl. the Windows symlink copy-fallback) + a Windows-runtime CI lane; public distribution (Homebrew tap + public mirror + `install.sh`); minisign-signed checksums + CycloneDX SBOM; the runner ref-domain keyspace; telemetry fully removed (never phones home).
+**Recently shipped:** content-addressed hydrate by digest (`--manifest-digest`, v0.1.5); the full ref lifecycle (`rm` / `ls --all` / `prune` / `erase`); GDPR Art.17 self-service erasure; the cross-platform Windows/Linux port (incl. the Windows symlink copy-fallback) + a Windows-runtime CI lane; public distribution (Homebrew tap + public mirror + `install.sh`); minisign-signed checksums + CycloneDX SBOM; the runner ref-domain keyspace; zero telemetry by design (never present — no sink, no opt-in flag, no phone-home path was ever built).
 
 **Planned (committed, not yet in the binary):**
 - One-step `auth rotate` (mint-and-revoke) — today rotation = re-run `clw auth login` with the new token; a one-step command can't ship on end-user machines without leaking the internal mint key.

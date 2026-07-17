@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Tests / CI — test-rigor & E2E drive (make robustness PROVABLE)
+A robustness wave that makes test-adequacy *provable* rather than assumed. All lanes are **additive** —
+they do not touch the required `gates`/`dco` checks (except the round-trip property test, which runs in the
+gate). See `docs/TESTING.md` for the index + the measure→ratchet→gate posture.
+- **Coverage lane** (`coverage.yml`, `cargo-llvm-cov`, per-PR) — measured baseline ≈ **88.8%** line coverage;
+  a floor is active and blocks a regression (deterministic, not flaky).
+- **Fuzz lane** (`fuzz.yml`, nightly) — runs the previously-dormant `cargo-fuzz` harness (the `clw-types`
+  untrusted-input targets: symlink-target / rel-path / manifest-parse / digest-from-hex); a crash is red.
+- **Mutation lane** (`mutation.yml`, weekly) — `cargo-mutants` whole-workspace, report-only; survivors feed a
+  follow-on that adds killing tests, then flips to block new survivors per-PR.
+- **Property round-trip** (`crates/clw-integration-tests/tests/roundtrip_prop.rs`, in the gate) — proptest
+  arbitrary trees (unicode/space names, nested dirs, empty+multi-byte files, exec bits, in-tree symlinks) →
+  `snapshot→hydrate` asserted byte-identical with structure/mode/symlink-target preserved.
+- **Stress lane** (`stress.yml`, weekly) — aggressive magnitude: GB-scale file, 100k files, deep+wide tree,
+  64-way concurrency; crash/hang/OOM/mismatch is red.
+- **Windows-runtime lane** (`windows.yml`, `windows-latest`/gnu) — the workspace test suite now actually
+  **runs** on Windows (was compile-only); it surfaced (and documents) the hydrate symlink→copy fallback as a
+  real, expected platform divergence.
+- **Shellcheck lane** (`shellcheck.yml`) — lints the distribution + CI shell scripts, including the public
+  `install.sh`.
+
 ## [0.1.11] — stabilization wave: gate-hole closure + last unbounded reads (2026-07-13)
 
 A quality-bar hardening wave from a 5-angle hidden-debt sweep. The core code was already
