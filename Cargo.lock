@@ -373,6 +373,7 @@ dependencies = [
  "clw-run",
  "clw-snapshot",
  "clw-types",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

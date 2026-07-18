@@ -11,6 +11,11 @@
 //! returns early (green), so the binary compiles/runs without credentials. Under
 //! `CLW_CONFORMANCE_REQUIRE=1` a skip becomes a hard failure (the scheduled lane).
 //!
+//! A backend **5xx** (502/503/504 — e.g. the server's 503 "audit closed" fail-closed
+//! state) is classified as backend-unavailable, NOT a clw defect: the primary journeys
+//! route it through `skip_or_fail` (so the REQUIRE=1 canary still reddens on a real
+//! outage), the extra-infra journeys through `soft_skip`. See `is_backend_unavailable`.
+//!
 //! # Journeys (by feature)
 //! Primary (need only `CLW_TOKEN`+`CLW_TENANT`): dedup-across-names, warm-cache,
 //! content-pinning by digest, concurrency, and (with `CLW_TOKEN_B`) the two-identity
@@ -140,6 +145,22 @@ fn is_capability_unavailable(err: &ClwError) -> bool {
     matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
 }
 
+/// A 5xx from the backend (502 Bad Gateway / 503 Service Unavailable / 504 Gateway
+/// Timeout — including the server's 503 "audit closed" fail-closed state) means the
+/// fabric is transiently unavailable: NOT a clw client defect and NOT a test-contract
+/// violation. The primary journeys route it through `skip_or_fail`, so the daily
+/// REQUIRE=1 conformance canary still REDDENS on a real prod outage (that IS its job,
+/// as a prod-health monitor), while a manual/dev run degrades to a clean skip with a
+/// precise diagnosis instead of a raw panic that reads like a clw bug. The extra-infra
+/// journeys route it through `soft_skip` (they never require-fail).
+///
+/// (Verified 2026-07-17: prod returned 503 "audit closed" when the audit sink was
+/// down; before this the suite hard-panicked on the catch-all arm, misattributing a
+/// backend outage to clw.)
+fn is_backend_unavailable(err: &ClwError) -> bool {
+    matches!(err, ClwError::Http { status, .. } if matches!(*status, 502..=504))
+}
+
 /// Best-effort delete of an AC ref this suite created. Ignores every error
 /// (idempotent / 405-501 / transient). NEVER touches anything but the given key.
 async fn cleanup(client: &HttpClient, ref_key: &Digest) {
@@ -220,6 +241,11 @@ async fn dedup_across_names_reuses_the_live_cas() {
         Err(e) if is_capability_unavailable(&e) => {
             return skip_or_fail("snapshot A hit 405/501 — dedup journey skipped")
         }
+        Err(e) if is_backend_unavailable(&e) => {
+            return skip_or_fail(&format!(
+                "snapshot A hit backend-unavailable ({e}) — dedup journey skipped"
+            ))
+        }
         Err(e) => panic!("snapshot A failed: {e}"),
     };
     assert!(a.chunks_uploaded > 0, "first snapshot must upload chunks");
@@ -234,6 +260,12 @@ async fn dedup_across_names_reuses_the_live_cas() {
         Err(e) if is_capability_unavailable(&e) => {
             cleanup(&client, &key_a).await;
             return skip_or_fail("snapshot B hit 405/501 — dedup journey skipped");
+        }
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client, &key_a).await;
+            return skip_or_fail(&format!(
+                "snapshot B hit backend-unavailable ({e}) — dedup journey skipped"
+            ));
         }
         Err(e) => {
             cleanup(&client, &key_a).await;
@@ -283,6 +315,11 @@ async fn warm_cache_second_hydrate_serves_locally() {
         if is_capability_unavailable(&e) {
             return skip_or_fail("snapshot hit 405/501 — warm-cache journey skipped");
         }
+        if is_backend_unavailable(&e) {
+            return skip_or_fail(&format!(
+                "snapshot hit backend-unavailable ({e}) — warm-cache journey skipped"
+            ));
+        }
         panic!("snapshot failed: {e}");
     }
 
@@ -297,6 +334,12 @@ async fn warm_cache_second_hydrate_serves_locally() {
             cleanup(&client, &key).await;
             return skip_or_fail("hydrate #1 hit 405/501 — warm-cache journey skipped");
         }
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client, &key).await;
+            return skip_or_fail(&format!(
+                "hydrate #1 hit backend-unavailable ({e}) — warm-cache journey skipped"
+            ));
+        }
         Err(e) => {
             cleanup(&client, &key).await;
             panic!("hydrate #1 failed: {e}");
@@ -308,9 +351,22 @@ async fn warm_cache_second_hydrate_serves_locally() {
     );
 
     let (_dest2_dir, dest2) = fresh_dest("h2");
-    let warm = clw_hydrate::hydrate(&dest2, &client, &hcache, &hopts)
-        .await
-        .expect("hydrate #2 (warm cache) failed");
+    // The "warm" hydrate still resolves the AC ref (name→root) over the wire — only
+    // the CAS blobs are locally cached — so a backend 5xx can still land here; classify
+    // it rather than panic (and clean up the ref we own on either failure).
+    let warm = match clw_hydrate::hydrate(&dest2, &client, &hcache, &hopts).await {
+        Ok(r) => r,
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client, &key).await;
+            return skip_or_fail(&format!(
+                "hydrate #2 hit backend-unavailable ({e}) — warm-cache journey skipped"
+            ));
+        }
+        Err(e) => {
+            cleanup(&client, &key).await;
+            panic!("hydrate #2 (warm cache) failed: {e}");
+        }
+    };
     assert!(
         warm.bytes_from_cache > 0,
         "the second hydrate must serve bytes from the now-warm cache (got 0)"
@@ -360,6 +416,11 @@ async fn team_two_identities_share_the_tenant_cas() {
         Err(e) if is_capability_unavailable(&e) => {
             return skip_or_fail("team: A snapshot hit 405/501 — skipped")
         }
+        Err(e) if is_backend_unavailable(&e) => {
+            return skip_or_fail(&format!(
+                "team: A snapshot hit backend-unavailable ({e}) — skipped"
+            ))
+        }
         Err(e) => panic!("team: A snapshot failed: {e}"),
     };
 
@@ -372,6 +433,12 @@ async fn team_two_identities_share_the_tenant_cas() {
         Err(e) if is_capability_unavailable(&e) => {
             cleanup(&client_a, &key).await;
             return skip_or_fail("team: B hydrate hit 405/501 — skipped");
+        }
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client_a, &key).await;
+            return skip_or_fail(&format!(
+                "team: B hydrate hit backend-unavailable ({e}) — skipped"
+            ));
         }
         Err(e) => {
             cleanup(&client_a, &key).await;
@@ -387,9 +454,23 @@ async fn team_two_identities_share_the_tenant_cas() {
     // B snapshots the SAME content under its own name → dedups against A's upload.
     let (_cache_b2_dir, cache_b2) = fresh_cache();
     let opts_b = clw_snapshot::SnapshotOptions::new(&name_b);
-    let b = clw_snapshot::snapshot(src.path(), &client_b, &cache_b2, &opts_b)
-        .await
-        .expect("team: B snapshot failed");
+    let b = match clw_snapshot::snapshot(src.path(), &client_b, &cache_b2, &opts_b).await {
+        Ok(r) => r,
+        // Clean up BOTH refs on failure — A's ref is live here; B's key_b delete is a
+        // harmless no-op if B's snapshot never created it.
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client_a, &key).await;
+            cleanup(&client_b, &key_b).await;
+            return skip_or_fail(&format!(
+                "team: B snapshot hit backend-unavailable ({e}) — skipped"
+            ));
+        }
+        Err(e) => {
+            cleanup(&client_a, &key).await;
+            cleanup(&client_b, &key_b).await;
+            panic!("team: B snapshot failed: {e}");
+        }
+    };
     assert!(
         b.chunks_uploaded < b.chunks_total,
         "B's snapshot of shared content must dedup against A's CAS upload ({} < {})",
@@ -485,6 +566,9 @@ async fn content_pinning_hydrate_by_digest_is_byte_identical() {
     let snap = match clw_snapshot::snapshot(src.path(), &client, &cache, &opts).await {
         Ok(r) => r,
         Err(e) if is_capability_unavailable(&e) => return soft_skip("snapshot 405/501"),
+        Err(e) if is_backend_unavailable(&e) => {
+            return soft_skip(&format!("snapshot backend-unavailable ({e})"))
+        }
         Err(e) => panic!("content-pin snapshot: {e}"),
     };
 
@@ -496,6 +580,10 @@ async fn content_pinning_hydrate_by_digest_is_byte_identical() {
         Err(e) if is_capability_unavailable(&e) => {
             cleanup(&client, &key).await;
             return soft_skip("hydrate 405/501");
+        }
+        Err(e) if is_backend_unavailable(&e) => {
+            cleanup(&client, &key).await;
+            return soft_skip(&format!("hydrate backend-unavailable ({e})"));
         }
         Err(e) => {
             cleanup(&client, &key).await;
@@ -551,12 +639,12 @@ async fn concurrent_distinct_snapshots_share_cas_without_corruption() {
     let results = [r0, r1, r2, r3];
     if results
         .iter()
-        .any(|r| matches!(r, Err(e) if is_capability_unavailable(e)))
+        .any(|r| matches!(r, Err(e) if is_capability_unavailable(e) || is_backend_unavailable(e)))
     {
         for n in &names {
             cleanup(&client, &clw_types::ref_key(n)).await;
         }
-        return soft_skip("concurrent snapshot 405/501");
+        return soft_skip("concurrent snapshot 405/501 or backend-unavailable (5xx)");
     }
     let roots: Vec<Digest> = results
         .iter()
@@ -591,7 +679,7 @@ async fn concurrent_distinct_snapshots_share_cas_without_corruption() {
             expected0,
             "concurrent snapshot #0 must hydrate back byte-identical from the real CAS"
         ),
-        Err(e) if is_capability_unavailable(&e) => {}
+        Err(e) if is_capability_unavailable(&e) || is_backend_unavailable(&e) => {}
         Err(e) => {
             for n in &names {
                 cleanup(&client, &clw_types::ref_key(n)).await;
@@ -643,6 +731,9 @@ async fn cred_ticket_redeems_against_the_real_fabric() {
     match AcTransport::list_refs(&client).await {
         Ok(_) => {}
         Err(e) if is_capability_unavailable(&e) => return soft_skip("list_refs 405/501"),
+        Err(e) if is_backend_unavailable(&e) => {
+            return soft_skip(&format!("list_refs backend-unavailable ({e})"))
+        }
         Err(e) => panic!("the redeemed CAS PAT failed to authenticate against prod: {e}"),
     }
 }
@@ -678,6 +769,9 @@ async fn metered_writes_hit_the_402_quota_wall() {
                 break;
             }
             Err(e) if is_capability_unavailable(&e) => return soft_skip("put 405/501"),
+            Err(e) if is_backend_unavailable(&e) => {
+                return soft_skip(&format!("put backend-unavailable ({e})"))
+            }
             Err(e) => panic!("unexpected error before the 402 wall: {e}"),
         }
     }
@@ -701,6 +795,12 @@ async fn metered_writes_hit_the_402_quota_wall() {
 /// Soft-skips without a dedicated wipeable tenant; and REFUSES to run when that
 /// tenant equals the primary `CLW_TENANT` (defense-in-depth — a misconfigured secret
 /// must never wipe the shared/sandbox tenant).
+///
+/// Scope note: the two `clw`-binary steps (`prune`/`erase`) assert on the child's exit
+/// status, so a backend 5xx there surfaces as a failed assertion (the child prints the
+/// real error), not a `soft_skip`. That is acceptable — this journey is ATTENDED /
+/// manual-only and NOT on the daily canary; the `ClwError` seed steps above DO classify
+/// a 5xx as backend-unavailable.
 #[cfg(unix)]
 #[tokio::test]
 async fn destructive_prune_then_erase_lifecycle_on_a_throwaway_tenant() {
@@ -746,16 +846,25 @@ async fn destructive_prune_then_erase_lifecycle_on_a_throwaway_tenant() {
         if is_capability_unavailable(&e) {
             return soft_skip("seed snapshot 405/501");
         }
+        if is_backend_unavailable(&e) {
+            return soft_skip(&format!("seed snapshot backend-unavailable ({e})"));
+        }
         panic!("seed live snapshot: {e}");
     }
-    let orphan = clw_snapshot::snapshot(
+    let orphan = match clw_snapshot::snapshot(
         src_o.path(),
         &client,
         &co,
         &clw_snapshot::SnapshotOptions::new(&orphan_name),
     )
     .await
-    .expect("seed orphan snapshot");
+    {
+        Ok(r) => r,
+        Err(e) if is_backend_unavailable(&e) => {
+            return soft_skip(&format!("seed orphan snapshot backend-unavailable ({e})"))
+        }
+        Err(e) => panic!("seed orphan snapshot: {e}"),
+    };
     // Orphan the second snapshot: delete its ref → its unique manifest + chunks are
     // now unreferenced. (Its content is distinct from the live snapshot, so nothing
     // it uploaded is shared/live.)
