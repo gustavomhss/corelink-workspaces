@@ -74,6 +74,9 @@ fn main() {
             journeys.push(guarded("J6-errors", || {
                 journeys::j6_errors::run(&bin, &creds)
             }));
+            journeys.push(guarded("J7-security", || {
+                journeys::j7_security::run(&bin, &creds)
+            }));
         }
         None => {
             eprintln!(
@@ -103,6 +106,11 @@ fn main() {
             journeys.push(journeys::skipped_journey(
                 "J6-errors",
                 "inducible failures return the right exit code + actionable message",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J7-security",
+                "redaction, plaintext refusal, consent gates — observed via the binary",
                 need,
             ));
         }
