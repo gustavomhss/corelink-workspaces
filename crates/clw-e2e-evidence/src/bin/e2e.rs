@@ -142,6 +142,10 @@ fn main() {
     // Adversarial (J9): needs no creds — the real binary vs a local hostile backend.
     journeys.push(adversarial(&bin));
 
+    // Efficiency (JE): needs no creds — a behaviour probe on the wire (divergent
+    // re-snapshot must fail-fast on the ref, not upload the whole workspace first).
+    journeys.push(guarded("JE-efficiency", || efficiency(&bin)));
+
     let meta = Meta {
         title: "clw — user-simulating E2E evidence".to_string(),
         clw_version,
@@ -493,6 +497,96 @@ fn adversarial(bin: &Path) -> Journey {
         j.push(s);
     }
 
+    let _ = std::fs::remove_dir_all(&workdir);
+    j
+}
+
+/// JE — an EFFICIENCY behaviour probe (story-driven, evaluated on the wire, not by exit
+/// code). The story: a teammate re-snapshots a name that ALREADY exists with different
+/// content, without `--force`. The right answer is 409 — but the question this asks is
+/// *how* clw gets there: does it upload the whole divergent workspace to the CAS BEFORE
+/// discovering the ref is occupied? Those uploads are wasted bandwidth + orphaned blobs.
+/// Needs no creds — a recording backend that occupies the ref and counts CAS PUTs.
+fn efficiency(bin: &Path) -> Journey {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut j = Journey::new(
+        "JE-efficiency",
+        "a divergent re-snapshot (no --force) must fail-fast on the ref, not upload the whole workspace first",
+        "recording backend (loopback http)",
+    );
+    let workdir = std::env::temp_dir().join(format!("clw-e2e-eff-{}", std::process::id()));
+    let src = workdir.join("src");
+    std::fs::create_dir_all(&src).ok();
+    // Several DISTINCT files → several distinct chunks, so "wasted uploads" is visibly
+    // plural, not a single blob.
+    const FILES: usize = 6;
+    for i in 0..FILES {
+        std::fs::write(
+            src.join(format!("f{i}.txt")),
+            format!("divergent-content-file-{i}-{}\n", "x".repeat(64 + i)),
+        )
+        .ok();
+    }
+    let src_s = src.to_string_lossy().into_owned();
+    let tenant = "00000000-0000-4000-8000-00000000dead";
+    let fake = Secret::new("core-e2e-efficiency-fake-token");
+    let deadline: &[(&str, &str, bool)] = &[("CLW_OP_DEADLINE_SECS", "10", false)];
+
+    let h = rt.block_on(Hostile::occupied_ref_conflict());
+    let r = Runner::new(
+        bin,
+        h.endpoint(),
+        "recording:occupied-ref",
+        tenant,
+        fake,
+        workdir.join("cache"),
+    );
+    let args = [
+        "--json",
+        "snapshot",
+        &src_s,
+        "--name",
+        "build-x-already-taken",
+    ];
+    let mut s = r.step(
+        "snapshot a name already occupied by different content (no --force)",
+        &args,
+        deadline,
+        ExpectExit::NonZero,
+    );
+    let cas_puts = rt.block_on(h.cas_puts());
+    // The create-only guard must still fire (the behaviour is CORRECT — it rejects).
+    s.observe(
+        Observation::behavior(
+            "the divergent re-snapshot is still rejected (create-only guard holds)",
+            "fixing the efficiency must NOT weaken the guardrail — a divergent write must never silently win",
+            )
+        .check(
+            s.exit_code.map(|c| c != 0).unwrap_or(false),
+            format!("exit {:?}", s.exit_code),
+        ),
+    );
+    // The EFFICIENCY assertion: zero blobs uploaded before the 409. clw knows the root
+    // after LOCAL chunking, so it can GET the ref and fail-fast without uploading. Before
+    // the pre-flight-ref fix this is RED (it uploads all N chunks + the manifest first);
+    // after the fix it is GREEN (0 CAS PUTs). This is the regression guard.
+    s.observe(
+        Observation::behavior(
+            "clw uploads ZERO blobs before discovering the ref conflict (fail-fast, no orphans)",
+            "uploading a whole divergent workspace only to 409 wastes bandwidth AND orphans blobs in the CAS until a prune — every conflicting write on a shared name pays this",
+        )
+        .check(
+            cas_puts == 0,
+            format!(
+                "clw issued {cas_puts} CAS blob upload(s) before the 409 (want 0; {FILES} files staged)"
+            ),
+        ),
+    );
+    j.push(s);
     let _ = std::fs::remove_dir_all(&workdir);
     j
 }

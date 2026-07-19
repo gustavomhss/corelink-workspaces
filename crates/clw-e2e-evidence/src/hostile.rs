@@ -112,4 +112,79 @@ impl Hostile {
             .await;
         Hostile { server }
     }
+
+    /// The AC ref key is ALREADY OCCUPIED (by different content), but the CAS accepts
+    /// every blob. Concretely: HEAD/GET on a CAS blob → 404 (absent → clw uploads it),
+    /// PUT on a CAS blob → 201 (accepted), GET on the AC ref → 200 with a non-empty body
+    /// (the key is occupied), PUT on the AC ref → 409 (create-only reject).
+    ///
+    /// This reproduces the "a teammate re-snapshots a name that already exists with
+    /// DIFFERENT content, without --force" story. Evidence target (a BEHAVIOUR, not a
+    /// status): how many blobs does clw PUT to the CAS *before* it discovers the ref is
+    /// occupied and 409s? Those uploads are wasted work + orphaned blobs. `cas_puts()`
+    /// counts them from the server's own request log.
+    ///
+    /// (The ref body is deliberately opaque: clw treats an unparseable-but-present ref
+    /// as "occupied, lineage unknown" — raw_present=true, no no-op short-circuit — so a
+    /// create-only PUT still 409s. No clw-internal serialization is needed here.)
+    pub async fn occupied_ref_conflict() -> Hostile {
+        let server = MockServer::start().await;
+        // AC ref GET → occupied (opaque body). High priority so it wins over the CAS
+        // catch-alls for the /v1/ac/ path.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/v1/ac/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("occupied-by-different-content"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // AC ref PUT → 409 create-only conflict.
+        Mock::given(method("PUT"))
+            .and(path_regex(r"/v1/ac/"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("already exists with different content"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // AC ref DELETE (only reached under --force) → accept.
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"/v1/ac/"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        // CAS blob HEAD/GET → 404 (absent → clw will upload).
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        // CAS blob PUT → 201 accepted. These are the (wasted) uploads we count.
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Hostile { server }
+    }
+
+    /// How many blobs clw PUT to the CAS (`PUT /v1/cas/…`) — the count of chunk +
+    /// manifest uploads. Under [`occupied_ref_conflict`], every one of these happened
+    /// BEFORE the ref 409, so it is wasted work + an orphaned blob.
+    pub async fn cas_puts(&self) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r: &&Request| {
+                r.method.to_string().eq_ignore_ascii_case("PUT")
+                    && r.url.path().contains("/v1/cas/")
+            })
+            .count()
+    }
 }

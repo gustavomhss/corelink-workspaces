@@ -146,6 +146,16 @@ fn guard_small_file_size(f: &WalkedFile, read_len: usize) -> Result<()> {
 /// so two concurrent tasks for the same digest can't both proceed; whichever
 /// wins the insert does the upload (and it completes before the snapshot moves
 /// on to the manifest, since all chunk tasks are awaited first).
+/// Shared, cross-file upload state threaded through the snapshot pipeline: the GLOBAL
+/// upload semaphore (bounds in-flight uploads across all files), the per-run chunk-digest
+/// dedup set, and the uploaded-chunk counter. Bundled so the pipeline fns stay under the
+/// argument budget and the "shared state" reads as one thing.
+struct Uploads<'a> {
+    sem: &'a Semaphore,
+    seen: &'a Mutex<HashSet<Digest>>,
+    counter: &'a AtomicU64,
+}
+
 async fn upload_chunk<C>(
     client: &C,
     cache: &LocalCache,
@@ -184,7 +194,11 @@ where
     }
 }
 
-/// Chunk one file and upload its chunks, returning its manifest [`Entry::File`].
+/// Chunk one file and (when `upload`) upload its chunks, returning its manifest
+/// [`Entry::File`]. With `upload == false` (DRY), it still reads + chunks the file to
+/// produce the exact same `Entry` (so the manifest digest is identical) but issues NO
+/// CAS round-trips — used to decide no-op-vs-409 on an occupied ref without uploading a
+/// workspace that will be rejected create-only.
 ///
 /// H1 (size truth): the entry's `size` is the sum of the `ChunkRef.size`s that
 /// were ACTUALLY produced from the read bytes — NOT the walk-time metadata size.
@@ -199,10 +213,9 @@ where
 async fn process_file<C>(
     client: &C,
     cache: &LocalCache,
-    sem: &Semaphore,
-    seen: &Mutex<HashSet<Digest>>,
-    counter: &AtomicU64,
+    up: &Uploads<'_>,
     concurrency: usize,
+    upload: bool,
     f: WalkedFile,
 ) -> Result<Entry>
 where
@@ -229,21 +242,27 @@ where
         // Upload THIS file's chunks; each contends on the GLOBAL semaphore, so
         // the real parallelism ceiling is `sem`'s permit count regardless of
         // how many files are in flight. `data` drops at the end of the block.
-        let results: Vec<Result<()>> = stream::iter(chunks_raw.iter().map(|c| {
-            let bytes = data[c.offset as usize..(c.offset + c.len) as usize].to_vec();
-            let digest = c.digest;
-            async move {
-                if upload_chunk(client, cache, sem, seen, &digest, bytes).await? {
-                    counter.fetch_add(1, Ordering::Relaxed);
+        // DRY (`!upload`): a divergent/no-op re-snapshot on an occupied name needs
+        // only the manifest DIGEST (a pure function of these chunk_refs) to decide
+        // no-op vs 409 — it will not write the ref, so uploading is wasted work +
+        // orphaned blobs. We compute the digests and skip every CAS round-trip.
+        if upload {
+            let results: Vec<Result<()>> = stream::iter(chunks_raw.iter().map(|c| {
+                let bytes = data[c.offset as usize..(c.offset + c.len) as usize].to_vec();
+                let digest = c.digest;
+                async move {
+                    if upload_chunk(client, cache, up.sem, up.seen, &digest, bytes).await? {
+                        up.counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(())
                 }
-                Ok(())
+            }))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+            for r in results {
+                r?;
             }
-        }))
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-        for r in results {
-            r?;
         }
 
         chunk_refs
@@ -262,8 +281,10 @@ where
                 digest: sc.digest,
                 size: sc.len,
             });
-            if upload_chunk(client, cache, sem, seen, &sc.digest, sc.data).await? {
-                counter.fetch_add(1, Ordering::Relaxed);
+            // DRY (`!upload`): compute the digest (already done above) but skip the
+            // CAS round-trip — see the small-file branch for why.
+            if upload && upload_chunk(client, cache, up.sem, up.seen, &sc.digest, sc.data).await? {
+                up.counter.fetch_add(1, Ordering::Relaxed);
             }
         }
         chunk_refs
@@ -529,6 +550,35 @@ where
         }
     }
 
+    // --- 2b. Pre-flight ref read (BEFORE any upload) ------------------------
+    //
+    // Read the existing ref up front so we can decide whether we will WRITE it at
+    // all. If the name is already occupied and the caller did NOT pass `--force`, the
+    // only outcomes are a no-op (identical content) or a create-only 409 (divergent) —
+    // NEITHER writes the ref, so NEITHER needs an upload. Deciding this now lets the
+    // chunk pipeline run DRY (digests only, no CAS round-trips), so a rejected divergent
+    // re-snapshot no longer uploads — and orphans — the entire workspace before the 409.
+    // (Absent ref OR `--force` ⇒ we will write the ref ⇒ we must upload.)
+    //
+    // Capture RAW presence separately from a successful parse: a present-but-corrupt ref
+    // still OCCUPIES the create-only AC key (so `--force` must delete it on RAW presence),
+    // while the parsed `existing` drives the no-op short-circuit and parent lineage.
+    let rk = ref_key_in(opts.ref_domain, &opts.workspace_name);
+    let raw_present;
+    let existing: Option<RefRecord> = match AcTransport::get(client, &rk).await? {
+        Some(bytes) => {
+            raw_present = true;
+            RefRecord::from_bytes(&bytes).ok() // corrupt → treat as absent for lineage
+        }
+        None => {
+            raw_present = false;
+            None
+        }
+    };
+    // We will write the ref (and therefore must upload) only when the key is free or we
+    // are force-replacing it. Otherwise the pipeline runs DRY.
+    let will_upload = !raw_present || opts.force;
+
     // Process files (and pass symlinks/dirs through) concurrently, tagging each
     // with its walk index so we can restore walk order for the manifest.
     let indexed: Vec<(usize, WalkedEntry)> = representable.into_iter().enumerate().collect();
@@ -538,9 +588,14 @@ where
             let seen = Arc::clone(&seen);
             let counter = Arc::clone(&uploaded_counter);
             async move {
+                let up = Uploads {
+                    sem: &sem,
+                    seen: &seen,
+                    counter: &counter,
+                };
                 let entry = match we {
                     WalkedEntry::File(f) => {
-                        process_file(client, cache, &sem, &seen, &counter, concurrency, f).await?
+                        process_file(client, cache, &up, concurrency, will_upload, f).await?
                     }
                     WalkedEntry::Symlink { rel, target } => Entry::Symlink { path: rel, target },
                     WalkedEntry::EmptyDir { rel } => Entry::Dir { path: rel },
@@ -610,7 +665,7 @@ where
         "snapshot chunk upload complete"
     );
 
-    // --- 5. Upload manifest -------------------------------------------------
+    // --- 5. Manifest digest + no-op decision (ref was pre-read in step 2b) ---
     let manifest_bytes = manifest.canonical_bytes()?;
     // FIX F2: reject an oversized manifest BEFORE the upload, so the failure is a
     // clear "too many entries" error instead of an opaque 413 from the server.
@@ -618,36 +673,13 @@ where
     let manifest_digest = Digest::of_bytes(&manifest_bytes);
     let manifest_size = manifest_bytes.len() as u64;
 
-    let already_there = CasTransport::exists(client, &manifest_digest).await?;
-    if !already_there {
-        CasTransport::put(client, &manifest_digest, manifest_bytes).await?;
-    }
-
-    // --- 6. Read existing ref (parent lineage + idempotency) ----------------
-    let rk = ref_key_in(opts.ref_domain, &opts.workspace_name);
-    // Capture RAW presence separately from a successful parse. A present-but-corrupt
-    // ref still OCCUPIES the create-only AC key, so a force-replace must delete it on
-    // RAW presence — gating the delete on `existing.is_some()` (a successful parse)
-    // would skip the delete for a corrupt ref and the create-only PUT below would 409,
-    // making `--force` unable to recover a corrupt-but-present ref. `existing` (the
-    // parsed record) is still used for the no-op short-circuit and the parent lineage.
-    let raw_present;
-    let existing: Option<RefRecord> = match AcTransport::get(client, &rk).await? {
-        Some(bytes) => {
-            raw_present = true;
-            RefRecord::from_bytes(&bytes).ok() // corrupt → treat as absent for lineage
-        }
-        None => {
-            raw_present = false;
-            None
-        }
-    };
-
-    // Idempotent no-op: the name already points at this EXACT root, so there is
+    // Idempotent no-op: the pre-read ref already points at this EXACT root, so there is
     // nothing to write. This makes "save again, nothing changed" (and a runner's
-    // idempotent re-snapshot per job) a clean SUCCESS instead of the create-only
-    // AC PUT's 409. Blobs were still re-verified/deduped above (chunks_uploaded
-    // reflects that), so the content is provably present.
+    // idempotent re-snapshot per job) a clean SUCCESS instead of the create-only AC
+    // PUT's 409. On the DRY path (occupied ref, no `--force`) `chunks_uploaded` is 0: we
+    // did not re-upload, because the ref committing to this exact root is itself the
+    // proof the content was durably stored. (A paranoid re-verify/heal against external
+    // CAS deletion is out of the default fast path; `--force` re-uploads in full.)
     if let Some(ex) = &existing {
         if ex.root == manifest_digest {
             return Ok(SnapshotReport {
@@ -661,6 +693,33 @@ where
                 unchanged: true,
             });
         }
+    }
+
+    // Occupied ref, no `--force`, and NOT a no-op ⇒ divergent (or corrupt-occupied).
+    // Enforce create-only CLIENT-SIDE: refuse WITHOUT uploading and WITHOUT attempting
+    // the ref write. We do NOT gamble on the server's 409 — relying on it would (a) waste
+    // the entire workspace upload first (proven: a 6-file divergent re-snapshot uploaded
+    // 7 blobs before the 409), and (b) leave the ref DANGLING against a backend that
+    // ALLOWS the overwrite, since the DRY pipeline skipped the chunk uploads. Returning
+    // the create-only guard here is both the efficient AND the safe choice: no orphans,
+    // no dangling ref, and the same 409 shape so the CLI renders the identical
+    // "already exists — re-run with --force" guidance. `--force` (⇒ `will_upload`) takes
+    // the real upload+replace path below.
+    if !will_upload {
+        return Err(ClwError::Http {
+            status: 409,
+            context: format!(
+                "ref '{}' already exists with different content — create-only \
+                 (re-run with --force to replace)",
+                opts.workspace_name
+            ),
+        });
+    }
+
+    // --- 6. Upload the manifest (we WILL write the ref) ---------------------
+    let already_there = CasTransport::exists(client, &manifest_digest).await?;
+    if !already_there {
+        CasTransport::put(client, &manifest_digest, manifest_bytes).await?;
     }
 
     // --- 7. Write new ref record --------------------------------------------
@@ -1048,7 +1107,12 @@ mod tests {
         // Modify small.txt only — its chunk is new; big.bin chunks unchanged.
         std::fs::write(root.join("small.txt"), b"changed content here!").unwrap();
 
-        let report2 = snapshot(root, &client, &cache, &opts).await.unwrap();
+        // Replacing an occupied name with DIFFERENT content is create-only: it needs
+        // `--force` (clw now refuses a divergent re-snapshot without it, client-side —
+        // see `divergent_resnapshot_without_force_refuses_without_uploading`). With
+        // `--force` we take the real upload+replace path and assert the delta + lineage.
+        let opts_force = SnapshotOptions::new("ws-changed").with_force(true);
+        let report2 = snapshot(root, &client, &cache, &opts_force).await.unwrap();
 
         // Root must differ (content changed)
         assert_ne!(report2.root, report1.root);
@@ -1075,6 +1139,60 @@ mod tests {
             rec.parent,
             Some(report1.root),
             "parent should point to first snapshot root"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3b: a divergent re-snapshot WITHOUT --force is refused client-side,
+    // uploading NOTHING (the efficiency + no-orphans guarantee; the binary-level
+    // guard is the `JE-efficiency` evidence probe). Regression for the
+    // upload-then-409 waste.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // uses build_tree (unix symlink fixture)
+    #[tokio::test]
+    async fn divergent_resnapshot_without_force_refuses_without_uploading() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        build_tree(root);
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let opts = SnapshotOptions::new("ws-occupied");
+
+        // First snapshot establishes the ref and uploads its blobs.
+        let _report1 = snapshot(root, &client, &cache, &opts).await.unwrap();
+        let cas_after_first = client.cas.lock().await.len();
+        let rk = ref_key("ws-occupied");
+        let ref_after_first = client.ac.lock().await.get(&rk).cloned();
+
+        // Change content, re-snapshot the SAME name WITHOUT --force.
+        std::fs::write(root.join("small.txt"), b"divergent content!").unwrap();
+        let err = match snapshot(root, &client, &cache, &opts).await {
+            Ok(_) => panic!("a divergent re-snapshot without --force must be refused"),
+            Err(e) => e,
+        };
+
+        // (1) Refused with the create-only 409 (so the CLI renders --force guidance).
+        match err {
+            ClwError::Http { status, .. } => {
+                assert_eq!(status, 409, "a divergent re-snapshot must be a 409");
+            }
+            other => panic!("expected ClwError::Http 409, got {other:?}"),
+        }
+        // (2) ZERO blobs uploaded — the CAS is exactly what the first snapshot left
+        // (a new small.txt chunk would bump the count; it must NOT).
+        assert_eq!(
+            client.cas.lock().await.len(),
+            cas_after_first,
+            "a refused divergent re-snapshot must upload NOTHING (no orphaned blobs)"
+        );
+        // (3) The existing ref is untouched.
+        assert_eq!(
+            client.ac.lock().await.get(&rk).cloned(),
+            ref_after_first,
+            "a refused divergent re-snapshot must not modify the existing ref"
         );
     }
 
@@ -1292,13 +1410,17 @@ mod tests {
             .await
             .insert(rk, b"this is not a valid RefRecord".to_vec());
 
-        // Without --force, the create-only PUT would 409 (delete is skipped).
+        // Without --force, a present-but-corrupt ref is occupied ⇒ clw refuses
+        // client-side with the canonical create-only 409 (the same `ClwError::Http`
+        // the real server returns, which the CLI maps to the --force guidance), WITHOUT
+        // uploading. (Previously this relied on the server's PUT 409, a stringy
+        // `Transport("409")`; the client-side guard is both safer and canonical.)
         let opts_noforce = SnapshotOptions::new("ws-corrupt");
         let res = snapshot(root, &client, &cache, &opts_noforce)
             .await
             .map(|_| ()); // discard the non-Debug SnapshotReport so we can match cleanly
         match res {
-            Err(ClwError::Transport(m)) if m.contains("409") => {}
+            Err(ClwError::Http { status: 409, .. }) => {}
             other => panic!("without --force a corrupt-but-present ref must 409, got: {other:?}"),
         }
 
@@ -1355,6 +1477,11 @@ mod tests {
         let sem = Semaphore::new(4);
         let seen = Mutex::new(HashSet::new());
         let counter = AtomicU64::new(0);
+        let up = Uploads {
+            sem: &sem,
+            seen: &seen,
+            counter: &counter,
+        };
 
         let tmp = TempDir::new().unwrap();
 
@@ -1367,7 +1494,7 @@ mod tests {
             mode: 0o644,
             size: 1, // WRONG on purpose (real is 14); still <= threshold → small path
         };
-        let entry = process_file(&client, &cache, &sem, &seen, &counter, 4, wf_small)
+        let entry = process_file(&client, &cache, &up, 4, true, wf_small)
             .await
             .unwrap();
         if let Entry::File { size, chunks, .. } = entry {
@@ -1389,7 +1516,7 @@ mod tests {
             mode: 0o644,
             size: STREAM_THRESHOLD_BYTES + 1, // WRONG (real is 100) → forces streaming path
         };
-        let entry = process_file(&client, &cache, &sem, &seen, &counter, 4, wf_big)
+        let entry = process_file(&client, &cache, &up, 4, true, wf_big)
             .await
             .unwrap();
         if let Entry::File { size, chunks, .. } = entry {
@@ -1417,6 +1544,11 @@ mod tests {
         let sem = Semaphore::new(4);
         let seen = Mutex::new(HashSet::new());
         let counter = AtomicU64::new(0);
+        let up = Uploads {
+            sem: &sem,
+            seen: &seen,
+            counter: &counter,
+        };
         let tmp = TempDir::new().unwrap();
 
         let grown = tmp.path().join("grown.bin");
@@ -1427,7 +1559,7 @@ mod tests {
             mode: 0o644,
             size: 1, // WRONG-small on purpose → selects the in-memory fast path
         };
-        let err = process_file(&client, &cache, &sem, &seen, &counter, 4, wf)
+        let err = process_file(&client, &cache, &up, 4, true, wf)
             .await
             .unwrap_err();
         match err {
