@@ -24,6 +24,9 @@ clap = { workspace = true, features = ["env"] }
 # to clap's 4.x line so the generated completions track the derived CLI surface.
 clap_complete = "4"
 tokio = { workspace = true }
+# Bounded-concurrent record fetches for `ls --all` (avoids the N+1 sequential
+# per-ref round-trips). Same 0.3 line already vetted via clw-snapshot.
+futures = "0.3"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

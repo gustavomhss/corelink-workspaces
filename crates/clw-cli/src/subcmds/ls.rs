@@ -10,6 +10,7 @@
 use clap::Args;
 use clw_client::HttpClient;
 use clw_types::{ref_key_in, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
+use futures::stream::{self, StreamExt};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -140,46 +141,72 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // them separately and never warn about them (they would otherwise flood the listing
     // and grow with every `clw run`).
     let mut run_cache = 0usize;
-    for key in &keys {
-        // Fetch this record. AUTH (401) is fatal — it means the WHOLE listing is
-        // unauthorized, so abort (map it to the actionable message first). Any
-        // OTHER per-record error (a transient transport blip) is TOLERATED the
-        // same way a corrupt record is: skip it, record it (named) for the summary +
-        // --json, and keep listing the rest. A ref deleted between enumeration and
-        // fetch (Ok(None)) simply drops out of the list.
-        let fetched = match AcTransport::get(&client, key).await {
-            Ok(b) => b,
-            Err(ClwError::Auth) => return Err(map_auth_error(ClwError::Auth)),
-            Err(e) => {
-                let key_hex = key.to_hex();
-                // Diagnostic channel only (shown with -v); the end-of-listing summary +
-                // --json carry it to the user — NO per-record stderr line (avoids flooding
-                // a large/degraded tenant and the duplicate tracing+eprintln print).
-                tracing::warn!(ref_key = %key_hex, error = %e, "skipping ref record after a transport error");
-                skipped.push((key_hex, e.to_string()));
-                continue;
+
+    // Fetch every record to recover its name/root. The keys are INDEPENDENT, so we fetch
+    // with BOUNDED CONCURRENCY instead of one-at-a-time. The old sequential loop paid N
+    // sequential round-trips — on a real 46-ref tenant that was ~46 back-to-back requests
+    // (and with a ~1s/request backend, ~46 s). The client's AIMD Governor still caps the
+    // true in-flight count and applies 429 backpressure, so this is a latency win, not a
+    // thundering herd. Results are re-sorted to enumeration order for a deterministic list.
+    const LS_FETCH_CONCURRENCY: usize = 16;
+
+    // Per-key outcome. `Box<RefRecord>` keeps the enum small (clippy large-variant).
+    enum Fetched {
+        Row(Box<RefRecord>),
+        Skip(String, String), // (key_hex, error) — corrupt record OR transient transport blip
+        RunCache,             // a `clw run` memo record legitimately sharing the keyspace
+        Gone,                 // Ok(None): deleted between enumeration and fetch
+        Auth,                 // 401: the WHOLE listing is unauthorized → abort
+    }
+
+    let mut indexed: Vec<(usize, Fetched)> = stream::iter(keys.iter().enumerate().map(
+        |(i, key)| {
+            let client = &client;
+            async move {
+                let out = match AcTransport::get(client, key).await {
+                    Ok(Some(bytes)) => match RefRecord::from_bytes(&bytes) {
+                        Ok(record) => Fetched::Row(Box::new(record)),
+                        // A `clw run` memo record is NOT corrupt — count it, stay silent.
+                        Err(_) if clw_run::is_run_record(&bytes) => {
+                            tracing::debug!(ref_key = %key.to_hex(), "skipping run-cache entry in ref listing");
+                            Fetched::RunCache
+                        }
+                        // Genuinely corrupt/unparseable: diagnostic warn (shown with -v) +
+                        // structured --json error + summary. No per-record stderr flood.
+                        Err(e) => {
+                            tracing::warn!(ref_key = %key.to_hex(), error = %e, "skipping unparseable ref record");
+                            Fetched::Skip(key.to_hex(), e.to_string())
+                        }
+                    },
+                    Ok(None) => Fetched::Gone,
+                    Err(ClwError::Auth) => Fetched::Auth,
+                    // A transient per-record transport blip is TOLERATED like a corrupt
+                    // record (read-only listing must not fail wholesale on one blip).
+                    Err(e) => {
+                        tracing::warn!(ref_key = %key.to_hex(), error = %e, "skipping ref record after a transport error");
+                        Fetched::Skip(key.to_hex(), e.to_string())
+                    }
+                };
+                (i, out)
             }
-        };
-        let Some(bytes) = fetched else {
-            continue;
-        };
-        match RefRecord::from_bytes(&bytes) {
-            Ok(record) => rows.push(record),
-            Err(e) => {
-                let key_hex = key.to_hex();
-                // A `clw run` memo record is NOT a corrupt ref — it legitimately shares the
-                // tenant keyspace. Count it as a run-cache entry and stay silent.
-                if clw_run::is_run_record(&bytes) {
-                    run_cache += 1;
-                    tracing::debug!(ref_key = %key_hex, "skipping run-cache entry in ref listing");
-                } else {
-                    // Genuinely corrupt/unparseable: diagnostic warn (shown with -v) +
-                    // structured --json error + end-of-listing summary. No per-record stderr
-                    // flood (a tenant with many corrupt records must not bury the listing).
-                    tracing::warn!(ref_key = %key_hex, error = %e, "skipping unparseable ref record");
-                    skipped.push((key_hex, e.to_string()));
-                }
-            }
+        },
+    ))
+    .buffer_unordered(LS_FETCH_CONCURRENCY)
+    .collect()
+    .await;
+
+    // Restore enumeration order so the listing is deterministic regardless of the
+    // completion order of the concurrent fetches.
+    indexed.sort_by_key(|(i, _)| *i);
+    for (_, out) in indexed {
+        match out {
+            Fetched::Row(record) => rows.push(*record),
+            Fetched::Skip(key_hex, err) => skipped.push((key_hex, err)),
+            Fetched::RunCache => run_cache += 1,
+            Fetched::Gone => {}
+            // AUTH (401) means the WHOLE listing is unauthorized: abort with the
+            // actionable auth message (the same outcome the sequential loop produced).
+            Fetched::Auth => return Err(map_auth_error(ClwError::Auth)),
         }
     }
 

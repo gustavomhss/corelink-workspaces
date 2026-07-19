@@ -337,6 +337,7 @@ dependencies = [
  "clw-run",
  "clw-snapshot",
  "clw-types",
+ "futures",
  "proptest",
  "serde_json",
  "tempfile",
