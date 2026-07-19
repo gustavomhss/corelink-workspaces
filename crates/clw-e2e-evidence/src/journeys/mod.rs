@@ -103,10 +103,25 @@ pub fn second_token() -> Option<Secret> {
 }
 
 /// A single "skipped — needs live creds" step, so a journey run with no identity still
-/// renders a truthful report entry (Info, never a false Pass or a panic).
+/// renders a truthful report entry (Info, never a false Pass or a panic). This is a
+/// REQUIRED skip: under `CLW_E2E_REQUIRE_PROD=1` it is a hard failure (the primary-cred
+/// journeys must always run in CI, or the lane is canary-blind).
 pub fn skipped_journey(name: &str, about: &str, need: &str) -> Journey {
+    build_skip(name, about, need, false)
+}
+
+/// Like [`skipped_journey`] but the skip is EXPECTED-optional: the journey needs extra
+/// infra beyond the primary PAT (J4's second identity, J5's throwaway erase tenant). It
+/// is reported truthfully but does NOT trip `CLW_E2E_REQUIRE_PROD` — so the CI lane is
+/// green with just the primary credential (mirrors the conformance suite's `soft_skip`).
+pub fn skipped_optional_journey(name: &str, about: &str, need: &str) -> Journey {
+    build_skip(name, about, need, true)
+}
+
+fn build_skip(name: &str, about: &str, need: &str, optional: bool) -> Journey {
     let mut j = Journey::new(name, about, "skipped (no creds)");
     j.skipped = true;
+    j.optional = optional;
     let mut ev = crate::StepEvidence {
         label: format!("skipped — {need}"),
         cmd: String::new(),

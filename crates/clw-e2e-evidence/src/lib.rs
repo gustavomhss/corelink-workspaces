@@ -240,6 +240,14 @@ pub struct Journey {
     /// can never be reported as "passed" (the canary-blind failure mode).
     #[serde(default)]
     pub skipped: bool,
+    /// True when a skip is EXPECTED-optional: the journey needs EXTRA infra beyond the
+    /// primary PAT (a second identity for J4, a throwaway erase tenant for J5). An
+    /// optional skip is still reported truthfully but does NOT trip `CLW_E2E_REQUIRE_PROD`
+    /// — mirroring the conformance suite's `soft_skip`, so the lane is green with just
+    /// the primary credential. A REQUIRED skip (a primary-cred journey that couldn't run)
+    /// DOES trip REQUIRE. Only meaningful when `skipped` is true.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl Journey {
@@ -254,6 +262,7 @@ impl Journey {
             target: target.into(),
             steps: Vec::new(),
             skipped: false,
+            optional: false,
         }
     }
     pub fn push(&mut self, step: StepEvidence) -> &mut StepEvidence {

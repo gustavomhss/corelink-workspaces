@@ -11,13 +11,19 @@
 //!   CLW_E2E_OUT   report output dir (default: ./e2e-reports)
 //!   CLW_ENDPOINT / CLW_TENANT / CLW_TOKEN  the target + identity (token optional →
 //!                 prod journeys are SKIPPED, an offline-only report is still produced)
-//!   CLW_E2E_REQUIRE_PROD=1  make a skipped prod journey a hard failure (CI uses this so
-//!                 the pipeline can never silently stop exercising prod — canary-blind).
+//!   CLW_E2E_REQUIRE_PROD=1  make a skipped PRIMARY-cred prod journey a hard failure (CI
+//!                 uses this so the pipeline can never silently stop exercising prod —
+//!                 canary-blind). An OPTIONAL skip (J4's 2nd identity, J5's throwaway
+//!                 erase tenant) is reported but never trips REQUIRE, so the lane is green
+//!                 with just the primary PAT.
+//!   CLW_TOKEN_B / CLW_E2E_ERASE_TENANT / CLW_E2E_ERASE_TOKEN  the extra (optional) infra
+//!                 that lets J4 (team) and J5 (destructive) actually run.
 //!
-//! Journeys shipped: `smoke-offline` (harness self-test) always; J1 onboarding + J2
-//! lifecycle against the live backend when creds are present; J9 adversarial vs a local
-//! hostile backend always. The remaining prod journeys (J3–J7, J8, J10/J11) land as
-//! follow-on modules per the plan. A skip is counted separately from a pass, so an
+//! Journeys shipped: `smoke-offline` (harness self-test) always; J1 onboarding, J2
+//! lifecycle, J3 content-addressing, J4 team, J5 destructive, J6 errors, J7 security
+//! against the live backend when creds are present; J9 adversarial vs a local hostile
+//! backend always. J8 (cred-ticket) + J10/J11 (cross-platform) land as follow-ons per the
+//! plan. A skip is counted separately from a pass — required vs optional — so an
 //! absent-creds run can never be reported as green.
 
 use std::path::{Path, PathBuf};
@@ -65,7 +71,7 @@ fn main() {
                 Some(token_b) => journeys.push(guarded("J4-team-concurrency", || {
                     journeys::j4_team::run(&bin, &creds, &token_b)
                 })),
-                None => journeys.push(journeys::skipped_journey(
+                None => journeys.push(journeys::skipped_optional_journey(
                     "J4-team-concurrency",
                     "two identities on one tenant + concurrent writes",
                     "CLW_TOKEN_B (a second identity PAT)",
@@ -83,7 +89,7 @@ fn main() {
                 Some(ec) => journeys.push(guarded("J5-destructive", || {
                     journeys::j5_destructive::run(&bin, &ec)
                 })),
-                None => journeys.push(journeys::skipped_journey(
+                None => journeys.push(journeys::skipped_optional_journey(
                     "J5-destructive",
                     "prune + erase on a dedicated throwaway tenant",
                     "CLW_E2E_ERASE_TENANT (≠ primary) + CLW_E2E_ERASE_TOKEN",
@@ -110,7 +116,7 @@ fn main() {
                 "dedup across a cold cache + pin-by-manifest-digest",
                 need,
             ));
-            journeys.push(journeys::skipped_journey(
+            journeys.push(journeys::skipped_optional_journey(
                 "J4-team-concurrency",
                 "two identities on one tenant + concurrent writes",
                 need,
@@ -125,7 +131,7 @@ fn main() {
                 "redaction, plaintext refusal, consent gates — observed via the binary",
                 need,
             ));
-            journeys.push(journeys::skipped_journey(
+            journeys.push(journeys::skipped_optional_journey(
                 "J5-destructive",
                 "prune + erase on a dedicated throwaway tenant",
                 need,
@@ -152,23 +158,27 @@ fn main() {
     // Count passes / skips / failures SEPARATELY — a skipped journey (no creds) is never
     // folded into "passed", so an absent-creds run can never masquerade as green (the
     // canary-blind failure mode). `CLW_E2E_REQUIRE_PROD=1` (set in CI) makes a skipped
-    // prod journey a hard failure, so the pipeline can't silently stop exercising prod.
+    // PRIMARY-cred prod journey a hard failure, so the pipeline can't silently stop
+    // exercising prod. An OPTIONAL skip (J4's 2nd identity, J5's throwaway erase tenant)
+    // is reported but never trips REQUIRE — so the lane is green with just the primary
+    // PAT (mirrors the conformance suite's soft-skip / the live-journeys lane).
     let passed = journeys.iter().filter(|j| !j.skipped && j.passed()).count();
     let failed = journeys
         .iter()
         .filter(|j| !j.skipped && !j.passed())
         .count();
     let skipped = journeys.iter().filter(|j| j.skipped).count();
+    let required_skipped = journeys.iter().filter(|j| j.skipped && !j.optional).count();
     let require_prod = std::env::var("CLW_E2E_REQUIRE_PROD").ok().as_deref() == Some("1");
-    let require_violated = require_prod && skipped > 0;
+    let require_violated = require_prod && required_skipped > 0;
     eprintln!(
-        "evidence: {passed} passed, {skipped} skipped, {failed} failed → {} · {}",
+        "evidence: {passed} passed, {skipped} skipped ({required_skipped} required), {failed} failed → {} · {}",
         md_path.display(),
         html_path.display()
     );
     if require_violated {
         eprintln!(
-            "FAIL: CLW_E2E_REQUIRE_PROD=1 but {skipped} prod journey(s) were skipped (creds absent)"
+            "FAIL: CLW_E2E_REQUIRE_PROD=1 but {required_skipped} primary-cred prod journey(s) were skipped (creds absent)"
         );
     }
     std::process::exit(if failed == 0 && !require_violated {

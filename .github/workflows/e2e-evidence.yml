@@ -1,0 +1,96 @@
+# E2E evidence — the REAL `clw` BINARY, driven as a user against PROD, with per-step
+# evidence published as an artifact.
+#
+# This is the BINARY-as-user complement to live-journeys.yml. live-journeys drives the
+# clw *library* APIs (clw-conformance, `--features live`); THIS lane drives the actual
+# `clw` binary (argv + env) via the `clw-e2e` evidence runner and uploads the analyzable
+# report (evidence.md + evidence.html) — the deliverable a human reads to analyze
+# behaviour + security per step. "Não pode ser por outro caminho": no library call, the
+# binary is the only entry point.
+#
+# Credential model (REUSES the live-journeys CI secrets — provision once, both lanes
+# light up):
+#   CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT   the primary identity (REQUIRED).
+#   CLW_CI_TOKEN_B                                    a 2nd identity → J4 team (OPTIONAL).
+#   CLW_CI_ERASE_TENANT / CLW_CI_ERASE_TOKEN          a throwaway tenant → J5 destructive
+#                                                     (OPTIONAL; the erase is real, so it
+#                                                     must be a dedicated throwaway ≠ the
+#                                                     primary tenant — the harness fences
+#                                                     both conditions).
+#
+# CLW_E2E_REQUIRE_PROD=1 makes a skipped PRIMARY-cred journey a HARD failure (so the lane
+# can never silently stop exercising prod — canary-blind). J4 + J5 are OPTIONAL skips:
+# reported but never require-failing, so the lane is green with just the primary PAT.
+#
+# The report artifact is uploaded ALWAYS (even on a red run) — a failed run is exactly
+# when the evidence matters most.
+
+name: e2e-evidence
+
+on:
+  # Daily, offset from the other prod canaries (conformance 13:00, deadman 16:00) so a
+  # backend blip doesn't red-herring across all of them at once.
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-evidence
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  evidence:
+    name: e2e evidence (prod, real binary as user)
+    # GitHub-hosted: a network test against prod; no dependency on the self-hosted Mac.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned Rust toolchain (rust-toolchain.toml channel)
+        run: |
+          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          rustup toolchain install "$CH" --profile minimal
+          rustup default "$CH"
+
+      # Build the clw binary (the harness drives it via argv+env) AND the evidence runner.
+      - name: build clw + the e2e evidence runner
+        run: cargo build -p clw-cli -p clw-e2e-evidence --bins
+
+      - name: run the evidence journeys against prod (REQUIRE_PROD=1)
+        env:
+          # Map the CI service identity onto the harness env names (same wiring +
+          # SAME secrets as the live-journeys lane).
+          CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
+          CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
+          CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+          # OPTIONAL extra infra — when absent, only J4 / J5 soft-skip (lane still passes).
+          CLW_TOKEN_B: ${{ secrets.CLW_CI_TOKEN_B }}
+          CLW_E2E_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
+          CLW_E2E_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
+          # A skipped PRIMARY-cred journey is a hard failure; J4/J5 optional-skip.
+          CLW_E2E_REQUIRE_PROD: "1"
+          CLW_E2E_OUT: e2e-reports
+        run: |
+          set -euo pipefail
+          if [ -z "${CLW_TOKEN:-}" ]; then
+            echo "::error::CLW_CI_TOKEN absent — the e2e-evidence lane REQUIRES the primary PAT (CLW_E2E_REQUIRE_PROD=1). Provision the CI service PAT secret."
+            exit 1
+          fi
+          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — J4 team journey soft-skips."
+          [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — J5 destructive journey soft-skips (provision a throwaway tenant ≠ primary to exercise it)."
+          echo "Driving the real clw binary as a user against prod; publishing per-step evidence."
+          # The evidence runner locates the binary next to itself; point it explicitly.
+          CLW_E2E_BIN="$(pwd)/target/debug/clw" ./target/debug/clw-e2e
+
+      - name: upload the evidence report (always — a red run is when it matters most)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence-report
+          path: e2e-reports/
+          if-no-files-found: warn
+          retention-days: 30
