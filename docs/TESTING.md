@@ -20,6 +20,7 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 | **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
 | **Windows runtime** | `.github/workflows/windows.yml` | PR (crates/scripts) + push-main + dispatch | the workspace test suite RUNS on Windows (was compile-only) — path/mode/symlink-copy-fallback behavior | red on any Windows test failure |
 | **Shellcheck** | `.github/workflows/shellcheck.yml` | PR (scripts) + push-main + dispatch | the distribution + CI shell scripts (incl. the public `install.sh`) lint clean | red on any shellcheck warning |
+| **E2E evidence** | `.github/workflows/e2e-evidence.yml` | daily 18:00 UTC + dispatch | the REAL `clw` binary, driven as a user (argv+env) against prod, emits a per-step evidence report | required primary-cred journey skip is red (`REQUIRE_PROD=1`); report artifact always uploaded |
 
 They run on github-hosted runners and are **additive** — they do not touch the required `gates`/`dco`
 checks (except the round-trip property test, which runs inside the gate). The Windows lane runs on
@@ -82,6 +83,85 @@ CLW_STRESS_FILES=100000 cargo test -p clw-integration-tests --test stress -- --i
 ```
 Fault-injection / chaos E2E (5xx/429/corrupt-body/mid-op-401, large round-trip, concurrency) already lives
 in `tests/adversarial.rs` and runs in the gate.
+
+## E2E evidence — the real binary, driven as a user (Phase 3)
+
+The lanes above all reach `clw` through a **library or test-harness** path (in-process stores,
+`--features live` conformance calls, proptest generators). That proves the *code* — but it is, in the
+owner's words, "outro caminho": it is NOT how a user reaches `clw`. A user runs the **binary**, with
+**argv + env**, against a **real backend**, and reads **stdout / stderr / exit-code**. The E2E-evidence
+lane closes exactly that gap.
+
+**The vehicle (non-negotiable).** Every step spawns the real `clw` binary and captures the exact
+command, the exit code (expected vs observed), stdout, stderr, the parsed JSON, the timing, and a
+**behaviour/security observation with its rationale**. The ONLY entry point is the binary via
+`crates/clw-e2e-evidence`'s `Runner::step` — no journey ever calls a clw library function. The token is
+a `Secret`: passed via the `CLW_TOKEN` env (never argv, never `ps`-visible) and scrubbed from every
+captured string **before** it is stored, so nothing secret can reach the report.
+
+**The product is the report, not the green tick.** Each run emits `evidence.md` + a self-contained,
+theme-aware `evidence.html` — the artifact a human reads to analyse behaviour and security per step.
+Pass/fail is a floor; the *evidence* is the deliverable.
+
+**The journeys** (`crates/clw-e2e-evidence/src/journeys/`, driven by the `clw-e2e` binary):
+
+| Journey | What its evidence proves (against PROD unless noted) |
+|---|---|
+| **smoke-offline** | the credential-free surface (version/completions/doctor) — harness self-test, always runs |
+| **J1 onboarding** | config `0600` / dir `0700`, flag>env precedence, PAT never leaked |
+| **J2 lifecycle** | dedup, `status` exit 0/1 contract, hydrate byte-identity, memoization proven from OUTSIDE (a marker ran exactly once) |
+| **J3 content-addressing** | all-fresh → 0-uploaded dedup on a cold cache → pin-by-`--manifest-digest` with `bytes_downloaded > 0` |
+| **J4 team + concurrency** *(opt: `CLW_TOKEN_B`)* | cross-identity read/dedup, concurrent writers converge on one root, cold hydrate-back byte-identical |
+| **J5 destructive** *(opt: throwaway erase creds)* | `prune` spares live data, wrong `--confirm-tenant` ABORTS, real `erase` verified-then-empty — throwaway tenant only |
+| **J6 errors** | every inducible failure's exact exit code + actionable message (409 / 401 / dest-not-empty / bad-digest / usage) |
+| **J7 security** | no-PAT-in-`-vv`, userinfo redaction, plaintext-`http://` refusal, `rm`/`logout` consent gates preserve identity |
+| **J9 adversarial** | the real binary vs a controllable HOSTILE backend (loopback) — SSRF-redirect NOT followed, 5xx/429 bounded-backoff-then-clean-error, 413 clean fail. Needs no creds. |
+
+**Two-tier skip (honest AND operable).** A journey that cannot run reports a **skip**, never a false
+pass. A skip of a **primary-cred** journey (J1/J2/J3/J6/J7) trips `CLW_E2E_REQUIRE_PROD=1` → hard
+failure, so CI can never silently stop exercising prod (the canary-blind failure mode). A skip of an
+**optional-infra** journey (J4 needs a 2nd identity, J5 needs a throwaway erase tenant) is reported but
+never require-fails — so the lane is green with just the primary PAT (mirrors the conformance suite's
+`soft_skip`).
+
+**Mechanized:** `.github/workflows/e2e-evidence.yml` builds the binary + the runner, drives the journeys
+against prod daily (18:00 UTC, offset from the other canaries) with `REQUIRE_PROD=1`, and uploads the
+evidence report as an artifact **always** (a red run is when the evidence matters most). It reuses the
+`CLW_CI_*` secrets from `live-journeys.yml` — provision once, both lanes light up.
+
+### The two anti-vacuity laws (learned the hard way — every journey's cold review broke on one)
+
+An E2E assertion can *pass while proving nothing*. The independent cold review of these journeys found a
+real over-claim on **every single one**; two rules stop them:
+
+1. **A "survives / reproduces / persisted" claim MUST hydrate on a COLD cache and assert
+   `bytes_downloaded > 0`.** A warm local cache replays without ever contacting the backend — so a
+   backend-side failure (a swept blob, a lost ref) would still "hydrate" green. Only a cold fetch with
+   bytes actually pulled proves the backend held the data.
+2. **A "no secret leaked" claim MUST check the pre-scrub `leaked_secret` signal, never the stored
+   output.** The harness redacts registered secrets from captured text *before* storing it, so any
+   assertion that a secret is ABSENT from the stored report is **vacuous** — it was scrubbed by
+   construction. The only non-vacuous leak signal is `StepEvidence.leaked_secret`, computed on the raw
+   output before redaction.
+
+Corollary (SSRF/redirect): a "did NOT contact the internal host" claim must first prove the binary
+**reached the backend** (saw a non-internal request in the server's own log) — else a mere connect
+failure passes falsely.
+
+### The security-observation catalog (each is a step with evidence, observed via the binary)
+
+**Observed today** (a report row a human can audit): token redaction (every command + `--json` + logs,
+verified **pre-scrub** via `leaked_secret`) · config **0600** / dir 0700 · endpoint-userinfo redaction ·
+plaintext-`http://` refusal (non-loopback) · **401** on a bad token · **409** create-only (no
+last-write-wins) · consent gates on `rm` / `prune` / `erase` / `logout --all` (declined → non-zero exit,
+identity preserved) · SSRF/redirect NOT followed · 5xx/429 bounded backoff then clean error (no hang, no
+hammer) · 413 clean fail.
+
+**Not yet driven via the evidence binary** (the doctrine's own standard: don't claim what the harness
+doesn't observe): **no `CLW_TOKEN` fallback** in the runner ref-domain — J7 soft-notes it as `Info`;
+full proof waits on J8 (cred-ticket). And the setuid-strip-on-hydrate + external-symlink-skip defenses
+(clw *does* enforce them — see the v0.1.6 / v0.1.7 hardening + `crates/clw-integration-tests`) are not
+yet E2E-evidence steps; a hostile-fixture journey to observe them via the binary is a follow-on.
 
 ## The done-line
 "Working as it should" = the required gate green **and** coverage ≥ floor (ratcheting) **and** the fuzz
