@@ -10,18 +10,23 @@
 //!   CLW_E2E_BIN   path to the clw binary (default: `clw` next to this exe)
 //!   CLW_E2E_OUT   report output dir (default: ./e2e-reports)
 //!   CLW_ENDPOINT / CLW_TENANT / CLW_TOKEN  the target + identity (token optional →
-//!                 offline-only smoke)
+//!                 prod journeys are SKIPPED, an offline-only report is still produced)
+//!   CLW_E2E_REQUIRE_PROD=1  make a skipped prod journey a hard failure (CI uses this so
+//!                 the pipeline can never silently stop exercising prod — canary-blind).
 //!
-//! This binary currently ships the SMOKE journey that proves the harness end-to-end
-//! (offline steps always; a prod snapshot→hydrate→rm when creds are present). The full
-//! journey set (J1–J11) lands as follow-on modules per the plan.
+//! Journeys shipped: `smoke-offline` (harness self-test) always; J1 onboarding + J2
+//! lifecycle against the live backend when creds are present; J9 adversarial vs a local
+//! hostile backend always. The remaining prod journeys (J3–J7, J8, J10/J11) land as
+//! follow-on modules per the plan. A skip is counted separately from a pass, so an
+//! absent-creds run can never be reported as green.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clw_e2e_evidence::hostile::Hostile;
+use clw_e2e_evidence::journeys::{self, ProdCreds};
 use clw_e2e_evidence::report::{render_html, render_markdown, Meta};
-use clw_e2e_evidence::{ExpectExit, Journey, Observation, Runner, Secret};
+use clw_e2e_evidence::{ExpectExit, Journey, Observation, Runner, Secret, StepEvidence};
 
 fn main() {
     let bin = clw_bin();
@@ -37,13 +42,41 @@ fn main() {
 
     let clw_version = probe_version(&bin);
     let mut journeys = Vec::new();
+    // Harness self-test: the credential-free surface (always runs, proves the harness).
     journeys.push(smoke_offline(&bin));
-    if let Some(j) = smoke_prod(&bin) {
-        journeys.push(j);
-    } else {
-        eprintln!("NOTE: CLW_TOKEN/CLW_TENANT absent → prod smoke skipped (offline-only report)");
+
+    // The prod journeys (Onda 2) — driven against the live backend when creds are
+    // present, else a truthful "skipped" entry so an offline run still yields a report.
+    // Each is guarded: a setup panic becomes a FAILED journey (not a lost report), so
+    // smoke-offline + the other journeys' evidence always survives.
+    match ProdCreds::from_env() {
+        Some(creds) => {
+            journeys.push(guarded("J1-onboarding", || {
+                journeys::j1_onboarding::run(&bin, &creds)
+            }));
+            journeys.push(guarded("J2-lifecycle", || {
+                journeys::j2_lifecycle::run(&bin, &creds)
+            }));
+        }
+        None => {
+            eprintln!(
+                "NOTE: CLW_TOKEN/CLW_TENANT absent → prod journeys skipped (offline-only report)"
+            );
+            let need = "CLW_TOKEN + CLW_TENANT";
+            journeys.push(journeys::skipped_journey(
+                "J1-onboarding",
+                "the first surface a user touches",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J2-lifecycle",
+                "snapshot → status → ls → hydrate → run → rm",
+                need,
+            ));
+        }
     }
-    // Adversarial: needs no creds — the real binary vs a local hostile backend.
+
+    // Adversarial (J9): needs no creds — the real binary vs a local hostile backend.
     journeys.push(adversarial(&bin));
 
     let meta = Meta {
@@ -59,19 +92,71 @@ fn main() {
     std::fs::write(&md_path, &md).expect("write md");
     std::fs::write(&html_path, &html).expect("write html");
 
-    let all_pass = journeys.iter().all(Journey::passed);
-    let (jp, jt): (usize, usize) = (
-        journeys.iter().filter(|j| j.passed()).count(),
-        journeys.len(),
-    );
+    // Count passes / skips / failures SEPARATELY — a skipped journey (no creds) is never
+    // folded into "passed", so an absent-creds run can never masquerade as green (the
+    // canary-blind failure mode). `CLW_E2E_REQUIRE_PROD=1` (set in CI) makes a skipped
+    // prod journey a hard failure, so the pipeline can't silently stop exercising prod.
+    let passed = journeys.iter().filter(|j| !j.skipped && j.passed()).count();
+    let failed = journeys
+        .iter()
+        .filter(|j| !j.skipped && !j.passed())
+        .count();
+    let skipped = journeys.iter().filter(|j| j.skipped).count();
+    let require_prod = std::env::var("CLW_E2E_REQUIRE_PROD").ok().as_deref() == Some("1");
+    let require_violated = require_prod && skipped > 0;
     eprintln!(
-        "evidence: {}/{} journeys passed → {} · {}",
-        jp,
-        jt,
+        "evidence: {passed} passed, {skipped} skipped, {failed} failed → {} · {}",
         md_path.display(),
         html_path.display()
     );
-    std::process::exit(if all_pass { 0 } else { 1 });
+    if require_violated {
+        eprintln!(
+            "FAIL: CLW_E2E_REQUIRE_PROD=1 but {skipped} prod journey(s) were skipped (creds absent)"
+        );
+    }
+    std::process::exit(if failed == 0 && !require_violated {
+        0
+    } else {
+        1
+    });
+}
+
+/// Run a journey builder, converting a panic (e.g. a fixture-setup failure) into a
+/// single FAILED-step journey rather than unwinding through `main` and losing the
+/// whole report (smoke-offline + the other journeys' evidence).
+fn guarded(name: &str, build: impl FnOnce() -> Journey + std::panic::UnwindSafe) -> Journey {
+    match std::panic::catch_unwind(build) {
+        Ok(j) => j,
+        Err(_) => {
+            let mut j = Journey::new(
+                name,
+                "journey aborted before completion",
+                "prod (setup failed)",
+            );
+            let mut ev = StepEvidence {
+                label: "journey setup".to_string(),
+                cmd: String::new(),
+                env_shown: Vec::new(),
+                expected_exit: ExpectExit::Any,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                json: None,
+                duration_ms: 0,
+                leaked_secret: false,
+                observations: Vec::new(),
+            };
+            ev.observe(
+                Observation::behavior(
+                    "the journey panicked during setup",
+                    "a fixture/FS failure must be a loud FAIL, not a lost report",
+                )
+                .check(false, "journey builder panicked — see stderr"),
+            );
+            j.push(ev);
+            j
+        }
+    }
 }
 
 /// Offline journey — no creds, no network: version, help, completions, doctor. Proves
@@ -116,12 +201,18 @@ fn smoke_offline(bin: &Path) -> Journey {
     );
     j.push(comp);
 
-    // doctor runs on a broken/empty config and MUST report the token as a marker,
-    // never the value. (The tenant IS shown in full by design — that is not a secret.)
+    // doctor runs on an empty config and MUST report the token as a marker, never the
+    // value. (The tenant IS shown in full by design — that is not a secret.) HOME is
+    // sandboxed to an empty temp dir so this self-test reads NO operator config and stays
+    // deterministic — the report never bleeds the machine's real ~/.clw.
+    let sandbox_home =
+        std::env::temp_dir().join(format!("clw-e2e-smoke-home-{}", std::process::id()));
+    std::fs::create_dir_all(&sandbox_home).ok();
+    let sandbox_home_s = sandbox_home.to_string_lossy().into_owned();
     let mut doc = r.step(
         "doctor --json",
         &["--json", "doctor"],
-        &[],
+        &[("HOME", &sandbox_home_s, false)],
         ExpectExit::Eq(0),
     );
     let marker =
@@ -138,106 +229,8 @@ fn smoke_offline(bin: &Path) -> Journey {
     );
     j.push(doc);
 
+    let _ = std::fs::remove_dir_all(&sandbox_home);
     j
-}
-
-/// Prod smoke — a real snapshot→hydrate→rm round-trip against the real backend, if
-/// creds are present. Returns `None` (skip) when `CLW_TOKEN`/`CLW_TENANT` is absent.
-fn smoke_prod(bin: &Path) -> Option<Journey> {
-    let token = std::env::var("CLW_TOKEN").ok().filter(|s| !s.is_empty())?;
-    let tenant = std::env::var("CLW_TENANT").ok().filter(|s| !s.is_empty())?;
-    let endpoint = std::env::var("CLW_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://corelink-api.humangr.com".to_string());
-
-    let workdir = std::env::temp_dir().join(format!("clw-e2e-{}", std::process::id()));
-    let src = workdir.join("src");
-    let dst = workdir.join("dst");
-    std::fs::create_dir_all(&src).ok()?;
-    std::fs::write(
-        src.join("small.txt"),
-        format!("e2e-{}\n", std::process::id()),
-    )
-    .ok()?;
-    let big: Vec<u8> = (0u32..(3 * 1024 * 1024))
-        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
-        .collect();
-    std::fs::write(src.join("big.bin"), &big).ok()?;
-
-    let cache = workdir.join("cache");
-    let r = Runner::new(bin, &endpoint, "prod", &tenant, Secret::new(token), &cache);
-    let name = format!("e2e-smoke-{}", std::process::id());
-    let mut j = Journey::new(
-        "smoke-prod",
-        "a real snapshot→hydrate→rm round-trip against the live backend",
-        format!("prod · {}", tenant),
-    );
-
-    let src_s = src.to_string_lossy().into_owned();
-    let dst_s = dst.to_string_lossy().into_owned();
-
-    let mut snap = r.step(
-        "snapshot a fresh workspace",
-        &["--json", "snapshot", &src_s, "--name", &name],
-        &[],
-        ExpectExit::Eq(0),
-    );
-    if let Some(v) = &snap.json {
-        let uploaded = v.get("chunks_uploaded").and_then(|x| x.as_u64());
-        snap.observe(
-            Observation::behavior(
-                "fresh snapshot uploads chunks",
-                "a first snapshot must populate the content-addressed store",
-            )
-            .check(
-                uploaded.unwrap_or(0) > 0,
-                format!("chunks_uploaded={uploaded:?}"),
-            ),
-        );
-    }
-    let snap_ok = snap.passed();
-    j.push(snap);
-
-    if snap_ok {
-        let mut hyd = r.step(
-            "hydrate into an empty dest",
-            &["--json", "hydrate", &dst_s, "--name", &name],
-            &[],
-            ExpectExit::Eq(0),
-        );
-        // Byte-identity: compare the hydrated big.bin to the source.
-        let identical = std::fs::read(dst.join("big.bin"))
-            .map(|b| b == big)
-            .unwrap_or(false);
-        hyd.observe(
-            Observation::behavior(
-                "hydrated tree is byte-identical to the source",
-                "content-addressing must round-trip exactly, or the store is unsafe",
-            )
-            .check(
-                identical,
-                if identical {
-                    "big.bin matches"
-                } else {
-                    "MISMATCH"
-                },
-            ),
-        );
-        j.push(hyd);
-    }
-
-    // Cleanup: rm the ref (idempotent, requires --yes).
-    let rm = r.step(
-        "rm the ref (cleanup)",
-        &["--json", "rm", "--name", &name, "--yes"],
-        &[],
-        ExpectExit::Eq(0),
-    );
-    j.push(rm);
-
-    let _ = std::fs::remove_dir_all(&workdir);
-    Some(j)
 }
 
 /// J9 — the real `clw` binary vs a controllable HOSTILE backend: the security /

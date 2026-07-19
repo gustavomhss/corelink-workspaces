@@ -20,6 +20,7 @@ use std::process::Command;
 use std::time::Instant;
 
 pub mod hostile;
+pub mod journeys;
 pub mod report;
 
 /// A secret (PAT, ticket) that must never appear in captured output, the report, a
@@ -170,6 +171,12 @@ pub struct StepEvidence {
     /// Parsed stdout when it is valid JSON (a `--json` step), else `None`.
     pub json: Option<serde_json::Value>,
     pub duration_ms: u128,
+    /// Whether clw's RAW output (stdout/stderr, BEFORE the harness redacted it)
+    /// contained any registered secret. This is computed at capture time so the
+    /// "clw did not leak the PAT" security observation is NON-VACUOUS — the harness's
+    /// own scrub (which protects the report) would otherwise hide a real clw leak.
+    /// `false` = clw redacted at the source (the correct behavior).
+    pub leaked_secret: bool,
     pub observations: Vec<Observation>,
 }
 
@@ -184,6 +191,25 @@ impl StepEvidence {
         self.observations.push(obs);
         self
     }
+    /// Security observation: clw's RAW output (pre-redaction) contained NO registered
+    /// secret. Non-vacuous — [`leaked_secret`](Self::leaked_secret) is computed before
+    /// the harness scrubbed anything, so this genuinely proves clw redacts at the source
+    /// rather than merely re-proving the harness's own scrub.
+    pub fn expect_no_secret_leak(&mut self, why: &str) -> &mut Self {
+        let leaked = self.leaked_secret;
+        self.observe(
+            Observation::security("clw prints no secret (PAT/ticket) in its raw output", why)
+                .check(
+                    !leaked,
+                    if leaked {
+                        "RAW OUTPUT CONTAINED A REGISTERED SECRET".to_string()
+                    } else {
+                        "raw output contained no registered secret".to_string()
+                    },
+                ),
+        )
+    }
+
     /// Convenience: assert stdout/stderr contains a needle (a behavior observation).
     pub fn expect_output_contains(&mut self, needle: &str, why: &str) -> &mut Self {
         let hit = self.stdout.contains(needle) || self.stderr.contains(needle);
@@ -209,6 +235,11 @@ pub struct Journey {
     /// The backend the steps ran against (redacted host label, e.g. "prod" or "hostile").
     pub target: String,
     pub steps: Vec<StepEvidence>,
+    /// True when the journey did NOT actually run (e.g. no prod creds). A skip is
+    /// neither a pass nor a fail — it must be counted SEPARATELY so an absent-creds run
+    /// can never be reported as "passed" (the canary-blind failure mode).
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl Journey {
@@ -222,6 +253,7 @@ impl Journey {
             about: about.into(),
             target: target.into(),
             steps: Vec::new(),
+            skipped: false,
         }
     }
     pub fn push(&mut self, step: StepEvidence) -> &mut StepEvidence {
@@ -371,6 +403,16 @@ impl Runner {
             ),
             Err(e) => (None, String::new(), format!("<spawn failed: {e}>")),
         };
+        // Non-vacuous leak check: did clw's RAW output carry any secret, BEFORE we
+        // scrub it? (cmd is built by us and never carries the PAT — it travels via env.)
+        let leaked_secret = self
+            .redactions
+            .iter()
+            .map(String::as_str)
+            .chain(extra_secrets.iter().copied())
+            .filter(|s| !s.is_empty())
+            .any(|secret| stdout.contains(secret) || stderr.contains(secret));
+
         let stdout = self.redact_with(&stdout, &extra_secrets);
         let stderr = self.redact_with(&stderr, &extra_secrets);
         let json = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
@@ -385,6 +427,7 @@ impl Runner {
             stderr,
             json,
             duration_ms,
+            leaked_secret,
             observations: Vec::new(),
         };
         // The exit-code expectation is itself the first behavior observation.
@@ -510,6 +553,48 @@ mod tests {
             redact_endpoint("https://host.example"),
             "https://host.example"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaked_secret_detects_a_raw_token_echo_yet_report_stays_scrubbed() {
+        // The real primitive J1/J7 rely on: if clw echoed the PAT, `leaked_secret` is
+        // true (non-vacuous), but the STORED evidence is still scrubbed to `<redacted>`.
+        let r = Runner::new(
+            "/bin/sh",
+            "https://x",
+            "test",
+            "t",
+            Secret::new("core-LEAK-XYZ"),
+            "/tmp/c",
+        );
+        let ev = r.step(
+            "echo the token",
+            &["-c", "printf %s \"$CLW_TOKEN\""],
+            &[],
+            ExpectExit::Eq(0),
+        );
+        assert!(ev.leaked_secret, "a raw PAT echo must be detected");
+        assert!(
+            !ev.stdout.contains("core-LEAK-XYZ"),
+            "the report must still be scrubbed"
+        );
+        assert!(ev.stdout.contains("<redacted>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_leak_when_the_command_does_not_echo_the_token() {
+        let r = Runner::new(
+            "/bin/sh",
+            "https://x",
+            "test",
+            "t",
+            Secret::new("core-SAFE-XYZ"),
+            "/tmp/c",
+        );
+        let ev = r.step("silent", &["-c", "printf hello"], &[], ExpectExit::Eq(0));
+        assert!(!ev.leaked_secret);
     }
 
     #[test]

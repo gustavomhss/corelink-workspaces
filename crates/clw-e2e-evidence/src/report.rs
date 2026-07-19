@@ -326,6 +326,7 @@ mod tests {
             stderr: String::new(),
             json: Some(serde_json::json!({"name":"x"})),
             duration_ms: 12,
+            leaked_secret: false,
             observations: vec![],
         };
         s.observe(
@@ -384,6 +385,7 @@ mod tests {
             stderr: String::new(),
             json: None,
             duration_ms: 1,
+            leaked_secret: false,
             observations: vec![Observation::behavior("c", "w").info("d")],
         });
         let html = render_html(&j_slice(&j), &meta());
