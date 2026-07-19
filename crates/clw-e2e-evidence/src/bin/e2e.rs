@@ -77,6 +77,18 @@ fn main() {
             journeys.push(guarded("J7-security", || {
                 journeys::j7_security::run(&bin, &creds)
             }));
+            // J5 is DESTRUCTIVE (real erase). It runs ONLY against a dedicated throwaway
+            // tenant that is not the primary — the loader fences both conditions.
+            match journeys::erase_creds(&creds.tenant) {
+                Some(ec) => journeys.push(guarded("J5-destructive", || {
+                    journeys::j5_destructive::run(&bin, &ec)
+                })),
+                None => journeys.push(journeys::skipped_journey(
+                    "J5-destructive",
+                    "prune + erase on a dedicated throwaway tenant",
+                    "CLW_E2E_ERASE_TENANT (≠ primary) + CLW_E2E_ERASE_TOKEN",
+                )),
+            }
         }
         None => {
             eprintln!(
@@ -111,6 +123,11 @@ fn main() {
             journeys.push(journeys::skipped_journey(
                 "J7-security",
                 "redaction, plaintext refusal, consent gates — observed via the binary",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J5-destructive",
+                "prune + erase on a dedicated throwaway tenant",
                 need,
             ));
         }

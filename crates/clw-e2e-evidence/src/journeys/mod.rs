@@ -17,6 +17,7 @@ pub mod j1_onboarding;
 pub mod j2_lifecycle;
 pub mod j3_content_addressing;
 pub mod j4_team;
+pub mod j5_destructive;
 pub mod j6_errors;
 pub mod j7_security;
 
@@ -53,6 +54,42 @@ impl ProdCreds {
     pub fn target(&self) -> String {
         format!("prod · {}", self.tenant)
     }
+}
+
+/// The DEDICATED throwaway tenant + PAT for the DESTRUCTIVE journey (J5). J5 runs a real,
+/// irreversible `erase`, so this is fenced hard: `None` (→ J5 is skipped) when unset, AND
+/// `None` if the erase tenant EQUALS `primary` — a misconfigured env must never let an
+/// erase touch the shared/primary tenant.
+pub struct EraseCreds {
+    pub endpoint: String,
+    pub tenant: String,
+    pub token: Secret,
+}
+
+pub fn erase_creds(primary_tenant: &str) -> Option<EraseCreds> {
+    let tenant = std::env::var("CLW_E2E_ERASE_TENANT")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let token = std::env::var("CLW_E2E_ERASE_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    // THE fence: never erase the primary tenant, whatever the env says.
+    if tenant == primary_tenant {
+        eprintln!(
+            "REFUSING J5: CLW_E2E_ERASE_TENANT == the primary CLW_TENANT ({primary_tenant}) — \
+             an erase must target a dedicated throwaway tenant, never the working one"
+        );
+        return None;
+    }
+    let endpoint = std::env::var("CLW_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    Some(EraseCreds {
+        endpoint,
+        tenant,
+        token: Secret::new(token),
+    })
 }
 
 /// A SECOND identity's PAT (`CLW_TOKEN_B`) on the same tenant, for the team journey (J4).
