@@ -52,13 +52,19 @@ jobs:
       # Run the workspace tests ONCE with instrumentation (--no-report collects the
       # profile), then emit lcov + JSON from the same run without re-testing.
       # Default-features: the `live` conformance suite is not compiled/run (no backend).
+      # `clw-e2e-evidence` is EXCLUDED: it is a user-simulating test harness whose
+      # bin/journeys exist to DRIVE the real clw binary (measured as uncovered lines by
+      # llvm-cov, since they run a subprocess) — measuring its line coverage is
+      # meaningless and would drag the product-code floor. Its own logic (model/report/
+      # redaction) is unit-tested within the crate regardless.
       - name: measure coverage (workspace, default-features)
         run: |
           set -euo pipefail
-          cargo llvm-cov --workspace --no-report
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --json --output-path coverage.json
-          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+          cargo llvm-cov --workspace --exclude clw-e2e-evidence --no-report
+          IGN='crates/clw-e2e-evidence/'
+          cargo llvm-cov report --ignore-filename-regex "$IGN" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$IGN" --json --output-path coverage.json
+          cargo llvm-cov report --ignore-filename-regex "$IGN" --summary-only | tee coverage-summary.txt
 
       # Extract the total line-coverage % (JSON is stable to parse vs the table).
       # Report-only: print to the job summary. Phase 1b adds the floor comparison.

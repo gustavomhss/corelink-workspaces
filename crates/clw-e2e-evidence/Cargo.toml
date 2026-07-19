@@ -1,0 +1,28 @@
+[package]
+name = "clw-e2e-evidence"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# User-simulating E2E: drives the REAL `clw` binary (argv+env) and captures
+# per-step evidence (command, output, exit, JSON, timing, behavior/security
+# observations) into an analyzable report. NOT a library/unit test path.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# H4 — the controllable hostile backend the REAL binary points at via CLW_ENDPOINT
+# (loopback http://, which clw accepts). wiremock spins a real local HTTP server, so
+# this is still user-simulation (the binary makes real requests); only the backend is
+# ours to make hostile. tokio drives the async server setup around the sync clw steps.
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "clw-e2e"
+path = "src/bin/e2e.rs"

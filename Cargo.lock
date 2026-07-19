@@ -379,6 +379,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clw-e2e-evidence"
+version = "0.1.11"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "clw-hydrate"
 version = "0.1.11"
 dependencies = [

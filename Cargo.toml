@@ -12,6 +12,7 @@ members = [
     "crates/clw-cli",
     "crates/clw-integration-tests",
     "crates/clw-conformance",
+    "crates/clw-e2e-evidence",
 ]
 
 [workspace.package]
