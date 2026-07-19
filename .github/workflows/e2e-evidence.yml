@@ -28,10 +28,10 @@
 name: e2e-evidence
 
 on:
-  # Daily, offset from the other prod canaries (conformance 13:00, deadman 16:00) so a
-  # backend blip doesn't red-herring across all of them at once.
-  schedule:
-    - cron: "0 18 * * *"
+  # MANUAL ONLY — no schedule. This lane exercises prod + burns CI minutes, so it runs
+  # only when a human clicks "Run workflow" (or via `gh workflow run e2e-evidence.yml`).
+  # The daily prod watch is already covered by the conformance/metered/deadman canaries;
+  # this is the on-demand "give me a fresh per-step evidence report" button.
   workflow_dispatch:
 
 concurrency:

@@ -98,6 +98,21 @@ pub fn render_markdown(journeys: &[Journey], meta: &Meta) -> String {
     o
 }
 
+/// How to render a step's exit status honestly:
+/// - a real exit code when the process ran and returned one;
+/// - `"signal"` when a process ran but was terminated by a signal (no code);
+/// - `"—"` for a SYNTHETIC step that ran no process at all (a skip / soft-note) —
+///   these have an empty `cmd`, so calling that "signal" would be a false claim.
+fn exit_label(s: &StepEvidence) -> String {
+    if s.cmd.is_empty() {
+        "—".to_string()
+    } else {
+        s.exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into())
+    }
+}
+
 fn render_step_md(o: &mut String, n: usize, s: &StepEvidence) {
     let head = if s.passed() { "✔" } else { "✗ FAIL" };
     o.push_str(&format!("### {n}. {head} {}\n\n", s.label));
@@ -107,9 +122,7 @@ fn render_step_md(o: &mut String, n: usize, s: &StepEvidence) {
     }
     o.push_str(&format!(
         "exit: **{}** · {} ms\n\n",
-        s.exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into()),
+        exit_label(s),
         s.duration_ms
     ));
     // Observations table.
@@ -222,9 +235,7 @@ fn render_step_html(o: &mut String, n: usize, s: &StepEvidence) {
         if s.passed() { "✔" } else { "✗" },
         n,
         esc(&s.label),
-        s.exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into()),
+        exit_label(s),
         s.duration_ms
     ));
     o.push_str(&format!("<pre class=\"cmd\">$ {}</pre>", esc(&s.cmd)));

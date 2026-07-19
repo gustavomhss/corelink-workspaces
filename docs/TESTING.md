@@ -20,7 +20,7 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 | **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
 | **Windows runtime** | `.github/workflows/windows.yml` | PR (crates/scripts) + push-main + dispatch | the workspace test suite RUNS on Windows (was compile-only) — path/mode/symlink-copy-fallback behavior | red on any Windows test failure |
 | **Shellcheck** | `.github/workflows/shellcheck.yml` | PR (scripts) + push-main + dispatch | the distribution + CI shell scripts (incl. the public `install.sh`) lint clean | red on any shellcheck warning |
-| **E2E evidence** | `.github/workflows/e2e-evidence.yml` | daily 18:00 UTC + dispatch | the REAL `clw` binary, driven as a user (argv+env) against prod, emits a per-step evidence report | required primary-cred journey skip is red (`REQUIRE_PROD=1`); report artifact always uploaded |
+| **E2E evidence** | `.github/workflows/e2e-evidence.yml` | **manual only** (`workflow_dispatch`) | the REAL `clw` binary, driven as a user (argv+env) against prod, emits a per-step evidence report | required primary-cred journey skip is red (`REQUIRE_PROD=1`); report artifact always uploaded |
 
 They run on github-hosted runners and are **additive** — they do not touch the required `gates`/`dco`
 checks (except the round-trip property test, which runs inside the gate). The Windows lane runs on
@@ -125,9 +125,11 @@ never require-fails — so the lane is green with just the primary PAT (mirrors 
 `soft_skip`).
 
 **Mechanized:** `.github/workflows/e2e-evidence.yml` builds the binary + the runner, drives the journeys
-against prod daily (18:00 UTC, offset from the other canaries) with `REQUIRE_PROD=1`, and uploads the
-evidence report as an artifact **always** (a red run is when the evidence matters most). It reuses the
-`CLW_CI_*` secrets from `live-journeys.yml` — provision once, both lanes light up.
+against prod **on demand** (manual `workflow_dispatch` — no schedule; the daily prod watch is already
+the conformance/metered/deadman canaries' job, and this lane exercises prod + burns CI minutes) with
+`REQUIRE_PROD=1`, and uploads the evidence report as an artifact **always** (a red run is when the
+evidence matters most). It reuses the `CLW_CI_*` secrets from `live-journeys.yml` — provision once, both
+lanes light up.
 
 ### The two anti-vacuity laws (learned the hard way — every journey's cold review broke on one)
 
