@@ -60,6 +60,17 @@ fn main() {
             journeys.push(guarded("J3-content-addressing", || {
                 journeys::j3_content_addressing::run(&bin, &creds)
             }));
+            // J4 needs a SECOND identity (CLW_TOKEN_B) on the same tenant.
+            match journeys::second_token() {
+                Some(token_b) => journeys.push(guarded("J4-team-concurrency", || {
+                    journeys::j4_team::run(&bin, &creds, &token_b)
+                })),
+                None => journeys.push(journeys::skipped_journey(
+                    "J4-team-concurrency",
+                    "two identities on one tenant + concurrent writes",
+                    "CLW_TOKEN_B (a second identity PAT)",
+                )),
+            }
         }
         None => {
             eprintln!(
@@ -79,6 +90,11 @@ fn main() {
             journeys.push(journeys::skipped_journey(
                 "J3-content-addressing",
                 "dedup across a cold cache + pin-by-manifest-digest",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J4-team-concurrency",
+                "two identities on one tenant + concurrent writes",
                 need,
             ));
         }

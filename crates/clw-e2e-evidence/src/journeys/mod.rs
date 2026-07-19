@@ -16,6 +16,7 @@ use crate::{Journey, Observation, Secret};
 pub mod j1_onboarding;
 pub mod j2_lifecycle;
 pub mod j3_content_addressing;
+pub mod j4_team;
 
 /// The default prod endpoint (same host the live conformance suite dials).
 pub const DEFAULT_ENDPOINT: &str = "https://corelink-api.humangr.com";
@@ -50,6 +51,16 @@ impl ProdCreds {
     pub fn target(&self) -> String {
         format!("prod · {}", self.tenant)
     }
+}
+
+/// A SECOND identity's PAT (`CLW_TOKEN_B`) on the same tenant, for the team journey (J4).
+/// `None` → J4 is skipped. Kept separate from [`ProdCreds`] because most journeys are
+/// single-identity; only the team journey needs two.
+pub fn second_token() -> Option<Secret> {
+    std::env::var("CLW_TOKEN_B")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(Secret::new)
 }
 
 /// A single "skipped — needs live creds" step, so a journey run with no identity still
