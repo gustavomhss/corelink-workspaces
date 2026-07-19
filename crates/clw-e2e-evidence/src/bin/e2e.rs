@@ -71,6 +71,9 @@ fn main() {
                     "CLW_TOKEN_B (a second identity PAT)",
                 )),
             }
+            journeys.push(guarded("J6-errors", || {
+                journeys::j6_errors::run(&bin, &creds)
+            }));
         }
         None => {
             eprintln!(
@@ -95,6 +98,11 @@ fn main() {
             journeys.push(journeys::skipped_journey(
                 "J4-team-concurrency",
                 "two identities on one tenant + concurrent writes",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J6-errors",
+                "inducible failures return the right exit code + actionable message",
                 need,
             ));
         }

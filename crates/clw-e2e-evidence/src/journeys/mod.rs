@@ -17,6 +17,7 @@ pub mod j1_onboarding;
 pub mod j2_lifecycle;
 pub mod j3_content_addressing;
 pub mod j4_team;
+pub mod j6_errors;
 
 /// The default prod endpoint (same host the live conformance suite dials).
 pub const DEFAULT_ENDPOINT: &str = "https://corelink-api.humangr.com";
