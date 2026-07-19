@@ -57,6 +57,9 @@ fn main() {
             journeys.push(guarded("J2-lifecycle", || {
                 journeys::j2_lifecycle::run(&bin, &creds)
             }));
+            journeys.push(guarded("J3-content-addressing", || {
+                journeys::j3_content_addressing::run(&bin, &creds)
+            }));
         }
         None => {
             eprintln!(
@@ -71,6 +74,11 @@ fn main() {
             journeys.push(journeys::skipped_journey(
                 "J2-lifecycle",
                 "snapshot → status → ls → hydrate → run → rm",
+                need,
+            ));
+            journeys.push(journeys::skipped_journey(
+                "J3-content-addressing",
+                "dedup across a cold cache + pin-by-manifest-digest",
                 need,
             ));
         }

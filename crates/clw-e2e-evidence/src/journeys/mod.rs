@@ -15,6 +15,7 @@ use crate::{Journey, Observation, Secret};
 
 pub mod j1_onboarding;
 pub mod j2_lifecycle;
+pub mod j3_content_addressing;
 
 /// The default prod endpoint (same host the live conformance suite dials).
 pub const DEFAULT_ENDPOINT: &str = "https://corelink-api.humangr.com";
@@ -148,6 +149,22 @@ pub fn pseudo_bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Deterministic bytes SEEDED so EVERY byte depends on `seed` (a splitmix64 hash of
+/// `i + seed`). Two blobs with the same seed are byte-identical (so their content-address
+/// / dedup match), while a fresh seed makes the WHOLE blob globally unique — a genuine
+/// first upload where no chunk pre-exists in the CAS (unlike [`pseudo_bytes`], whose tail
+/// chunks are constant across runs and would dedup). Still RNG-free and reproducible.
+pub fn pseudo_bytes_seeded(len: usize, seed: u64) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| {
+            let mut z = i.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z >> 24) as u8
+        })
+        .collect()
+}
+
 /// Read a file's unix permission bits (`mode & 0o777`), or `None` off-unix.
 #[cfg(unix)]
 pub fn unix_mode(path: &std::path::Path) -> Option<u32> {
@@ -160,4 +177,30 @@ pub fn unix_mode(path: &std::path::Path) -> Option<u32> {
 #[cfg(not(unix))]
 pub fn unix_mode(_path: &std::path::Path) -> Option<u32> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_bytes_are_deterministic_per_seed_but_differ_across_seeds() {
+        // Same seed → byte-identical (so J3's A and B share a root and dedup).
+        assert_eq!(pseudo_bytes_seeded(4096, 42), pseudo_bytes_seeded(4096, 42));
+        // Different seed → different content (so a fresh run is a genuine first upload);
+        // require a large fraction of bytes to differ, not just one.
+        let a = pseudo_bytes_seeded(4096, 1);
+        let b = pseudo_bytes_seeded(4096, 2);
+        let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert!(
+            differing > 4096 * 3 / 4,
+            "seed must perturb the whole blob, only {differing}/4096 bytes differed"
+        );
+    }
+
+    #[test]
+    fn seeded_bytes_have_the_requested_length() {
+        assert_eq!(pseudo_bytes_seeded(0, 7).len(), 0);
+        assert_eq!(pseudo_bytes_seeded(1_000_003, 7).len(), 1_000_003);
+    }
 }
