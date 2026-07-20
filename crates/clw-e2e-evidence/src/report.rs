@@ -90,6 +90,12 @@ pub fn render_markdown(journeys: &[Journey], meta: &Meta) -> String {
     for j in journeys {
         let (p, n) = j.counts();
         o.push_str(&format!("## {} — {}  ({p}/{n})\n\n", j.name, j.about));
+        if let Some(persona) = &j.persona {
+            o.push_str(&format!(
+                "> **{}** — {}. _Goal: {}_\n\n",
+                persona.handle, persona.role, persona.goal
+            ));
+        }
         o.push_str(&format!("_target: {}_\n\n", j.target));
         for (i, s) in j.steps.iter().enumerate() {
             render_step_md(&mut o, i + 1, s);
@@ -116,6 +122,9 @@ fn exit_label(s: &StepEvidence) -> String {
 fn render_step_md(o: &mut String, n: usize, s: &StepEvidence) {
     let head = if s.passed() { "✔" } else { "✗ FAIL" };
     o.push_str(&format!("### {n}. {head} {}\n\n", s.label));
+    if let Some(beat) = &s.narration {
+        o.push_str(&format!("_{beat}_\n\n"));
+    }
     o.push_str(&format!("```console\n$ {}\n```\n", s.cmd));
     if !s.env_shown.is_empty() {
         o.push_str(&format!("env: `{}`\n\n", s.env_shown.join("` `")));
@@ -213,6 +222,14 @@ pub fn render_html(journeys: &[Journey], meta: &Meta) -> String {
             p,
             n
         ));
+        if let Some(persona) = &j.persona {
+            o.push_str(&format!(
+                "<p class=\"persona\"><b>{}</b> — {}. <i>Goal: {}</i></p>",
+                esc(&persona.handle),
+                esc(&persona.role),
+                esc(&persona.goal)
+            ));
+        }
         o.push_str(&format!(
             "<p class=\"target\">target: {}</p>",
             esc(&j.target)
@@ -238,6 +255,9 @@ fn render_step_html(o: &mut String, n: usize, s: &StepEvidence) {
         exit_label(s),
         s.duration_ms
     ));
+    if let Some(beat) = &s.narration {
+        o.push_str(&format!("<p class=\"beat\">{}</p>", esc(beat)));
+    }
     o.push_str(&format!("<pre class=\"cmd\">$ {}</pre>", esc(&s.cmd)));
     if !s.env_shown.is_empty() {
         o.push_str(&format!(
@@ -301,6 +321,8 @@ const STYLE: &str = r#"<style>
 h1{font-size:1.5rem;margin:0 0 .25rem}h2{font-size:1.15rem;margin:2rem 0 .25rem;border-top:1px solid var(--line);padding-top:1.25rem}h2 small{color:var(--mut);font-weight:400;font-size:.85rem}
 h2.ok{color:var(--fg)}h2.bad{color:var(--bad)}.badge{float:right;color:var(--mut);font-size:.8rem;font-weight:400}
 .meta,.note,.target{color:var(--mut);font-size:.85rem;margin:.25rem 0}.note{margin-bottom:1rem}
+.persona{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--acc,#6aa);border-radius:8px;padding:.5rem .8rem;margin:.4rem 0;font-size:.92rem}
+.beat{color:var(--fg);font-style:italic;opacity:.9;margin:.15rem 0 .5rem;line-height:1.5}
 .summary{display:flex;flex-wrap:wrap;gap:.5rem;margin:.75rem 0}
 .pill{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:.2rem .7rem;font-size:.82rem}
 .pill.ok{color:var(--ok);border-color:var(--ok)}.pill.bad{color:var(--bad);border-color:var(--bad)}
@@ -338,6 +360,7 @@ mod tests {
             json: Some(serde_json::json!({"name":"x"})),
             duration_ms: 12,
             leaked_secret: false,
+            narration: None,
             observations: vec![],
         };
         s.observe(
@@ -397,6 +420,7 @@ mod tests {
             json: None,
             duration_ms: 1,
             leaked_secret: false,
+            narration: None,
             observations: vec![Observation::behavior("c", "w").info("d")],
         });
         let html = render_html(&j_slice(&j), &meta());

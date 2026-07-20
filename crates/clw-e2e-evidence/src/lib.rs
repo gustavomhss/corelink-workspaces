@@ -177,6 +177,13 @@ pub struct StepEvidence {
     /// own scrub (which protects the report) would otherwise hide a real clw leak.
     /// `false` = clw redacted at the source (the correct behavior).
     pub leaked_secret: bool,
+    /// The STORY BEAT: what the persona is doing/thinking at this moment, in plain
+    /// human terms ("Marina heads home and snapshots her work so she can pick it up on
+    /// her laptop"). This is what makes the suite story-driven rather than a step-list —
+    /// the report reads as a narrative, and the evidence is judged against the user's
+    /// INTENT, not just the exit code. `None` for a bare mechanical step.
+    #[serde(default)]
+    pub narration: Option<String>,
     pub observations: Vec<Observation>,
 }
 
@@ -189,6 +196,12 @@ impl StepEvidence {
     /// Add an observation derived from this step's captured evidence.
     pub fn observe(&mut self, obs: Observation) -> &mut Self {
         self.observations.push(obs);
+        self
+    }
+    /// Attach the STORY BEAT — the persona's intent at this moment, in plain human terms.
+    /// This is what makes a step a beat in a narrative rather than a bare command.
+    pub fn narrate(&mut self, beat: impl Into<String>) -> &mut Self {
+        self.narration = Some(beat.into());
         self
     }
     /// Security observation: clw's RAW output (pre-redaction) contained NO registered
@@ -226,12 +239,40 @@ impl StepEvidence {
     }
 }
 
+/// WHO is using clw — a realistic customer, not a test harness. A story is told from a
+/// persona's point of view so the evidence is judged against a real user's INTENT. The
+/// handle/role/goal are what a genuine customer would have; NOTHING here signals "test".
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Persona {
+    /// A real-looking handle (e.g. "marina"). Never a sentinel/`e2e-`/`test-` marker.
+    pub handle: String,
+    /// What they do ("backend engineer shipping an orders API").
+    pub role: String,
+    /// What they're trying to accomplish in this story ("ship orders-api and pick it up
+    /// on her laptop tomorrow").
+    pub goal: String,
+}
+
+impl Persona {
+    pub fn new(handle: &str, role: &str, goal: &str) -> Self {
+        Persona {
+            handle: handle.to_string(),
+            role: role.to_string(),
+            goal: goal.to_string(),
+        }
+    }
+}
+
 /// A named sequence of user steps against ONE backend target, accumulating evidence.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Journey {
     pub name: String,
     /// One-line description of what the journey proves.
     pub about: String,
+    /// The persona living this story (story-driven journeys). `None` for a bare
+    /// mechanical journey (smoke/adversarial harness self-tests).
+    #[serde(default)]
+    pub persona: Option<Persona>,
     /// The backend the steps ran against (redacted host label, e.g. "prod" or "hostile").
     pub target: String,
     pub steps: Vec<StepEvidence>,
@@ -260,10 +301,17 @@ impl Journey {
             name: name.into(),
             about: about.into(),
             target: target.into(),
+            persona: None,
             steps: Vec::new(),
             skipped: false,
             optional: false,
         }
+    }
+    /// A story-driven journey: `about` is the story premise, told for `persona`.
+    pub fn story(name: impl Into<String>, persona: Persona, premise: impl Into<String>) -> Self {
+        let mut j = Journey::new(name, premise, format!("prod · {}", persona.handle));
+        j.persona = Some(persona);
+        j
     }
     pub fn push(&mut self, step: StepEvidence) -> &mut StepEvidence {
         self.steps.push(step);
@@ -437,6 +485,7 @@ impl Runner {
             json,
             duration_ms,
             leaked_secret,
+            narration: None,
             observations: Vec::new(),
         };
         // The exit-code expectation is itself the first behavior observation.

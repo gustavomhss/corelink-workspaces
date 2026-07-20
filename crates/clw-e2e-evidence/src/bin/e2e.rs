@@ -16,15 +16,16 @@
 //!                 canary-blind). An OPTIONAL skip (J4's 2nd identity, J5's throwaway
 //!                 erase tenant) is reported but never trips REQUIRE, so the lane is green
 //!                 with just the primary PAT.
-//!   CLW_TOKEN_B / CLW_E2E_ERASE_TENANT / CLW_E2E_ERASE_TOKEN  the extra (optional) infra
-//!                 that lets J4 (team) and J5 (destructive) actually run.
+//!   CLW_TOKEN_B                       a 2nd identity → the team story (optional).
+//!   CLW_E2E_ERASE_TENANT / _TOKEN     a throwaway tenant → the offboarding story (optional).
+//!   CLW_E2E_QUOTA_TENANT / _TOKEN     a low-ceiling tenant → the quota story (optional).
 //!
-//! Journeys shipped: `smoke-offline` (harness self-test) always; J1 onboarding, J2
-//! lifecycle, J3 content-addressing, J4 team, J5 destructive, J6 errors, J7 security
-//! against the live backend when creds are present; J9 adversarial vs a local hostile
-//! backend always. J8 (cred-ticket) + J10/J11 (cross-platform) land as follow-ons per the
-//! plan. A skip is counted separately from a pass — required vs optional — so an
-//! absent-creds run can never be reported as green.
+//! Journeys shipped: `smoke-offline` (harness self-test) always; the STORY-DRIVEN persona
+//! cast against the live backend when creds are present — Marina (solo), the team, Dana
+//! (security), Ravi (automation), Omar (offboarding), Nadia (quota); plus J9 adversarial vs
+//! a local hostile backend and JE efficiency, both always. J8 (cred-ticket) + J10/J11
+//! (cross-platform) land as follow-ons. A skip is counted separately from a pass — required
+//! vs optional — so an absent-creds run can never be reported as green.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,41 +58,55 @@ fn main() {
     // smoke-offline + the other journeys' evidence always survives.
     match ProdCreds::from_env() {
         Some(creds) => {
-            journeys.push(guarded("J1-onboarding", || {
-                journeys::j1_onboarding::run(&bin, &creds)
+            // Story-driven: a real persona living a real week with clw (the exemplar for
+            // the rewrite of J1–J7 into user stories).
+            journeys.push(guarded("marina-ships-orders-api", || {
+                journeys::story_ship_service::run(&bin, &creds)
             }));
-            journeys.push(guarded("J2-lifecycle", || {
-                journeys::j2_lifecycle::run(&bin, &creds)
-            }));
-            journeys.push(guarded("J3-content-addressing", || {
-                journeys::j3_content_addressing::run(&bin, &creds)
-            }));
-            // J4 needs a SECOND identity (CLW_TOKEN_B) on the same tenant.
+            // Story-driven: the TEAM (two identities on one tenant). Needs a second PAT.
             match journeys::second_token() {
-                Some(token_b) => journeys.push(guarded("J4-team-concurrency", || {
-                    journeys::j4_team::run(&bin, &creds, &token_b)
+                Some(token_b) => journeys.push(guarded("team-shares-billing-service", || {
+                    journeys::story_team::run(&bin, &creds, &token_b)
                 })),
                 None => journeys.push(journeys::skipped_optional_journey(
-                    "J4-team-concurrency",
-                    "two identities on one tenant + concurrent writes",
-                    "CLW_TOKEN_B (a second identity PAT)",
+                    "team-shares-billing-service",
+                    "two engineers, one tenant: cross-identity read/dedup, create-only conflict, concurrent convergence",
+                    "CLW_TOKEN_B (a second identity PAT on the same tenant)",
                 )),
             }
-            journeys.push(guarded("J6-errors", || {
-                journeys::j6_errors::run(&bin, &creds)
+            // Story-driven: the SECURITY engineer (redaction, plaintext refusal, consent gates).
+            journeys.push(guarded("dana-hardens-clw-usage", || {
+                journeys::story_security::run(&bin, &creds)
             }));
-            journeys.push(guarded("J7-security", || {
-                journeys::j7_security::run(&bin, &creds)
+            // Story-driven: AUTOMATION/CI (exit-code passthrough + runner ref-domain).
+            journeys.push(guarded("ravi-wires-clw-into-ci", || {
+                journeys::story_automation::run(&bin, &creds)
             }));
-            // J5 is DESTRUCTIVE (real erase). It runs ONLY against a dedicated throwaway
-            // tenant that is not the primary — the loader fences both conditions.
-            match journeys::erase_creds(&creds.tenant) {
-                Some(ec) => journeys.push(guarded("J5-destructive", || {
-                    journeys::j5_destructive::run(&bin, &ec)
+            // Story-driven: QUOTA (the real 402 spend-ceiling). Needs a dedicated low-quota
+            // tenant whose $-ceiling is set out-of-band; fenced ≠ primary.
+            match journeys::quota_creds(&creds.tenant) {
+                Some(qc) => journeys.push(guarded("nadia-hits-her-plan-ceiling", || {
+                    journeys::story_quota::run(&bin, &qc)
                 })),
                 None => journeys.push(journeys::skipped_optional_journey(
-                    "J5-destructive",
-                    "prune + erase on a dedicated throwaway tenant",
+                    "nadia-hits-her-plan-ceiling",
+                    "a metered tenant at its monthly budget → a real, actionable 402",
+                    "CLW_E2E_QUOTA_TENANT (≠ primary, ceiling set to ~$0) + CLW_E2E_QUOTA_TOKEN",
+                )),
+            }
+            // (The old J1–J7 mechanical journeys were REPLACED by the persona stories above:
+            // Marina ⊃ onboarding/lifecycle/content-addressing/errors, the team ⊃ J4, Dana ⊃
+            // security, Omar ⊃ the destructive J5 — see below.)
+
+            // Story-driven OFFBOARDING: DESTRUCTIVE (real prune + erase). Runs ONLY against a
+            // dedicated throwaway tenant that is not the primary — the loader fences both.
+            match journeys::erase_creds(&creds.tenant) {
+                Some(ec) => journeys.push(guarded("omar-offboards-a-tenant", || {
+                    journeys::story_offboarding::run(&bin, &ec)
+                })),
+                None => journeys.push(journeys::skipped_optional_journey(
+                    "omar-offboards-a-tenant",
+                    "an ops engineer's offboarding: prune (orphans only) + GDPR erase on a throwaway tenant",
                     "CLW_E2E_ERASE_TENANT (≠ primary) + CLW_E2E_ERASE_TOKEN",
                 )),
             }
@@ -101,39 +116,36 @@ fn main() {
                 "NOTE: CLW_TOKEN/CLW_TENANT absent → prod journeys skipped (offline-only report)"
             );
             let need = "CLW_TOKEN + CLW_TENANT";
+            // The primary-cred persona stories (a skip here trips CLW_E2E_REQUIRE_PROD).
             journeys.push(journeys::skipped_journey(
-                "J1-onboarding",
-                "the first surface a user touches",
+                "marina-ships-orders-api",
+                "a backend engineer's real week: snapshot → hydrate → iterate → conflict → run → clean up",
                 need,
             ));
             journeys.push(journeys::skipped_journey(
-                "J2-lifecycle",
-                "snapshot → status → ls → hydrate → run → rm",
+                "dana-hardens-clw-usage",
+                "a security review: no PAT leak, redaction, plaintext refusal, consent gates",
                 need,
             ));
             journeys.push(journeys::skipped_journey(
-                "J3-content-addressing",
-                "dedup across a cold cache + pin-by-manifest-digest",
+                "ravi-wires-clw-into-ci",
+                "automation: exit-code passthrough, reserved 125, runner ref-domain disjointness",
+                need,
+            ));
+            // The extra-infra persona stories (optional skips — never trip REQUIRE).
+            journeys.push(journeys::skipped_optional_journey(
+                "team-shares-billing-service",
+                "two identities: cross-identity read/dedup, create-only conflict, concurrent convergence",
                 need,
             ));
             journeys.push(journeys::skipped_optional_journey(
-                "J4-team-concurrency",
-                "two identities on one tenant + concurrent writes",
-                need,
-            ));
-            journeys.push(journeys::skipped_journey(
-                "J6-errors",
-                "inducible failures return the right exit code + actionable message",
-                need,
-            ));
-            journeys.push(journeys::skipped_journey(
-                "J7-security",
-                "redaction, plaintext refusal, consent gates — observed via the binary",
+                "omar-offboards-a-tenant",
+                "destructive: prune (orphans only) + GDPR erase on a throwaway tenant",
                 need,
             ));
             journeys.push(journeys::skipped_optional_journey(
-                "J5-destructive",
-                "prune + erase on a dedicated throwaway tenant",
+                "nadia-hits-her-plan-ceiling",
+                "a metered tenant at its monthly budget → a real, actionable 402",
                 need,
             ));
         }
@@ -215,6 +227,7 @@ fn guarded(name: &str, build: impl FnOnce() -> Journey + std::panic::UnwindSafe)
                 json: None,
                 duration_ms: 0,
                 leaked_secret: false,
+                narration: None,
                 observations: Vec::new(),
             };
             ev.observe(

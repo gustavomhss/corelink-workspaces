@@ -103,33 +103,46 @@ captured string **before** it is stored, so nothing secret can reach the report.
 theme-aware `evidence.html` — the artifact a human reads to analyse behaviour and security per step.
 Pass/fail is a floor; the *evidence* is the deliverable.
 
-**The journeys** (`crates/clw-e2e-evidence/src/journeys/`, driven by the `clw-e2e` binary):
+**Story-driven (the key move).** Each journey is a **PERSONA** — a real-looking customer living a
+realistic narrative — so the backend can't tell it's a test and the evidence is judged against the
+user's **intent**, not a step-list with baked asserts. Nothing signals "test": realistic project data
+(`realistic::orders_api`), names a user would type, no sentinels, provisioned through the real front
+door. The report reads as a story: each beat narrates what the persona is doing, then shows the real
+`clw` invocation + the full-shape verification.
 
-| Journey | What its evidence proves (against PROD unless noted) |
+**The cast** (`crates/clw-e2e-evidence/src/journeys/story_*`, driven by the `clw-e2e` binary):
+
+| Persona (story) | What its evidence proves (against PROD unless noted) |
 |---|---|
 | **smoke-offline** | the credential-free surface (version/completions/doctor) — harness self-test, always runs |
-| **J1 onboarding** | config `0600` / dir `0700`, flag>env precedence, PAT never leaked |
-| **J2 lifecycle** | dedup, `status` exit 0/1 contract, hydrate byte-identity, memoization proven from OUTSIDE (a marker ran exactly once) |
-| **J3 content-addressing** | all-fresh → 0-uploaded dedup on a cold cache → pin-by-`--manifest-digest` with `bytes_downloaded > 0` |
-| **J4 team + concurrency** *(opt: `CLW_TOKEN_B`)* | cross-identity read/dedup, concurrent writers converge on one root, cold hydrate-back byte-identical |
-| **J5 destructive** *(opt: throwaway erase creds)* | `prune` spares live data, wrong `--confirm-tenant` ABORTS, real `erase` verified-then-empty — throwaway tenant only |
-| **J6 errors** | every inducible failure's exact exit code + actionable message (409 / 401 / dest-not-empty / bad-digest / usage) |
-| **J7 security** | no-PAT-in-`-vv`, userinfo redaction, plaintext-`http://` refusal, `rm`/`logout` consent gates preserve identity |
+| **Marina** — solo dev | config `0600`/`0700`, flag>env, full lifecycle, dedup + pin-by-`--manifest-digest`, hydrate byte+mode+unicode-identical (cold), memoize (replica-lag-tolerant), create-only conflict + `--force`, the error surface, rm-then-gone |
+| **Dana** — security | no-PAT-in-`-vv` (pre-scrub), endpoint-userinfo redaction, plaintext-`http://` refusal, `rm`/`logout` consent gates preserve identity |
+| **Ravi** — automation/CI | exit-code passthrough (child's `3` → `3` verbatim), reserved exit `125` (clw-internal, step never ran), runner ref-domain (`CLW_REF_DOMAIN=runner`) is a keyspace disjoint from developers' |
+| **Priya + Sam** — team *(opt: `CLW_TOKEN_B`)* | cross-identity read + dedup, create-only stops a teammate clobbering a shared name, two concurrent identical saves converge on one root |
+| **Omar** — offboarding *(opt: erase creds)* | `prune` sweeps orphans only (live data survives, verified cold), erase refuses the wrong `--confirm-tenant`, the correct confirmation empties the tenant (GDPR Art.17), verified gone |
+| **Nadia** — quota *(opt: quota creds)* | a metered tenant at its monthly budget → a real, actionable **402** (not a cryptic 500) |
 | **J9 adversarial** | the real binary vs a controllable HOSTILE backend (loopback) — SSRF-redirect NOT followed, 5xx/429 bounded-backoff-then-clean-error, 413 clean fail. Needs no creds. |
+| **JE efficiency** | a divergent re-snapshot fails-fast on the ref (0 uploads before the 409), not upload-then-reject. Needs no creds. |
 
-**Two-tier skip (honest AND operable).** A journey that cannot run reports a **skip**, never a false
-pass. A skip of a **primary-cred** journey (J1/J2/J3/J6/J7) trips `CLW_E2E_REQUIRE_PROD=1` → hard
+**Two-tier skip (honest AND operable).** A story that cannot run reports a **skip**, never a false
+pass. A skip of a **primary-cred** persona (Marina / Dana / Ravi) trips `CLW_E2E_REQUIRE_PROD=1` → hard
 failure, so CI can never silently stop exercising prod (the canary-blind failure mode). A skip of an
-**optional-infra** journey (J4 needs a 2nd identity, J5 needs a throwaway erase tenant) is reported but
-never require-fails — so the lane is green with just the primary PAT (mirrors the conformance suite's
-`soft_skip`).
+**optional-infra** persona (team needs a 2nd identity, offboarding a throwaway erase tenant, quota a
+low-ceiling tenant) is reported but never require-fails — so the lane is green with just the primary PAT
+(mirrors the conformance suite's `soft_skip`).
 
-**Mechanized:** `.github/workflows/e2e-evidence.yml` builds the binary + the runner, drives the journeys
+**Provisioning (indistinguishable from a real user).** Each persona gets a real `{tenant, PAT}` via the
+actual admin/mint path — the data plane (CAS/AC/auth) can't distinguish it from a genuine customer.
+`mint-dogfood-pat.sh` provisions a PAT for an **existing** tenant (the `pat` row FK-references `tenant`,
+so it cannot *create* tenants — fresh dedicated tenants still need the signup/seed path). Optional-infra
+personas need dedicated tenants (a throwaway for erase; a low-ceiling one for the 402).
+
+**Mechanized:** `.github/workflows/e2e-evidence.yml` builds the binary + the runner, drives the stories
 against prod **on demand** (manual `workflow_dispatch` — no schedule; the daily prod watch is already
 the conformance/metered/deadman canaries' job, and this lane exercises prod + burns CI minutes) with
 `REQUIRE_PROD=1`, and uploads the evidence report as an artifact **always** (a red run is when the
-evidence matters most). It reuses the `CLW_CI_*` secrets from `live-journeys.yml` — provision once, both
-lanes light up.
+evidence matters most). It reuses the `CLW_CI_*` secrets from `live-journeys.yml` (+ `CLW_CI_TOKEN_B` for
+the team, `CLW_CI_ERASE_*` for offboarding, `CLW_CI_QUOTA_*` for quota).
 
 ### The two anti-vacuity laws (learned the hard way — every journey's cold review broke on one)
 
@@ -160,8 +173,9 @@ identity preserved) · SSRF/redirect NOT followed · 5xx/429 bounded backoff the
 hammer) · 413 clean fail.
 
 **Not yet driven via the evidence binary** (the doctrine's own standard: don't claim what the harness
-doesn't observe): **no `CLW_TOKEN` fallback** in the runner ref-domain — J7 soft-notes it as `Info`;
-full proof waits on J8 (cred-ticket). And the setuid-strip-on-hydrate + external-symlink-skip defenses
+doesn't observe): the runner ref-domain KEYSPACE is now exercised (Ravi/automation proves it's disjoint
+from the user's), but the **no `CLW_TOKEN` fallback** property specifically still waits on J8
+(cred-ticket). And the setuid-strip-on-hydrate + external-symlink-skip defenses
 (clw *does* enforce them — see the v0.1.6 / v0.1.7 hardening + `crates/clw-integration-tests`) are not
 yet E2E-evidence steps; a hostile-fixture journey to observe them via the binary is a follow-on.
 

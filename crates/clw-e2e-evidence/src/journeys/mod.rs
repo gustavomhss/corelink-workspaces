@@ -1,10 +1,14 @@
 //! The user-simulating journeys — each drives the REAL `clw` binary against a target
 //! and returns a [`Journey`](crate::Journey) of per-step evidence.
 //!
-//! Onda 2 = the prod journeys (J1–J7): a real user's paths against the live backend.
-//! Every journey is runnable — it drives the binary and emits analyzable evidence — and
-//! degrades gracefully to a single "skipped (no creds)" info step when the prod identity
-//! is absent, so an offline run still produces a report (never a panic).
+//! STORY-DRIVEN: each journey is a PERSONA (a real-looking customer) living a realistic
+//! narrative, so the system can't tell it's a test and the evidence is judged against the
+//! user's INTENT — not a step-list with baked asserts. The cast (`story_*`): Marina (a solo
+//! backend engineer's real week), Priya + Sam (two identities on one tenant), Dana (a
+//! security engineer's audit), Ravi (clw inside CI), Omar (a destructive decommission + GDPR
+//! erase on a throwaway), and Nadia (a metered tenant hitting its 402 spend wall). Each
+//! degrades gracefully to a "skipped (no creds)" step when its identity is absent, so an
+//! offline run still produces a report (never a panic).
 //!
 //! Nothing here calls a clw library function: the ONLY entry point is the binary via
 //! [`Runner::step`](crate::Runner). "Não pode ser por outro caminho."
@@ -13,13 +17,13 @@ use std::path::PathBuf;
 
 use crate::{Journey, Observation, Secret};
 
-pub mod j1_onboarding;
-pub mod j2_lifecycle;
-pub mod j3_content_addressing;
-pub mod j4_team;
-pub mod j5_destructive;
-pub mod j6_errors;
-pub mod j7_security;
+pub mod realistic;
+pub mod story_automation;
+pub mod story_offboarding;
+pub mod story_quota;
+pub mod story_security;
+pub mod story_ship_service;
+pub mod story_team;
 
 /// The default prod endpoint (same host the live conformance suite dials).
 pub const DEFAULT_ENDPOINT: &str = "https://corelink-api.humangr.com";
@@ -92,6 +96,33 @@ pub fn erase_creds(primary_tenant: &str) -> Option<EraseCreds> {
     })
 }
 
+/// A DEDICATED low-quota tenant + PAT for the quota persona (its monthly $-ceiling is set
+/// tiny out-of-band so a snapshot trips the real 402). Fenced like the erase creds: `None`
+/// unless set AND `!= primary` — a $1 ceiling must never land on the working tenant.
+pub type QuotaCreds = EraseCreds;
+
+pub fn quota_creds(primary_tenant: &str) -> Option<QuotaCreds> {
+    let tenant = std::env::var("CLW_E2E_QUOTA_TENANT")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let token = std::env::var("CLW_E2E_QUOTA_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    if tenant == primary_tenant {
+        eprintln!("REFUSING quota persona: CLW_E2E_QUOTA_TENANT == primary — a $-ceiling must target a dedicated tenant");
+        return None;
+    }
+    let endpoint = std::env::var("CLW_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    Some(EraseCreds {
+        endpoint,
+        tenant,
+        token: Secret::new(token),
+    })
+}
+
 /// A SECOND identity's PAT (`CLW_TOKEN_B`) on the same tenant, for the team journey (J4).
 /// `None` → J4 is skipped. Kept separate from [`ProdCreds`] because most journeys are
 /// single-identity; only the team journey needs two.
@@ -133,6 +164,7 @@ fn build_skip(name: &str, about: &str, need: &str, optional: bool) -> Journey {
         json: None,
         duration_ms: 0,
         leaked_secret: false,
+        narration: None,
         observations: Vec::new(),
     };
     ev.observe(
@@ -162,6 +194,11 @@ impl Workspace {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create workspace root");
         Workspace { root }
+    }
+
+    /// The workspace root (for generators that write a whole tree under it).
+    pub fn root_dir(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// A named subdirectory (created).
