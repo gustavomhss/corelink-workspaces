@@ -122,6 +122,26 @@ from CAS are uploaded. Files ≤ 16 MiB take an in-memory path; larger files **s
 memory at a time). A proptest proves the two paths produce byte-identical chunks, so a file's digest never
 depends on which path it took.
 
+### Who shares what — you, your team, CI
+The **tenant is the sharing boundary.** Everyone who authenticates to a tenant (their own PAT, same tenant id)
+shares that tenant's **remote CAS + AC** — so the content-addressed store itself *is* a shared cache:
+- **Solo / personal** — your own tenant; the CAS is your private store, shared across all *your* machines.
+- **A team / org** — point the team at **one shared tenant** and dedup becomes team-wide: you upload only the
+  chunks a teammate hasn't already pushed, and anyone can `clw hydrate --name <ref>` (or `--manifest-digest`) a
+  snapshot someone else created. The first person to snapshot a big dependency set or toolchain pays the
+  upload; **everyone else on the tenant gets it deduped — near-free**.
+- **CI / runners** — the same tenant (so CI shares the team's CAS blobs), but `CLW_REF_DOMAIN=runner` gives CI
+  a **disjoint ref namespace** so its refs never collide with a human's.
+
+Two things this does *not* mean:
+- **The local `~/.clw/cache` is never shared** — it's per-machine, owner-only (`0700`), just a warm L1 in
+  front of the shared tenant CAS. "Shared cache" = the remote tenant store, not your disk.
+- **Different tenants are isolated** — content is stored per-tenant (`/v1/cas/{tenant}/…`), so there is no
+  clw-level sharing or dedup *across* different tenants.
+
+clw itself doesn't manage org membership or issue PATs — it just points at whichever tenant you give it; who
+holds a PAT for a shared tenant is an account-side decision.
+
 ### Snapshot: blobs before ref
 `walk → chunk → upload missing chunks → upload manifest blob → write ref`. Chunks and the manifest are
 uploaded **before** the ref is written, so a ref never points at absent content. `exists` is checked before
@@ -146,7 +166,7 @@ memoizes **only if the child exited 0**. Before spawning the child, clw strips s
 the cred-ticket trio, …) so an untrusted command can't read them. (An env var passed via `--env` is folded
 into the key with a presence-distinguishing encoding — *unset* hashes differently from *set-but-empty*.)
 
-### Everything is BLAKE3-verified
+### Everything fetched from CAS is BLAKE3-verified
 `CasTransport::get` re-hashes every blob; hydrate re-verifies the manifest and every chunk; the local cache
 self-heals (a corrupt blob is detected on read and removed). `--manifest-digest` makes hydrate end-to-end
 self-verifying — a hostile or buggy CAS cannot substitute different content.
@@ -168,9 +188,12 @@ Brew resolves the OS/arch binary, verifies its SHA-256, and (on macOS) installs 
 curl -fsSL https://raw.githubusercontent.com/HumanGuardrail/clw-releases/main/install.sh \
   | CLW_VERSION=0.1.11 sh
 ```
-It downloads the binary + a **minisign-signed `SHA256SUMS`** + the trust-root `minisign.pub`, verifies the
-signature over the checksum manifest, then the binary's SHA-256 (never skippable), **strips the macOS
-quarantine attribute**, and installs to `~/.local/bin/clw` (ensure that's on your `PATH`).
+It downloads the binary + a **minisign-signed `SHA256SUMS`** (+ `.minisig`), verifies the signature against a
+trust-root public key **embedded in the script itself** (the published `docs/minisign.pub` is deliberately
+*not* fetched — pinning the key in the script avoids a trust-on-first-use hole), then verifies the binary's
+SHA-256 (**never skippable**). The signature step *can* be bypassed (`CLW_SKIP_SIGNATURE=1`, or if `minisign`
+isn't installed) — the checksum check still runs. It then **strips the macOS quarantine attribute** and
+installs to `~/.local/bin/clw` (ensure that's on your `PATH`).
 
 **Windows:** download `clw-<version>-x86_64-pc-windows-gnu.exe` from the mirror release
 (`github.com/HumanGuardrail/clw-releases`) and verify it with **minisign** over `SHA256SUMS` + the SHA-256
@@ -231,6 +254,23 @@ content-addressed backend, and memoize work done against it. Everything is built
 
 The rest are lifecycle + identity helpers: `status`, `ls`, `rm`, `prune`, `erase`, `init`,
 `auth`, `doctor`, `uninstall`, `completions`.
+
+### What a snapshot captures (the walk rules)
+
+`snapshot` (and `run`'s `--input <dir>` walk) don't capture *everything* under the path — they apply a
+deliberate, git-aware filter. Know these so a "byte-identical tree" holds no surprises:
+
+- **`.git/` is always excluded** — unconditionally, on every snapshot, regardless of any ignore file. A
+  snapshot captures your *working tree*, not the repo database. (So a hydrated tree is byte-identical for
+  everything that was captured — minus `.git` and anything ignored below.)
+- **The full ignore stack is honored**, not just `.gitignore`: also `.clwignore`, `.ignore`,
+  `.git/info/exclude`, your global `core.excludesFile`, and parent-directory `.gitignore` files — and
+  gitignore rules apply **even outside a git repo**.
+- **Hidden / dotfiles ARE included** by default (e.g. `.env`, `.config/…`) unless an ignore rule drops them.
+  This is why `snapshot` **secret-scans** and warns about `.env`/keys — they're captured, not skipped (clw
+  never silently drops your data; add them to `.clwignore` if you don't want them).
+- **Symlinks that point outside the workspace are skipped** with a warning (they can't round-trip safely);
+  in-tree symlinks (including intra-workspace `..`) are preserved. **Empty directories are preserved.**
 
 ---
 
@@ -587,7 +627,63 @@ on the `run` path). It is a **billing** limit on your CoreLink account, not a cl
 <a id="11-features-in-depth"></a>
 ## 11. Features in depth
 
-The full capability inventory, grouped. Everything below is a distinct, shipped behavior you can rely on.
+The fastest way to *get* clw is to see what it replaces. Each item is a real job: how you'd do it today,
+and what clw turns it into (**→** = the payoff).
+
+**Move a work tree to another machine** &nbsp;·&nbsp; **→ Your exact tree, reproduced bit-for-bit anywhere**
+- *Today:* `zip`/`rsync`/`scp`, or commit half-built state and pull — slow, and symlinks, exec bits, and empty dirs get mangled.
+- *With clw:* `clw snapshot` here → `clw hydrate` there: a **byte-identical** tree, permission bits and symlinks preserved, in seconds — warmed by the local cache next time (on Windows, symlinks arrive as copies).
+
+**Re-run a build or test suite** &nbsp;·&nbsp; **→ Identical work is computed once, then replayed**
+- *Today:* it runs from scratch every time, even when nothing that affects the result changed.
+- *With clw:* `clw run --input src/ -- cargo test` — on a cache hit (identical declared inputs, a `0`-exit prior run), it **replays the cached output + exit code** instead of recomputing.
+
+**Save a snapshot of a barely-changed tree** &nbsp;·&nbsp; **→ Every version stored, only the delta paid for**
+- *Today:* the whole tree re-uploads, even the 99% that didn't change.
+- *With clw:* only the chunks the server **doesn't already have** cross the wire — you store and transfer just the delta.
+
+**Share a workspace/build cache across a team** &nbsp;·&nbsp; **→ Your team uploads each chunk once, together**
+- *Today:* every teammate re-downloads and rebuilds the same dependencies from scratch on their own machine — no reuse across people.
+- *With clw:* put the team on **one shared tenant** — the first `clw snapshot` populates the shared CAS; every teammate's `clw hydrate` pulls it **deduped**, and their own snapshots upload only what's genuinely new. (The remote tenant store is the shared cache; your local `~/.clw/cache` stays personal.)
+
+**Pin an exact workspace by identity** &nbsp;·&nbsp; **→ The content hash is the proof — no trust needed**
+- *Today:* trust a tag or a path and *hope* it resolves to the same bytes everywhere.
+- *With clw:* `clw hydrate --manifest-digest <hex>` materializes **exactly** that content — the manifest must hash to the digest, so a wrong or tampered store can't substitute anything.
+
+**Know if your tree still matches a snapshot** &nbsp;·&nbsp; **→ Uncommitted drift, caught in one exit code**
+- *Today:* eyeball `git status`, diff by hand, or just guess.
+- *With clw:* `clw status` — exit **0 = clean / 1 = dirty**, a scriptable one-line gate in any CI step.
+
+**Reclaim storage from old snapshots** &nbsp;·&nbsp; **→ Reclaim space with zero risk to live data**
+- *Today:* track by hand what's still referenced; deleting the wrong thing is a real risk.
+- *With clw:* `clw prune` (dry-run first) sweeps **only unreferenced** blobs, and fail-safes abort the wipe the moment the live set looks wrong.
+
+**Honor a "delete all my data" request** &nbsp;·&nbsp; **→ Deletion that's verified empty, not assumed**
+- *Today:* hunt down every copy and hope you actually got them all.
+- *With clw:* `clw erase --confirm-tenant …` irreversibly wipes the tenant, then **re-enumerates to prove it's empty** before it will report success.
+
+**Give a throwaway CI container an identity** &nbsp;·&nbsp; **→ No long-lived credential anyone could steal**
+- *Today:* bake a long-lived token into the env — it can leak, and it outlives the container.
+- *With clw:* the runner gets a **single-use cred-ticket**, redeemed once at boot; no PAT sits in the environment, and a second use fails closed.
+
+**Trust bytes from a shared or remote store** &nbsp;·&nbsp; **→ Corrupt or tampered bytes never make it in**
+- *Today:* assume the download is intact and hope the store didn't lie.
+- *With clw:* every fetched blob, chunk, and manifest is **re-hashed (BLAKE3)** before use — a mismatch is rejected and never written to disk.
+
+**Run a command you don't fully trust** &nbsp;·&nbsp; **→ Untrusted commands never touch your token**
+- *Today:* the child process inherits your whole environment — token included.
+- *With clw:* `clw run` **strips your credentials** (token + the cred-ticket vars) from the child's environment before it execs.
+
+**Work against a flaky or slow backend** &nbsp;·&nbsp; **→ A dead backend fails fast — it can't hang you**
+- *Today:* a stall hangs your command indefinitely; a rate-limit fails it outright.
+- *With clw:* bounded retries + an overall deadline + adaptive concurrency ride out a 5xx/429; a black-hole backend **fails cleanly** at the deadline instead of hanging.
+
+---
+
+### The full capability catalog (reference)
+
+The complete inventory, grouped — every distinct, shipped behavior you can rely on, for when you want the
+mechanism behind a row above (or the fine-grained guarantees the table doesn't show).
 
 ### A · The workspace lifecycle
 - **`snapshot`** — content-address + upload a directory and record it under a name.
@@ -643,7 +739,7 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
   chunked, so an unrestorable snapshot can't be published.
 
 ### E · Security & privacy
-- **Token never printed** — redacted to `<set>`/`<unset>` in every log, `doctor`, `whoami`, and `Debug`;
+- **Token never printed** — redacted to `<set>`/`<unset>` in every log, `doctor`, and `whoami` (and `<redacted>` in `Debug`);
   the 0600 config file is the only place the plaintext PAT is written.
 - **Endpoint userinfo redaction** — a `user:pass@host` endpoint is shown as `<redacted>@host` everywhere.
 - **Plaintext-PAT / SSRF defenses** — HTTPS-only (exact-host loopback check, no `127.0.0.1.evil.com`
@@ -714,8 +810,8 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **`auth`** — login / logout (`--all`) / whoami / rotate, fully offline.
 
 ### J · Platform & distribution
-- **Five native targets** — macOS (arm64 + x86_64), Linux (x86_64 + arm64), Windows (x86_64-gnu); the suite
-  runs on Windows and unix.
+- **Five release targets** — macOS (arm64 + x86_64), Linux (x86_64 + arm64), Windows (x86_64-gnu); four are
+  native, the Intel-macOS binary is cross-built on the Apple-Silicon runner (§20). The suite runs on Windows and unix.
 - **Windows symlink copy-fallback** + **Windows-aware path validation** on every platform.
 - **Signed distribution** — minisign-signed `SHA256SUMS` + committed trust-root + CycloneDX SBOM; Homebrew
   tap + `install.sh` + public mirror; macOS quarantine stripped by the install paths.
@@ -762,7 +858,9 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - Memoizing **deterministic**, side-effect-light commands (builds, test suites) whose inputs are enumerable
   as files + declared env vars.
 - Ephemeral / disposable compute that treats the workspace as the durable object.
-- Tenant-isolated private workspaces (only identical, deterministic content dedups across tenants).
+- A **shared team store**: put a team on one tenant and its CAS becomes a team-wide cache — dedup across
+  members, and anyone can hydrate a teammate's ref/digest (see §4, "Who shares what"). Different tenants stay
+  isolated (dedup is *within* a tenant).
 
 **Limits / handle with care**
 - **Manifest single-blob ceiling.** A manifest is one CAS blob capped at **5 MiB**, so a workspace with very
@@ -776,15 +874,51 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **Windows symlinks become copies** (content round-trips, the link relationship doesn't).
 - **Single-operator threat model.** clw is a pure client; tenant isolation / auth enforcement live server-side.
   The PAT is the single credential — leaking it grants full tenant access.
-- **Quotas & plan ceilings.** Plans are **flat** (a monthly subscription), and paid tenants default to a very
-  high monthly $-ceiling. But there are concrete limits you can hit: a **free tier caps storage (~10 GB) →
-  HTTP 429** with a `Retry-After` (clw backs off and retries), and a monthly $-ceiling → **HTTP 402** ("raise
-  your plan", not a clw setting). A `429` is transient backpressure; a `402` is a billing wall.
+- **Quotas & plan ceilings.** These are **CoreLink backend/plan limits, enforced server-side — not clw
+  settings** (clw only reacts to the status codes). Plans are flat (a monthly subscription); the exact storage
+  and $-ceiling numbers are set by your plan. Two codes you may see: **HTTP 429** (a rate/storage limit) — clw
+  honors a `Retry-After` and retries as *transient backpressure*, but a **persistent** cap will retry-then-fail
+  at the op deadline (retrying can't clear a limit that isn't temporary); and **HTTP 402** (a monthly $-ceiling
+  reached) → an actionable "raise your plan" message, a billing wall clw can't retry past. Confirm your plan's
+  actual limits with CoreLink — clw can neither enforce nor report them.
 
 ---
 
 <a id="14-security--safety"></a>
 ## 14. Security & safety model
+
+Why running through clw is the safer, more assertive choice — each item is a concrete threat and what clw does
+about it. All of it is **client-side and on by default; there is nothing to configure.**
+
+**A leaked PAT grants full tenant access** &nbsp;·&nbsp; **→ The token never leaves the 0600 file**
+- *The risk:* a token printed to a log, a CI transcript, or a crash dump is a full-tenant credential in the clear.
+- *What clw does:* redacted to `<set>`/`<unset>` in every log, `doctor`, and `whoami` (and to `<redacted>` in `Debug` output); the only place clw ever **persists** the plaintext PAT is the `0600` config file — and it's stripped from the environment before any `clw run` child.
+
+**A hostile endpoint tries to steal your token** &nbsp;·&nbsp; **→ A redirect can't chase your token away**
+- *The risk:* a plain-HTTP endpoint, a `https://host@evil.com` userinfo trick, or a 3xx redirect could exfiltrate the bearer token to another host.
+- *What clw does:* HTTPS-only, embedded `user:pass@` userinfo rejected, and a **no-redirect** policy — a 3xx is an error, never followed, so the `Authorization` header can't be carried off-host.
+
+**A malicious manifest tries to escape the tree** &nbsp;·&nbsp; **→ Nothing a manifest says can write outside the workspace**
+- *The risk:* a crafted path (`../../etc/…`, an absolute path, a symlink pointing outside) could make a hydrate write anywhere on disk.
+- *What clw does:* every path is validated (no absolute / `..` / backslash / drive-letter / NTFS-ADS colon, on *every* OS) and symlink targets must resolve **within** the workspace. Producer and consumer share the validator, so it can't diverge.
+
+**A tampered or corrupt store feeds you bad bytes** &nbsp;·&nbsp; **→ The store can't hand you bytes it didn't promise**
+- *The risk:* a compromised or buggy backend (or a shared cache) could serve altered content under the right hash.
+- *What clw does:* every blob, chunk, and manifest fetched from CAS is **re-hashed with BLAKE3** and compared to the id you asked for; a mismatch is an `Integrity` error — rejected, never written, never cached. The content *is* the identity.
+
+**A poisoned registry or tampered store swaps your toolchain** &nbsp;·&nbsp; **→ Pin by content — substitution is impossible, not just detected**
+- *The risk:* a mutable tag, a compromised registry, or a MITM hands you a *different* (poisoned) artifact than the one you vetted — the classic supply-chain / package-poisoning move.
+- *What clw does:* you pin a workspace or toolchain by its **BLAKE3 content digest**: `clw hydrate --manifest-digest <hex>` yields **exactly** those bytes or fails — the manifest must hash to the digest and every chunk is verified, so a hostile store **cannot substitute** anything. `clw run`'s memo key also folds the tool's content digest, so a swapped toolchain never triggers a stale, poisoned replay. *(This is why runners pin `toolchain_ref = <digest>`.)* Note: clw guarantees you get the bytes you pinned — it is **not** a dependency-CVE scanner or upstream-signature checker.
+
+**A giant/hostile manifest exhausts your machine** &nbsp;·&nbsp; **→ A malicious manifest can't OOM or fill your disk**
+- *The risk:* an attacker-declared `total_size`, a billion entries, or a symlink bomb could exhaust RAM or disk on hydrate.
+- *What clw does:* up-front caps (≤ 1M entries, 100k symlinks, 1 TiB, 64M chunks) budgeted against the **real** summed sizes — not the attacker's number — plus a 5 MiB streamed cap on every download before it's hashed.
+
+**A destructive op fires by accident** &nbsp;·&nbsp; **→ Wipes are triple-guarded and verify their own result**
+- *The risk:* a fat-fingered `prune`/`erase` could delete live data, or report success while data remains.
+- *What clw does:* `erase` = dry-run default + `--yes` + typed-tenant confirmation, then **re-enumerates to prove empty**; `prune` aborts the moment the live set looks wrong (replica-lag ref, empty-live-set-over-non-empty-CAS) rather than sweeping live blobs.
+
+### The controls, in full (reference)
 
 - **The token is never printed** — everywhere it's redacted to `<set>`/`<unset>`; the only place the plaintext
   PAT is written is the 0600 config file (parent dir 0700; atomic, PAT-leak-safe writes; an over-permissive
@@ -868,12 +1002,15 @@ The full capability inventory, grouped. Everything below is a distinct, shipped 
 - **"config file already exists"** on `clw init` — you already have `~/.clw/config.toml`. Re-run with
   `clw init --force` to overwrite it.
 - **HTTP 402** — your CoreLink account hit its plan's monthly usage/$-ceiling. It's a billing limit, not a clw
-  error; raise your plan (the message links the pricing page). **HTTP 429** — a rate/storage limit (e.g. the
-  free-tier storage cap); clw honors `Retry-After` and backs off automatically.
+  error; raise your plan (the message links the pricing page). **HTTP 429** — a server-side rate/storage limit;
+  clw honors a `Retry-After` and retries as transient backpressure — but if the limit is *persistent* (e.g. a
+  storage cap you're over), the retries exhaust at the op deadline and it fails. Both are backend/plan limits
+  clw only reacts to; check your plan with CoreLink.
 - **`clw run` replayed a stale result** — an undeclared input changed. Declare every output-affecting env var with
   `--env` and every input path with `--input`; only memoize deterministic commands.
-- **"too many entries" on snapshot** — the workspace exceeds the ~32k-file single-blob manifest ceiling. Split it
-  or trim tracked files.
+- **"too many entries" on snapshot** — the workspace's manifest would exceed the single 5 MiB CAS blob. The
+  entry count where this hits is **path-length dependent** (short paths fit far more; **~32k files is only a
+  rough estimate**). Split the workspace or trim tracked files.
 - **macOS "cannot be opened / unidentified developer"** on a raw download — install via `brew` or `install.sh`
   (they strip quarantine), or `xattr -d com.apple.quarantine <asset>` after verifying the signature.
 - **A hung operation** — clw bounds every operation by `CLW_OP_DEADLINE_SECS` (default 300s); a black-hole backend
@@ -1159,7 +1296,7 @@ Five signed release targets, one binary each (macOS/Linux ship as bare binaries;
 | Linux | arm64 | `aarch64-unknown-linux-gnu` |
 | Windows | x86_64 | `x86_64-pc-windows-gnu` |
 
-Each target is **built natively on its own runner** (the release pipeline runs a per-OS matrix — no cross-compilation). The workspace **compiles and its test suite runs on Windows** as well as unix (a dedicated Windows CI lane exercises the runtime).
+Each target is **built on a runner of its own OS** (the release pipeline runs a per-OS matrix). Four of the five are native; the **Intel-macOS** binary (`x86_64-apple-darwin`) is **cross-built on the Apple-Silicon macOS runner** (same OS, different arch). The workspace **compiles and its test suite runs on Windows** as well as unix (a dedicated Windows CI lane exercises the runtime).
 
 **Platform caveats**
 - **Windows — hydrated symlinks become copies.** No unprivileged symlinks on Windows, so a symlink entry materializes as a byte-for-byte copy (file → copy, dir → copied subtree). Content round-trips; the link relationship does not survive.
