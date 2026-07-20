@@ -16,40 +16,41 @@ env:
 
 jobs:
   gates:
-    # Self-hosted Mac fallback (clw-mac-1): runs WITHOUT consuming GitHub-hosted
-    # Actions minutes. The GitHub-hosted lane (ubuntu-latest) is the preferred path;
-    # this is the fallback when hosted minutes are exhausted/unavailable.
-    runs-on: [self-hosted, macOS, X64]
+    # GitHub-hosted ubuntu is the authoritative lane: it runs INSIDE GitHub's
+    # network and never traverses the public self-hosted-runner session endpoint
+    # (pipelines.actions.githubusercontent.com), so a single self-hosted Mac is no
+    # longer a merge SPOF. (2026-07-20: an expired cert on that public endpoint
+    # wedged every self-hosted runner while github-hosted jobs stayed green — this
+    # move makes the required gate immune to that class of outage. The gate is
+    # platform-agnostic; the OS-divergent target (Windows) is covered by the
+    # windows-gnu cross-check below + the separate windows-runtime lane.)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # On the self-hosted Mac the shared-host "rustup-nuke" can break the rustup
-      # PROXY (~/.cargo/bin/cargo → rustup), so we do NOT rely on `rustup show`.
-      # Instead put the pinned toolchain's OWN bin (cargo+rustc, installed under the
-      # rust-toolchain.toml channel) directly on PATH — proxy-independent.
-      - name: put pinned Rust toolchain on PATH (rust-toolchain.toml channel)
-        run: |
-          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          BIN="$HOME/.rustup/toolchains/${CH}-x86_64-apple-darwin/bin"
-          test -x "$BIN/cargo" || { echo "pinned toolchain $CH is not installed on the runner at $BIN — run 'rustup toolchain install $CH' on clw-mac-1"; exit 1; }
-          echo "$BIN" >> "$GITHUB_PATH"
+      # ubuntu-latest ships rustup; rust-toolchain.toml pins the channel (1.91.1)
+      # and its components (rustfmt, clippy), which rustup auto-installs. `rustup
+      # show` in the repo root forces that install now so a download failure surfaces
+      # here rather than mid-gate.
+      - name: install pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show
       # Provision the supply-chain tools as PREBUILT binaries (gates.sh runs
-      # `cargo deny check` + `cargo audit`). Works on macOS too.
+      # `cargo deny check` + `cargo audit`).
       - name: install cargo-deny + cargo-audit (prebuilt)
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.8,cargo-audit@0.22.2
       # The windows-gnu cross-CHECK in gates.sh compiles `ring`'s C build script,
-      # which needs the mingw-w64 cross-CC. On the Mac it comes from brew.
+      # which needs the mingw-w64 cross-CC (x86_64-w64-mingw32-gcc).
       - name: ensure mingw-w64 (windows-gnu cross-CC for ring's C build)
-        run: brew list mingw-w64 >/dev/null 2>&1 || brew install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - name: gates (fmt + clippy + test + supply-chain + windows cross-check)
         run: bash scripts/gates.sh
 
   dco:
-    runs-on: [self-hosted, macOS, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
