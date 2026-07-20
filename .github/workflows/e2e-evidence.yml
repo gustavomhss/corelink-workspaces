@@ -8,19 +8,25 @@
 # behaviour + security per step. "Não pode ser por outro caminho": no library call, the
 # binary is the only entry point.
 #
-# Credential model (REUSES the live-journeys CI secrets — provision once, both lanes
-# light up):
-#   CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT   the primary identity (REQUIRED).
-#   CLW_CI_TOKEN_B                                    a 2nd identity → J4 team (OPTIONAL).
-#   CLW_CI_ERASE_TENANT / CLW_CI_ERASE_TOKEN          a throwaway tenant → J5 destructive
-#                                                     (OPTIONAL; the erase is real, so it
-#                                                     must be a dedicated throwaway ≠ the
-#                                                     primary tenant — the harness fences
-#                                                     both conditions).
+# Credential model — one secret set per persona (REUSES the live-journeys CI secrets where
+# they overlap; provision once, both lanes light up):
+#   CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT   primary identity → Marina (solo),
+#                                                     Dana (security), Ravi (automation). REQUIRED.
+#   CLW_CI_TOKEN_B                                    a 2nd identity (same tenant) → the TEAM
+#                                                     persona (Priya+Sam). OPTIONAL.
+#   CLW_CI_ERASE_TENANT / CLW_CI_ERASE_TOKEN          a dedicated throwaway tenant → the
+#                                                     OFFBOARDING persona (Omar). OPTIONAL; the
+#                                                     erase is REAL, so it must be a throwaway ≠
+#                                                     the primary tenant (the harness fences both).
+#   CLW_CI_QUOTA_TENANT / CLW_CI_QUOTA_TOKEN          a dedicated $-ceilinged tenant → the QUOTA
+#                                                     persona (Nadia → real 402). OPTIONAL; also
+#                                                     fenced ≠ primary (a snapshot here is meant to
+#                                                     hit the budget wall — never the primary).
 #
-# CLW_E2E_REQUIRE_PROD=1 makes a skipped PRIMARY-cred journey a HARD failure (so the lane
-# can never silently stop exercising prod — canary-blind). J4 + J5 are OPTIONAL skips:
-# reported but never require-failing, so the lane is green with just the primary PAT.
+# CLW_E2E_REQUIRE_PROD=1 makes a skipped PRIMARY-cred journey a HARD failure (so the lane can
+# never silently stop exercising prod — canary-blind). The team / offboarding / quota personas
+# are OPTIONAL skips: reported but never require-failing, so the lane is green with just the
+# primary PAT.
 #
 # The report artifact is uploaded ALWAYS (even on a red run) — a failed run is exactly
 # when the evidence matters most.
@@ -67,11 +73,14 @@ jobs:
           CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
           CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
           CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
-          # OPTIONAL extra infra — when absent, only J4 / J5 soft-skip (lane still passes).
+          # OPTIONAL extra infra — when absent, only the team / offboarding / quota persona
+          # soft-skips (the lane still passes on the primary PAT alone).
           CLW_TOKEN_B: ${{ secrets.CLW_CI_TOKEN_B }}
           CLW_E2E_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
           CLW_E2E_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
-          # A skipped PRIMARY-cred journey is a hard failure; J4/J5 optional-skip.
+          CLW_E2E_QUOTA_TENANT: ${{ secrets.CLW_CI_QUOTA_TENANT }}
+          CLW_E2E_QUOTA_TOKEN: ${{ secrets.CLW_CI_QUOTA_TOKEN }}
+          # A skipped PRIMARY-cred journey is a hard failure; team/offboarding/quota optional-skip.
           CLW_E2E_REQUIRE_PROD: "1"
           CLW_E2E_OUT: e2e-reports
         run: |
@@ -80,8 +89,9 @@ jobs:
             echo "::error::CLW_CI_TOKEN absent — the e2e-evidence lane REQUIRES the primary PAT (CLW_E2E_REQUIRE_PROD=1). Provision the CI service PAT secret."
             exit 1
           fi
-          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — J4 team journey soft-skips."
-          [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — J5 destructive journey soft-skips (provision a throwaway tenant ≠ primary to exercise it)."
+          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — the TEAM persona (Priya+Sam) soft-skips."
+          [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — the OFFBOARDING persona (Omar) soft-skips (needs a throwaway tenant ≠ primary; the erase is real)."
+          [ -z "${CLW_E2E_QUOTA_TENANT:-}" ] && echo "::warning::CLW_CI_QUOTA_TENANT absent — the QUOTA persona (Nadia) soft-skips (needs a dedicated \$-ceilinged tenant ≠ primary to trip a real 402)."
           echo "Driving the real clw binary as a user against prod; publishing per-step evidence."
           # The evidence runner locates the binary next to itself; point it explicitly.
           CLW_E2E_BIN="$(pwd)/target/debug/clw" ./target/debug/clw-e2e
