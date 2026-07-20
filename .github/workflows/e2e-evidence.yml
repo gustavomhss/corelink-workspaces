@@ -49,18 +49,38 @@ env:
 
 jobs:
   evidence:
-    name: e2e evidence (prod, real binary as user)
+    name: e2e evidence (${{ matrix.os }}, real binary as user)
     # GitHub-hosted: a network test against prod; no dependency on the self-hosted Mac.
-    runs-on: ubuntu-latest
+    # Run the SAME six personas on both the Linux binary (J11) and the Windows binary
+    # (J10) — the harness assertions are platform-split (unix exec-bit vs Windows content-
+    # only) so the personas exercise the actual per-OS `clw` binary against the same prod.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # bash on windows-latest is Git Bash — one script body works on both OSes.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
       - name: install pinned Rust toolchain (rust-toolchain.toml channel)
         run: |
+          set -euo pipefail
           CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          rustup toolchain install "$CH" --profile minimal
-          rustup default "$CH"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            # Match the SHIPPED windows-gnu binary (the GH Windows image ships mingw-w64 for
+            # ring's C build; the msvc host would need nasm, which isn't guaranteed present).
+            rustup toolchain install "${CH}-x86_64-pc-windows-gnu" --profile minimal --no-self-update
+            rustup default "${CH}-x86_64-pc-windows-gnu"
+          else
+            rustup toolchain install "$CH" --profile minimal
+            rustup default "$CH"
+          fi
+          rustc -vV
 
       # Build the clw binary (the harness drives it via argv+env) AND the evidence runner.
       - name: build clw + the e2e evidence runner
@@ -93,14 +113,19 @@ jobs:
           [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — the OFFBOARDING persona (Omar) soft-skips (needs a throwaway tenant ≠ primary; the erase is real)."
           [ -z "${CLW_E2E_QUOTA_TENANT:-}" ] && echo "::warning::CLW_CI_QUOTA_TENANT absent — the QUOTA persona (Nadia) soft-skips (needs a dedicated \$-ceilinged tenant ≠ primary to trip a real 402)."
           echo "Driving the real clw binary as a user against prod; publishing per-step evidence."
+          # Windows names the binaries clw.exe / clw-e2e.exe; pick the right suffix. Under
+          # Git Bash, `$(pwd)` yields a POSIX path clw accepts, so no separator juggling.
+          EXT=""
+          [ "${RUNNER_OS}" = "Windows" ] && EXT=".exe"
           # The evidence runner locates the binary next to itself; point it explicitly.
-          CLW_E2E_BIN="$(pwd)/target/debug/clw" ./target/debug/clw-e2e
+          CLW_E2E_BIN="$(pwd)/target/debug/clw${EXT}" "./target/debug/clw-e2e${EXT}"
 
       - name: upload the evidence report (always — a red run is when it matters most)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-evidence-report
+          # Per-OS name — artifact names must be unique across the matrix (upload-artifact@v4).
+          name: e2e-evidence-report-${{ matrix.os }}
           path: e2e-reports/
           if-no-files-found: warn
           retention-days: 30

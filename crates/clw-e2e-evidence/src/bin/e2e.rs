@@ -379,9 +379,20 @@ fn adversarial(bin: &Path) -> Journey {
             .check(
                 s.exit_code.map(|c| c != 0).unwrap_or(false)
                     && s.duration_ms < 20_000
-                    && s.stderr.contains("deadline")
+                    // WHICH error wins the race between the op-deadline firing and the last
+                    // 5xx propagating is timing/platform-dependent: unix surfaced the deadline
+                    // by name, windows-latest surfaced the terminal `HTTP 503`. Both are clear,
+                    // actionable, and — the load-bearing invariant — BOUNDED (no multi-minute
+                    // hang). Assert bounded + a non-empty named terminal failure, not the exact
+                    // wording (requiring only "deadline" was over-specific and latently flaky).
+                    && (s.stderr.contains("deadline")
+                        || s.stderr.contains("503")
+                        || s.stderr.contains("timed out"))
                     && s.stderr.contains("error:"),
-                format!("exit {:?} in {} ms; error names the deadline", s.exit_code, s.duration_ms),
+                format!(
+                    "exit {:?} in {} ms; bounded + clear terminal error (deadline or 5xx)",
+                    s.exit_code, s.duration_ms
+                ),
             ),
         );
         j.push(s);

@@ -655,6 +655,49 @@ mod tests {
         assert!(!ev.leaked_secret);
     }
 
+    // Windows siblings of the two leak-detection primitives above: `/bin/sh` doesn't
+    // exist on Windows, so exercise the SAME primitive through `cmd.exe`. `echo %CLW_TOKEN%`
+    // expands the PAT that step() injected into the child env.
+    #[cfg(windows)]
+    #[test]
+    fn leaked_secret_detects_a_raw_token_echo_yet_report_stays_scrubbed() {
+        let r = Runner::new(
+            "cmd",
+            "https://x",
+            "test",
+            "t",
+            Secret::new("core-LEAK-XYZ"),
+            std::env::temp_dir(),
+        );
+        let ev = r.step(
+            "echo the token",
+            &["/C", "echo %CLW_TOKEN%"],
+            &[],
+            ExpectExit::Eq(0),
+        );
+        assert!(ev.leaked_secret, "a raw PAT echo must be detected");
+        assert!(
+            !ev.stdout.contains("core-LEAK-XYZ"),
+            "the report must still be scrubbed"
+        );
+        assert!(ev.stdout.contains("<redacted>"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_leak_when_the_command_does_not_echo_the_token() {
+        let r = Runner::new(
+            "cmd",
+            "https://x",
+            "test",
+            "t",
+            Secret::new("core-SAFE-XYZ"),
+            std::env::temp_dir(),
+        );
+        let ev = r.step("silent", &["/C", "echo hello"], &[], ExpectExit::Eq(0));
+        assert!(!ev.leaked_secret);
+    }
+
     #[test]
     fn expect_exit_semantics() {
         assert!(ExpectExit::Eq(0).satisfied_by(Some(0)));

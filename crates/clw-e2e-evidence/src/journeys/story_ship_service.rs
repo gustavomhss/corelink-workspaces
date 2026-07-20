@@ -189,12 +189,34 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
         let downloaded = json_u64(&s, "bytes_downloaded");
         let root_ok = json_str(&s, "root").as_deref() == Some(root_v1.as_str());
         let identical = dirs_identical(&project, &checkout);
-        let exec_ok = match (
-            realistic::deploy_script_is_executable(&project),
-            realistic::deploy_script_is_executable(&checkout),
-        ) {
-            (Some(a), Some(b)) => a == b && b, // exec bit set on both
-            _ => true,                         // off-unix: not applicable
+        // The deploy-script MODE expectation is platform-split. On Unix the 0755 exec bit
+        // MUST survive snapshot→hydrate (a hydrated checkout with a non-exec deploy.sh is
+        // broken). On Windows there is no unix exec bit and clw does not synthesize one
+        // (documented windows.yml / FT-C behavior, not a bug), so the Windows-correct
+        // expectation is that the script is materialized with byte-identical CONTENT (proven
+        // by dirs_identical above) and simply lands on disk.
+        #[cfg(unix)]
+        let (exec_ok, exec_note) = {
+            let ok = matches!(
+                (
+                    realistic::deploy_script_is_executable(&project),
+                    realistic::deploy_script_is_executable(&checkout),
+                ),
+                (Some(a), Some(b)) if a == b && b // exec bit set on both
+            );
+            (ok, format!("exec_bit_preserved={ok}"))
+        };
+        #[cfg(windows)]
+        let (exec_ok, exec_note) = {
+            // No unix mode on Windows; assert the script materialized (content already
+            // verified byte-for-byte by dirs_identical).
+            let ok = checkout.join("scripts/deploy.sh").is_file();
+            (
+                ok,
+                format!(
+                    "deploy_script_materialized={ok} (Windows: no exec bit; content byte-verified)"
+                ),
+            )
         };
         s.observe(
             Observation::behavior(
@@ -203,7 +225,7 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
             )
             .check(
                 identical && exec_ok && downloaded.map(|b| b > 0).unwrap_or(false) && root_ok,
-                format!("tree_identical={identical} exec_bit_preserved={exec_ok} bytes_downloaded={downloaded:?} root_matches_v1={root_ok}"),
+                format!("tree_identical={identical} {exec_note} bytes_downloaded={downloaded:?} root_matches_v1={root_ok}"),
             ),
         );
         j.push(s);
