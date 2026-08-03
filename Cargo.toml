@@ -27,7 +27,7 @@ edition = "2021"
 # The real, binding posture is EULA.md + `publish = false` on every crate; this
 # field is just the SPDX-valid proprietary marker. See deny.toml LICENSE POSTURE.
 license = "LicenseRef-Proprietary"
-repository = "https://github.com/HumanGuardrail/corelink-workspaces"
+repository = "https://github.com/HuGR-Labs/corelink-workspaces"
 
 [workspace.dependencies]
 clw-types = { path = "crates/clw-types" }

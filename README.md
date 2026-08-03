@@ -2,7 +2,7 @@
 
 **The workspace as a content-addressed object; compute as a disposable cursor.**
 
-`clw` snapshots a directory tree into [CoreLink](https://github.com/HumanGuardrail/corelink-server)'s
+`clw` snapshots a directory tree into [CoreLink](https://github.com/HuGR-Labs/corelink-server)'s
 content-addressed store (CAS + AC), hydrates it anywhere in seconds, and memoizes
 deterministic commands so they never re-run when the inputs have not changed.
 
@@ -46,7 +46,7 @@ are `brew install`-able without being open source.
 Primary install (macOS / Linux) — the public Homebrew tap:
 
 ```sh
-brew install humanguardrail/clw/clw
+brew install hugr-labs/clw/clw
 ```
 
 Fallbacks: the `curl … | sh` one-liner (`scripts/install.sh`, anonymous public

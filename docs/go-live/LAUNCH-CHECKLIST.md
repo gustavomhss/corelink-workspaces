@@ -41,7 +41,7 @@ Decisions are already made in `docs/DISTRIBUTION.md`, and the signing/publish **
 - **macOS — Developer ID + notarization** (decision (c): notarized **zip** for the bare-binary PATH install). Provision:
   `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, plus the App Store Connect notarization creds (`MACOS_NOTARY_KEY_BASE64`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER_ID`).
 - **Linux — minisign** (sigstore documented as the alternative). Generate a minisign keypair; provision the secret key as `MINISIGN_SECRET_KEY` and the passphrase as `MINISIGN_PASSWORD`; publish the **public** key in the repo + `docs/DISTRIBUTION.md` trust-root section.
-- **Distribution — public mirror Release + Homebrew tap** (decision (a); the binary host is the **public** mirror repo `HumanGuardrail/clw-releases`, with `HumanGuardrail/homebrew-clw` as the public tap). Provision a cross-repo publish credential `CLW_RELEASES_TOKEN` (publish the GitHub Release + 5 binaries on the mirror) and `HOMEBREW_TAP_TOKEN` (bump `Formula/clw.rb` on real `v<version>` tags only). No R2 creds and no `CLW_INSTALL_TOKEN` — the download surface is public, so there is no authenticated route to coordinate (server dep **D-12 is dropped/moot**).
+- **Distribution — public mirror Release + Homebrew tap** (decision (a); the binary host is the **public** mirror repo `HuGR-Labs/clw-releases`, with `HuGR-Labs/homebrew-clw` as the public tap). Provision a cross-repo publish credential `CLW_RELEASES_TOKEN` (publish the GitHub Release + 5 binaries on the mirror) and `HOMEBREW_TAP_TOKEN` (bump `Formula/clw.rb` on real `v<version>` tags only). No R2 creds and no `CLW_INSTALL_TOKEN` — the download surface is public, so there is no authenticated route to coordinate (server dep **D-12 is dropped/moot**).
 
 → See `docs/go-live/RUNBOOK-key-rotation-revocation.md` for how these keys are rotated/revoked once provisioned (gate 10).
 
@@ -53,7 +53,7 @@ lines and we mark the Windows ACL runtime-verified for v0.1.0.
 
 ### C. Verify install **and** uninstall per platform (gate 4)
 After the signed binaries build: on each of macOS / Linux / Windows, run the public install
-(`brew install humanguardrail/clw/clw`, the `install.sh` curl fallback, or the direct `.exe` on Windows),
+(`brew install hugr-labs/clw/clw`, the `install.sh` curl fallback, or the direct `.exe` on Windows),
 confirm `clw doctor` is green, then run `clw uninstall --yes` and confirm `~/.clw` (config + PAT +
 cache) is gone and the binary-removal instruction is printed. (The uninstall **logic** is audited +
 e2e-tested; this is the per-platform packaging confirmation.)
@@ -87,8 +87,8 @@ gate 9 from operative-for-beta → published.
 
 1. Confirm `main` is gate-green and live-conformance-green (the `release.yml` `conformance` job gates this).
 2. Tag `v0.1.0`. The pipeline runs: preflight → conformance gate → build+sign (5 targets) → **signed**
-   SHA-256 checksums + SBOM → publish the GitHub Release on the public mirror `HumanGuardrail/clw-releases`
-   (`CLW_RELEASES_TOKEN`) → bump the Homebrew tap `HumanGuardrail/homebrew-clw` (`HOMEBREW_TAP_TOKEN`,
+   SHA-256 checksums + SBOM → publish the GitHub Release on the public mirror `HuGR-Labs/clw-releases`
+   (`CLW_RELEASES_TOKEN`) → bump the Homebrew tap `HuGR-Labs/homebrew-clw` (`HOMEBREW_TAP_TOKEN`,
    real tags only).
 3. Smoke-test the published, signed artifact on one machine per OS (download → verify signature →
    `clw doctor`).

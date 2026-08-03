@@ -7,7 +7,7 @@ platform, and how to upgrade, pin, or uninstall.
 
 `clw` is **proprietary**, commercial-licensed software (see `EULA.md`) — but it is
 **publicly downloadable**: binaries are published as GitHub Release assets on the
-public mirror repo **`HumanGuardrail/clw-releases`**, and macOS/Linux install via a
+public mirror repo **`HuGR-Labs/clw-releases`**, and macOS/Linux install via a
 public Homebrew tap. The license governs *use*; the download itself needs no
 credential. (See `docs/DISTRIBUTION.md`.)
 
@@ -24,7 +24,7 @@ credential. (See `docs/DISTRIBUTION.md`.)
 ### macOS / Linux — Homebrew (preferred)
 
 ```sh
-brew install humanguardrail/clw/clw
+brew install hugr-labs/clw/clw
 clw --version
 ```
 
@@ -54,7 +54,7 @@ no `latest` alias):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  "https://raw.githubusercontent.com/HumanGuardrail/clw-releases/main/install.sh" \
+  "https://raw.githubusercontent.com/HuGR-Labs/clw-releases/main/install.sh" \
   | CLW_VERSION=<version> sh
 ```
 
@@ -72,7 +72,7 @@ and verify it (see [§4d](#4d-windows--authenticode)):
 
 ```powershell
 $ver = "<version>"
-$base = "https://github.com/HumanGuardrail/clw-releases/releases/download/v$ver"
+$base = "https://github.com/HuGR-Labs/clw-releases/releases/download/v$ver"
 Invoke-WebRequest "$base/clw-$ver-x86_64-pc-windows-gnu.exe" -OutFile "clw.exe"
 Invoke-WebRequest "$base/SHA256SUMS"          -OutFile "SHA256SUMS"
 Invoke-WebRequest "$base/SHA256SUMS.minisig"  -OutFile "SHA256SUMS.minisig"
@@ -96,7 +96,7 @@ Then install it on `PATH` per [§5 Windows](#windows-powershell-1).
 All assets live at:
 
 ```
-https://github.com/HumanGuardrail/clw-releases/releases/download/v<version>/<asset>
+https://github.com/HuGR-Labs/clw-releases/releases/download/v<version>/<asset>
 ```
 
 Notes:
@@ -115,7 +115,7 @@ Notes:
 
 A binary fetched with `curl`/`wget`/a browser is tagged `com.apple.quarantine` by
 macOS, so Gatekeeper blocks it on first run. **A Homebrew *formula* install is not
-quarantined** — which is why `brew install humanguardrail/clw/clw` is the preferred
+quarantined** — which is why `brew install hugr-labs/clw/clw` is the preferred
 macOS path and needs no extra step.
 
 The `curl` `install.sh` handles this for you: after verifying the download it runs
@@ -187,7 +187,7 @@ compromise and follow `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
 > provenance attestation published with the release:
 >
 > ```sh
-> gh attestation verify clw-<version>-<target> --repo HumanGuardrail/clw-releases
+> gh attestation verify clw-<version>-<target> --repo HuGR-Labs/clw-releases
 > ```
 
 ### 4c. macOS — Gatekeeper / signature
@@ -287,7 +287,7 @@ there are no versioned `clw@<version>` formulae. Install the latest, then pin to
 a future `brew upgrade` from moving it:
 
 ```sh
-brew install humanguardrail/clw/clw   # installs the latest release
+brew install hugr-labs/clw/clw   # installs the latest release
 brew pin clw                        # hold this version; `brew unpin clw` to allow upgrades
 ```
 
@@ -296,7 +296,7 @@ To roll back / move off a pinned version and re-track the latest:
 ```sh
 brew unpin clw 2>/dev/null || true
 brew uninstall clw
-brew install humanguardrail/clw/clw
+brew install hugr-labs/clw/clw
 ```
 
 ### Uninstall

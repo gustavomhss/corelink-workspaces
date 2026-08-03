@@ -2,7 +2,7 @@
 
 > The full reference for CoreLink Workspaces: what it is, the problems it solves, how it works,
 > every command and flag, and how / when / why to use it.
-> Status: **v0.1.11 — open beta.** `brew install humanguardrail/clw/clw`.
+> Status: **v0.1.11 — open beta.** `brew install hugr-labs/clw/clw`.
 
 ---
 
@@ -178,14 +178,14 @@ self-verifying — a hostile or buggy CAS cannot substitute different content.
 
 **Install (macOS / Linux — preferred):**
 ```sh
-brew install humanguardrail/clw/clw
+brew install hugr-labs/clw/clw
 ```
 Brew resolves the OS/arch binary, verifies its SHA-256, and (on macOS) installs a formula binary that is
 **not** Gatekeeper-quarantined.
 
 **Fallback (any \*nix), the curl installer** — `CLW_VERSION` is **required** (there is no `latest` alias):
 ```sh
-curl -fsSL https://raw.githubusercontent.com/HumanGuardrail/clw-releases/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/HuGR-Labs/clw-releases/main/install.sh \
   | CLW_VERSION=0.1.11 sh
 ```
 It downloads the binary + a **minisign-signed `SHA256SUMS`** (+ `.minisig`), verifies the signature against a
@@ -196,7 +196,7 @@ isn't installed) — the checksum check still runs. It then **strips the macOS q
 installs to `~/.local/bin/clw` (ensure that's on your `PATH`).
 
 **Windows:** download `clw-<version>-x86_64-pc-windows-gnu.exe` from the mirror release
-(`github.com/HumanGuardrail/clw-releases`) and verify it with **minisign** over `SHA256SUMS` + the SHA-256
+(`github.com/HuGR-Labs/clw-releases`) and verify it with **minisign** over `SHA256SUMS` + the SHA-256
 of the `.exe`, then put it on `PATH`. *(Authenticode signing via Azure is not yet live — `Get-AuthenticodeSignature`
 will show `NotSigned`; minisign is the verification path today.)*
 
@@ -955,8 +955,8 @@ about it. All of it is **client-side and on by default; there is nothing to conf
 
 - **Distribution model.** `clw` is **proprietary-licensed** (a commercial EULA governs *use*) but **publicly
   downloadable** — the two are independent. The source tree stays private; signed pre-built binaries are mirrored
-  publicly on `HumanGuardrail/clw-releases` (a GitHub Release per tag) and installed via the public Homebrew tap
-  `HumanGuardrail/homebrew-clw`. Downloading needs no credential.
+  publicly on `HuGR-Labs/clw-releases` (a GitHub Release per tag) and installed via the public Homebrew tap
+  `HuGR-Labs/homebrew-clw`. Downloading needs no credential.
 - **Signing & trust root.** Every release publishes a **minisign-signed `SHA256SUMS`** (+ `.minisig`), the trust
   root `minisign.pub` (committed in-repo + republished per release), and a CycloneDX **SBOM**. `brew` verifies the
   asset against the `sha256` baked into the formula (derived at bump-time from the minisign-verified manifest);

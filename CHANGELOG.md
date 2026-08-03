@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed
+- **GitHub org migration `HumanGuardrail` → `HuGR-Labs` — the whole release + install path is repinned.**
+  All six CoreLink repos moved orgs on 2026-08-01. A GitHub rename leaves a 301 redirect, so `git clone`
+  and `gh` kept working and the drift was invisible — but an **exact-string** comparison does not follow
+  redirects. The release pipeline (`.github/workflows/release.yml`) hardcoded the old org in ~20 places
+  across the entire publish path: the cross-repo `gh release create/upload/view --repo`, the `install.sh`
+  contents-API push, the **`git clone` of the Homebrew tap**, the generated formula's `homepage`, and the
+  `BASE_URL` baked into every published binary URL. Also repinned: `scripts/install.sh`'s
+  `DEFAULT_BASE_URL` (the anonymous `curl | sh` download surface — a real customer path),
+  `scripts/provision-release-secrets.sh` (its `[ "$REPO" = … ]` equality check + the fine-grained-PAT
+  resource-owner/scope instructions — exactly the exact-match class that a redirect does *not* rescue),
+  `Cargo.toml`'s `repository`, and every consumer-facing install doc
+  (`brew install humanguardrail/clw/clw` → `brew install hugr-labs/clw/clw` in README, `docs/INSTALL.md`,
+  `docs/DISTRIBUTION.md`, `docs/GUIDE.md`). Dated handoffs/relays/replies, the go-live rework plan, the
+  roadmap decision ledger and the archived WP briefs are deliberately **left as-is** — they are historical
+  records of what was true at the time, not live config.
+- **New `dead-org-slug` guard in `scripts/gates.sh`.** Runs in *every* lane (including the docs-only
+  fast path, which is precisely where an install-doc regression would otherwise slip through) and fails
+  the gate if either dead org slug (`humangr-labs`, `HumanGuardrail`) reappears in live config —
+  workflows, scripts, `Cargo.toml`, or the consumer-facing install docs. Historical documents are exempt
+  by construction (the guard scans an explicit live-config allowlist, not the whole tree).
+
 ### Added
 - **`CLW_CACHE_BUDGET_BYTES` — the local cache eviction budget is now configurable.** The `~/.clw/cache`
   GC budget was a hard-coded 8 GiB with no override, so a working set larger than 8 GiB silently evicted

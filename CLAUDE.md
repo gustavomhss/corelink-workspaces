@@ -10,7 +10,7 @@ content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + ten
 no config file required. Single human owner = Gustavo (stakeholder + approver).
 
 **Status: SHIPPED — v0.1.11 is live (open beta; v0.1.0 launched 2026-06-18).**
-`brew install humanguardrail/clw/clw`. v0.1.11 (2026-07-13) is a stabilization wave from a 5-angle
+`brew install hugr-labs/clw/clw`. v0.1.11 (2026-07-13) is a stabilization wave from a 5-angle
 hidden-debt sweep (core code was clean; the recurring debt lived in the GATE layer): signing is now
 FAIL-CLOSED on real releases (a real `vX.Y.Z` with the minisign secret absent hard-fails instead of
 publishing unsigned + bumping brew — #182); the PR scoped-lane no longer has coverage holes (tests
@@ -51,8 +51,8 @@ v0.1.7 (2026-07-10) closes the external-symlink LOW. v0.1.5 shipped `clw hydrate
   (mac×2 native, linux×2 + windows-gnu cross) → SBOM → checksum + publish.
 - **`vX.Y.Z-rc.N` = dry-run** (⇒ `--prerelease`, NO formula bump, reversible). Cut an rc to exercise the
   tag-only legs before a real release — rc dry-runs have repeatedly caught latent, tag-only bugs.
-- **Real `vX.Y.Z`** publishes the GitHub Release on the PUBLIC mirror `HumanGuardrail/clw-releases` (latest)
-  and bumps the formula in the PUBLIC tap `HumanGuardrail/homebrew-clw`.
+- **Real `vX.Y.Z`** publishes the GitHub Release on the PUBLIC mirror `HuGR-Labs/clw-releases` (latest)
+  and bumps the formula in the PUBLIC tap `HuGR-Labs/homebrew-clw`.
 - Binaries are minisign-signed (`SHA256SUMS.minisig`, trust-root `docs/minisign.pub`). SLSA provenance is
   gated to public repos only (deferred per waiver — this repo is private). macOS Developer-ID + Azure
   Windows signing are deferred.

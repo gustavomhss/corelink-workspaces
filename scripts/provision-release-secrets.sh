@@ -9,8 +9,8 @@
 # What it provisions (idempotent — safe to re-run; re-running overwrites):
 #   1. minisign keypair  -> MINISIGN_SECRET_KEY (base64 of the key) + MINISIGN_PASSWORD
 #                           and writes docs/minisign.pub (the PUBLIC half, safe to commit)
-#   2. CLW_RELEASES_TOKEN -> fine-grained PAT scoped to HumanGuardrail/clw-releases
-#   3. HOMEBREW_TAP_TOKEN -> fine-grained PAT scoped to HumanGuardrail/homebrew-clw
+#   2. CLW_RELEASES_TOKEN -> fine-grained PAT scoped to HuGR-Labs/clw-releases
+#   3. HOMEBREW_TAP_TOKEN -> fine-grained PAT scoped to HuGR-Labs/homebrew-clw
 #
 # It CANNOT mint the PATs for you (that needs the GitHub web UI + your 2FA); it
 # walks you through minting each, then reads the pasted value HIDDEN and stores
@@ -35,8 +35,8 @@ gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth log
 
 # Secrets live on the repo where release.yml runs (the MAIN, private repo).
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
-[ "$REPO" = "HumanGuardrail/corelink-workspaces" ] || \
-  warn "secret target repo resolved to '$REPO' (expected HumanGuardrail/corelink-workspaces)"
+[ "$REPO" = "HuGR-Labs/corelink-workspaces" ] || \
+  warn "secret target repo resolved to '$REPO' (expected HuGR-Labs/corelink-workspaces)"
 ok "secrets will be set on: $REPO"
 
 # helper: set a secret from stdin (value never appears in argv or output)
@@ -106,7 +106,7 @@ provision_pat() { # $1=secret name  $2=repo it must be scoped to
   Mint a FINE-GRAINED PAT (only you can — needs your GitHub login + 2FA):
     1. https://github.com/settings/personal-access-tokens/new
     2. Token name      : ${name}
-    3. Resource owner  : HumanGuardrail
+    3. Resource owner  : HuGR-Labs
     4. Expiration      : 90 days (rotate per docs/go-live/RUNBOOK-key-rotation-revocation.md)
     5. Repository access: Only select repositories -> ${scope_repo}
     6. Permissions      : Repository permissions -> Contents -> Read and write
@@ -121,12 +121,12 @@ EOF
     warn "skipped $name."
   fi
 }
-provision_pat CLW_RELEASES_TOKEN HumanGuardrail/clw-releases
+provision_pat CLW_RELEASES_TOKEN HuGR-Labs/clw-releases
 
 # =============================================================================
 bold $'\n3) HOMEBREW_TAP_TOKEN  (bump the formula on real tags)'
 # -----------------------------------------------------------------------------
-provision_pat HOMEBREW_TAP_TOKEN HumanGuardrail/homebrew-clw
+provision_pat HOMEBREW_TAP_TOKEN HuGR-Labs/homebrew-clw
 
 # =============================================================================
 bold $'\nDone. Current secrets on '"$REPO"':'

@@ -649,11 +649,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # STAGE 4 — CHECKSUM + PUBLISH (REWORKED — public mirror + brew, WP-B/WP-C)
   # Collect every signed artifact, produce one signed SHA256SUMS, then publish a
-  # PUBLIC GitHub Release on the dedicated mirror repo `HumanGuardrail/clw-releases`
+  # PUBLIC GitHub Release on the dedicated mirror repo `HuGR-Labs/clw-releases`
   # (the source repo `corelink-workspaces` is PRIVATE, so its own Release assets
   # are not public — see DISTRIBUTION-REWORK-PLAN §8 B1). After a real upload,
   # add SLSA build-provenance attestation, then bump the Homebrew formula in
-  # `HumanGuardrail/homebrew-clw` (real tags only). minisign stays the offline
+  # `HuGR-Labs/homebrew-clw` (real tags only). minisign stays the offline
   # signature-of-record; attestation is the added provenance layer.
   # ---------------------------------------------------------------------------
   publish:
@@ -799,7 +799,7 @@ jobs:
 
       # =======================================================================
       # PUBLISH — create a PUBLIC GitHub Release on the MIRROR repo
-      # `HumanGuardrail/clw-releases`, uploading ALL of release/* as assets.
+      # `HuGR-Labs/clw-releases`, uploading ALL of release/* as assets.
       #
       # WHY a cross-repo token: the source repo here is PRIVATE, so its own
       # Release assets are not public. The default GITHUB_TOKEN is scoped to THIS
@@ -814,19 +814,19 @@ jobs:
       # rc-vs-real: a prerelease tag (PRERELEASE=="true", classified once in
       # preflight) passes `--prerelease`; a real vX.Y.Z is published as latest.
       # =======================================================================
-      - name: publish GitHub Release on the public mirror (HumanGuardrail/clw-releases)
+      - name: publish GitHub Release on the public mirror (HuGR-Labs/clw-releases)
         id: mirror_release
         shell: bash
         env:
           # TODO(OWNER): provision CLW_RELEASES_TOKEN — a deploy key / fine-grained
-          # PAT scoped to ONLY HumanGuardrail/clw-releases, contents:write. The
+          # PAT scoped to ONLY HuGR-Labs/clw-releases, contents:write. The
           # default GITHUB_TOKEN cannot cross repos (confirmed, plan §8 B1).
           GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING public mirror Release (dry-run)."
-            echo "would create release v${VERSION} on HumanGuardrail/clw-releases (prerelease=${PRERELEASE}) with:"
+            echo "would create release v${VERSION} on HuGR-Labs/clw-releases (prerelease=${PRERELEASE}) with:"
             ls -la release/
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -843,22 +843,22 @@ jobs:
           # Create the cross-repo Release and upload every assembled asset. If the
           # release already exists (a re-run of the same tag), upload --clobber
           # rather than fail — the tag is immutable but a re-run must be idempotent.
-          if gh release view "v${VERSION}" --repo HumanGuardrail/clw-releases >/dev/null 2>&1; then
+          if gh release view "v${VERSION}" --repo HuGR-Labs/clw-releases >/dev/null 2>&1; then
             echo "release v${VERSION} already exists on the mirror — uploading assets with --clobber."
-            gh release upload "v${VERSION}" release/* --repo HumanGuardrail/clw-releases --clobber
+            gh release upload "v${VERSION}" release/* --repo HuGR-Labs/clw-releases --clobber
           else
             gh release create "v${VERSION}" release/* \
-              --repo HumanGuardrail/clw-releases \
+              --repo HuGR-Labs/clw-releases \
               --title "clw v${VERSION}" \
               --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed. macOS: a direct browser download is Gatekeeper-blocked (binary not yet Apple-notarized) — install via 'brew' or install.sh (both strip quarantine), or run 'xattr -d com.apple.quarantine <asset>' after verifying the signature. See docs/INSTALL.md." \
               ${PRERELEASE_FLAG}
           fi
-          echo "published release/ -> HumanGuardrail/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
+          echo "published release/ -> HuGR-Labs/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       # =======================================================================
       # PUBLISH install.sh TO THE PUBLIC MIRROR — REAL tags only.
-      # The docs advertise `curl …raw.githubusercontent.com/HumanGuardrail/
+      # The docs advertise `curl …raw.githubusercontent.com/HuGR-Labs/
       # clw-releases/main/install.sh | sh`, but nothing publishes scripts/install.sh
       # there, so that URL 404s. Push the repo's scripts/install.sh to the mirror's
       # main branch via the GitHub contents API (create-or-update: re-fetch the
@@ -871,7 +871,7 @@ jobs:
         shell: bash
         env:
           # Same scoped token as the mirror Release step (contents:write on
-          # HumanGuardrail/clw-releases).
+          # HuGR-Labs/clw-releases).
           GH_TOKEN: ${{ secrets.CLW_RELEASES_TOKEN }}
         run: |
           set -euo pipefail
@@ -879,7 +879,7 @@ jobs:
             echo "::warning::CLW_RELEASES_TOKEN absent — SKIPPING install.sh publish to the mirror (dry-run)."
             exit 0
           fi
-          REPO="HumanGuardrail/clw-releases"
+          REPO="HuGR-Labs/clw-releases"
           SRC="scripts/install.sh"
           # base64 of the file content (portable: -w0 on GNU, no wrap on BSD).
           CONTENT_B64="$(base64 < "$SRC" | tr -d '\n')"
@@ -946,7 +946,7 @@ jobs:
 
       # =======================================================================
       # HOMEBREW FORMULA BUMP — REAL tags only (PRERELEASE=="false") AND only when
-      # HOMEBREW_TAP_TOKEN is present. Checks out HumanGuardrail/homebrew-clw, bumps
+      # HOMEBREW_TAP_TOKEN is present. Checks out HuGR-Labs/homebrew-clw, bumps
       # `version` + each of the 4 brew platforms' url+sha256 (aarch64/x86_64 ×
       # darwin/linux; Windows is not brew), then commits + pushes to the tap.
       #
@@ -962,13 +962,13 @@ jobs:
         shell: bash
         env:
           # TODO(OWNER): provision HOMEBREW_TAP_TOKEN — deploy key / fine-grained
-          # PAT scoped to ONLY HumanGuardrail/homebrew-clw, contents:write (R3).
+          # PAT scoped to ONLY HuGR-Labs/homebrew-clw, contents:write (R3).
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
             echo "::warning::HOMEBREW_TAP_TOKEN absent — SKIPPING Homebrew formula bump (dry-run)."
-            echo "would bump HumanGuardrail/homebrew-clw Formula/clw.rb to version ${VERSION} with url+sha256 from release/SHA256SUMS:"
+            echo "would bump HuGR-Labs/homebrew-clw Formula/clw.rb to version ${VERSION} with url+sha256 from release/SHA256SUMS:"
             grep -E "clw-${VERSION}-(aarch64|x86_64)-(apple-darwin|unknown-linux-gnu)$" release/SHA256SUMS || true
             exit 0
           fi
@@ -984,7 +984,7 @@ jobs:
             fi
             printf '%s' "$line" | awk '{print $1}'
           }
-          BASE_URL="https://github.com/HumanGuardrail/clw-releases/releases/download/v${VERSION}"
+          BASE_URL="https://github.com/HuGR-Labs/clw-releases/releases/download/v${VERSION}"
           # The 4 brew platforms (Windows is NOT brew — excluded).
           A_DARWIN="clw-${VERSION}-aarch64-apple-darwin"
           X_DARWIN="clw-${VERSION}-x86_64-apple-darwin"
@@ -998,7 +998,7 @@ jobs:
           # Check out the tap with the scoped token and regenerate Formula/clw.rb.
           TAP_DIR="$RUNNER_TEMP/homebrew-clw"
           rm -rf "$TAP_DIR"
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/HumanGuardrail/homebrew-clw.git" "$TAP_DIR"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/HuGR-Labs/homebrew-clw.git" "$TAP_DIR"
           mkdir -p "$TAP_DIR/Formula"
           cat > "$TAP_DIR/Formula/clw.rb" <<EOF
           # clw — CoreLink workspaces CLI. PROPRIETARY: the EULA governs use; the
@@ -1006,7 +1006,7 @@ jobs:
           # is AUTO-GENERATED by the release pipeline — do not hand-edit.
           class Clw < Formula
             desc "CoreLink workspaces CLI"
-            homepage "https://github.com/HumanGuardrail/clw-releases"
+            homepage "https://github.com/HuGR-Labs/clw-releases"
             version "${VERSION}"
             # Closed-source: brew has no SPDX expression for this. tap CI gates on
             # \`brew style\` only (NOT \`brew audit --strict\`, which rejects this).
@@ -1053,4 +1053,4 @@ jobs:
           git add Formula/clw.rb
           git commit -m "clw ${VERSION} (auto-bump from clw-releases v${VERSION})"
           git push origin HEAD
-          echo "bumped HumanGuardrail/homebrew-clw Formula/clw.rb -> ${VERSION}"
+          echo "bumped HuGR-Labs/homebrew-clw Formula/clw.rb -> ${VERSION}"

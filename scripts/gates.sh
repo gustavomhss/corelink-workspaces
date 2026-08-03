@@ -25,6 +25,30 @@ if [ "${CI:-}" = "true" ]; then
   mkdir -p "$CARGO_TARGET_DIR"
 fi
 
+# --- DEAD-ORG-SLUG GUARD (runs in EVERY lane, including docs-only) -----------
+# The GitHub org moved `humangr-labs` -> `HumanGuardrail` -> `HuGR-Labs` (2026-08-01).
+# Renames leave a 301 redirect, so a stale slug KEEPS WORKING for `git clone` /
+# `gh` and hides itself — but an exact-string comparison (repo allowlists,
+# `[ "$REPO" = ... ]`, a brew tap path, an attestation `--repo`) does NOT follow
+# redirects and silently fails. This guard fails the gate if a DEAD org slug
+# reappears in live config (workflows, scripts, manifests, consumer-facing docs).
+# Historical records (dated handoffs/relays/replies, the go-live plan + roadmap
+# ledger, archived WP briefs) are deliberately EXEMPT — they record what was
+# true then and must not be rewritten.
+dead_org_hits="$(
+  grep -rIn --exclude=gates.sh -E 'HumanGuardrail|humangr-labs|humanguardrail/clw' \
+    .github scripts Cargo.toml README.md CLAUDE.md \
+    docs/INSTALL.md docs/DISTRIBUTION.md docs/GUIDE.md \
+    docs/go-live/LAUNCH-CHECKLIST.md docs/go-live/RUNBOOK-key-rotation-revocation.md \
+    2>/dev/null || true
+)"
+if [ -n "$dead_org_hits" ]; then
+  echo "GATE FAILED: dead GitHub org slug in live config — the org is 'HuGR-Labs'" >&2
+  echo "$dead_org_hits" >&2
+  exit 1
+fi
+echo "dead-org-slug guard: clean (org = HuGR-Labs)"
+
 SCOPE="full"
 if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
   base_ref="${GITHUB_BASE_REF:-main}"
