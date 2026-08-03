@@ -1,5 +1,11 @@
 # Distribution rework — public Homebrew tap + GitHub Releases (PLAN, paranoid/SOTA)
 
+> **Note added 2026-08-02 — this is the 2026-06-17 PLAN, kept verbatim; its org names are stale.**
+> The repos moved from `HumanGuardrail` to **`HuGR-Labs`** on 2026-08-01, and the tap/org strings
+> written below (`humangr-labs/...`) were never the real ones. Do not copy any invocation from this
+> plan. Operative today: `HuGR-Labs/clw-releases`, `HuGR-Labs/homebrew-clw`, and
+> `brew install hugr-labs/clw/clw` — see `docs/DISTRIBUTION.md` (canonical) and `docs/INSTALL.md`.
+
 > **Decision (owner, 2026-06-17):** open beta distributes `clw` via a **public Homebrew tap**
 > (`brew install humangr-labs/clw/clw`) with a `curl | sh` `install.sh` fallback. Supersedes the prior
 > "proprietary, authenticated R2-only, NOT a public GitHub Release" posture (`docs/DISTRIBUTION.md`).

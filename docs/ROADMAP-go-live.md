@@ -1,5 +1,12 @@
 # ROADMAP — `clw` / CoreLink Workspaces go-live (mature, SOTA, impeccable) — **v2**
 
+> **Note added 2026-08-02 — org names below are as-of their entry date.** On 2026-08-01 these repos
+> moved from the GitHub org `HumanGuardrail` to **`HuGR-Labs`**. The progress-log rows and the
+> resolved-milestone entries below are a record of what was decided on their dates and are left
+> verbatim. If you are acting TODAY, the operative strings are `HuGR-Labs/clw-releases`,
+> `HuGR-Labs/homebrew-clw`, and `brew install hugr-labs/clw/clw` — see `docs/DISTRIBUTION.md`
+> (canonical) and `docs/INSTALL.md`.
+
 > **Owner seat:** TechLead (CoreLink). **v2 drafted:** 2026-06-14, after a 26-agent hardening fleet
 > (`clw-golive-harden`) produced execution-ready WP briefs + an independent fresh audit + adversarial
 > critique. **Baseline:** `main @ f8f5edf`. **Execution specs:** `docs/go-live/WP-BRIEFS.md`.

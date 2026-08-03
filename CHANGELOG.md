@@ -2,27 +2,49 @@
 
 ## [Unreleased]
 
-### Fixed
-- **GitHub org migration `HumanGuardrail` → `HuGR-Labs` — the whole release + install path is repinned.**
-  All six CoreLink repos moved orgs on 2026-08-01. A GitHub rename leaves a 301 redirect, so `git clone`
-  and `gh` kept working and the drift was invisible — but an **exact-string** comparison does not follow
-  redirects. The release pipeline (`.github/workflows/release.yml`) hardcoded the old org in ~20 places
-  across the entire publish path: the cross-repo `gh release create/upload/view --repo`, the `install.sh`
-  contents-API push, the **`git clone` of the Homebrew tap**, the generated formula's `homepage`, and the
-  `BASE_URL` baked into every published binary URL. Also repinned: `scripts/install.sh`'s
+### Security
+- **The release + install path no longer performs privileged writes through a GitHub org-transfer
+  redirect.** All six CoreLink repos moved from the `HumanGuardrail` org to **`HuGR-Labs`** on
+  2026-08-01. A GitHub org transfer leaves a `301` behind, so `git clone`, `gh` and `curl` kept working
+  and the drift was invisible — but an **exact-string** comparison does not follow a redirect, and
+  neither does a trust boundary. `release.yml` was reaching `HumanGuardrail/clw-releases` and
+  `HumanGuardrail/homebrew-clw` **through that redirect while holding write-scoped tokens**
+  (`CLW_RELEASES_TOKEN` for the mirror Release plus the `install.sh` contents-API `PUT`;
+  `HOMEBREW_TAP_TOKEN` for the `git clone`/push of the tap). A redirect is only as durable as the org
+  name behind it: were `HumanGuardrail` ever released and re-registered, those privileged writes — and
+  the public `install.sh` download surface — would land in an attacker-controlled path.
+  The whole publish path is now pinned directly at `HuGR-Labs`: ~20 references in
+  `.github/workflows/release.yml` (the cross-repo `gh release create/upload/view --repo`, the
+  `install.sh` contents-API push, the **`git clone` of the Homebrew tap**, the generated formula's
+  `homepage`, and the `BASE_URL` baked into every published binary URL), `scripts/install.sh`'s
   `DEFAULT_BASE_URL` (the anonymous `curl | sh` download surface — a real customer path),
-  `scripts/provision-release-secrets.sh` (its `[ "$REPO" = … ]` equality check + the fine-grained-PAT
-  resource-owner/scope instructions — exactly the exact-match class that a redirect does *not* rescue),
-  `Cargo.toml`'s `repository`, and every consumer-facing install doc
-  (`brew install humanguardrail/clw/clw` → `brew install hugr-labs/clw/clw` in README, `docs/INSTALL.md`,
-  `docs/DISTRIBUTION.md`, `docs/GUIDE.md`). Dated handoffs/relays/replies, the go-live rework plan, the
-  roadmap decision ledger and the archived WP briefs are deliberately **left as-is** — they are historical
-  records of what was true at the time, not live config.
-- **New `dead-org-slug` guard in `scripts/gates.sh`.** Runs in *every* lane (including the docs-only
-  fast path, which is precisely where an install-doc regression would otherwise slip through) and fails
-  the gate if either dead org slug (`humangr-labs`, `HumanGuardrail`) reappears in live config —
-  workflows, scripts, `Cargo.toml`, or the consumer-facing install docs. Historical documents are exempt
-  by construction (the guard scans an explicit live-config allowlist, not the whole tree).
+  `scripts/provision-release-secrets.sh` (its `[ "$REPO" = … ]` equality check plus the
+  fine-grained-PAT resource-owner/scope instructions — exactly the exact-match class a redirect does
+  *not* rescue), `Cargo.toml`'s `repository`, and every consumer-facing install doc
+  (`brew install humanguardrail/clw/clw` → `brew install hugr-labs/clw/clw` in README,
+  `docs/INSTALL.md`, `docs/DISTRIBUTION.md`, `docs/GUIDE.md`). Dated handoffs/relays/replies, the
+  go-live rework plan, the roadmap decision ledger and the archived WP briefs are deliberately
+  **left as-is** — they are historical records of what was true at the time, not live config.
+  **Repinning narrows this exposure; it does not eliminate it.** Every reference *inside this repo* now
+  points at the live org, but the chain still terminates in a URL a human types — a **name**, not a
+  key. The genuinely open residual is **bootstrap/TOFU**: anyone who already holds the old one-liner in
+  a bookmark, a blog post, a `Dockerfile` or a CI config keeps traversing the redirect, and those copies
+  are outside this repo's reach. That is why the `HumanGuardrail` org **must stay registered forever**,
+  repin or no repin. Closing this for real needs an out-of-band anchor — a vanity domain we own, a
+  self-verifying channel (the Homebrew tap plus a formula `sha256`), or publishing the signing-key
+  fingerprint somewhere a user can independently check it. None of those exist yet.
+  **What a customer downloads is unchanged.** Both org paths resolve to the same repository
+  (id `1272675315`) and the same release-asset GUIDs; `SHA256SUMS` and `SHA256SUMS.minisig` for
+  v0.1.11 fetch byte-identical from either org — the repin removes a `301` hop and nothing else. The
+  minisign trust root stays **embedded** in `install.sh` (key `4B57B8B54A0E396D`) and is still never
+  fetched from the download surface, so signature verification is unchanged and unweakened. The
+  published `Formula/clw.rb` in `HuGR-Labs/homebrew-clw` still carries old-org URLs; it is generated by
+  `release.yml`, so it repins itself on the next real release and must **not** be hand-edited.
+- **A `dead-org-slug` guard in `scripts/gates.sh` keeps it pinned.** Runs in *every* lane (including the
+  docs-only fast path, which is precisely where an install-doc regression would otherwise slip through)
+  and fails the gate if either dead org slug (`humangr-labs`, `HumanGuardrail`) reappears in live
+  config — workflows, scripts, `Cargo.toml`, or the consumer-facing install docs. Historical documents
+  are exempt by construction (the guard scans an explicit live-config allowlist, not the whole tree).
 
 ### Added
 - **`CLW_CACHE_BUDGET_BYTES` — the local cache eviction budget is now configurable.** The `~/.clw/cache`
