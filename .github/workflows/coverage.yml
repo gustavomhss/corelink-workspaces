@@ -9,9 +9,11 @@
 #     final step to `exit 1` on a drop. Deterministic (same tests => same %), not flaky.
 #   * Phase 1c: promote to a required check once stable; ratchet the floor upward.
 #
-# Runs on github-hosted ubuntu (like the canaries) — clean ephemeral toolchain, no
-# self-hosted rustup-nuke. Default-features only: the clw-conformance `live` suite is
-# NEVER run here (no backend), matching the gate's `cargo test`.
+# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Each box is a fresh
+# microVM, so the toolchain is clean per run. Default-features only: the clw-conformance
+# `live` suite is NEVER compiled/run here (no backend), matching the gate's `cargo test`,
+# so this lane needs NO live-cred wiring.
 
 name: coverage
 
@@ -31,7 +33,7 @@ permissions:
 jobs:
   coverage:
     name: llvm-cov (report-only)
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

@@ -4,8 +4,11 @@
 # broken script there is a real user hazard, and the release/gate scripts are load-bearing.
 # They were never shellcheck-gated. This runs shellcheck on all of scripts/*.sh.
 #
-# github-hosted ubuntu (shellcheck is preinstalled), additive — does not touch the
-# required gates/dco checks. Runs on PRs that touch scripts + push-to-main + dispatch.
+# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The corelink image
+# does NOT bake shellcheck, so the job installs it via apt (passwordless sudo + apt are
+# present on the box). Additive — does not touch the required gates/dco checks. Runs on
+# PRs that touch scripts + push-to-main + dispatch.
 
 name: shellcheck
 
@@ -22,10 +25,14 @@ permissions:
 jobs:
   shellcheck:
     name: shellcheck scripts/*.sh
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # The corelink image does not bake shellcheck; install it from apt (the box has
+      # passwordless sudo + apt — see the runner Dockerfile).
+      - name: install shellcheck (not baked into the corelink image)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
       - name: shellcheck (warning level — errors + warnings fail)
         run: |
           set -euo pipefail

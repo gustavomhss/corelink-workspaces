@@ -37,11 +37,15 @@ env:
 jobs:
   canary:
     name: live conformance canary (prod)
-    # GitHub-hosted: prod-health monitoring must NOT depend on the single self-hosted
-    # Mac (a dead box = a SILENT blind spot — a scheduled canary that never runs
-    # produces no red). The canary is a network test against live prod, so any hosted
-    # OS works; ubuntu-latest is the cheapest reliable lane.
-    runs-on: ubuntu-latest
+    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric
+    # (zero hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The
+    # earlier "must be hosted so it doesn't depend on the single Mac" rationale no
+    # longer holds: `corelink` boxes are ephemeral microVMs, NOT the single Mac, so
+    # there is no shared-box blind spot. The canary is a network test against live
+    # prod; if the corelink fabric is itself down the job fails-to-start = RED, which
+    # is the correct signal (and hosted already produced no useful red under the
+    # GitHub-Actions billing block — a 2s no-runner failure).
+    runs-on: corelink
     timeout-minutes: 20
     env:
       # CI service identity for the live conformance suite (same secrets as
@@ -53,14 +57,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GitHub-hosted ubuntu ships rustup; install the pinned rust-toolchain.toml
-      # channel explicitly (minimal profile) so the suite builds against the same
-      # toolchain the gate/release use.
-      - name: install pinned Rust toolchain (rust-toolchain.toml channel)
-        run: |
-          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          rustup toolchain install "$CH" --profile minimal
-          rustup default "$CH"
+      # The `corelink` image ships rustup; `rustup show` reads rust-toolchain.toml
+      # and provisions the pinned channel (1.91.1 + rustfmt/clippy) on first use.
+      # Do NOT `rustup default`/`toolchain install` here: the pin in the file is
+      # authoritative and rustup honours it over any global default — matching the
+      # corelink-server self-hosted lanes. The box is an ephemeral microVM, so there
+      # is no shared-$HOME hazard, but keeping the pin as the single source of truth
+      # avoids a per-run global mutation for nothing.
+      - name: provision the workspace-pinned toolchain (rust-toolchain.toml)
+        run: rustup show
 
       # The canary REQUIRES the live cases to actually run: a missing PAT (or an
       # unreachable/unavailable endpoint) must FAIL loudly, never green-skip.
@@ -74,6 +79,19 @@ jobs:
           CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
           CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
           CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+          # This canary is a TOKEN-identity conformance check (CLW_CI_TOKEN). Now that
+          # it runs on a `corelink` box spawned by the runner fabric, env-0 injects an
+          # ambient single-use cred ticket (CLW_CRED_TICKET+CLW_LEASE_ID+
+          # CLW_FABRIC_ENDPOINT) bound to the BOX's SPAWN tenant (dogfood), which is a
+          # DIFFERENT tenant than CLW_CI_TENANT. The C2c `cred_ticket_redeems_*` journey
+          # would then redeem that ambient ticket and hit /v1/ac/<CLW_CI_TENANT> with a
+          # dogfood-bound PAT → a correct cross-tenant 403 (tenant isolation), a false
+          # canary red. Null the trio so that journey soft-skips here (as it did on the
+          # old hosted lane); the redeem path is exercised by real runner E2E, not this
+          # token-identity canary.
+          CLW_CRED_TICKET: ""
+          CLW_LEASE_ID: ""
+          CLW_FABRIC_ENDPOINT: ""
           # REQUIRE=1 turns a skip (missing cred OR a 405/501 unavailable endpoint)
           # into a hard failure, so a red/unreachable prod fails the canary.
           CLW_CONFORMANCE_REQUIRE: "1"

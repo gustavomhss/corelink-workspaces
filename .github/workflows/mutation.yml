@@ -14,7 +14,10 @@
 # wave triages survivors (critical crates first), adds tests that kill them, then flips to
 # `--in-diff` per-PR blocking on any NEW survivor.
 #
-# Runs on github-hosted ubuntu.
+# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The box bakes the
+# pinned rust toolchain (rust-toolchain.toml honoured by `rustup show`); cargo-mutants is
+# installed per-run as a prebuilt.
 
 name: mutation
 
@@ -33,7 +36,7 @@ permissions:
 jobs:
   mutation:
     name: cargo-mutants shard ${{ matrix.shard }}/6
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 300
     strategy:
       fail-fast: false   # each shard is independent; a survivor in one must not cancel the rest

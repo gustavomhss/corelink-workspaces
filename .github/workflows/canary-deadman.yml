@@ -24,7 +24,10 @@ permissions:
 jobs:
   deadman:
     name: canary freshness dead-man's-switch
-    runs-on: ubuntu-latest
+    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Pure gh/jq/date
+    # check (all baked into the image); no toolchain needed.
+    runs-on: corelink
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}

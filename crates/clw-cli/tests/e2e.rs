@@ -407,8 +407,39 @@ fn build_source_tree(root: &std::path::Path) {
 // Helper: spawn `clw` with common env vars
 // ---------------------------------------------------------------------------
 
-fn clw_cmd(endpoint: &str, cache_dir: &std::path::Path) -> Command {
+/// Base builder for the real `clw` binary with a CLEAN credential environment.
+///
+/// Every child `clw` must start from a known-empty identity: the test process can
+/// inherit an ambient credential (a developer's exported `CLW_*`, or the C2c
+/// credential-broker trio `CLW_CRED_TICKET`/`CLW_LEASE_ID`/`CLW_FABRIC_ENDPOINT`
+/// that a `runs-on: corelink` fabric box injects into every job's env-0). If that
+/// leaks into the child, `resolve` takes the broker path (token → redeem) instead
+/// of the static-token path the tests set up, and both the happy-path and the
+/// fail-closed broker tests read the wrong state. Strip the FULL namespace here so
+/// each caller then sets ONLY the identity it intends (the broker tests set the
+/// trio themselves, on top of this clean base).
+fn clw_bin() -> Command {
     let mut cmd = Command::cargo_bin("clw").unwrap();
+    for v in [
+        "CLW_ENDPOINT",
+        "CLW_TENANT",
+        "CLW_TOKEN",
+        "CLW_CACHE_DIR",
+        "CLW_REF_DOMAIN",
+        "CORELINK_ENDPOINT",
+        "CORELINK_TENANT",
+        "CORELINK_TOKEN",
+        "CLW_CRED_TICKET",
+        "CLW_LEASE_ID",
+        "CLW_FABRIC_ENDPOINT",
+    ] {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
+fn clw_cmd(endpoint: &str, cache_dir: &std::path::Path) -> Command {
+    let mut cmd = clw_bin();
     cmd.env("CLW_ENDPOINT", endpoint)
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", TEST_PAT)
@@ -534,18 +565,11 @@ fn clw_runner_cmd(
     cache_dir: &std::path::Path,
     ref_domain: Option<&str>,
 ) -> Command {
-    let mut cmd = Command::cargo_bin("clw").unwrap();
+    let mut cmd = clw_bin();
+    // `clw_bin()` already stripped the full CLW_*/CORELINK_* + broker namespace, so
+    // this run is genuinely env-only (no inherited config-file fallback). Inject the
+    // runner's full identity purely via env (no flags, no file).
     cmd.env("HOME", home.to_str().unwrap())
-        // Strip any identity that could leak in from the parent env so the run is
-        // genuinely env-only — no inherited CLW_*/CORELINK_* config-file fallback.
-        .env_remove("CLW_ENDPOINT")
-        .env_remove("CLW_TENANT")
-        .env_remove("CLW_TOKEN")
-        .env_remove("CLW_REF_DOMAIN")
-        .env_remove("CORELINK_ENDPOINT")
-        .env_remove("CORELINK_TENANT")
-        .env_remove("CORELINK_TOKEN")
-        // The runner's full identity, injected purely via env (no flags, no file).
         .env("CLW_ENDPOINT", endpoint)
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", TEST_PAT)
@@ -930,8 +954,7 @@ async fn auth_failure() {
     let cache_dir = TempDir::new().unwrap();
 
     // Use wrong token by overriding CLW_TOKEN
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("CLW_ENDPOINT", server.uri())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", "wrong-token")
@@ -981,8 +1004,7 @@ fn doctor_runs_and_redacts_token() {
     let home = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", SECRET_TOKEN)
@@ -1031,8 +1053,7 @@ fn doctor_json_redacts_token() {
     let home = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", SECRET_TOKEN)
@@ -1075,8 +1096,7 @@ fn init_writes_0600_config_and_rejects_reinit() {
     let cache_dir = TempDir::new().unwrap();
 
     let run_init = |args: &[&str]| {
-        Command::cargo_bin("clw")
-            .unwrap()
+        clw_bin()
             .env("HOME", home.path())
             .env("CLW_ENDPOINT", "https://example.com")
             .env("CLW_TENANT", TEST_TENANT)
@@ -1137,8 +1157,7 @@ fn auth_whoami_prints_tenant_not_token() {
     let home = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_TOKEN", SECRET_TOKEN)
@@ -1190,8 +1209,7 @@ fn doctor_redacts_endpoint_userinfo_text_and_json() {
     let cache_dir = TempDir::new().unwrap();
 
     for args in [vec!["doctor"], vec!["--json", "doctor"]] {
-        let out = Command::cargo_bin("clw")
-            .unwrap()
+        let out = clw_bin()
             .env("HOME", home.path())
             .env("CLW_ENDPOINT", ENDPOINT_WITH_USERINFO)
             .env("CLW_TENANT", TEST_TENANT)
@@ -1227,8 +1245,7 @@ fn whoami_redacts_endpoint_userinfo_text_and_json() {
     let cache_dir = TempDir::new().unwrap();
 
     for args in [vec!["auth", "whoami"], vec!["--json", "auth", "whoami"]] {
-        let out = Command::cargo_bin("clw")
-            .unwrap()
+        let out = clw_bin()
             .env("HOME", home.path())
             .env("CLW_ENDPOINT", ENDPOINT_WITH_USERINFO)
             .env("CLW_TENANT", TEST_TENANT)
@@ -1272,8 +1289,7 @@ fn run_dispatch_panic_exits_reserved_125_not_101() {
     let cache_dir = TempDir::new().unwrap();
     let input = TempDir::new().unwrap();
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         // A resolvable identity so config resolution SUCCEEDS and we reach the
         // dispatch path (no network call is made — the panic fires first).
@@ -1313,8 +1329,7 @@ fn ls_unconfigured_fails_cleanly() {
     let home = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         // Strip any inherited identity so the binary is genuinely unconfigured.
         .env_remove("CLW_ENDPOINT")
@@ -1384,8 +1399,7 @@ fn uninstall_dry_run_lists_paths_removes_nothing_and_no_token() {
     let (home, cache) = seed_clw_footprint();
     let clw_dir = home.path().join(".clw");
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         .env_remove("CLW_TENANT")
         .env_remove("CLW_TOKEN")
@@ -1432,7 +1446,7 @@ fn uninstall_without_yes_noninteractive_errors_and_deletes_nothing() {
     // No TTY in the test harness (stdin is not a terminal) and no --yes: the
     // binary must REFUSE and delete nothing, in both plain and --json mode.
     for json in [false, true] {
-        let mut cmd = Command::cargo_bin("clw").unwrap();
+        let mut cmd = clw_bin();
         cmd.env("HOME", home.path())
             .env_remove("CLW_TENANT")
             .env_remove("CLW_TOKEN")
@@ -1472,8 +1486,7 @@ fn uninstall_yes_scrubs_config_and_cache_keeps_binary() {
     let (home, cache) = seed_clw_footprint();
     let clw_dir = home.path().join(".clw");
 
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("HOME", home.path())
         .env_remove("CLW_TENANT")
         .env_remove("CLW_TOKEN")
@@ -1523,8 +1536,7 @@ fn uninstall_yes_scrubs_config_and_cache_keeps_binary() {
 fn completions_each_shell_nonempty_and_offline() {
     let home = TempDir::new().unwrap();
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
-        let out = Command::cargo_bin("clw")
-            .unwrap()
+        let out = clw_bin()
             // Fresh, unconfigured user: no identity at all.
             .env("HOME", home.path())
             .env_remove("CLW_ENDPOINT")
@@ -2733,7 +2745,7 @@ async fn snapshot_surfaces_nonretryable_tier_403_cleanly() {
 /// (so no real ~/.clw leaks in) and every CLW_*/CORELINK_* var stripped. Tests then
 /// set EXACTLY the layers they are exercising.
 fn clw_clean_env(home: &std::path::Path) -> Command {
-    let mut cmd = Command::cargo_bin("clw").unwrap();
+    let mut cmd = clw_bin();
     cmd.env("HOME", home.to_str().unwrap())
         .env_remove("CLW_ENDPOINT")
         .env_remove("CLW_TENANT")
@@ -2997,8 +3009,7 @@ fn init_force_overwrites_existing_config_keeping_0600() {
     let home = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     let run_init = |args: &[&str], token: &str| {
-        Command::cargo_bin("clw")
-            .unwrap()
+        clw_bin()
             .env("HOME", home.path())
             .env("CLW_ENDPOINT", "https://example.com")
             .env("CLW_TENANT", TEST_TENANT)
@@ -3723,8 +3734,7 @@ fn rm_name_and_ref_key_together_conflict() {
 #[test]
 fn invalid_tenant_with_slash_rejected_cleanly() {
     let cache = TempDir::new().unwrap();
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("CLW_ENDPOINT", "http://127.0.0.1:1")
         .env("CLW_TENANT", "a/b")
         .env("CLW_TOKEN", TEST_PAT)
@@ -3882,8 +3892,7 @@ async fn cred_ticket_redeem_happy_path_snapshots() {
     let src = TempDir::new().unwrap();
     std::fs::write(src.path().join("f.txt"), b"cred-ticket payload").unwrap();
     let cache = TempDir::new().unwrap();
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("CLW_ENDPOINT", server.uri())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
@@ -3906,8 +3915,7 @@ async fn cred_ticket_redeem_happy_path_snapshots() {
 #[test]
 fn cred_ticket_missing_lease_id_fails_closed() {
     let cache = TempDir::new().unwrap();
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("CLW_ENDPOINT", "http://127.0.0.1:1")
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
@@ -3945,8 +3953,7 @@ async fn cred_ticket_fabric_410_fails_closed() {
     let src = TempDir::new().unwrap();
     std::fs::write(src.path().join("f.txt"), b"x").unwrap();
     let cache = TempDir::new().unwrap();
-    let out = Command::cargo_bin("clw")
-        .unwrap()
+    let out = clw_bin()
         .env("CLW_ENDPOINT", server.uri())
         .env("CLW_TENANT", TEST_TENANT)
         .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())

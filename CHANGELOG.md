@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### CI / Infrastructure
+- **Every GitHub-hosted Linux CI lane now runs on `corelink`** — CoreLink's own ephemeral
+  CF-Firecracker runner fabric — so this repo spends **zero** GitHub-hosted Actions minutes, per the
+  org mandate *"self-hosted tudo ou não roda"*. Migrated `ci` (gates + dco), `conformance-canary`,
+  `coverage`, `live-journeys`, `mutation`, `fuzz`, `stress`, `shellcheck`, `canary-deadman` and
+  `metered-probe-canary` from `ubuntu-latest`. Image-capability adaptations: `live-journeys` uses
+  `rustup show` (the toolchain is baked) instead of `rustup toolchain install/default`; `shellcheck`
+  and the `ci`-gates mingw cross-CC install via apt (passwordless sudo is present on the box);
+  `metered-probe` installs `blake3` into a venv (Ubuntu 24.04 is PEP-668 externally-managed).
+  `release.yml`, `windows.yml` and `e2e-evidence.yml` intentionally keep hosted targets pending the
+  cross-platform release rework.
+
+### Fixed
+- **`clw-cli` config-resolution unit tests are now hermetic against the ambient credential
+  environment.** Seven `resolve`/`resolve_lenient` tests read the process env but did not clear the
+  full `CLW_*`/`CORELINK_*` namespace or the C2c broker trio (`CLW_CRED_TICKET`/`CLW_LEASE_ID`/
+  `CLW_FABRIC_ENDPOINT`); they passed only because a GitHub-hosted runner's env happened to be clean.
+  On a `runs-on: corelink` box the fabric injects the broker trio into every job's env-0, which drove
+  `resolve` down the credential-broker path (token resolved to `""`) and made the "missing
+  tenant/token" tests see ambient values — four failed. A new `VarGuard::isolate()` snapshots and
+  clears the complete `CRED_ENV_VARS` set (restored on drop), so every resolve test starts from a
+  known-empty credential environment regardless of what the host/CI injected.
+
 ### Security
 - **The release + install path no longer performs privileged writes through a GitHub org-transfer
   redirect.** All six CoreLink repos moved from the `HumanGuardrail` org to **`HuGR-Labs`** on

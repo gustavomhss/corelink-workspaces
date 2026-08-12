@@ -35,17 +35,22 @@ env:
 jobs:
   journeys:
     name: live journeys (prod, real user)
-    # GitHub-hosted: a network test against prod; no dependency on the self-hosted Mac.
-    runs-on: ubuntu-latest
+    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). This is a network
+    # test against live prod; the box is an ephemeral microVM (NOT the single Mac), so
+    # there is no shared-box blind spot, and if the fabric is down the job fails-to-start =
+    # RED, the correct signal.
+    runs-on: corelink
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: install pinned Rust toolchain (rust-toolchain.toml channel)
-        run: |
-          CH=$(grep -E '^[[:space:]]*channel' rust-toolchain.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          rustup toolchain install "$CH" --profile minimal
-          rustup default "$CH"
+      # The `corelink` image ships rustup; `rustup show` reads rust-toolchain.toml and
+      # provisions the pinned channel (1.91.1) on first use. Do NOT `rustup default` — the
+      # pin in the file is authoritative and the box is an ephemeral microVM (no shared-$HOME
+      # hazard), matching the corelink-server self-hosted lanes.
+      - name: provision the workspace-pinned toolchain (rust-toolchain.toml)
+        run: rustup show
 
       # The destructive erase/prune journeys spawn the real `clw` binary; build it so
       # `clw_binary()` can locate target/debug/clw (else those journeys soft-skip).
@@ -69,6 +74,16 @@ jobs:
           CLW_PROBE_TOKEN: ${{ secrets.CLW_CI_PROBE_TOKEN }}
           CLW_LIVE_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
           CLW_LIVE_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
+          # Null the ambient cred trio. On a `corelink` box spawned by the runner fabric,
+          # env-0 injects a single-use cred ticket (CLW_CRED_TICKET+CLW_LEASE_ID+
+          # CLW_FABRIC_ENDPOINT) bound to the BOX's SPAWN tenant (dogfood) — a DIFFERENT
+          # tenant than CLW_TENANT here. The `cred_ticket_redeems_*` journey would redeem
+          # it and hit /v1/ac/<CLW_TENANT> with a dogfood-bound PAT → a correct cross-tenant
+          # 403 (tenant isolation), a false red. Nulling makes that journey soft-skip (as it
+          # did on the old hosted lane); the redeem path is exercised by real runner E2E.
+          CLW_CRED_TICKET: ""
+          CLW_LEASE_ID: ""
+          CLW_FABRIC_ENDPOINT: ""
           # REQUIRE=1: a skip of the PRIMARY-cred journeys is a hard failure. The
           # extra-infra journeys use `soft_skip` (NOT skip_or_fail), so they never
           # trip REQUIRE — the lane is green with just the primary PAT.

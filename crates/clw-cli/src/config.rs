@@ -1305,6 +1305,7 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = HomeEnvGuard::new();
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
@@ -1363,34 +1364,58 @@ cache_dir = "~/.clw/cache"
         }
     }
 
+    /// The COMPLETE credential/config env namespace that
+    /// [`ResolvedConfig::resolve`] + [`ResolvedConfig::resolve_lenient`] consult:
+    /// the clap `env=` bindings on `Cli` (CLW_*) plus the `corelink_env` fallbacks
+    /// (CORELINK_*) plus the C2c credential-broker trio. A resolve test MUST
+    /// neutralize ALL of these, not merely the few it sets — otherwise an ambient
+    /// value silently changes the resolution path and the test goes red for a reason
+    /// unrelated to its assertion. This is not hypothetical: a `runs-on: corelink`
+    /// fabric box injects the broker trio (CLW_CRED_TICKET/CLW_LEASE_ID/
+    /// CLW_FABRIC_ENDPOINT) into every job's env-0, and a developer may have
+    /// CLW_TENANT/CLW_TOKEN exported — both made these tests flake red until they
+    /// isolated the full set. Keep this list in lockstep with `resolve`.
+    const CRED_ENV_VARS: &[&str] = &[
+        "CLW_ENDPOINT",
+        "CLW_TENANT",
+        "CLW_TOKEN",
+        "CLW_CACHE_DIR",
+        "CLW_REF_DOMAIN",
+        "CORELINK_ENDPOINT",
+        "CORELINK_TENANT",
+        "CORELINK_TOKEN",
+        "CLW_CRED_TICKET",
+        "CLW_LEASE_ID",
+        "CLW_FABRIC_ENDPOINT",
+    ];
+
+    impl VarGuard {
+        /// Snapshot the FULL [`CRED_ENV_VARS`] namespace and CLEAR every one, so a
+        /// resolve test starts from a known-empty credential environment regardless
+        /// of what the host/CI injected; the originals are restored on drop. Hold
+        /// [`ENV_LOCK`] for the whole test.
+        fn isolate() -> Self {
+            let g = Self::capture(CRED_ENV_VARS);
+            for &n in CRED_ENV_VARS {
+                std::env::remove_var(n);
+            }
+            g
+        }
+    }
+
     #[test]
     fn resolve_accepts_corelink_aliases_and_clw_wins() {
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = HomeEnvGuard::new();
-        let _vars = VarGuard::capture(&[
-            "CLW_ENDPOINT",
-            "CLW_TENANT",
-            "CLW_TOKEN",
-            "CORELINK_ENDPOINT",
-            "CORELINK_TENANT",
-            "CORELINK_TOKEN",
-        ]);
+        // Isolate the FULL credential namespace (incl. the broker trio a corelink
+        // box injects) so only the CORELINK_* aliases this test sets are in play.
+        let _cred = VarGuard::isolate();
         // Disposable-runner state: empty HOME (no config file), no CLW_* — only
         // the CoreLink-wide CORELINK_* aliases injected at dispatch.
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
-        for v in [
-            "CLW_ENDPOINT",
-            "CLW_TENANT",
-            "CLW_TOKEN",
-            "CORELINK_ENDPOINT",
-            "CORELINK_TENANT",
-            "CORELINK_TOKEN",
-        ] {
-            std::env::remove_var(v);
-        }
         std::env::set_var("CORELINK_TENANT", "acme-runner");
         std::env::set_var("CORELINK_TOKEN", "rtok");
 
@@ -1429,11 +1454,10 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = HomeEnvGuard::new();
-        let _vars = VarGuard::capture(&["CLW_REF_DOMAIN"]);
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
-        std::env::remove_var("CLW_REF_DOMAIN");
 
         // Default (no selector) => the user keyspace.
         let cli = crate::Cli::try_parse_from([
@@ -1501,11 +1525,10 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _home = HomeEnvGuard::new();
-        let _vars = VarGuard::capture(&["CLW_REF_DOMAIN"]);
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
-        std::env::remove_var("CLW_REF_DOMAIN");
 
         // Lenient resolve must NOT error on a bad ref-domain (it powers `doctor`);
         // it falls back to the user keyspace BUT records the raw value so the bad
@@ -1543,6 +1566,7 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = HomeEnvGuard::new();
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
@@ -1568,6 +1592,7 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = HomeEnvGuard::new();
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");
@@ -1593,6 +1618,7 @@ cache_dir = "~/.clw/cache"
         use clap::Parser as _;
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _guard = HomeEnvGuard::new();
+        let _cred = VarGuard::isolate();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("USERPROFILE");

@@ -10,7 +10,11 @@
 #
 # cargo-fuzz REQUIRES nightly (-Z build-std / libFuzzer wiring); the workspace is
 # stable-pinned, and fuzz/ is a detached out-of-workspace package precisely so the
-# main stable gate never sees libfuzzer-sys. Runs on github-hosted ubuntu.
+# main stable gate never sees libfuzzer-sys. Runs on `corelink` — CoreLink's OWN ephemeral
+# CF-Firecracker runner fabric (zero hosted-Actions spend; org mandate "self-hosted tudo ou
+# não roda"). Each box is a fresh microVM, so `rustup toolchain install nightly` + a source
+# `cargo install cargo-fuzz` are clean per run (no shared-$HOME hazard — that only bites the
+# Mac fleet, not these one-shot boxes).
 
 name: fuzz
 
@@ -29,7 +33,7 @@ permissions:
 jobs:
   fuzz:
     name: fuzz ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 20
     strategy:
       fail-fast: false   # one crashing target must not hide the others' results

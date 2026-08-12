@@ -16,8 +16,33 @@ use tempfile::TempDir;
 /// is required (doctor never phones home). Distinctive token so redaction is provable.
 const SECRET_TOKEN: &str = "portable-secret-token-DO-NOT-LEAK";
 
-fn base(cache: &std::path::Path) -> Command {
+/// Base builder for the real `clw` binary with a CLEAN credential environment —
+/// see the same helper in `e2e.rs`. The test process can inherit an ambient
+/// identity (an exported `CLW_*`, or the C2c broker trio a `runs-on: corelink`
+/// fabric box injects into env-0); stripping it here keeps every offline journey
+/// deterministic regardless of what the host/CI environment carries.
+fn clw_bin() -> Command {
     let mut cmd = Command::cargo_bin("clw").unwrap();
+    for v in [
+        "CLW_ENDPOINT",
+        "CLW_TENANT",
+        "CLW_TOKEN",
+        "CLW_CACHE_DIR",
+        "CLW_REF_DOMAIN",
+        "CORELINK_ENDPOINT",
+        "CORELINK_TENANT",
+        "CORELINK_TOKEN",
+        "CLW_CRED_TICKET",
+        "CLW_LEASE_ID",
+        "CLW_FABRIC_ENDPOINT",
+    ] {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
+fn base(cache: &std::path::Path) -> Command {
+    let mut cmd = clw_bin();
     cmd.env("CLW_TENANT", "portable-tenant")
         .env("CLW_TOKEN", SECRET_TOKEN)
         .env("CLW_CACHE_DIR", cache.to_str().unwrap());
@@ -26,11 +51,7 @@ fn base(cache: &std::path::Path) -> Command {
 
 #[test]
 fn version_flag_prints_a_version() {
-    let out = Command::cargo_bin("clw")
-        .unwrap()
-        .arg("--version")
-        .output()
-        .unwrap();
+    let out = clw_bin().arg("--version").output().unwrap();
     assert!(out.status.success(), "clw --version must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

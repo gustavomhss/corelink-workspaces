@@ -16,24 +16,24 @@ env:
 
 jobs:
   gates:
-    # GitHub-hosted ubuntu is the authoritative lane: it runs INSIDE GitHub's
-    # network and never traverses the public self-hosted-runner session endpoint
-    # (pipelines.actions.githubusercontent.com), so a single self-hosted Mac is no
-    # longer a merge SPOF. (2026-07-20: an expired cert on that public endpoint
-    # wedged every self-hosted runner while github-hosted jobs stayed green — this
-    # move makes the required gate immune to that class of outage. The gate is
-    # platform-agnostic; the OS-divergent target (Windows) is covered by the
-    # windows-gnu cross-check below + the separate windows-runtime lane.)
-    runs-on: ubuntu-latest
+    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Each box is an
+    # ephemeral microVM, NOT the single self-hosted Mac, so this required gate has no
+    # shared-box SPOF: the 2026-07-20 class of outage (an expired cert wedging every
+    # Mac-backed runner) does not apply to per-lease Firecracker boxes, and if the fabric
+    # itself is down the job fails-to-start = RED, the correct signal for a required check.
+    # The gate is platform-agnostic; the OS-divergent target (Windows) is covered by the
+    # windows-gnu cross-check below + the separate windows-runtime lane.
+    runs-on: corelink
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # ubuntu-latest ships rustup; rust-toolchain.toml pins the channel (1.91.1)
-      # and its components (rustfmt, clippy), which rustup auto-installs. `rustup
-      # show` in the repo root forces that install now so a download failure surfaces
-      # here rather than mid-gate.
+      # The `corelink` image ships rustup + the pinned toolchain baked; `rustup show`
+      # reads rust-toolchain.toml (1.91.1 + rustfmt/clippy) and resolves it with zero
+      # per-spawn download. A download failure (if the pin ever drifts) surfaces here
+      # rather than mid-gate.
       - name: install pinned Rust toolchain (rust-toolchain.toml)
         run: rustup show
       # Provision the supply-chain tools as PREBUILT binaries (gates.sh runs
@@ -50,7 +50,8 @@ jobs:
         run: bash scripts/gates.sh
 
   dco:
-    runs-on: ubuntu-latest
+    # Same `corelink` ephemeral fabric — pure git + bash, no toolchain (zero hosted spend).
+    runs-on: corelink
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

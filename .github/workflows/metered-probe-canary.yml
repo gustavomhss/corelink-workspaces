@@ -33,15 +33,22 @@ permissions:
 jobs:
   probe:
     name: metered probe — assert the $-ceiling 402 fires
-    runs-on: ubuntu-latest
+    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). curl + python3 are
+    # baked; blake3 is NOT, and Ubuntu 24.04 is PEP-668 "externally managed" so a global
+    # `pip install` is refused — the probe installs blake3 into a venv instead.
+    runs-on: corelink
     timeout-minutes: 12
     env:
       EP: https://corelink-api.humangr.com
       PROBE_TENANT: ${{ secrets.CLW_PROBE_TENANT }}
       PROBE_TOKEN: ${{ secrets.CLW_PROBE_TOKEN }}
     steps:
-      - name: install blake3 (CAS content-address)
-        run: pip install --quiet blake3
+      - name: install blake3 in a venv (CAS content-address; PEP-668 blocks global pip)
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/probe-venv
+          /tmp/probe-venv/bin/pip install --quiet blake3
 
       - name: drive the probe over its $0.50 ceiling and assert the 402 boundary
         run: |
@@ -50,7 +57,7 @@ jobs:
             echo "::error::CLW_PROBE_TENANT/TOKEN unset — a missing probe cred must FAIL this canary (a silent skip would defeat the purpose)."
             exit 1
           fi
-          b3() { python3 -c "import blake3,sys; print(blake3.blake3(sys.stdin.buffer.read()).hexdigest())"; }
+          b3() { /tmp/probe-venv/bin/python3 -c "import blake3,sys; print(blake3.blake3(sys.stdin.buffer.read()).hexdigest())"; }
           got402=0
           ok=0            # count of ACCEPTED (2xx) writes — a real metering gap needs many of these with no 402
           last_bad=""     # last non-2xx status — points at availability/harness, not the ceiling

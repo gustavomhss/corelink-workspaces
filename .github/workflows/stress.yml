@@ -5,8 +5,10 @@
 # magnitude (2 GiB file, 100k files, deep+wide tree, 64-way concurrency) plus the
 # property round-trip at a high case count. A crash / hang / OOM / mismatch goes RED.
 #
-# github-hosted ubuntu; --release so the 2 GiB xorshift + chunking + hydrate finish in
-# time; --test-threads=1 so the heavy scenarios don't run at once and blow disk/RAM.
+# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
+# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). --release so the 2 GiB
+# xorshift + chunking + hydrate finish in time; --test-threads=1 so the heavy scenarios
+# don't run at once and blow disk/RAM on the microVM.
 
 name: stress
 
@@ -28,7 +30,7 @@ jobs:
   # be 30-50 min on a shared ubuntu runner).
   scale:
     name: scale scenarios (2GiB / 100k / deep-wide / 64-way)
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 90
     env:
       CLW_STRESS_BIG_BYTES: "2147483648" # 2 GiB single file
@@ -49,7 +51,7 @@ jobs:
 
   property:
     name: exhaustive property round-trip (2000 cases)
-    runs-on: ubuntu-latest
+    runs-on: corelink
     timeout-minutes: 90
     env:
       PROPTEST_CASES: "2000"
