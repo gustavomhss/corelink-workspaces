@@ -1,17 +1,25 @@
-# Windows RUNTIME lane — validate what was compile-only.
+# Windows RUNTIME smoke — zero-hosted (org mandate "self-hosted tudo ou não roda").
 #
-# The gate cross-CHECKS windows-gnu (`cargo check` on ubuntu), and release.yml BUILDS the
-# windows-gnu binary — but until now NO workflow ever RAN `cargo test` on Windows, so every
-# Windows-specific runtime path (backslash / drive-letter / NTFS-ADS rejection at hydrate,
-# the constant 0o644 mode, the symlink copy-fallback) shipped validated by compile + unix
-# unit tests only. This runs the workspace test suite natively on Windows.
+# What this IS: a cheap regression smoke that the SHIPPED windows-gnu `clw.exe`
+# actually EXECUTES and dispatches commands. It builds the binary with mingw on
+# `corelink` (Linux) and runs it under Wine — catching a build/link that compiles
+# but won't run, or a broken command dispatch, at $0 hosted cost. This replaces the
+# old `windows-latest` lane, which under the GitHub-Actions billing block never
+# started (steps=0, no runner) and therefore tested NOTHING.
 #
-# Uses the GNU toolchain to match the SHIPPED windows-gnu binary (the GH Windows image ships
-# mingw-w64 for ring's C build). The unix-only test files (`#![cfg(unix)]`: clw-cli e2e,
-# roundtrip_prop) self-exclude; this exercises the cross-platform + windows-specific paths.
+# What this is NOT — and MUST NOT be mistaken for: a full Windows-runtime gate.
+# Wine's fidelity for the very things a Windows lane exists to check — NTFS
+# alternate-data-stream rejection, drive-letter/backslash edge cases, the symlink
+# copy-fallback — is partial/uncertain, so a GREEN here does NOT prove those. It was
+# measured (PoC on corelink 2026-08-12): `wine clw.exe` runs and dispatches fine,
+# and the pure-logic unit tests pass under Wine, but clw-run's command-execution +
+# FS-semantics tests and the assert_cmd-based e2e harness do NOT run trustworthily
+# under Wine (subprocess/path-translation limits). Full-fidelity Windows-runtime
+# coverage needs a REAL self-hosted Windows runner — the owner-chosen Phase-3 item;
+# until that box exists, this smoke is the honest, zero-hosted floor.
 #
-# NOT yet a required check — it runs on push-to-main + dispatch while the Windows runtime is
-# brought to green; promote to pull_request once stable.
+# The shipped Windows BINARY is separately cross-built + released via zig on the Mac
+# (release.yml) — independent of this lane.
 
 name: windows
 
@@ -29,23 +37,54 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  TGT: x86_64-pc-windows-gnu
+  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+  WINEDEBUG: "-all"
+
 jobs:
-  test:
-    name: windows runtime (cargo test, gnu)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
+  smoke:
+    name: windows binary smoke (mingw build, wine run)
+    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). Neither wine
+    # nor mingw is baked into the image; both install via apt (passwordless sudo is
+    # present on the box).
+    runs-on: corelink
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: install pinned gnu toolchain (matches the shipped windows-gnu binary)
+      - name: install wine + mingw (not baked into the corelink image)
         run: |
           set -euo pipefail
-          rustup toolchain install 1.91.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
-          rustup default 1.91.1-x86_64-pc-windows-gnu
-          rustc -vV
+          sudo apt-get update -qq
+          # `wine` (the metapackage) provides the PATH wrapper that dispatches to the
+          # 64-bit loader for x64 exes; `gcc-mingw-w64-x86-64` is the windows-gnu linker.
+          sudo apt-get install -y wine gcc-mingw-w64-x86-64
+          command -v wine >/dev/null || { echo "::error::wine not on PATH after install"; exit 1; }
+          command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "::error::mingw not on PATH after install"; exit 1; }
+          wine --version
 
-      - name: cargo test (validate the Windows RUNTIME — previously compile-only)
-        run: cargo test --workspace
+      - name: pinned toolchain + windows-gnu target
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup target add "$TGT"
+
+      - name: build the shipped-shape clw.exe (windows-gnu, mingw linker)
+        run: cargo build --release --locked -p clw-cli --target "$TGT"
+
+      - name: smoke — the real clw.exe runs + dispatches under wine
+        run: |
+          set -euo pipefail
+          BIN="target/${TGT}/release/clw.exe"
+          test -f "$BIN"
+          # --version: proves the mingw-built windows-gnu binary actually executes
+          # (not just links). Assert it prints a name + a digit.
+          OUT="$(wine "$BIN" --version)"
+          echo "clw.exe --version => $OUT"
+          echo "$OUT" | grep -q "clw" || { echo "::error::clw.exe --version did not print a clw version"; exit 1; }
+          # doctor: exercises offline command dispatch (arg parsing + config resolution
+          # + the --json path) on the Windows binary.
+          CLW_TENANT=smoke CLW_TOKEN=smoke-tok wine "$BIN" --json doctor >/dev/null
+          echo "clw.exe --json doctor dispatched OK"
+          echo "WINDOWS-SMOKE-OK (dispatch only; full NTFS/drive/ADS fidelity needs a real Windows runner)"
