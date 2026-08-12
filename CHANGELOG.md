@@ -3,6 +3,18 @@
 ## [Unreleased]
 
 ### CI / Infrastructure
+- **The release pipeline is now zero-hosted too.** `release.yml` moved off GitHub-hosted runners entirely,
+  mirroring the proven corelink-server CLI release: all five targets build on ONE self-hosted Mac
+  (`corelink-builder`, $0 CF) via `cargo-zigbuild` — darwin native (system linker), and the Linux
+  x86_64/aarch64 + windows-gnu targets cross-compiled with zig's libc+linker (a real macOS host is required
+  for codesign/notarize anyway, so every leg folds onto it at no extra cost). Rust comes from the pinned
+  host toolchain via the new `scripts/ci-use-host-toolchain.sh` (never `rustup install`/`default` on the
+  shared-`$HOME` Mac fleet). The non-build jobs (preflight, conformance, sbom, publish) run on `corelink`.
+  Ported the server's hard-won build fixes (zigcc linker-script perms / exit-126 guard; the `windows-rs`
+  cache-integrity re-fetch) and added `SOURCE_DATE_EPOCH` + a `RUSTFLAGS` path-remap so the shipped binaries
+  are reproducible and carry no dev-host `$HOME`/username in their strings. The Linux minisign signing leg
+  now installs via `brew` (it runs on the Mac now, not apt-based ubuntu). Conformance nulls the ambient
+  env-0 cred trio (same cross-tenant fix as the CI lanes).
 - **Every GitHub-hosted Linux CI lane now runs on `corelink`** — CoreLink's own ephemeral
   CF-Firecracker runner fabric — so this repo spends **zero** GitHub-hosted Actions minutes, per the
   org mandate *"self-hosted tudo ou não roda"*. Migrated `ci` (gates + dco), `conformance-canary`,

@@ -18,21 +18,25 @@
 #   * Proprietary: the download surface is NOT a public GitHub Release.
 #   * Signed: macOS Developer ID + notarize; Windows cloud/HSM Authenticode;
 #     Linux minisign (sigstore as documented alternative).
-#   * Cross-platform, 5 locked targets — each built NATIVELY on its own
-#     GitHub-hosted runner (no cross-compilation):
-#       aarch64-apple-darwin       -> macos-14         (macOS)
-#       x86_64-apple-darwin        -> macos-14         (macOS, cross on Apple Silicon)
-#       x86_64-pc-windows-gnu      -> windows-latest   (Windows, gnu ABI)
-#       x86_64-unknown-linux-gnu   -> ubuntu-latest    (Linux)
-#       aarch64-unknown-linux-gnu  -> ubuntu-24.04-arm (Linux, native arm64)
-#   * Build hosts: GitHub-hosted, ephemeral, NATIVE per target. The release path
-#     migrated OFF the owner's self-hosted single-owner Mac to GitHub-hosted
-#     runners — every target now compiles on a runner of its own OS/arch, so there
-#     is no cross-compilation (cargo-zigbuild is gone) and no shared-host rustup to
-#     isolate (each ephemeral runner has a fresh rustup). The non-build jobs
-#     (preflight, conformance, sbom, publish) run on ubuntu-latest.
-#     Windows is gnu, NOT msvc: msvc would require an msvc toolchain; the gnu ABI
-#     builds natively on windows-latest (the GH Windows image ships mingw-w64).
+#   * Cross-platform, 5 locked targets, built with ZERO GitHub-hosted spend
+#     (org mandate "self-hosted tudo ou não roda"), mirroring the PROVEN
+#     corelink-server CLI release (release-cli.yml): ONE self-hosted Mac runner
+#     (`corelink-builder`) builds every target via `cargo-zigbuild` —
+#       aarch64-apple-darwin       -> native `cargo build` (system linker)
+#       x86_64-apple-darwin        -> native `cargo build` (cross on Apple Silicon)
+#       x86_64-unknown-linux-gnu   -> `cargo zigbuild` (zig libc+linker)
+#       aarch64-unknown-linux-gnu  -> `cargo zigbuild` (zig libc+linker)
+#       x86_64-pc-windows-gnu      -> `cargo zigbuild` (zig, gnu ABI)
+#   * Build host: the self-hosted Mac fleet (`corelink-builder`, $0 CF). zig
+#     supplies the libc headers + linker for the Linux + windows-gnu cross
+#     targets; the darwin targets build NATIVELY (zigcc has an upstream
+#     iconv/charset bug for darwin-on-darwin). A real macOS host is required for
+#     the Developer-ID codesign + notarization anyway, so folding every leg onto
+#     it costs nothing extra. Rust comes from the pre-installed HOST toolchain via
+#     `scripts/ci-use-host-toolchain.sh` (NEVER `rustup install`/`default` on the
+#     shared-$HOME Mac fleet — the os-error-2 crash + reproducibility-pin drift).
+#     The non-build jobs (preflight, conformance, sbom, publish) run on `corelink`
+#     (ephemeral CF-Firecracker Linux). Windows is gnu, NOT msvc.
 
 name: release
 
@@ -63,7 +67,10 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: preflight (guard + gates)
-    runs-on: ubuntu-latest
+    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). rustup +
+    # the pinned toolchain are baked; `sudo apt-get` (mingw for the windows-gnu
+    # cross-check) works on the box.
+    runs-on: corelink
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -231,7 +238,9 @@ jobs:
   conformance:
     name: live conformance gate (pre-tag)
     needs: preflight
-    runs-on: ubuntu-latest
+    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend); a network
+    # test against live prod.
+    runs-on: corelink
     timeout-minutes: 30
     env:
       # CI service identity for the live conformance suite. The suite reads these
@@ -274,6 +283,15 @@ jobs:
           CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
           CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
           CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
+          # Null the ambient env-0 cred trio: a `corelink` box injects a single-use
+          # cred ticket (CLW_CRED_TICKET/CLW_LEASE_ID/CLW_FABRIC_ENDPOINT) bound to
+          # its SPAWN tenant (dogfood) — a different tenant than CLW_TENANT. The
+          # cred-ticket-redeem journey would redeem it and hit /v1/ac/<CLW_TENANT>
+          # with a dogfood-bound PAT → a correct cross-tenant 403 (isolation), a
+          # false red. Null the trio so that journey soft-skips (require-safe).
+          CLW_CRED_TICKET: ""
+          CLW_LEASE_ID: ""
+          CLW_FABRIC_ENDPOINT: ""
         run: |
           set -euo pipefail
           # For a REAL (non-prerelease) tag the live conformance gate is MANDATORY:
@@ -305,41 +323,44 @@ jobs:
     # `conformance` is a REQUIRED predecessor (WP M4.5): no binary is built or
     # signed until the live conformance gate is green.
     needs: [preflight, conformance]
-    runs-on: ${{ matrix.os }}
+    # ALL five targets build on the repo's self-hosted Mac runner `clw-mac-1`
+    # (labels: self-hosted, macOS, X64 — an Intel host, $0 CF), mirroring the
+    # proven corelink-server release mechanism: darwin native, and the Linux +
+    # windows-gnu targets cross-compiled with cargo-zigbuild (zig supplies the libc
+    # + linker). A real macOS host is required for codesign/notarize anyway, so
+    # every leg folds onto it at no extra cost. (NB: this repo's Mac carries the
+    # `macOS` label, NOT the server's `corelink-builder` — verified against the live
+    # runner registration.)
+    runs-on: [self-hosted, macOS, X64]
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # The fleet is one physical Mac; cap parallelism so 5 concurrent builds do
+      # not thrash CPU/RAM (mirrors release-cli.yml). 5/3 = two batches.
+      max-parallel: 3
       matrix:
         include:
-          # --- macOS (Apple Silicon, native on macos-14) --------------------
+          # --- macOS (Apple Silicon host, native `cargo build`) -------------
           - target: aarch64-apple-darwin
-            os: macos-14
             platform: macos
             ext: ""
-          # --- macOS (Intel: cross-built on the Apple-Silicon macos-14 runner.
-          #     The Apple toolchain builds both arches natively, and macos-13
-          #     (Intel) hosted runners are scarce/unschedulable on this plan —
-          #     v0.1.1-rc5 sat queued ~1h. `rustup target add x86_64-apple-darwin`
-          #     + `cargo build --target` on macos-14 produces a valid Intel binary.)
+          # --- macOS (Intel: native cross on the Apple-Silicon host; the Apple
+          #     toolchain builds both arches with the system linker) ----------
           - target: x86_64-apple-darwin
-            os: macos-14
             platform: macos
             ext: ""
-          # --- Windows (x86_64, gnu ABI: native on windows-latest — the GH
-          #     Windows image ships mingw-w64; msvc would need the msvc
+          # --- Windows (x86_64, gnu ABI: cross via cargo-zigbuild on the Mac —
+          #     zig provides the gnu libc + linker; msvc would need the msvc
           #     toolchain, a future option) ----------------------------------
           - target: x86_64-pc-windows-gnu
-            os: windows-latest
             platform: windows
             ext: ".exe"
-          # --- Linux (x86_64, native on ubuntu-latest) ----------------------
+          # --- Linux (x86_64, cross via cargo-zigbuild on the Mac) -----------
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
             platform: linux
             ext: ""
-          # --- Linux (aarch64, native on the arm64 ubuntu runner) -----------
+          # --- Linux (aarch64, cross via cargo-zigbuild on the Mac) ----------
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
             platform: linux
             ext: ""
     env:
@@ -350,48 +371,103 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Materialize the rust-toolchain.toml pin (1.91.1) via the preinstalled rustup
-      # on the ephemeral runner, then add this leg's NATIVE target. Every target now
-      # builds on a runner of its own OS/arch, so no cross-compilation is needed.
-      - name: install pinned rust toolchain + target
+      # Rust from the pre-installed HOST toolchain (rust-toolchain.toml channel) +
+      # this leg's target. NEVER `rustup install`/`default` on the shared-$HOME Mac
+      # fleet — the os-error-2 crash + reproducibility-pin drift the helper prevents.
+      - name: use the workspace-pinned host toolchain (provisions nothing)
+        shell: bash
+        run: bash scripts/ci-use-host-toolchain.sh "${{ matrix.target }}"
+
+      # zig cross-toolchain (Linux + windows-gnu only): libc headers + linker for
+      # the cross targets. The darwin targets build natively (zigcc has an upstream
+      # iconv/charset bug for darwin-on-darwin), so they skip zig. The Mac host has
+      # zig via `brew install zig`; hard-fail with that instruction if it is absent
+      # (do NOT fall back to a hosted setup action — zero-hosted mandate).
+      - name: ensure zig is present (Linux + Windows cross)
+        if: matrix.platform != 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          rustup show
-          rustup target add "${{ matrix.target }}"
+          if command -v zig >/dev/null 2>&1; then
+            echo "zig found at $(command -v zig)"
+          else
+            echo "::error::zig is required for the ${{ matrix.target }} cross build but is not installed on this runner host. Run once on the host: brew install zig" >&2
+            exit 1
+          fi
 
-      # windows-gnu links with the GNU (mingw-w64) toolchain, which the GitHub
-      # windows-latest image ships under the bundled MSYS2 (`C:\msys64`). Make the
-      # gnu linker (x86_64-w64-mingw32-gcc / dlltool) resolvable for the cargo build
-      # below; if it is already on PATH this is a no-op.
-      - name: ensure mingw-w64 gnu linker is on PATH (windows-gnu)
+      # cargo-zigbuild as a PREBUILT binary (Linux + Windows only). NOT
+      # `cargo install` — that compiles into the shared ~/.cargo all runners use at
+      # once (the os-error-2 race). install-action is a no-op when already present.
+      - name: install cargo-zigbuild (prebuilt, Linux + Windows cross)
+        if: matrix.platform != 'macos'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.19.8
+
+      # Exit-126 guard: cargo-zigbuild writes zigcc-*.sh linker wrappers under
+      # ~/Library/Caches/cargo-zigbuild/; a cache restore can strip their execute
+      # bit. chmod +x unconditionally (they are tiny). Ported from release-cli.yml.
+      - name: fix zigcc linker-script permissions (exit-126 guard)
+        if: matrix.platform != 'macos'
+        shell: bash
+        run: |
+          ZIGBUILD_CACHE="$HOME/Library/Caches/cargo-zigbuild"
+          if [ -d "$ZIGBUILD_CACHE" ]; then
+            find "$ZIGBUILD_CACHE" -name '*.sh' -exec chmod +x {} +
+            echo "fixed zigcc wrapper perms in $ZIGBUILD_CACHE"
+          else
+            echo "no zigcc cache dir yet — wrappers will be created fresh"
+          fi
+
+      # Reproducible build: SOURCE_DATE_EPOCH from the commit timestamp.
+      - name: set SOURCE_DATE_EPOCH
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      # windows-gnu cache-integrity fix: the `windows_x86_64_gnu` crate ships a
+      # static archive the linker consumes; a partial cache restore can drop it.
+      # Re-fetch so the .a is present. Ported from release-cli.yml.
+      - name: re-fetch windows-rs deps (cache integrity fix)
         if: matrix.platform == 'windows'
         shell: bash
         run: |
           set -euo pipefail
-          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-            echo "mingw-w64 gnu linker already on PATH: $(command -v x86_64-w64-mingw32-gcc)"
-            exit 0
-          fi
-          # The runner ships MSYS2 with the mingw64 gcc under C:\msys64\mingw64\bin.
-          MINGW_BIN="/c/msys64/mingw64/bin"
-          if [ -x "${MINGW_BIN}/x86_64-w64-mingw32-gcc.exe" ]; then
-            echo "$MINGW_BIN" >> "$GITHUB_PATH"
-            echo "added ${MINGW_BIN} to PATH for the gnu linker"
-          else
-            # Fall back to installing the mingw-w64 toolchain via the bundled MSYS2.
-            echo "mingw-w64 gcc not found at ${MINGW_BIN} — installing via MSYS2 pacman"
-            /c/msys64/usr/bin/pacman -S --noconfirm --needed mingw-w64-x86_64-gcc
-            echo "$MINGW_BIN" >> "$GITHUB_PATH"
-          fi
+          rm -rf "$HOME"/.cargo/registry/src/index.crates.io-*/windows_x86_64_gnu-* || true
+          rm -rf "$HOME"/.cargo/registry/src/index.crates.io-*/windows-targets-* || true
+          cargo fetch --target "${{ matrix.target }}"
 
-      - name: build release binary
+      # Strip absolute dev-host paths from the shipped binary (no $HOME/username
+      # leak in `strings`); map known prefixes to short placeholders.
+      - name: set RUSTFLAGS path-remap
+        shell: bash
+        run: |
+          REMAP=""
+          REMAP="$REMAP --remap-path-prefix=$HOME/.cargo/registry=cargo-registry"
+          REMAP="$REMAP --remap-path-prefix=$HOME/.cargo/git=cargo-git"
+          REMAP="$REMAP --remap-path-prefix=$HOME/.rustup=rustup"
+          REMAP="$REMAP --remap-path-prefix=$GITHUB_WORKSPACE=clw"
+          echo "RUSTFLAGS=$REMAP" >> "$GITHUB_ENV"
+
+      - name: build release binary (cargo zigbuild — Linux + Windows)
+        if: matrix.platform != 'macos'
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
+          RUSTFLAGS: ${{ env.RUSTFLAGS }}
+        run: cargo zigbuild --release --locked -p clw-cli --target "${{ matrix.target }}"
+
+      - name: build release binary (cargo build, native — macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
+          RUSTFLAGS: ${{ env.RUSTFLAGS }}
+        run: cargo build --release --locked -p clw-cli --target "${{ matrix.target }}"
+
+      - name: stage the binary under its per-target asset name
         shell: bash
         run: |
           set -euo pipefail
-          # NATIVE build for this leg's target (no cross-compilation).
-          cargo build --release -p clw-cli --target "${{ matrix.target }}"
-          # Stage the binary under its final per-target asset name.
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/clw${{ matrix.ext }}" "dist/${ASSET}"
 
@@ -544,10 +620,10 @@ jobs:
             exit 0
           fi
           # Real minisign detached signature -> dist/${ASSET}.minisig.
-          # This leg runs on a GitHub-hosted Ubuntu runner — install minisign via
-          # apt (skip if already present).
+          # This leg now builds+signs on the self-hosted Mac (corelink-builder),
+          # so install minisign via brew (NOT apt), skipping if already present.
           if ! command -v minisign >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+            brew install minisign
           fi
           printf '%s' "$MINISIGN_SECRET_KEY" | base64 -d > minisign.key
           trap 'rm -f minisign.key' EXIT   # remove the key even if signing aborts under set -e
@@ -584,7 +660,9 @@ jobs:
   sbom:
     name: sbom (CycloneDX)
     needs: [preflight, conformance]
-    runs-on: ubuntu-latest
+    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend); derived from
+    # Cargo.lock, no network/secret.
+    runs-on: corelink
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -661,7 +739,9 @@ jobs:
     # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
     # predecessor of publish/sign — a red conformance tag never ships.
     needs: [preflight, conformance, build, sbom]
-    runs-on: ubuntu-latest
+    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). minisign +
+    # cargo-about install here; gh is baked for the cross-repo mirror Release.
+    runs-on: corelink
     timeout-minutes: 20
     # Provenance attestation needs to mint an OIDC token + write the attestation.
     # `contents: write` is harmless here (the public Release is created on the
