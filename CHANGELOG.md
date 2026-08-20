@@ -2,11 +2,6 @@
 
 ## [Unreleased]
 
-### Security
-- **Bumped `h2` 0.4.14 → 0.4.17** to clear `RUSTSEC-2026-0258` (h2 unbounded empty DATA frames), a newly
-  published advisory that failed the repo-wide `cargo-deny` advisories gate on every PR. Transitive via
-  `reqwest`→`hyper`; lockfile-only change, no API surface touched. `cargo deny check advisories` → ok.
-
 ### CI / Infrastructure
 - **The release pipeline is now zero-hosted too.** `release.yml` moved off GitHub-hosted runners entirely,
   mirroring the proven corelink-server CLI release: all five targets build on ONE self-hosted Mac
@@ -32,6 +27,18 @@
   cross-platform release rework.
 
 ### Fixed
+- **`clw ls --all` no longer mislabels native ActionCache values as "corrupt ref records."**
+  A tenant's AC keyspace is shared three ways: workspace refs, `clw run` memo records, and raw
+  native/Bazel ActionCache values (arbitrary non-JSON bytes). `list_refs` enumerates the whole
+  keyspace, so `ls --all` fetched every entry and — because a raw AC value is not a `RefRecord` —
+  warned "skipping unparseable ref record" for each one and counted it under `--json` `errors`. On a
+  dogfood tenant that had accumulated native AC blobs (e.g. `ac-roundtrip-value-*`) this flooded the
+  listing with false-corruption warnings. A ref/run record is always JSON, so a value that does not
+  parse as JSON at all is now classified as a benign foreign AC entry: counted separately (new
+  `foreign_ac_entries` in `--json`, `; N non-ref AC entries` in the human summary), silent at debug,
+  never warned. Only bytes that ARE valid JSON but do not match the `RefRecord`/`RunRecord` shape are
+  still treated as a genuinely corrupt ref (warn + `skipped` + named by ref key). No data-loss surface
+  (`prune` sweeps CAS blobs, not AC values; foreign AC entries were never touched).
 - **`clw-cli` config-resolution unit tests are now hermetic against the ambient credential
   environment.** Seven `resolve`/`resolve_lenient` tests read the process env but did not clear the
   full `CLW_*`/`CORELINK_*` namespace or the C2c broker trio (`CLW_CRED_TICKET`/`CLW_LEASE_ID`/
@@ -43,6 +50,9 @@
   known-empty credential environment regardless of what the host/CI injected.
 
 ### Security
+- **Bumped `h2` 0.4.14 → 0.4.17** to clear `RUSTSEC-2026-0258` (h2 unbounded empty DATA frames), a newly
+  published advisory that failed the repo-wide `cargo-deny` advisories gate on every PR. Transitive via
+  `reqwest`→`hyper`; lockfile-only change, no API surface touched. `cargo deny check advisories` → ok.
 - **The release + install path no longer performs privileged writes through a GitHub org-transfer
   redirect.** All six CoreLink repos moved from the `HumanGuardrail` org to **`HuGR-Labs`** on
   2026-08-01. A GitHub org transfer leaves a `301` behind, so `git clone`, `gh` and `curl` kept working

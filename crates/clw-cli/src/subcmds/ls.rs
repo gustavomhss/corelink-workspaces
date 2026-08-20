@@ -115,6 +115,11 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
 /// would flood a large/degraded tenant. `clw run` memo records (the AC-backed run
 /// cache) legitimately share the keyspace; they are recognized via
 /// [`clw_run::is_run_record`], counted as `run_cache_entries`, and never warned.
+/// Likewise, the tenant AC keyspace is SHARED with native/Bazel ActionCache, whose
+/// values are arbitrary NON-JSON bytes; a ref/run record is always JSON, so bytes
+/// that fail to parse as JSON at all are a foreign AC value — counted as
+/// `foreign_ac_entries` and never warned. Only bytes that ARE valid JSON but do not
+/// match the `RefRecord`/`RunRecord` shape are treated as a genuinely corrupt ref.
 /// In `--json` each genuinely-corrupt record is a structured `{key, error}` entry
 /// under `errors` so a machine caller sees the partial-listing rather than a hard
 /// failure. Partial output is strictly better than no output for a listing.
@@ -141,6 +146,10 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // them separately and never warn about them (they would otherwise flood the listing
     // and grow with every `clw run`).
     let mut run_cache = 0usize;
+    // Native/Bazel ActionCache values (arbitrary non-JSON bytes) also share this
+    // tenant's AC keyspace. They are NOT corrupt refs — count them separately and
+    // stay silent, exactly like run-cache entries.
+    let mut foreign = 0usize;
 
     // Fetch every record to recover its name/root. The keys are INDEPENDENT, so we fetch
     // with BOUNDED CONCURRENCY instead of one-at-a-time. The old sequential loop paid N
@@ -155,6 +164,7 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
         Row(Box<RefRecord>),
         Skip(String, String), // (key_hex, error) — corrupt record OR transient transport blip
         RunCache,             // a `clw run` memo record legitimately sharing the keyspace
+        Foreign,              // a non-JSON AC value (native/Bazel ActionCache) sharing the keyspace
         Gone,                 // Ok(None): deleted between enumeration and fetch
         Auth,                 // 401: the WHOLE listing is unauthorized → abort
     }
@@ -171,8 +181,18 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
                             tracing::debug!(ref_key = %key.to_hex(), "skipping run-cache entry in ref listing");
                             Fetched::RunCache
                         }
-                        // Genuinely corrupt/unparseable: diagnostic warn (shown with -v) +
-                        // structured --json error + summary. No per-record stderr flood.
+                        // The tenant AC keyspace is SHARED with native/Bazel ActionCache,
+                        // whose values are arbitrary (non-JSON) bytes — NOT corrupt refs.
+                        // A ref/run record is always JSON; so bytes that are not valid JSON
+                        // at all are a foreign AC value, benign like a run-cache entry: count
+                        // it, stay silent (no warn, no --json `errors` line).
+                        Err(_) if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() => {
+                            tracing::debug!(ref_key = %key.to_hex(), "skipping foreign (non-JSON) AC value in ref listing");
+                            Fetched::Foreign
+                        }
+                        // Valid JSON but NOT a RefRecord/RunRecord shape: a genuinely corrupt
+                        // ref — diagnostic warn (shown with -v) + structured --json error +
+                        // summary. No per-record stderr flood.
                         Err(e) => {
                             tracing::warn!(ref_key = %key.to_hex(), error = %e, "skipping unparseable ref record");
                             Fetched::Skip(key.to_hex(), e.to_string())
@@ -203,6 +223,7 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
             Fetched::Row(record) => rows.push(*record),
             Fetched::Skip(key_hex, err) => skipped.push((key_hex, err)),
             Fetched::RunCache => run_cache += 1,
+            Fetched::Foreign => foreign += 1,
             Fetched::Gone => {}
             // AUTH (401) means the WHOLE listing is unauthorized: abort with the
             // actionable auth message (the same outcome the sequential loop produced).
@@ -233,11 +254,12 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
                 "count": rows.len(),
                 "refs": arr,
                 "run_cache_entries": run_cache,
+                "foreign_ac_entries": foreign,
                 "skipped": errors.len(),
                 "errors": errors,
             })
         );
-    } else if rows.is_empty() && skipped.is_empty() && run_cache == 0 {
+    } else if rows.is_empty() && skipped.is_empty() && run_cache == 0 && foreign == 0 {
         println!("no refs for tenant '{tenant}'");
     } else {
         for r in &rows {
@@ -252,6 +274,9 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
         let mut summary = format!("({} refs in tenant '{tenant}'", rows.len());
         if run_cache > 0 {
             summary.push_str(&format!("; {run_cache} run-cache entries"));
+        }
+        if foreign > 0 {
+            summary.push_str(&format!("; {foreign} non-ref AC entries"));
         }
         if !skipped.is_empty() {
             summary.push_str(&format!(
@@ -503,6 +528,47 @@ mod tests {
             skipped[0].1.contains("connection reset"),
             "skip carries the transport error text"
         );
+    }
+
+    /// The `run_all` classifier for a byte value fetched from the SHARED AC keyspace,
+    /// extracted as a pure fn so the exact branch order (Ref → RunRecord → non-JSON
+    /// foreign → JSON-but-corrupt) is unit-testable without a live fetch. MUST mirror
+    /// the `match RefRecord::from_bytes` arms in `run_all`.
+    #[derive(Debug, PartialEq)]
+    enum Class {
+        Ref,
+        RunCache,
+        Foreign,
+        Corrupt,
+    }
+    fn classify(bytes: &[u8]) -> Class {
+        match RefRecord::from_bytes(bytes) {
+            Ok(_) => Class::Ref,
+            Err(_) if clw_run::is_run_record(bytes) => Class::RunCache,
+            Err(_) if serde_json::from_slice::<serde_json::Value>(bytes).is_err() => Class::Foreign,
+            Err(_) => Class::Corrupt,
+        }
+    }
+
+    // The keyspace-sharing fix: a native/Bazel ActionCache value (arbitrary non-JSON
+    // bytes, e.g. the `ac-roundtrip-value-*` values seen live) is classified FOREIGN
+    // (benign, silent), NOT a corrupt ref. A real ref stays a Ref; only valid-JSON
+    // that is not a RefRecord/RunRecord shape is Corrupt (the genuine warn signal).
+    #[test]
+    fn foreign_ac_value_is_not_a_corrupt_ref() {
+        // A raw native AC value observed live in a shared dogfood tenant.
+        assert_eq!(
+            classify(b"ac-roundtrip-value-000012e618bfbfe8288c5064"),
+            Class::Foreign
+        );
+        // Empty body and other non-JSON bytes are also foreign, not corrupt.
+        assert_eq!(classify(b""), Class::Foreign);
+        assert_eq!(classify(&[0xff, 0x00, 0x01]), Class::Foreign);
+        // A real ref is still a ref.
+        assert_eq!(classify(&good_record("alpha")), Class::Ref);
+        // Valid JSON that is neither a RefRecord nor a RunRecord IS a corrupt ref
+        // (the only case that should warn).
+        assert_eq!(classify(br#"{"unexpected":"shape"}"#), Class::Corrupt);
     }
 
     // FIX 4 — an AUTH (401) error fetching a record is STILL fatal: a 401 means the

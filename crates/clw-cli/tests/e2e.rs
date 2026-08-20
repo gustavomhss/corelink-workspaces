@@ -1687,13 +1687,23 @@ async fn ls_all_lists_refs_tolerates_corruption_and_reflects_rm() {
         "ls --all must list the snapshotted ref '{ws}', got:\n{stdout}"
     );
 
-    // Inject a corrupt AC record under a fake ref key (a non-decodable value).
-    // The good ref must STILL list, AND the skipped record must be reported.
-    let fake_key = "ff".repeat(32); // 64 hex chars, not a real ref
+    // The tenant AC keyspace is SHARED with native/Bazel ActionCache, so enumeration
+    // surfaces THREE non-ref cases. Inject one of each and assert the classifier keeps
+    // them apart — the good ref must STILL list through all of it:
+    //   (a) a foreign NON-JSON AC value (a native ActionCache blob) → benign, counted
+    //       as `foreign_ac_entries`, NOT reported as a corrupt ref (the live-observed
+    //       `ac-roundtrip-value-*` case that used to flood the listing with warnings);
+    //   (b) a genuinely corrupt ref: valid JSON but NOT a RefRecord/RunRecord shape →
+    //       reported as `skipped` and named by its ref key.
+    let foreign_key = "ee".repeat(32); // 64 hex, a non-JSON native AC value
     ac.lock().unwrap().insert(
-        fake_key.clone(),
-        b"{ this is not a valid ref record".to_vec(),
+        foreign_key.clone(),
+        b"ac-roundtrip-value-000012e618bfbfe8288c5064".to_vec(),
     );
+    let corrupt_key = "ff".repeat(32); // 64 hex, valid JSON but wrong shape = corrupt ref
+    ac.lock()
+        .unwrap()
+        .insert(corrupt_key.clone(), br#"{"unexpected":"shape"}"#.to_vec());
 
     let out = clw_cmd(&server.uri(), cache.path())
         .args(["--json", "ls", "--all"])
@@ -1711,16 +1721,21 @@ async fn ls_all_lists_refs_tolerates_corruption_and_reflects_rm() {
         "the one good ref must still be listed, got:\n{stdout}"
     );
     assert_eq!(
-        parsed["skipped"], 1,
-        "the corrupt record must be reported as skipped, got:\n{stdout}"
+        parsed["foreign_ac_entries"], 1,
+        "the non-JSON native AC value must be counted foreign, NOT skipped, got:\n{stdout}"
     );
     assert_eq!(
-        parsed["errors"][0]["ref_key"], fake_key,
-        "the skipped record must be named by its ref key"
+        parsed["skipped"], 1,
+        "only the valid-JSON-wrong-shape record is a corrupt ref, got:\n{stdout}"
+    );
+    assert_eq!(
+        parsed["errors"][0]["ref_key"], corrupt_key,
+        "the skipped record must be named by its (corrupt) ref key, not the foreign one"
     );
 
-    // Remove the corrupt record, then rm the good ref: ls --all no longer lists it.
-    ac.lock().unwrap().remove(&fake_key);
+    // Remove both non-ref records, then rm the good ref: ls --all no longer lists it.
+    ac.lock().unwrap().remove(&foreign_key);
+    ac.lock().unwrap().remove(&corrupt_key);
     clw_cmd(&server.uri(), cache.path())
         .args(["rm", "--name", ws, "--yes"])
         .assert()
@@ -3395,13 +3410,19 @@ async fn ls_all_distinguishes_run_cache_from_corrupt_refs_without_flooding() {
         "11".repeat(32),
         format!("{{\"exit_code\":0,\"stdout\":\"{digest}\",\"stderr\":\"{digest}\"}}").into_bytes(),
     );
-    // A genuinely-corrupt (non-JSON) record.
+    // A foreign native ActionCache value (non-JSON bytes) sharing the keyspace.
+    let foreign = "33".repeat(32);
+    ac.lock()
+        .unwrap()
+        .insert(foreign.clone(), b"ac-roundtrip-value-abc123".to_vec());
+    // A genuinely-corrupt ref: valid JSON but NOT a RefRecord/RunRecord shape.
     let corrupt = "22".repeat(32);
     ac.lock()
         .unwrap()
-        .insert(corrupt.clone(), b"not json at all".to_vec());
+        .insert(corrupt.clone(), br#"{"unexpected":"shape"}"#.to_vec());
 
-    // --json: the real ref counts, the run-cache entry is recognized, only the corrupt one is skipped.
+    // --json: the real ref counts, the run-cache entry is recognized, the foreign AC
+    // value is counted (not skipped), and only the JSON-wrong-shape ref is skipped.
     let out = clw_cmd(&server.uri(), cache.path())
         .args(["--json", "ls", "--all"])
         .output()
@@ -3418,23 +3439,29 @@ async fn ls_all_distinguishes_run_cache_from_corrupt_refs_without_flooding() {
         "the run-cache entry must be recognized, NOT counted as corrupt, got:\n{parsed}"
     );
     assert_eq!(
+        parsed["foreign_ac_entries"], 1,
+        "the non-JSON native AC value must be counted foreign, NOT skipped, got:\n{parsed}"
+    );
+    assert_eq!(
         parsed["skipped"], 1,
-        "only the genuinely-corrupt record is skipped, got:\n{parsed}"
+        "only the JSON-wrong-shape record is skipped, got:\n{parsed}"
     );
     assert_eq!(
         parsed["errors"][0]["ref_key"], corrupt,
-        "the skipped record must be the corrupt one (not the run-cache entry)"
+        "the skipped record must be the corrupt one (not the run-cache or foreign entry)"
     );
 
-    // human mode: summary names both, and there is NO per-record warning flood on stderr.
+    // human mode: summary names all three, and there is NO per-record warning flood on stderr.
     let human = clw_cmd(&server.uri(), cache.path())
         .args(["ls", "--all"])
         .output()
         .unwrap();
     let hstdout = String::from_utf8_lossy(&human.stdout);
     assert!(
-        hstdout.contains("run-cache entries") && hstdout.contains("corrupt record(s) skipped"),
-        "the summary must name run-cache entries + the corrupt skip, got:\n{hstdout}"
+        hstdout.contains("run-cache entries")
+            && hstdout.contains("non-ref AC entries")
+            && hstdout.contains("corrupt record(s) skipped"),
+        "the summary must name run-cache + non-ref AC entries + the corrupt skip, got:\n{hstdout}"
     );
     assert!(
         !String::from_utf8_lossy(&human.stderr).contains("warning: skipping"),
