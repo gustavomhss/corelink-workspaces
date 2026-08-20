@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Security
+- **Bumped `h2` 0.4.14 → 0.4.17** to clear `RUSTSEC-2026-0258` (h2 unbounded empty DATA frames), a newly
+  published advisory that failed the repo-wide `cargo-deny` advisories gate on every PR. Transitive via
+  `reqwest`→`hyper`; lockfile-only change, no API surface touched. `cargo deny check advisories` → ok.
+
 ### CI / Infrastructure
 - **The release pipeline is now zero-hosted too.** `release.yml` moved off GitHub-hosted runners entirely,
   mirroring the proven corelink-server CLI release: all five targets build on ONE self-hosted Mac
