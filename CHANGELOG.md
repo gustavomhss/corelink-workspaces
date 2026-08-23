@@ -39,6 +39,20 @@
   never warned. Only bytes that ARE valid JSON but do not match the `RefRecord`/`RunRecord` shape are
   still treated as a genuinely corrupt ref (warn + `skipped` + named by ref key). No data-loss surface
   (`prune` sweeps CAS blobs, not AC values; foreign AC entries were never touched).
+- **`live-journeys.yml` wired to the actually-bound probe secrets.** The metered-quota 402 journey
+  read `secrets.CLW_CI_PROBE_TENANT`/`CLW_CI_PROBE_TOKEN`, but the repo secrets bound for this purpose
+  are `CLW_PROBE_TENANT`/`CLW_PROBE_TOKEN` (no `_CI_`) — the same ones `metered-probe-canary.yml`
+  already uses. Because the journey soft-skips on a missing cred, the wrong names made it silently
+  no-op every run instead of exercising `metered_writes_hit_the_402_quota_wall` (the clw-conformance
+  library path to the 402 wall, distinct code from the canary's raw curl/python probe). Corrected to
+  the real secret names so the journey actually runs.
+- **Documented the `137` exit code in the frozen CLI exit-code table (`docs/CLI-SURFACE-EXIT-FREEZE.md`).**
+  `CLW_RUN_OUTPUT_TOO_LARGE = 137` (`crates/clw-cli/src/subcmds/run.rs`) was a real, tested exit code —
+  returned when `clw run`'s child DID run but was killed for exceeding the captured-output CAS blob
+  cap — but was missing from the frozen table (only `125`/child-never-ran and the child-passthrough
+  range were documented). Not exploitable (a `TooLarge` run errors out before `clw-run`'s memoization
+  step is ever reached, so it is never cached), but it was undocumented conformance drift against the
+  runner-facing contract. Added the `137` row + updated the runner-rule pseudocode and stability note.
 - **`clw-cli` config-resolution unit tests are now hermetic against the ambient credential
   environment.** Seven `resolve`/`resolve_lenient` tests read the process env but did not clear the
   full `CLW_*`/`CORELINK_*` namespace or the C2c broker trio (`CLW_CRED_TICKET`/`CLW_LEASE_ID`/

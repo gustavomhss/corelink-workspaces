@@ -53,10 +53,16 @@
 |---|---|---|---|
 | `N` (the child's code, **0–255**, **passed through verbatim**) | the child ran and returned `N` (`run.rs` → `process::exit(outcome.exit_code)`) | cached **iff `N == 0`** (`clw-run` only stores on exit 0) | `Child(N)` |
 | **`125`** (RESERVED) | **clw-INTERNAL failure: the child NEVER ran** — substrate unreachable, bad config, hydrate/cache error (`run.rs` → `process::exit(CLW_RUN_INTERNAL_NOT_RUN=125)`) | **never** | `ClwFailed{clw_exit_code: 125}` |
+| **`137`** (RESERVED) | **clw-INTERNAL failure: the child DID run but clw killed it** for exceeding the captured-output CAS blob cap (`ClwError::TooLarge`; `run.rs` → `process::exit(CLW_RUN_OUTPUT_TOO_LARGE=137)`). Distinct from `125` — the child started and ran up to the point clw SIGKILLed it — so it borrows the POSIX `128+signal` convention for SIGKILL (`128+9=137`), the same convention used for any signal-killed child. | **never** — `run_memoized` returns `Err` before the memoization/store step is ever reached (`crates/clw-run/src/lib.rs`) | `ClwFailed{clw_exit_code: 137}` |
 | `2` (clap usage error) | **malformed `clw run` invocation** — bad/missing flags; clap exits before the child runs (child NEVER ran). The runner builds the argv, so this is not expected in production. | **never** | treat as clw-failed (child never ran) |
 
 - **125** is the industry "the wrapper itself failed" code (docker run, `env`, `timeout`, `nice`). A
   child SHOULD avoid emitting 125–127; clw reserves them for "child did not run."
+- **137** is reserved for the one case where clw kills a child that DID run (oversized captured
+  output) — see the table row above. It is not exploitable via a normal child exit: a child that
+  itself returns 137 (e.g. it was independently SIGKILLed) is indistinguishable to the runner from
+  clw's own 137, but in both cases the run is a non-zero exit and is never cached, so the ambiguity
+  has no cache-correctness impact.
 - A clw-internal `clw run` failure also prints a stderr sentinel `[clw] internal error — child not run: …`
   as a secondary signal (the exit code is the contract; the line is for humans/logs).
 - **This supersedes** the earlier "exit 2 = clw-internal" framing in the 2026-06-17 four-confirms reply:
@@ -66,10 +72,11 @@
 ```
 exit = run `clw run … -- <cmd>`
 if exit == 125  -> ClwFailed{clw_exit_code: 125}   # child never ran; never cache
+if exit == 137  -> ClwFailed{clw_exit_code: 137}   # child ran, clw killed it (output cap); never cache
 else            -> Child(exit)                      # transparent; clw already caches iff exit==0
 ```
 (`snapshot`/`hydrate`: `0` = ok, non-zero = `ClwFailed`.)
 
 ## 3. Stability
-Frozen for v0.1.0. The verbs, flag names, arg order, the `125` reserved code, and the
+Frozen for v0.1.0. The verbs, flag names, arg order, the `125` and `137` reserved codes, and the
 child-passthrough + cache-iff-0 semantics will not change without a new contract version announced here.

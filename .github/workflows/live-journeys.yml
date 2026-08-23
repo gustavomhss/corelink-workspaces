@@ -70,8 +70,8 @@ jobs:
           # Extra-infra journeys, ALL optional (soft-skip when absent, lane still
           # passes): the metered-quota 402 probe, the real-fabric cred-ticket, and the
           # DESTRUCTIVE erase/prune throwaway tenant. Wire these to exercise them.
-          CLW_PROBE_TENANT: ${{ secrets.CLW_CI_PROBE_TENANT }}
-          CLW_PROBE_TOKEN: ${{ secrets.CLW_CI_PROBE_TOKEN }}
+          CLW_PROBE_TENANT: ${{ secrets.CLW_PROBE_TENANT }}
+          CLW_PROBE_TOKEN: ${{ secrets.CLW_PROBE_TOKEN }}
           CLW_LIVE_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
           CLW_LIVE_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
           # Null the ambient cred trio. On a `corelink` box spawned by the runner fabric,
