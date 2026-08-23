@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### CI / Infrastructure
+- **Added `scripts/pre-merge-gate-check.sh`, ported from corelink-server.** Guards against a
+  failure mode that bit both repos within two hours of each other: a CONFLICTING PR gets NO
+  `pull_request` check runs at all (GitHub cannot build the merge ref) — not queued, not
+  failed, absent — so `gh pr checks` reports "nothing failing" and reads as green. Refuses to
+  say OK to merge unless (1) `mergeable == MERGEABLE` (UNKNOWN is also refused — it means "ask
+  again", not "fine"), (2) the always-present gates (`gates` + `dco` from `ci.yml`, and
+  `llvm-cov (report-only)` from `coverage.yml` — the only workflows here with a bare
+  `on: pull_request` and no `paths:` filter) actually appear in the check list, and (3) a
+  report of zero checks fails rather than passing as "nothing to gate". Proven in both
+  directions by `scripts/pre-merge-gate-check-selftest.sh` (stubbed `gh`, no network), wired
+  into `ci.yml` as its own job so the safety script keeps proving itself on every PR.
 - **The release pipeline is now zero-hosted too.** `release.yml` moved off GitHub-hosted runners entirely,
   mirroring the proven corelink-server CLI release: all five targets build on ONE self-hosted Mac
   (`corelink-builder`, $0 CF) via `cargo-zigbuild` — darwin native (system linker), and the Linux

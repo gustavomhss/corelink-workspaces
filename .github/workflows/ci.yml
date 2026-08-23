@@ -61,3 +61,16 @@ jobs:
         run: git fetch origin ${{ github.base_ref || 'main' }} --no-tags
       - name: DCO trailer check
         run: bash scripts/dco-check.sh origin/${{ github.base_ref || 'main' }}
+
+  gate-check-selftest:
+    # Same `corelink` ephemeral fabric — pure bash + python3, no toolchain (zero hosted
+    # spend). Proves scripts/pre-merge-gate-check.sh (the mandatory pre-merge gate, see
+    # its header) still refuses CONFLICTING/UNKNOWN/zero-checks/missing-always-present-
+    # gate and still allows a healthy PR, against a stubbed `gh` — so the safety script
+    # keeps proving itself on every PR that touches it, instead of silently bit-rotting.
+    runs-on: corelink
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: pre-merge-gate-check self-test
+        run: bash scripts/pre-merge-gate-check-selftest.sh
