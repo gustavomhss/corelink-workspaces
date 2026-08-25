@@ -1,5 +1,20 @@
 # FINDING → server TL: every authenticated request costs ~1 second (PAT verification)
 
+> ## ⚠️ SUPERSEDED (partially)
+> Edge PAT verification was fixed: the Worker's `auth` phase now measures 5-6 ms, KV-served
+> (`Server-Timing: auth;dur=5;desc="kv"`), measured 2026-08-24 in production.
+>
+> This finding measured tenant `…0000000f0006`, which is on the **enterprise** tier. Enterprise is
+> uncapped for requests and unlimited for storage, so that tenant skips quota work other tenants pay.
+> A latency measurement that does not state the tenant's tier is not reproducible.
+>
+> The finding is **not** fully refuted. It blamed PAT verification; the EDGE half was fixed, but the
+> CONTAINER still re-verifies the PAT on every request — including Argon2id — and that work has never
+> been measured. It sits inside the container's unattributed `oother` residue, which measures
+> 172-194 ms in production. Instrumentation to split it is in flight.
+>
+> No number is claimed for the container's Argon2id cost. It has not been measured.
+
 **Date:** 2026-07-19 · **Reporter:** clw TL · **Severity:** HIGH (dominates all clw command latency)
 **Backend:** `corelink-api.humangr.com` · **Tenant measured:** f0006 (`…0000000f0006`, enterprise)
 

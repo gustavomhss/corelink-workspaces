@@ -251,11 +251,19 @@ Fields serialized in declaration order: `name`, `root`, `manifest_size`,
 
 ### 6.3 Concurrency model (v1)
 
-The v1 concurrency model is **last-write-wins**. The AC does not provide
-compare-and-swap semantics in v1; concurrent writers for the same ref name will
-have their writes serialized by the server and the last PUT wins. The `parent`
-field provides a lineage trail for post-hoc inspection but does not enforce
-ordering. Future versions MAY introduce optimistic concurrency with CAS semantics.
+The server contract is **atomic put-if-absent**: a `PUT` on a ref key returns 201 for a
+brand-new key, 200 for an idempotent re-PUT of the identical value, and 409 when the key
+already holds a **divergent** value. There is genuinely no compare-and-swap token — no
+`If-Match`, no `ETag`, no generation number is sent on the AC PUT. The `parent` field is
+lineage only, recorded for post-hoc inspection, and is never read on the write path.
+
+*Replacing* an existing name is therefore delete-then-put: a client that wants to overwrite
+a divergent occupant must delete the ref and PUT again, a non-atomic window in which two
+concurrent `--force` writers can race. An identical concurrent write is not part of that
+race — the server's idempotent 200 (and a client-side reconcile that treats a matching
+occupant on 409 as a safe no-op) makes a duplicate write of the same value harmless; only a
+genuinely divergent occupant errors. Future versions MAY extend this with richer optimistic
+concurrency (e.g. an explicit CAS token).
 
 ---
 
@@ -329,7 +337,7 @@ making a network request when the limit would be exceeded.
 | 5.3 | Chunking parameters MUST NOT be changed without a lead decision record. |
 | 5.4 | Every chunk MUST be < 5 MiB. |
 | 6.1 | Ref key MUST be `BLAKE3("clw/ref/v1/" || name)`. |
-| 6.3 | v1 concurrency is last-write-wins; future MAY add CAS semantics. |
+| 6.3 | v1 concurrency is atomic put-if-absent (201 new / 200 idempotent / 409 divergent), not last-write-wins; future MAY add a CAS token. |
 | 7.2 | All requests MUST use `Authorization: Bearer <token>`. PAT MUST NEVER be logged. |
 | 7.3 | Clients MUST verify BLAKE3 digest on every CAS GET response. |
 | 7.4 | CAS PUT body MUST NOT exceed 5 MiB. |

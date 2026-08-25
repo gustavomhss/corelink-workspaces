@@ -534,7 +534,7 @@ to split the workspace / trim inputs, not to reconfigure clw.)
 | Bound | Value | Effect when reached |
 |---|---|---|
 | **Local cache GC budget** | **8 GiB** (default) | The `~/.clw/cache` self-evicts (LRU by mtime, checked once per 256 writes) back under this ceiling. **Overridable via `CLW_CACHE_BUDGET_BYTES`** (raw byte count) — raise it for a working set larger than 8 GiB so warm blobs aren't evicted, or lower it on a disk-tight machine. It's a cache (a miss just re-fetches), never data loss. |
-| CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB. A manifest is one blob → a very large tree (~32k files, path-length dependent) fails up-front with "too many entries". `clw run` SIGKILLs a child exceeding 5 MiB on stdout *or* stderr → exit 137. |
+| CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB (`CAS_BLOB_CAP_BYTES`). A manifest is one blob → a very large tree (path-length dependent) fails up-front with "too many entries". `clw run` SIGKILLs a child exceeding 5 MiB on stdout *or* stderr → exit 137. |
 | Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time); a file that grows past 16 MiB *between* the directory walk and the read is rejected (not silently slurped). |
 | Hydrate resource caps | ≤ **1M** entries · **100k** symlinks · **1 TiB** total · **64M** total chunks · **16M** chunks/file | A manifest exceeding any of these aborts the hydrate before writing (anti-OOM / anti-disk-fill / anti-symlink-bomb), budgeted against the *real* summed sizes, not the attacker-declared `total_size`. |
 | `ls --all` / `prune` enumeration caps | **16 MiB** per page · **10M** keys total · **1M** pages · page size **1000** | A tenant enumeration that blows past 10M keys aborts with `TooLarge` rather than growing unbounded. |
@@ -865,7 +865,9 @@ mechanism behind a row above (or the fine-grained guarantees the table doesn't s
 **Limits / handle with care**
 - **Manifest single-blob ceiling.** A manifest is one CAS blob capped at **5 MiB**, so a workspace with very
   many entries hits an up-front, actionable "too many entries" error. The exact file limit is byte-derived
-  (it depends on path lengths — short paths fit far more; **~32k files** is a rough estimate). Split the
+  (it depends on path lengths — short paths fit far more). The real gate is a **byte cap**:
+  `CAS_BLOB_CAP_BYTES = 5 MiB`, checked client-side before upload, with the server's 413 as the
+  authoritative limit. Split the
   workspace or trim tracked files (multi-part manifests are a future server capability).
 - **`clw run` is not hermetic in v0.1.** The child inherits the full ambient environment (only secret vars are
   stripped). Any env var that affects output **must** be declared with `--env`, or a stale result can replay.
@@ -1009,8 +1011,9 @@ about it. All of it is **client-side and on by default; there is nothing to conf
 - **`clw run` replayed a stale result** — an undeclared input changed. Declare every output-affecting env var with
   `--env` and every input path with `--input`; only memoize deterministic commands.
 - **"too many entries" on snapshot** — the workspace's manifest would exceed the single 5 MiB CAS blob. The
-  entry count where this hits is **path-length dependent** (short paths fit far more; **~32k files is only a
-  rough estimate**). Split the workspace or trim tracked files.
+  entry count where this hits is **path-length dependent** (short paths fit far more). The enforced limit
+  is a **byte cap** (`CAS_BLOB_CAP_BYTES = 5 MiB`), not a file count — checked client-side before upload,
+  with the server's 413 as the real gate. Split the workspace or trim tracked files.
 - **macOS "cannot be opened / unidentified developer"** on a raw download — install via `brew` or `install.sh`
   (they strip quarantine), or `xattr -d com.apple.quarantine <asset>` after verifying the signature.
 - **A hung operation** — clw bounds every operation by `CLW_OP_DEADLINE_SECS` (default 300s); a black-hole backend
@@ -1271,7 +1274,7 @@ component** (rejecting a Windows drive-letter `C:` or NTFS alternate-data-stream
 { "name":"<name>", "root":"<64-hex>", "manifest_size":<u64>,
   "created_at_unix":<u64>, "parent":"<64-hex>|null", "tool_version":"<string>" }
 ```
-`ref_key(name) = BLAKE3("clw/ref/v1/" ‖ name)` (runner keyspace: `"clw/ref/runner/v1/"`). Concurrency is **last-write-wins** in v1 (the `parent` field is lineage only; compare-and-swap is a future MAY).
+`ref_key(name) = BLAKE3("clw/ref/v1/" ‖ name)` (runner keyspace: `"clw/ref/runner/v1/"`). The server contract is **atomic put-if-absent** in v1 — 201 new, 200 idempotent (identical value), 409 divergent — not last-write-wins; there is no CAS token (no `If-Match`/`ETag`/generation) on the wire, and the `parent` field is lineage only, never read on the write path. Replacing a divergent value is delete-then-put (`--force`), a non-atomic window; an identical concurrent write instead reconciles as a safe no-op on the idempotent 200/409-same-value path. A real compare-and-swap token is a future MAY.
 
 **RunRecord** (the `clw run` memoization value, a first-class CAS object keyed by the input hash) — declaration order:
 ```json
@@ -1346,13 +1349,17 @@ Each target is **built on a runner of its own OS** (the release pipeline runs a 
 - macOS Developer-ID signing + notarization; Windows Authenticode (Azure Trusted Signing) — until live, verify via minisign.
 - Customer-selectable regional residency (incl. EEA/UK in-region) — US-only at launch.
 - EU/UK Art. 27 representative appointment; external-counsel legal sign-off; SOC 2 / ISO 27001 reports — all before GA.
-- Optimistic concurrency (compare-and-swap) for refs — v1 is last-write-wins.
+- A real compare-and-swap token (e.g. `If-Match`/generation number) for refs — v1's atomic put-if-absent
+  (201 new / 200 idempotent / 409 divergent) already rejects a divergent overwrite without one; a token
+  would let a caller express "replace only if it still matches X" instead of delete-then-put.
 - `clw run` child-env sandboxing (`env_clear` + allowlist) — v1 doesn't sandbox the child env.
 - Billing / paid plans — no payment subprocessor at v1.
 
 **Deferred (logged waivers):** SLSA build-provenance attestation (gated to public repos; the source repo is private); a distinct CAS-PUT created-vs-existed status (so `chunks_uploaded` is best-effort).
 
-**On the manifest ceiling:** the manifest is a single 5 MiB CAS blob, so very large workspaces (~32k+ files, path-length dependent) hit a clean "too many entries" error today; the error notes multi-part manifests as a future server capability. Split the workspace for now.
+**On the manifest ceiling:** the manifest is a single CAS blob capped by `CAS_BLOB_CAP_BYTES = 5 MiB`
+(path-length dependent, so no fixed file count), so very large workspaces hit a clean "too many entries"
+error today; the error notes multi-part manifests as a future server capability. Split the workspace for now.
 
 ---
 

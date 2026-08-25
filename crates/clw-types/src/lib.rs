@@ -371,8 +371,10 @@ pub fn validate_symlink_target_contained(link_rel: &str, t: &str) -> Result<()> 
 // ---------------------------------------------------------------------------
 
 /// The mutable pointer stored in the AC: workspace name → root manifest.
-/// Concurrency model v1: last-write-wins (single-operator tool); `parent`
-/// records lineage git-style for history/debugging.
+/// Concurrency model v1: atomic put-if-absent (201 new / 200 idempotent on an
+/// identical value / 409 on a divergent value) — not last-write-wins, and there
+/// is no CAS token on the wire; `parent` records lineage git-style for
+/// history/debugging and is never read on the write path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefRecord {
     pub name: String,

@@ -245,7 +245,7 @@ async fn many_files_roundtrip() {
 }
 
 /// The OTHER side of the file-count boundary: a workspace with TOO MANY entries to fit
-/// the single-blob manifest (5 MiB CAS cap, ~162 B/entry ⇒ ~32k files) must fail with a
+/// the single-blob manifest (`CAS_BLOB_CAP_BYTES = 5 MiB`; the gate is a byte cap, not a file count) must fail with a
 /// CLEAN, actionable `InvalidManifest` — never a crash/hang/corruption. `many_files_*`
 /// proves the supported max works; this proves overflowing it degrades gracefully.
 #[tokio::test(flavor = "multi_thread")]
