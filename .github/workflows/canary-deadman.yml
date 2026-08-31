@@ -72,7 +72,6 @@ env:
     fuzz.yml                   26     # cron "0 8 * * *"   — daily 08:00 UTC
     live-journeys.yml          192    # cron "17 6 * * 1"  — Mon 06:17 UTC
     metered-probe-canary.yml   192    # cron "0 12 * * 1"  — Mon 12:00 UTC
-    mutation.yml               192    # cron "0 4 * * 1"   — Mon 04:00 UTC
     stress.yml                 192    # cron "0 2 * * 1"   — Mon 02:00 UTC
     # deadman:lanes:end
 

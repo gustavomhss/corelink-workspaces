@@ -14,6 +14,13 @@
 # Ephemeral cross-TL courier correspondence (audit trail kept on disk, not tracked)
 docs/handoff/
 
+# cargo-mutants working state. Both are produced in the working tree by the local
+# repro documented in docs/TESTING.md, so they are ignored to keep tool output from
+# being swept into a commit.
+/mutants.out/
+/pr.diff
+/mutant-list.txt
+
 # PR-body scratch files. PR metadata belongs in the PR, not the repository —
 # committed at repo root it goes stale the moment the PR moves, and CLAUDE.md
 # rules out committing working state.

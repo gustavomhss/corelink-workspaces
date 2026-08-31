@@ -15,7 +15,7 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 |---|---|---|---|---|
 | **Coverage** | `.github/workflows/coverage.yml` | every PR + push-main + dispatch | how much code a test actually executes | report-only → floor (Phase 1b) → required (1c) |
 | **Fuzz** | `.github/workflows/fuzz.yml` | nightly + dispatch | the untrusted-input parsers never panic/UB on arbitrary bytes | **yes — a crash is red** |
-| **Mutation** | `.github/workflows/mutation.yml` | weekly + dispatch | the tests actually *kill* injected faults (not just run) | report-only → follow-on blocks new survivors |
+| **Mutation** | `.github/workflows/mutation.yml` | every PR + dispatch (`mode: workspace\|diff`) | the tests actually *kill* injected faults (not just run) | a survivor in the PR's own diff turns the lane **red** — but red ≠ blocked: it is not (yet) a required check |
 | **Round-trip (property)** | `crates/clw-integration-tests/tests/roundtrip_prop.rs` | every PR (32 cases) + weekly exhaustive (2000) | `snapshot→hydrate` is byte-identical on ARBITRARY trees | gate test — red on any fidelity break |
 | **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
 | **Windows runtime** | `.github/workflows/windows.yml` | PR (crates/scripts) + push-main + dispatch | the workspace test suite RUNS on Windows (was compile-only) — path/mode/symlink-copy-fallback behavior | red on any Windows test failure |
@@ -63,9 +63,35 @@ cargo install cargo-mutants
 cargo mutants --workspace            # or -p clw-types to scope
 ```
 
-**Follow-on ratchet**: triage the survivors (critical crates first — `clw-types`, `clw-manifest`,
-`clw-hydrate`, `clw-client`: the untrusted-input, containment, atomicity and retry/cap logic), add tests
-that kill them, then flip mutation to `--in-diff` per-PR blocking on any **new** survivor.
+**The lane is scoped to the PR's own diff** (`--in-diff`), and any survivor in it is red: a fault was
+injected into code this PR touches and the suite still passed. Reproduce a CI red locally with
+
+```
+git diff "$(git merge-base origin/main HEAD)" HEAD -- '*.rs' > pr.diff
+cargo mutants --workspace --in-diff pr.diff
+```
+
+**A Rust diff that yields no mutants is INCONCLUSIVE, not a pass.** A test-only, comment-only or
+rename-only change generates nothing to inject, and `cargo mutants` exits 0 in that case — so the lane
+asks `--list` first and reports "nothing was verified" rather than claiming the tests are adequate. It
+does **not** fail: adding tests is the right thing to do and must not redden a PR.
+
+**The exhaustive sweep** — for triaging the survivor backlog (critical crates first: `clw-types`,
+`clw-manifest`, `clw-hydrate`, `clw-client` — the untrusted-input, containment, atomicity and retry/cap
+logic) — is `workflow_dispatch` with `mode: workspace`, which is the dispatch default. That mode keeps
+the old report-only posture (survivors and timeouts are counted, not failed) and the old hard failures
+(a broken baseline is still red). It is no longer on a schedule, so sweeping the backlog is now a
+deliberate act rather than something CI does on its own.
+
+It was a weekly whole-workspace run, report-only, until WP-34 (2026-08-31). That lane was red in 4 of
+its last 6 runs, and none of the four was a mutation finding — but they were not all the same fault
+either, and the lane changed runners mid-window. 2026-07-20/08-03/08-10 ran on GitHub-hosted
+`ubuntu-latest` and were **hosted-runner reclaims** (`The runner has received a shutdown signal.`);
+2026-08-24 and 08-31 ran on `corelink`, where the ephemeral VM was destroyed mid-step and, on 08-31,
+3 of 6 shards queued 89 minutes for a runner. What the two eras share is that a five-hour job is a
+five-hour exposure to losing its runner, and that report-only, the lane gated nothing to show for the
+cost. On `corelink` there was the further cost that six concurrent 300-minute jobs starve the fleet the
+required `gates` check also uses. See `.github/workflows/mutation.yml`.
 
 ## E2E round-trip + stress (Phase 2)
 `crates/clw-integration-tests/tests/roundtrip_prop.rs` is a **property-based** lifecycle test: proptest

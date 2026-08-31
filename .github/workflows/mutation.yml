@@ -1,98 +1,315 @@
-# Mutation lane — prove the 518 tests actually KILL bugs, not just execute.
+# Mutation lane — prove the tests actually KILL bugs, not just execute.
 #
-# Part of the test-rigor wave. cargo-mutants injects small faults (mutants) and re-runs
-# the tests; a SURVIVING mutant = a change the suite failed to catch = a real test gap.
-# Coverage says "this line ran under a test"; mutation says "a test actually asserts on
-# it". They are complementary — this is the stronger signal.
+# cargo-mutants injects small faults (mutants) and re-runs the tests; a SURVIVING
+# mutant = a change the suite failed to catch = a real test gap. Coverage says "this
+# line ran under a test"; mutation says "a test actually asserts on it".
 #
-# Whole-workspace (owner's choice: exhaustive), so it is SLOW — hence WEEKLY, and SHARDED
-# across a matrix so each shard finishes comfortably (and a slow shard can't wedge the rest).
+# Two modes:
+#   * `diff` (every PR, and the default) — mutate only the lines the PR touched. A
+#     survivor here is a fault this PR introduced that this PR's tests do not catch,
+#     so it is RED.
+#   * `workspace` (workflow_dispatch only) — the exhaustive whole-workspace sweep,
+#     for triaging the survivor backlog. Report-only: a baseline always carries
+#     survivors, so they are counted, not failed.
 #
-# Report-only posture (Phase 1): upload the survivor report + summarize counts; do NOT
-# fail on survivors (a baseline always has some). A harness failure (the UNMUTATED tests
-# don't pass, bad args) DOES fail — that is a real break, not a metric. The follow-on
-# wave triages survivors (critical crates first), adds tests that kill them, then flips to
-# `--in-diff` per-PR blocking on any NEW survivor.
+# ── WHY THE WEEKLY LANE WENT (WP-34, 2026-08-31) ─────────────────────────────
+# It used to be a weekly `--workspace` run sharded 6 ways with `timeout-minutes:
+# 300`, report-only. It was RED in 4 of its last 6 runs (2026-07-20, 08-03, 08-10,
+# 08-24) and nobody noticed, because nothing was watching it.
+#
+# None of the four was a mutation finding. All four are infrastructure, but NOT all
+# of the same infrastructure — the lane moved runners mid-window, and the two eras
+# have different causes:
+#
+#   * 07-20, 08-03, 08-10 ran on `runs-on: ubuntu-latest` (GitHub-hosted; the 08-03
+#     log header reads `Hosted Compute Agent` / `Azure Region: westus3`). The
+#     recoverable log for 08-03 shard 0 ends with
+#         ##[error]The runner has received a shutdown signal.
+#     and its step 5 concluded `cancelled`. That is a HOSTED-runner reclaim. The
+#     corelink fleet did not exist for these and its capacity is irrelevant to them.
+#   * 08-24 and 2026-08-31 ran on `runs-on: corelink` (CF-Firecracker), and the two
+#     do NOT share a record shape — stating them together is what produced the
+#     over-generalisation this header exists to retract, so they are separated:
+#       - 08-24: the failed shard reported NO step conclusions and no log blob at all,
+#         consistent with the ephemeral VM being destroyed mid-step. No exit code was
+#         ever produced, so none is claimed.
+#       - 08-31: the failed shard reported EIGHT step conclusions with trailing nulls,
+#         and three of six shards sat QUEUED 89 minutes for a runner while the run
+#         held the fleet. A different shape, and the queue is the documented part.
+#
+# So the failure shapes are not uniform, and a claim that they are would be wrong:
+# 08-03 shard 0 has nine step conclusions and a 297-line log, and today's shard 5
+# has eight with trailing nulls. What IS uniform is that a five-hour job is a
+# five-hour exposure to losing its runner, on hosted and ephemeral fabrics alike,
+# and that being report-only the lane gated nothing to show for the cost. On
+# corelink there is the additional, measured cost that six concurrent 300-minute
+# jobs starve the fleet the required `gates` check also depends on.
+#
+# `--in-diff` addresses both: minutes instead of hours and one job instead of six,
+# so it is small enough not to starve the fabric and short enough to be unlikely to
+# lose its runner — and a new survivor now reddens the PR that introduced it. This
+# is the "flip to --in-diff per-PR blocking on any new survivor" that the old header
+# and docs/TESTING.md both promised and that was never wired.
+#
+# ── THE ZERO-MUTANT TRAP ─────────────────────────────────────────────────────
+# `--in-diff` can pass having verified NOTHING, and the empty-file check is not
+# enough to catch it. Verified locally with cargo-mutants 27.0.0 on a 487-byte diff
+# of a REAL .rs file that only adds a #[test]:
+#     $ cargo mutants --workspace --in-diff tests-only.diff ; echo $?
+#      INFO No mutants to filter
+#     0
+# Exit 0, `mutants.out/` not even created, nothing tested. That shape is not exotic:
+# it is a test-only PR — precisely the PR someone writes to KILL survivors — and
+# also any comment-only or rename-only .rs change.
+#
+# Reporting that as "no surviving mutants" would be a lie about what happened, so
+# this lane asks cargo-mutants itself how many mutants the diff yields (`--list`,
+# which needs no build) and branches on the answer rather than trying to sniff the
+# diff for test-ness:
+#     0 listed  -> INCONCLUSIVE. Reported as a distinct outcome that claims nothing.
+#                  NOT failed: a test-only PR is a good PR and must not be punished
+#                  for giving the mutation lane no purchase.
+#     N listed  -> run for real. Afterwards the mutant count actually tested must be
+#                  > 0; if `--list` promised N and the run tested none, that is a
+#                  harness anomaly and a NAMED FAILURE, never a silent pass.
+#
+# ── EXIT CONTRACT ────────────────────────────────────────────────────────────
+# cargo-mutants exit codes (mutants.rs/exit-codes): 0=clean, 1=bad args, 2=SURVIVING
+# mutants, 3=timeouts, 4=baseline (unmutated) tests failed, 70=internal.
+#
+# In `diff` mode every non-zero fails: scoped to a diff, the whole-workspace excuse
+# for survivors (2) and timeouts (3) is gone. In `workspace` mode 2 and 3 stay
+# excused exactly as the old weekly lane had them, because an exhaustive baseline
+# legitimately carries both. 1, 4 and 70 fail in BOTH modes, as they always did —
+# in particular a broken baseline (4) on a dispatched workspace sweep is still RED,
+# which is the behaviour the old lane had and which `workspace` mode preserves.
 #
 # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The box bakes the
-# pinned rust toolchain (rust-toolchain.toml honoured by `rustup show`); cargo-mutants is
-# installed per-run as a prebuilt.
+# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"), matching
+# coverage.yml, the repo's other per-PR analysis lane.
 
 name: mutation
 
 on:
-  schedule:
-    - cron: "0 4 * * 1"   # weekly Monday 04:00 UTC (offset from the daily/Mon-noon canaries)
+  pull_request:
   workflow_dispatch:
-
-concurrency:
-  group: mutation
-  cancel-in-progress: false
+    inputs:
+      mode:
+        description: "diff = only this ref's changes; workspace = exhaustive backlog sweep"
+        type: choice
+        options: [workspace, diff]
+        default: workspace
 
 permissions:
   contents: read
 
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   mutation:
-    name: cargo-mutants shard ${{ matrix.shard }}/6
+    name: cargo-mutants (new survivors in this diff)
     runs-on: corelink
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false   # each shard is independent; a survivor in one must not cancel the rest
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+    # A workspace sweep is hours; a diff run is minutes. An exceeded ceiling is a
+    # bare `cancelled` with no exit code and nothing to act on, so the budget is
+    # generous and the per-mutant timeouts below do the real bounding.
+    # 330 for a dispatched workspace sweep, 90 for the per-PR diff lane.
+    #
+    # HONEST LIMIT: the workspace branch has never been executed. The last GREEN weekly
+    # sweep (2026-08-17) totalled roughly 409 minutes of shard work across six shards,
+    # with shard 2 alone at 4h22m — so an UNSHARDED sweep will exceed this 330-minute
+    # ceiling and be cancelled, producing exactly the bare `cancelled` with no exit code
+    # that this header names as the thing to eliminate. A dispatched sweep therefore
+    # needs re-sharding, or a higher ceiling, before it is useful. It gates nothing and
+    # is dispatch-only, so this is a known gap rather than a live defect — recorded here
+    # because discovering it by dispatching costs five and a half hours.
+    timeout-minutes: ${{ github.event.inputs.mode == 'workspace' && 330 || 90 }}
+    env:
+      MODE: ${{ github.event.inputs.mode || 'diff' }}
+      # Bound each mutant explicitly rather than inheriting the auto-timeout. The
+      # 08-03 log shows a single mutant at 886s of BUILD, so the build bound is set
+      # well above that; the test bound is far above the observed ~9s baseline test.
+      # Generous on purpose: a too-tight bound turns exit 3 into exactly the
+      # unactionable red this WP exists to remove.
+      MUT_TIMEOUTS: "--timeout 300 --build-timeout 1200"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # --in-diff needs the merge-base, so the graft point is not enough.
+          fetch-depth: 0
+
+      # ── ANTI-VACUITY, PART 1: getting a diff at all ─────────────────────────
+      # An EMPTY diff file makes cargo-mutants print "Diff file is empty" and exit 0
+      # — green, having tested nothing. So a diff that failed to GENERATE would pass
+      # silently. Every way of not getting one is a named failure here. The one
+      # legitimate empty case (no .rs touched) is reported as a distinct skip.
+      #
+      # Note on how that skip surfaces: the STEP is skipped and the summary says so,
+      # but the JOB still concludes `success`, so `gh pr checks` and
+      # pre-merge-gate-check.sh both render it `pass`. It is honest in the log, not
+      # on the check line. Making GitHub report `skipped` would need a second job,
+      # i.e. a second runner acquisition on the fabric this WP is trying to unload.
+      - name: compute the diff under test
+        id: diff
+        if: env.MODE != 'workspace'
+        run: |
+          set -euo pipefail
+
+          case "${{ github.event_name }}" in
+            pull_request) base_sha="${{ github.event.pull_request.base.sha }}" ;;
+            workflow_dispatch)
+              git fetch --no-tags origin "${{ github.event.repository.default_branch }}"
+              base_sha="$(git rev-parse FETCH_HEAD)" ;;
+            *) echo "::error::unsupported event '${{ github.event_name }}' — this lane only knows how to derive a base for pull_request and workflow_dispatch."; exit 1 ;;
+          esac
+
+          [ -n "$base_sha" ] || { echo "::error::base sha resolved EMPTY — the diff cannot be derived, so this lane would mutate nothing and report success. Failing instead."; exit 1; }
+          git cat-file -e "${base_sha}^{commit}" 2>/dev/null || { echo "::error::base commit ${base_sha} is not present in this checkout — fetch-depth is wrong or the base was force-pushed. Refusing to run against an unknown base."; exit 1; }
+
+          merge_base="$(git merge-base "$base_sha" HEAD)" || { echo "::error::git merge-base failed against ${base_sha} — cannot scope the diff."; exit 1; }
+          echo "base=${base_sha} merge-base=${merge_base} head=$(git rev-parse HEAD)"
+
+          git diff "$merge_base" HEAD -- '*.rs' > pr.diff || { echo "::error::git diff failed — no diff was produced, so there is nothing honest to report."; exit 1; }
+
+          if [ ! -s pr.diff ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: this diff touches no .rs files, so there are no mutants to generate." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "changed .rs files: $(git diff --name-only "$merge_base" HEAD -- '*.rs' | wc -l)"
+          fi
 
       - name: install pinned toolchain
+        if: env.MODE == 'workspace' || steps.diff.outputs.run == 'true'
         run: rustup show
 
       - name: install cargo-mutants (prebuilt)
+        if: env.MODE == 'workspace' || steps.diff.outputs.run == 'true'
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
+          # PINNED. This lane now GATES, so it belongs with the pinned tools
+          # (cargo-audit@0.22.2, cargo-deny@0.19.8 in ci.yml/release.yml) rather than
+          # with coverage.yml, which this was modelled on and which gates nothing.
+          # The reason is specific: the zero-mutant branch is decided by
+          # `--list | grep -c .`. If a future release moves that output to stderr or
+          # changes its shape, the count reads 0, the lane reports INCONCLUSIVE, and it
+          # stays green FOREVER — a silently blinded instrument, and the only vacuity
+          # path review could still find. The reverse (a stray header line on stdout)
+          # fails safe via the tested-count assert.
+          tool: cargo-mutants@27.0.0
 
-      # --shard k/6 splits the mutant list across the matrix. Report-only: survivors
-      # (exit 1) are EXPECTED for a baseline and must NOT fail the job; only a real
-      # harness fault (baseline tests fail / bad args, exit >= 2) fails it.
-      - name: cargo-mutants (workspace, shard ${{ matrix.shard }}/6, report-only)
+      # ── ANTI-VACUITY, PART 2: the diff yielding no mutants ──────────────────
+      # `--list` needs no build, so this is cheap. cargo-mutants is the authority on
+      # what its own diff filter yields; asking it beats guessing whether a .rs diff
+      # is "only tests" from the text.
+      - name: how many mutants does this diff yield?
+        id: count
+        if: steps.diff.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          cargo mutants --workspace --in-diff pr.diff --list > mutant-list.txt || { echo "::error::cargo-mutants --list failed — the mutant count is unknown, so no later result could be trusted."; exit 1; }
+          n="$(grep -c . mutant-list.txt || true)"
+          echo "listed=${n:-0}" >> "$GITHUB_OUTPUT"
+          echo "mutants listed for this diff: ${n}"
+
+      - name: cargo-mutants
+        id: run
+        if: env.MODE == 'workspace' || (steps.diff.outputs.run == 'true' && steps.count.outputs.listed != '0')
         run: |
           set -uo pipefail
           set +e
-          cargo mutants --workspace --shard "${{ matrix.shard }}/6"
+          if [ "${MODE}" = "workspace" ]; then
+            # shellcheck disable=SC2086
+            cargo mutants --workspace ${MUT_TIMEOUTS}
+          else
+            # shellcheck disable=SC2086
+            cargo mutants --workspace --in-diff pr.diff ${MUT_TIMEOUTS}
+          fi
           code=$?
           set -e
-          # cargo-mutants exit codes (mutants.rs/exit-codes): 0=clean, 2=SURVIVING mutants,
-          # 3=timeouts — all EXPECTED report-only baseline outcomes, must NOT fail the job.
-          # 1=bad args, 4=baseline (unmutated) tests already failed, 70=internal — those are
-          # REAL harness faults and MUST fail. (Default output dir is ./mutants.out.)
-          case "$code" in
-            0) echo "shard clean — no surviving mutants" ;;
-            2) echo "surviving mutants found (report-only baseline — expected)" ;;
-            3) echo "some mutants timed out (report-only — noted; may need --timeout tuning)" ;;
-            *) echo "::error::cargo-mutants harness fault (exit $code: 1=bad-args, 4=baseline-tests-failed, 70=internal) — must be fixed"; exit "$code" ;;
-          esac
 
-      - name: summarize this shard
-        if: always()
+          if [ "${MODE}" = "workspace" ]; then
+            # Exhaustive baseline: survivors and timeouts are counted, not failed —
+            # the same posture the weekly lane had.
+            case "$code" in
+              0) echo "workspace sweep clean — no surviving mutants" ;;
+              2) echo "surviving mutants found (exhaustive sweep — expected; this is the backlog to triage)" ;;
+              3) echo "some mutants timed out (exhaustive sweep — noted)" ;;
+              1) echo "::error::cargo-mutants rejected its arguments (exit 1) — this lane is misconfigured, not your code."; exit 1 ;;
+              4) echo "::error::the UNMUTATED baseline tests failed (exit 4). Not a mutation finding — the suite itself is red or flaky, which also affects the required gate. Fix the test, never this lane's exit contract."; exit 4 ;;
+              *) echo "::error::cargo-mutants internal fault (exit $code)."; exit "$code" ;;
+            esac
+          else
+            case "$code" in
+              0) echo "no surviving mutants among the ${{ steps.count.outputs.listed }} generated for this diff" ;;
+              2) echo "::error::SURVIVING mutants in this diff: a fault was injected into code this PR touches and the suite still passed. See the uploaded report for the exact mutants, then add the assertions that kill them."; exit 2 ;;
+              3) echo "::error::mutants TIMED OUT even at ${MUT_TIMEOUTS}. A timeout is not a kill — the lane could not decide, so it must not report success. Usually an injected fault caused an unbounded loop the tests do not bound."; exit 3 ;;
+              1) echo "::error::cargo-mutants rejected its arguments (exit 1) — this lane is misconfigured, not your code."; exit 1 ;;
+              4) echo "::error::the UNMUTATED baseline tests failed (exit 4). Not a mutation finding — the suite itself is red or flaky on this runner, which also affects the required gate. Fix the test, never this lane's exit contract."; exit 4 ;;
+              *) echo "::error::cargo-mutants internal fault (exit $code)."; exit "$code" ;;
+            esac
+          fi
+
+      # ── ANTI-VACUITY, PART 3: `--list` promised mutants, the run tested none ──
+      # Only reachable when the run was supposed to happen. A zero total here means
+      # the run silently did nothing, which must never read as a pass.
+      - name: assert the run actually tested something
+        if: steps.run.outcome == 'success' && (env.MODE == 'workspace' || (steps.diff.outputs.run == 'true' && steps.count.outputs.listed != '0'))
+        run: |
+          set -euo pipefail
+          OUT="mutants.out"
+          [ -d "$OUT" ] || { echo "::error::cargo-mutants exited 0 but produced no ${OUT}/ directory — it cannot have tested anything, so this is not a pass."; exit 1; }
+          total=0
+          for f in caught missed timeout unviable; do
+            n=0; [ -f "$OUT/$f.txt" ] && n=$(grep -c . "$OUT/$f.txt" 2>/dev/null || true)
+            total=$(( total + ${n:-0} ))
+          done
+          if [ "$total" -eq 0 ]; then
+            echo "::error::cargo-mutants exited 0 having tested ZERO mutants (listed=${{ steps.count.outputs.listed }}). A green that verified nothing is exactly what this lane must never report."
+            exit 1
+          fi
+          echo "mutants actually tested: ${total}"
+
+      # The INCONCLUSIVE outcome: a real .rs diff that yields no mutants (test-only,
+      # comment-only, rename-only). Reported as itself. Not failed — see the header.
+      - name: report INCONCLUSIVE (diff yields no mutants)
+        if: steps.diff.outputs.run == 'true' && steps.count.outputs.listed == '0'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Mutation: INCONCLUSIVE"
+            echo ""
+            echo "This diff touches Rust but yields **no mutants** (\`cargo mutants --list\` returned 0)."
+            echo "That is normal for a test-only, comment-only or rename-only change."
+            echo ""
+            echo "**Nothing was verified.** This lane is not asserting that the tests are adequate —"
+            echo "it is reporting that it had nothing to inject here."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: summarize
+        if: always() && (env.MODE == 'workspace' || (steps.diff.outputs.run == 'true' && steps.count.outputs.listed != '0'))
         run: |
           set -euo pipefail
           OUT="mutants.out"
           {
-            echo "## Mutation shard ${{ matrix.shard }}/6"
-            for f in caught missed timeout unviable; do
-              n=0; [ -f "$OUT/$f.txt" ] && n=$(grep -c . "$OUT/$f.txt" 2>/dev/null || echo 0)
-              echo "- ${f}: ${n}"
-            done
-            echo ""
-            echo "'missed' = SURVIVORS (a real test gap). Triaged + killed in the follow-on wave (critical crates first)."
+            echo "## Mutation (${MODE})"
+            if [ -d "$OUT" ]; then
+              for f in caught missed timeout unviable; do
+                n=0; [ -f "$OUT/$f.txt" ] && n=$(grep -c . "$OUT/$f.txt" 2>/dev/null || true)
+                echo "- ${f}: ${n:-0}"
+              done
+              echo ""
+              echo "'missed' = a SURVIVOR. In diff mode that is code this PR touched whose injected fault the suite did not notice."
+            else
+              echo "- no \`${OUT}/\` was produced; see the step log."
+            fi
           } >> "$GITHUB_STEP_SUMMARY" || true
 
-      - name: upload survivor report (shard ${{ matrix.shard }})
-        if: always()
+      - name: upload survivor report
+        if: always() && (env.MODE == 'workspace' || (steps.diff.outputs.run == 'true' && steps.count.outputs.listed != '0'))
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-shard-${{ matrix.shard }}
+          name: mutants-${{ env.MODE }}
           path: mutants.out/**
           if-no-files-found: warn
