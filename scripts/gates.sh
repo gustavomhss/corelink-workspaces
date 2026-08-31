@@ -133,6 +133,32 @@ for wf in $workflow_perms_exempt; do
 done
 echo "workflow-permissions guard: clean (all workflows declare 'permissions:'; exempt: ${workflow_perms_exempt})"
 
+# --- DEADMAN-REGISTRY GUARD (runs in EVERY lane, including docs-only) --------
+# Every SCHEDULED workflow must be registered in canary-deadman.yml's lane
+# registry, and every registered lane must actually be scheduled — equality in
+# BOTH directions. Without the first leg, adding a scheduled lane silently adds a
+# lane nobody watches: it can stop running and produce no red, which is the exact
+# blind spot the deadman exists to close. Without the second, the registry
+# overstates its own reach and the deadman false-alarms forever on a lane GitHub
+# was never going to run.
+#
+# This runs here — at PR time — and AGAIN inside canary-deadman.yml, because the
+# two catch different things: here it fails the PR that introduces the drift; there
+# it fails if the registry rots on main by some path that skipped this gate.
+#
+# EXPLICITLY NOT COVERED: the deadman's own liveness. A dead-man's-switch cannot be
+# an element of the set it watches — if canary-deadman.yml stops running, its entry
+# stops being evaluated and the silence looks like health. It is excluded from the
+# registry by name (and registering it is a hard failure). An observer outside this
+# repo's Actions scheduler is tracked as WP-36; until then, nothing detects a dead
+# deadman.
+bash scripts/deadman-registry.sh check
+# And the gate's own teeth: plant every defect class it claims to catch against a
+# copy of the REAL workflows dir and assert it goes red AND names the thing — plus
+# that the unmodified copy passes, so a gate that fires on everything cannot score
+# full marks. Offline; no network.
+bash scripts/deadman-selftest.sh
+
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken
 # classifier would otherwise route around the check that would have caught it.

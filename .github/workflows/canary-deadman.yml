@@ -1,60 +1,123 @@
-# Dead-man's-switch for the conformance-canary.
+# Dead-man's-switch for EVERY scheduled lane in this repo.
 #
-# The canary (conformance-canary.yml) goes RED when prod regresses — but a canary that
-# NEVER RUNS (a broken schedule, a disabled workflow, an Actions outage) produces NO run
-# and therefore NO red: a SILENT blind spot. This job runs on its own schedule and FAILS
-# loudly if the canary hasn't reported a fresh SUCCESS recently — converting "the canary
-# silently stopped" into a visible red workflow (which GitHub emails repo watchers about).
+# A scheduled lane goes RED when it finds a problem — but a lane that NEVER RUNS
+# (a broken cron, a disabled workflow, an Actions outage, a starved self-hosted
+# fabric) produces NO run and therefore NO red: a SILENT blind spot. This job runs
+# on its own schedule and FAILS loudly when a registered lane has no completed run,
+# has not reported inside its window, or reported a non-success — converting "the
+# surveillance silently stopped" into a visible red workflow (which GitHub emails
+# repo watchers about).
 #
-# Independent safety net for prod-breakage finding #4 (prod-health monitoring must not be
-# able to go dark unnoticed).
+# WHAT THIS IS NOT (read this before trusting it):
+#   * It is NOT evidence the system is alive. It watches that THE WATCHING RUNS.
+#     A lane can be fresh, green, and asserting nothing at all; the deadman cannot
+#     tell the difference and does not try to.
+#   * Its OWN liveness is EXPLICITLY OUT OF SCOPE. A deadman cannot be an element
+#     of the set it watches: if this workflow stops running, its own entry stops
+#     being evaluated and the silence is indistinguishable from health. That is why
+#     canary-deadman.yml is excluded from the registry below by name rather than by
+#     accident. Closing that self-blindness needs an observer OUTSIDE this repo's
+#     Actions scheduler and is tracked as WP-36 — until WP-36 lands, nothing here
+#     detects a dead deadman.
+#
+# Independent safety net for prod-breakage finding #4 (prod-health monitoring must
+# not be able to go dark unnoticed).
+#
+# ── HOW TO CHANGE A CADENCE ──────────────────────────────────────────────────
+# Edit ONE line in DEADMAN_LANES below. That block is the registry: the ONLY place
+# a window is written down. scripts/deadman-registry.sh is its only reader, and it
+# gates (in scripts/gates.sh, on every PR) that the registry and the set of
+# scheduled workflows are EXACTLY equal in both directions — so a new scheduled
+# lane that nobody registered turns the repo red at PR time, and a registry entry
+# for a lane that is not actually scheduled turns it red too.
 
 name: canary-deadman
 
 on:
-  # A few hours after the canary's 13:00 UTC schedule, so a same-day canary has finished.
+  # A few hours after the latest daily lane (conformance-canary 13:00 UTC), so a
+  # same-day run of every daily lane has finished before this evaluates freshness.
   schedule:
     - cron: "0 16 * * *"
   workflow_dispatch:
+    inputs:
+      override_lane:
+        description: "TEST ONLY: lane whose window to override (e.g. fuzz.yml)"
+        required: false
+        default: ""
+      override_hours:
+        description: "TEST ONLY: window in hours to apply to override_lane"
+        required: false
+        default: ""
 
 permissions:
   actions: read
   contents: read
 
+env:
+  # ══ LANE REGISTRY — DATA. One line per lane: <workflow-file> <max_age_hours> ══
+  # The window is the lane's own cadence plus slack, NOT a uniform number: the repo
+  # staggers these crons deliberately and a uniform window would either miss a dead
+  # weekly lane for days or false-alarm on a healthy one.
+  #   daily lane  -> 26h  (24h cadence + 2h slack for a late/queued run)
+  #   weekly lane -> 192h (7d cadence + 24h slack)
+  # Comments and blank lines are ignored by the parser.
+  # These two are the REGISTRY, and they are exported so the data is visible as YAML
+  # to anyone reading the workflow. The script does NOT read them from the environment
+  # — it parses this file between the markers, so that the gate in scripts/gates.sh
+  # checks the same bytes a reader sees. Do not "simplify" by having the script read
+  # $DEADMAN_LANES: the gate would then check something the workflow never runs.
+  DEADMAN_LANES: |
+    # deadman:lanes:begin
+    conformance-canary.yml     26     # cron "0 13 * * *"  — daily 13:00 UTC
+    fuzz.yml                   26     # cron "0 8 * * *"   — daily 08:00 UTC
+    live-journeys.yml          192    # cron "17 6 * * 1"  — Mon 06:17 UTC
+    metered-probe-canary.yml   192    # cron "0 12 * * 1"  — Mon 12:00 UTC
+    mutation.yml               192    # cron "0 4 * * 1"   — Mon 04:00 UTC
+    stress.yml                 192    # cron "0 2 * * 1"   — Mon 02:00 UTC
+    # deadman:lanes:end
+
+  # ══ KNOWN_RED LEDGER — DATA. One line per EXCUSED lane: <workflow-file> <reason> ══
+  # "green except where red is expected" is not a predicate, so the expectation is
+  # written down here or it does not exist. Semantics:
+  #   * a lane listed here may conclude non-success without failing the deadman;
+  #   * it must STILL exist and STILL be fresh — an excused lane that stops running
+  #     is exactly the blindness this workflow exists to catch, so freshness is never
+  #     excused;
+  #   * the ledger is SHRINK-ONLY: an entry whose lane is now concluding `success`
+  #     is STALE and FAILS the deadman, so a fixed lane cannot stay quietly excused;
+  #   * an entry naming a lane that is not in DEADMAN_LANES FAILS the registry gate.
+  # Ships EMPTY on purpose: no lane in this repo is currently excused from being
+  # green, and excusing one is a decision that belongs in a diff, not in a habit.
+  DEADMAN_KNOWN_RED: |
+    # deadman:known-red:begin
+    # deadman:known-red:end
+
 jobs:
   deadman:
-    name: canary freshness dead-man's-switch
+    name: scheduled-lane dead-man's-switch
     # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Pure gh/jq/date
-    # check (all baked into the image); no toolchain needed.
+    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Pure gh/jq/git/date
+    # (all baked into the image); no toolchain needed.
     runs-on: corelink
-    timeout-minutes: 5
+    timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
-      # Max age of the newest completed canary run before we call it stale.
-      MAX_AGE_HOURS: "26"
     steps:
-      - name: assert the canary reported a fresh success
-        run: |
-          set -euo pipefail
-          latest=$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow conformance-canary.yml \
-            -L 15 --json createdAt,conclusion,status \
-            --jq 'map(select(.status=="completed")) | sort_by(.createdAt) | last // {}')
-          created=$(echo "$latest" | jq -r '.createdAt // empty')
-          concl=$(echo "$latest" | jq -r '.conclusion // empty')
-          if [ -z "$created" ]; then
-            echo "::error::DEAD-MAN'S-SWITCH: no completed conformance-canary run found at all — the canary is not running. Prod-health monitoring is DARK."
-            exit 1
-          fi
-          now=$(date -u +%s)
-          then=$(date -u -d "$created" +%s)
-          age_h=$(( (now - then) / 3600 ))
-          if [ "$age_h" -gt "${MAX_AGE_HOURS}" ]; then
-            echo "::error::DEAD-MAN'S-SWITCH: the newest conformance-canary run is ${age_h}h old (> ${MAX_AGE_HOURS}h) — the scheduled canary has stopped reporting (silent blind spot). Check the canary workflow + the schedule."
-            exit 1
-          fi
-          if [ "$concl" != "success" ]; then
-            echo "::error::DEAD-MAN'S-SWITCH: the newest conformance-canary run (${age_h}h ago) concluded '${concl}', not success — live prod may be broken. See the canary run."
-            exit 1
-          fi
-          echo "OK — newest conformance-canary run is ${age_h}h old and succeeded."
+      # fetch-depth: 0 is load-bearing — the days-since-last-tag line needs the tags,
+      # and a default shallow checkout has none (it would report "no tags" on a repo
+      # that has eleven).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Checked here AND in scripts/gates.sh. In gates.sh it fails the PR that adds an
+      # unregistered scheduled lane; here it fails the deadman if the registry rots on
+      # main by some path that skipped the gate (a direct push, a reverted guard).
+      - name: registry is exactly the set of scheduled lanes
+        run: bash scripts/deadman-registry.sh check
+
+      - name: every registered lane exists, is fresh, and concluded success
+        env:
+          DEADMAN_OVERRIDE_LANE: ${{ inputs.override_lane }}
+          DEADMAN_OVERRIDE_HOURS: ${{ inputs.override_hours }}
+        run: bash scripts/deadman-registry.sh watch
