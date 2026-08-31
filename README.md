@@ -171,7 +171,9 @@ clw run --input src/ -- cargo test
 Resolution order: **CLI flag > environment variable > `~/.clw/config.toml` > default**.
 
 `tenant` and `token` have no default and produce a friendly error (exit 2) if still
-missing after all layers.
+missing after all layers. A `CLW_*` variable that is **set but empty** counts as
+**absent** (a missing secret in CI shows up exactly that way), so resolution falls
+through to the next layer instead of using the empty value.
 
 | Flag            | Environment variable | Config-file key | Default                              |
 |-----------------|----------------------|-----------------|--------------------------------------|

@@ -36,6 +36,10 @@ and `Config::resolve()` succeeds from env alone:
 | `CLW_CACHE_DIR` | local cache dir | `:58` |
 | `CLW_REF_DOMAIN` | **(PROPOSED, see below)** ref keyspace selector: `user` (default) or `runner` | — |
 
+A `CLW_*` var that is **set but EMPTY counts as ABSENT** (M12) — resolution falls through to the
+config file and then the default, so a missing CI secret yields the actionable "missing token/tenant"
+(exit 2, no request) instead of an empty `Bearer ` on the wire. Same rule as the `CORELINK_*` aliases.
+
 The per-job, short-TTL, CAS+AC-scoped PAT is **injected at dispatch time** (server **D-9**, FROZEN).
 clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole client tenant authority.
 

@@ -983,6 +983,126 @@ async fn auth_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 5b/5c (M12): a SET-BUT-EMPTY `CLW_*` var is ABSENT, not a value
+//
+// A missing secret in CI materialises as an env var that is set but EMPTY. clap
+// hands that to the program as `Some("")`, which used to short-circuit config
+// resolution — so `CLW_TOKEN=""` produced a REAL request carrying a bare
+// `Bearer ` header ("authentication failed") instead of the actionable "missing
+// token" with NO request at all. These drive the real binary and assert the
+// message, the exit code, AND that the mock server saw nothing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_clw_token_is_missing_token_exit_2_and_makes_no_request() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = clw_bin()
+        .env("HOME", home.path()) // empty HOME => no ~/.clw/config.toml fallback
+        .env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", "") // set BUT EMPTY — the CI missing-secret shape
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an empty CLW_TOKEN must exit 2 (config error), got: {:?}",
+        out.status.code()
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains("missing token: set --token, CLW_TOKEN/CORELINK_TOKEN"),
+        "stderr must carry the actionable missing-token message, got: {stderr_str}"
+    );
+    assert!(
+        !stderr_str.to_lowercase().contains("authentication failed"),
+        "an empty token must never reach the network as a bare Bearer, got: {stderr_str}"
+    );
+
+    // The decisive assertion: NO request was ever made.
+    let seen = server.received_requests().await.unwrap();
+    assert!(
+        seen.is_empty(),
+        "an empty CLW_TOKEN must fail BEFORE any network request, got {} request(s)",
+        seen.len()
+    );
+}
+
+#[tokio::test]
+async fn empty_clw_tenant_is_missing_tenant_exit_2_and_makes_no_request() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = clw_bin()
+        .env("HOME", home.path())
+        .env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", "") // set BUT EMPTY
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["ls", "--all"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an empty CLW_TENANT must exit 2 (config error), got: {:?}",
+        out.status.code()
+    );
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr_str.contains("missing tenant: set --tenant, CLW_TENANT/CORELINK_TENANT"),
+        "stderr must carry the actionable missing-tenant message, got: {stderr_str}"
+    );
+    let seen = server.received_requests().await.unwrap();
+    assert!(
+        seen.is_empty(),
+        "an empty CLW_TENANT must fail BEFORE any network request, got {} request(s)",
+        seen.len()
+    );
+}
+
+#[test]
+fn empty_clw_endpoint_falls_back_to_the_default_endpoint() {
+    // `doctor` is offline and echoes the RESOLVED endpoint, so it black-boxes the
+    // fallback: pre-fix an empty CLW_ENDPOINT resolved to "" (reported as an
+    // "endpoint is empty" problem / rejected downstream as plaintext).
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    let out = clw_bin()
+        .env("HOME", home.path())
+        .env("CLW_ENDPOINT", "") // set BUT EMPTY
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache_dir.path().to_str().unwrap())
+        .args(["doctor"])
+        .output()
+        .unwrap();
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout_str.contains("https://corelink-api.humangr.com"),
+        "an empty CLW_ENDPOINT must resolve to the default endpoint, got:\n{stdout_str}"
+    );
+    assert!(
+        !stdout_str.contains("endpoint is empty"),
+        "an empty CLW_ENDPOINT must not survive resolution, got:\n{stdout_str}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Binary-level smoke tests for the offline subcommands: doctor / init / auth /
 // ls. These never touch the network — they exercise config resolution,
 // filesystem effects, and the redaction invariant against the REAL binary.

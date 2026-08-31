@@ -72,23 +72,69 @@ pub struct ResolvedConfig {
     pub broker: Option<BrokerCred>,
 }
 
+/// The five global options (`--endpoint`/`--tenant`/`--token`/`--cache-dir`/
+/// `--ref-domain`, each also bound by clap to its `CLW_*` env var), normalized so
+/// that **set-but-EMPTY means ABSENT**.
+///
+/// M12: clap hands a variable that is set but empty to the program as `Some("")`,
+/// which then short-circuits the whole resolution chain — beating the config file
+/// AND the default. A missing secret in CI materialises as exactly that (an empty
+/// var), so `CLW_TOKEN=""` used to produce a real request with an empty `Bearer `
+/// header ("authentication failed") instead of the actionable "missing token", and
+/// `CLW_ENDPOINT=""` produced "refusing plaintext (got '')" instead of the default
+/// endpoint. Filtering happens HERE, in ONE place, for every resolve entry point —
+/// so no path can bypass it — and matches the long-standing behavior of
+/// [`corelink_env`], which already treats an empty `CORELINK_*` as unset.
+///
+/// Scope note: this covers ONLY these five clap-merged globals. The C2c broker
+/// trio (`CLW_CRED_TICKET`/`CLW_LEASE_ID`/`CLW_FABRIC_ENDPOINT`) is read through
+/// `corelink_env` and is deliberately NOT touched here — its fail-closed rule (a
+/// NON-EMPTY ticket with a missing lease-id/fabric-endpoint is a hard error) lives
+/// in [`resolve_credential_inputs`] and is unchanged.
+struct GlobalOpts {
+    endpoint: Option<String>,
+    tenant: Option<String>,
+    token: Option<String>,
+    cache_dir: Option<String>,
+    ref_domain: Option<String>,
+}
+
+impl GlobalOpts {
+    fn from_cli(cli: &Cli) -> Self {
+        /// The ONE empty-to-absent filter for the clap-merged globals.
+        fn present(v: &Option<String>) -> Option<String> {
+            v.clone().filter(|s| !s.is_empty())
+        }
+        Self {
+            endpoint: present(&cli.endpoint),
+            tenant: present(&cli.tenant),
+            token: present(&cli.token),
+            cache_dir: present(&cli.cache_dir),
+            ref_domain: present(&cli.ref_domain),
+        }
+    }
+}
+
 impl ResolvedConfig {
     /// Resolve config from the parsed [`Cli`]:
     /// 1. CLI flags (already in `cli.endpoint` etc.)
     /// 2. Env vars (already merged by clap via `env = "..."`)
     /// 3. `~/.clw/config.toml` (parsed manually)
     /// 4. Hard defaults
+    ///
+    /// A set-but-EMPTY flag/env value counts as ABSENT (see [`GlobalOpts`]).
     pub fn resolve(cli: &Cli) -> Result<Self, ClwError> {
+        let cli_opts = GlobalOpts::from_cli(cli);
         let file_cfg = read_config_file();
 
-        let endpoint = cli
+        let endpoint = cli_opts
             .endpoint
             .clone()
             .or_else(|| corelink_env("CORELINK_ENDPOINT"))
             .or_else(|| file_cfg.get("endpoint").cloned())
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
-        let tenant = cli
+        let tenant = cli_opts
             .tenant
             .clone()
             .or_else(|| corelink_env("CORELINK_TENANT"))
@@ -106,7 +152,7 @@ impl ResolvedConfig {
         // `../other`) fails early (exit 2) with an actionable message.
         validate_tenant(&tenant)?;
 
-        let cache_dir_str = cli
+        let cache_dir_str = cli_opts
             .cache_dir
             .clone()
             .or_else(|| file_cfg.get("cache_dir").cloned())
@@ -115,7 +161,8 @@ impl ResolvedConfig {
         let cache_dir = expand_tilde(&cache_dir_str);
 
         let ref_domain = parse_ref_domain(
-            cli.ref_domain
+            cli_opts
+                .ref_domain
                 .as_deref()
                 .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
         )?;
@@ -135,7 +182,8 @@ impl ResolvedConfig {
             corelink_env("CLW_FABRIC_ENDPOINT"),
             || {
                 // NEVER print the token; only validate it is present.
-                cli.token
+                cli_opts
+                    .token
                     .clone()
                     .or_else(|| corelink_env("CORELINK_TOKEN"))
                     .or_else(|| file_cfg.get("token").cloned())
@@ -197,9 +245,10 @@ impl ResolvedConfig {
     /// network call, and `doctor` re-validates the tenant itself when it reports.
     #[must_use]
     pub fn resolve_lenient(cli: &Cli) -> Self {
+        let cli_opts = GlobalOpts::from_cli(cli);
         let file_cfg = read_config_file();
 
-        let endpoint = cli
+        let endpoint = cli_opts
             .endpoint
             .clone()
             .or_else(|| corelink_env("CORELINK_ENDPOINT"))
@@ -208,21 +257,21 @@ impl ResolvedConfig {
 
         // Missing tenant/token => empty string (reported as <unset> by the
         // local-only commands), never an error.
-        let tenant = cli
+        let tenant = cli_opts
             .tenant
             .clone()
             .or_else(|| corelink_env("CORELINK_TENANT"))
             .or_else(|| file_cfg.get("tenant").cloned())
             .unwrap_or_default();
 
-        let token = cli
+        let token = cli_opts
             .token
             .clone()
             .or_else(|| corelink_env("CORELINK_TOKEN"))
             .or_else(|| file_cfg.get("token").cloned())
             .unwrap_or_default();
 
-        let cache_dir_str = cli
+        let cache_dir_str = cli_opts
             .cache_dir
             .clone()
             .or_else(|| file_cfg.get("cache_dir").cloned())
@@ -231,7 +280,7 @@ impl ResolvedConfig {
         // Local-only commands don't touch refs; a bad value here must not error
         // the diagnostic path, so fall back to the default keyspace — but capture
         // the raw input so `doctor` can SURFACE it rather than silently swallow it.
-        let raw_ref_domain = cli
+        let raw_ref_domain = cli_opts
             .ref_domain
             .clone()
             .or_else(|| file_cfg.get("ref_domain").cloned());
@@ -263,8 +312,9 @@ impl ResolvedConfig {
     /// for `cache_dir` alone, and never touches the token.
     #[must_use]
     pub fn resolve_cache_dir_lenient(cli: &Cli) -> PathBuf {
+        let cli_opts = GlobalOpts::from_cli(cli);
         let file_cfg = read_config_file();
-        let cache_dir_str = cli
+        let cache_dir_str = cli_opts
             .cache_dir
             .clone()
             .or_else(|| file_cfg.get("cache_dir").cloned())
@@ -1854,5 +1904,337 @@ cache_dir = "~/.clw/cache"
         )
         .unwrap_err();
         assert!(matches!(err, ClwError::Config(m) if m.contains("CLW_FABRIC_ENDPOINT")));
+    }
+
+    // -----------------------------------------------------------------------
+    // M12 — a SET-BUT-EMPTY `CLW_*` global must be treated as ABSENT
+    //
+    // clap hands a set-but-empty env var to the program as `Some("")`, which used
+    // to short-circuit the resolution chain (beating BOTH the config file and the
+    // default). A missing secret in CI materialises as exactly that. Each test
+    // below walks the SAME variable through three states — absent / empty /
+    // populated — and additionally pins that the empty state falls THROUGH to the
+    // config file (the strongest signal, and what goes red if the fix is reverted).
+    // -----------------------------------------------------------------------
+
+    /// Fresh isolated env for an M12 test: an empty fake `$HOME` (so no ambient
+    /// `~/.clw/config.toml`) plus the FULL credential namespace cleared. Returns
+    /// the guards + the temp home; the caller must bind them for the whole test.
+    fn m12_env() -> (HomeEnvGuard, VarGuard, TempDir) {
+        let home = HomeEnvGuard::new();
+        let cred = VarGuard::isolate();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("USERPROFILE");
+        (home, cred, tmp)
+    }
+
+    /// Parse a bare `clw ls --name ws` so clap merges whatever `CLW_*` env the
+    /// test has set (this is exactly the surface M12 is about).
+    fn m12_cli() -> crate::Cli {
+        use clap::Parser as _;
+        crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap()
+    }
+
+    #[test]
+    fn empty_clw_endpoint_is_absent_not_an_empty_endpoint() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+        std::env::set_var("CLW_TOKEN", "tok");
+
+        // ABSENT => the hard default.
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .endpoint,
+            DEFAULT_ENDPOINT,
+            "an absent CLW_ENDPOINT must use the default endpoint"
+        );
+
+        // EMPTY => absent, so ALSO the hard default (pre-fix: an empty endpoint
+        // reached the client and surfaced as "refusing plaintext (got '')").
+        std::env::set_var("CLW_ENDPOINT", "");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .endpoint,
+            DEFAULT_ENDPOINT,
+            "an EMPTY CLW_ENDPOINT must fall through to the default endpoint"
+        );
+
+        // EMPTY must also fall through to the CONFIG FILE, not beat it.
+        write_config_file(tmp.path(), "endpoint = \"https://from-file.example.com\"\n");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .endpoint,
+            "https://from-file.example.com",
+            "an EMPTY CLW_ENDPOINT must not beat the config file"
+        );
+
+        // POPULATED => used verbatim (trailing slash trimmed, as before).
+        std::env::set_var("CLW_ENDPOINT", "https://from-env.example.com");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .endpoint,
+            "https://from-env.example.com",
+            "a populated CLW_ENDPOINT still wins"
+        );
+    }
+
+    #[test]
+    fn empty_clw_tenant_is_absent_and_yields_the_missing_tenant_error() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        std::env::set_var("CLW_TOKEN", "tok");
+
+        const MISSING_TENANT: &str = "missing tenant: set --tenant, CLW_TENANT/CORELINK_TENANT, or add tenant to ~/.clw/config.toml";
+
+        // ABSENT => the exact actionable config error.
+        match ResolvedConfig::resolve(&m12_cli()) {
+            Err(ClwError::Config(msg)) => assert_eq!(msg, MISSING_TENANT),
+            Err(other) => panic!("expected the missing-tenant config error, got: {other:?}"),
+            Ok(_) => panic!("expected the missing-tenant config error, got a resolved config"),
+        }
+
+        // EMPTY => the SAME error (pre-fix: an empty tenant was accepted and
+        // interpolated into every request path).
+        std::env::set_var("CLW_TENANT", "");
+        match ResolvedConfig::resolve(&m12_cli()) {
+            Err(ClwError::Config(msg)) => assert_eq!(
+                msg, MISSING_TENANT,
+                "an EMPTY CLW_TENANT must produce the same actionable missing-tenant error"
+            ),
+            Err(other) => panic!("expected the missing-tenant config error, got: {other:?}"),
+            Ok(_) => panic!("expected the missing-tenant config error, got a resolved config"),
+        }
+
+        // EMPTY must fall through to the config file rather than beat it.
+        write_config_file(tmp.path(), "tenant = \"file-tenant\"\n");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .tenant,
+            "file-tenant",
+            "an EMPTY CLW_TENANT must not beat the config file"
+        );
+
+        // POPULATED => used.
+        std::env::set_var("CLW_TENANT", "env-tenant");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .tenant,
+            "env-tenant"
+        );
+    }
+
+    #[test]
+    fn empty_clw_token_is_absent_and_yields_the_missing_token_error() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+
+        const MISSING_TOKEN: &str = "missing token: set --token, CLW_TOKEN/CORELINK_TOKEN, or add token to ~/.clw/config.toml";
+
+        // ABSENT => the exact actionable config error.
+        match ResolvedConfig::resolve(&m12_cli()) {
+            Err(ClwError::Config(msg)) => assert_eq!(msg, MISSING_TOKEN),
+            Err(other) => panic!("expected the missing-token config error, got: {other:?}"),
+            Ok(_) => panic!("expected the missing-token config error, got a resolved config"),
+        }
+
+        // EMPTY => the SAME error. Pre-fix this resolved to an empty token and a
+        // real request went out with a bare `Bearer ` header ("authentication
+        // failed") — the exact CI-missing-secret failure mode M12 is about.
+        std::env::set_var("CLW_TOKEN", "");
+        match ResolvedConfig::resolve(&m12_cli()) {
+            Err(ClwError::Config(msg)) => assert_eq!(
+                msg, MISSING_TOKEN,
+                "an EMPTY CLW_TOKEN must produce the actionable missing-token error"
+            ),
+            Err(other) => panic!("expected the missing-token config error, got: {other:?}"),
+            Ok(_) => panic!("expected the missing-token config error, got a resolved config"),
+        }
+
+        // EMPTY must fall through to the config file rather than beat it.
+        write_config_file(tmp.path(), "token = \"file-token\"\n");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .token,
+            "file-token",
+            "an EMPTY CLW_TOKEN must not beat the config file"
+        );
+
+        // POPULATED => used.
+        std::env::set_var("CLW_TOKEN", "env-token");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .token,
+            "env-token"
+        );
+    }
+
+    #[test]
+    fn empty_clw_cache_dir_is_absent_not_an_empty_path() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+        std::env::set_var("CLW_TOKEN", "tok");
+        let default_cache = tmp.path().join(".clw").join("cache");
+
+        // ABSENT => ~/.clw/cache.
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .cache_dir,
+            default_cache
+        );
+
+        // EMPTY => absent, so ALSO ~/.clw/cache (pre-fix: an EMPTY PathBuf, i.e.
+        // the process CWD, silently became the blob cache root).
+        std::env::set_var("CLW_CACHE_DIR", "");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .cache_dir,
+            default_cache,
+            "an EMPTY CLW_CACHE_DIR must fall through to the default cache dir"
+        );
+        // The lenient uninstall path resolves the same way (one shared filter).
+        assert_eq!(
+            ResolvedConfig::resolve_cache_dir_lenient(&m12_cli()),
+            default_cache,
+            "the lenient cache-dir path must apply the same empty-is-absent rule"
+        );
+
+        // EMPTY must fall through to the config file rather than beat it.
+        write_config_file(tmp.path(), "cache_dir = \"/from/file/cache\"\n");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .cache_dir,
+            PathBuf::from("/from/file/cache"),
+            "an EMPTY CLW_CACHE_DIR must not beat the config file"
+        );
+
+        // POPULATED => used.
+        std::env::set_var("CLW_CACHE_DIR", "/from/env/cache");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli())
+                .unwrap()
+                .clw_config
+                .cache_dir,
+            PathBuf::from("/from/env/cache")
+        );
+    }
+
+    #[test]
+    fn empty_clw_ref_domain_is_absent_not_a_forced_user_keyspace() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+        std::env::set_var("CLW_TOKEN", "tok");
+
+        // ABSENT => the default user keyspace.
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli()).unwrap().ref_domain,
+            RefDomain::User
+        );
+
+        // EMPTY, no config file => still the default user keyspace.
+        std::env::set_var("CLW_REF_DOMAIN", "");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli()).unwrap().ref_domain,
+            RefDomain::User
+        );
+
+        // EMPTY must fall THROUGH to the config file (pre-fix the `Some("")`
+        // short-circuited the chain and forced `user`, silently ignoring a
+        // configured runner keyspace).
+        write_config_file(tmp.path(), "ref_domain = \"runner\"\n");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli()).unwrap().ref_domain,
+            RefDomain::Runner,
+            "an EMPTY CLW_REF_DOMAIN must not beat the config file"
+        );
+
+        // POPULATED => used.
+        std::env::set_var("CLW_REF_DOMAIN", "user");
+        assert_eq!(
+            ResolvedConfig::resolve(&m12_cli()).unwrap().ref_domain,
+            RefDomain::User
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M12 guard-rails on the C2c credential seam — UNCHANGED by the empty filter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nonempty_cred_ticket_missing_lease_stays_fail_closed_through_resolve() {
+        // THE fail-closed property that must never weaken: a NON-EMPTY ticket in
+        // the runner domain with a missing CLW_LEASE_ID is a HARD ERROR — it never
+        // falls back to the static token, even when CLW_TOKEN is perfectly good.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, _tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+        std::env::set_var("CLW_TOKEN", "a-perfectly-good-static-pat");
+        std::env::set_var("CLW_REF_DOMAIN", "runner");
+        std::env::set_var("CLW_CRED_TICKET", "a-real-ticket");
+        // CLW_LEASE_ID deliberately NOT set; the fabric endpoint is.
+        std::env::set_var("CLW_FABRIC_ENDPOINT", "https://fabricd.example");
+
+        match ResolvedConfig::resolve(&m12_cli()) {
+            Err(ClwError::Config(msg)) => assert!(
+                msg.contains("CLW_LEASE_ID") && msg.contains("fail-closed"),
+                "must be the fail-closed lease error, got: {msg}"
+            ),
+            Err(other) => panic!(
+                "a non-empty ticket without a lease MUST be a hard error, never a \
+                 static-token fall-through; got: {other:?}"
+            ),
+            Ok(_) => panic!(
+                "a non-empty ticket without a lease MUST be a hard error, never a \
+                 static-token fall-through; got a resolved config"
+            ),
+        }
+    }
+
+    #[test]
+    fn empty_cred_ticket_still_means_absent_and_uses_the_static_token() {
+        // A CI job that sets `CLW_CRED_TICKET: ""` to neutralize an inherited
+        // fabric ticket relies on empty meaning ABSENT — `corelink_env` has always
+        // filtered it, and the M12 filter (which covers only the five clap globals)
+        // must not disturb that: the static token path stays selected.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, _tmp) = m12_env();
+        std::env::set_var("CLW_TENANT", "acme");
+        std::env::set_var("CLW_TOKEN", "static-pat");
+        std::env::set_var("CLW_REF_DOMAIN", "runner");
+        std::env::set_var("CLW_CRED_TICKET", "");
+
+        let resolved = ResolvedConfig::resolve(&m12_cli()).unwrap();
+        assert!(
+            resolved.broker.is_none(),
+            "an EMPTY ticket must not arm the broker path"
+        );
+        assert_eq!(resolved.clw_config.token, "static-pat");
+        assert_eq!(resolved.ref_domain, RefDomain::Runner);
     }
 }

@@ -38,6 +38,20 @@
   cross-platform release rework.
 
 ### Fixed
+- **A `CLW_*` variable that is SET BUT EMPTY is now treated as ABSENT, not as a value (M12).**
+  clap hands an empty env var to the program as `Some("")`, which short-circuited the whole
+  resolution chain — beating BOTH `~/.clw/config.toml` and the built-in default. A missing secret
+  in CI materialises as exactly that, so this was routine, not exotic: `CLW_TOKEN=""` sent a real
+  request with a bare `Bearer ` header and failed with "authentication failed" instead of the
+  actionable "missing token" (and with no request at all); `CLW_ENDPOINT=""` failed with "refusing
+  plaintext (got '')" instead of falling back to the default endpoint; `CLW_CACHE_DIR=""` silently
+  made the process CWD the blob-cache root. All five clap-merged globals (`endpoint`, `tenant`,
+  `token`, `cache_dir`, `ref_domain`) are now filtered empty-to-absent in ONE place, shared by every
+  resolve entry point — matching the `CORELINK_*` fallback path, which has always done this.
+  Credential semantics are unchanged: the C2c broker trio is read through that same `CORELINK_*`
+  reader (an empty `CLW_CRED_TICKET` already meant absent) and the fail-closed rule — a NON-EMPTY
+  ticket with a missing `CLW_LEASE_ID`/`CLW_FABRIC_ENDPOINT` is a hard error, never a fall-through
+  to the static token — is now pinned by a test at the `resolve` level.
 - **The local cache's eviction is now an approximate LRU instead of FIFO (audit M22).** `gc` sorts
   candidates oldest-`mtime`-first and the docs promised "LRU(mtime)", but nothing ever refreshed
   an `mtime`: `get` read the blob without touching it and a `put` of an already-present blob
