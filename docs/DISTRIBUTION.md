@@ -30,7 +30,7 @@ the release scaffold (`.github/workflows/release.yml`) needs to run end-to-end.
                                 ├─ GitHub Release per tag v<version>  (PUBLIC binary host)
                                 │    • 5 binaries (mac arm/intel, linux arm/intel, windows .exe)
                                 │    • SHA256SUMS + SHA256SUMS.minisig + minisign.pub
-                                │    • SBOM + gh attestation (provenance)
+                                │    • SBOM  (gh attestation: gated to public repos ⇒ SKIPPED)
                                 │    • rc tags ⇒ --prerelease (no formula bump)
                                 └─ bump Homebrew formula on REAL tags only
                                      → HuGR-Labs/homebrew-clw : Formula/clw.rb
@@ -106,9 +106,14 @@ over a trusted channel** and key **rotation** is defined.
 (`.../v<version>/minisign.pub`). Document its fingerprint in `docs/INSTALL.md` + the
 README so a consumer can pin it out-of-band. The signing **secret** key + passphrase
 live only as GitHub secrets (`MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD`) and never
-persist on a runner after the signing step. The pipeline also publishes a
-`gh attestation` provenance statement (SLSA) as the SOTA supply-chain bar, with
-minisign as the offline signature-of-record.
+persist on a runner after the signing step. A `gh attestation` provenance statement
+(SLSA) is the intended additional supply-chain bar, but that pipeline step is gated to
+PUBLIC repositories and this source repo is private, so it is **skipped on every
+release** (owner waiver, 2026-06-18). Until that changes, minisign is not merely the
+offline signature-of-record — it is the **only** cryptographic assurance shipped. (Note
+the distinction the missing attestation would have added: a detached minisign signature
+proves integrity and authenticity, not *provenance* — it binds no build platform and no
+source commit.)
 
 **What `brew install` actually verifies — and what the real backstop is.**
 `brew install` does **not** itself run minisign. It trusts the tap + mirror: it
@@ -118,8 +123,8 @@ where that `sha256` was derived **at formula-bump time** from the minisign-verif
 rests on (1) branch-protection rulesets on the mirror + tap repos and (2) that
 bump-time chain back to the signed manifest — not on any per-machine signature check.
 Independent cryptographic verification is available to the diligent via the documented
-`minisign -V` / `gh attestation` path (`docs/INSTALL.md` §4), and **that** is the real
-backstop. Do not represent `brew install` as auto-verifying the minisign signature.
+`minisign -V` path (`docs/INSTALL.md` §4), and **that** is the real backstop. Do not
+represent `brew install` as auto-verifying the minisign signature.
 
 **Decision (rotation).** A single active signing key with a documented successor
 procedure. On rotation, dual-publish the new public key (on the mirror and in-repo)
@@ -156,7 +161,7 @@ and do NOT bump the formula).
 | (a) | Distribution model | **Public mirror `clw-releases` + Homebrew tap `homebrew-clw` + `install.sh` fallback** (supersedes R2-authenticated) | the two public repos + branch protection |
 | (b) | Windows signing | Azure Trusted Signing | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE` |
 | (c) | macOS signing | Developer-ID (near-term); brew path unblocked, curl path strips quarantine | `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY` (+ notary keys) |
-| (d) | minisign trust root + rotation | Commit `minisign.pub`, dual-publish on rotation; `gh attestation` provenance | `MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD` |
+| (d) | minisign trust root + rotation | Commit `minisign.pub`, dual-publish on rotation. (`gh attestation` provenance is deferred — gated to public repos, waived 2026-06-18) | `MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD` |
 | (e) | Cross-repo publish credential | Deploy key (preferred) / scoped fine-grained PAT to `clw-releases` + `homebrew-clw` | `HOMEBREW_TAP_TOKEN` (or deploy keys) |
 
 These are deployment decisions + secrets the **owner** provisions; the release

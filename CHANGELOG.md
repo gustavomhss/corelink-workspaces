@@ -51,6 +51,87 @@
   cross-platform release rework.
 
 ### Fixed
+- **New releases no longer advertise SLSA provenance that is not published.** Every
+  GitHub Release told users it carried "SLSA provenance"; it never did — the
+  `attest-build-provenance` step is gated to PUBLIC repositories and this source repo is
+  private, so it is skipped on every release (owner waiver, 2026-06-18). The notes then
+  pointed at `docs/INSTALL.md`, which handed the reader
+  `gh attestation verify … --repo HuGR-Labs/clw-releases` — a command that **cannot**
+  succeed. A user verifying a download on a security-sensitive path hit a failing
+  supply-chain check and could reasonably conclude the binary was compromised; the
+  practical effect was to train people to ignore verification failures. The claim is
+  removed from the notes template, `docs/INSTALL.md` and `docs/DISTRIBUTION.md`, and
+  `docs/INSTALL.md` now states plainly that the check is unavailable and that its failure
+  is expected, not evidence of tampering.
+  The published body is no longer a string inside the workflow. It is a committed file,
+  `.github/release-notes.md`, which `release.yml` renders by substituting `__VERSION__`
+  and passes with `--notes-file`. That indirection is the fix: the text every user reads
+  is now an ordinary file diff, which is what review is good at. The original defect
+  survived for months because the sentence lived in a shell assignment two-thirds of the
+  way down a thousand-line workflow, where a reviewer of a release-pipeline change has
+  no reason to look.
+  `scripts/check-release-notes.sh` (wired into `scripts/gates.sh`, so it runs in every
+  lane) keeps that indirection in place. Within `release.yml` it covers three things.
+  Every literal `gh release create|edit` must pass `--notes-file "$NOTES_FILE"` and none
+  of `gh`'s other notes-bearing flags — `--notes`, `-n`, `-F`, `--notes-from-tag`,
+  `--generate-notes`, `--notes-start-tag` — matched so that the attached forms `-nVALUE`
+  and `-F-` are caught too, since `pflag` takes the LAST occurrence and a trailing `-F-`
+  would source the body from stdin with the required flag still in plain sight. Neither
+  the variable `$NOTES_FILE` may be referenced anywhere but its one assignment and one
+  render, and the rendered file's basename is reserved to that assignment line — which
+  catches the literal path spelling, and only that. A path the workflow ASSEMBLES
+  (`> "$RUNNER_TEMP/release-notes.rendered".md`, `>> "$RUNNER_TEMP/$D.md"`, a `sed -i`
+  naming it through a variable) is NOT caught, was demonstrated in review, and is named
+  in the script header alongside the other escapes rather than implied away. A fourth
+  is named there too, and is the one that most limits the headline claim: a step can
+  rewrite `.github/release-notes.md` ITSELF before the render, so "the body is a
+  reviewed file" means a human reviews that file — not that what ships is what they
+  read. The mutation would happen on the runner, between checkout and render, and
+  leave no trace in the diff. The render must match one permitted spelling
+  exactly — a positive match, because the forbidden-option list it replaced named `-e`,
+  `-f` and `-i` and could not see GNU sed's `--expression`, `--file` and `--in-place`.
+  And `.github/release-publish.expected` pins the complete argv of both invocations, so
+  `--title`, `--repo`, `--draft` and a `--latest`/`--prerelease` inversion are covered.
+  It reads three files, runs no subprocess but `python3`, and takes ~0.1s.
+  **What it does not cover, named rather than implied.** Two constructs inside
+  `release.yml` itself escape it and are deliberately not chased: a `gh()` shell function
+  shadowing the real binary, and a `run:` step whose shell is `python` or `pwsh` calling
+  the API directly. Outside the file it proves nothing at all — a `curl` to the REST API,
+  a step in another workflow, or a person with a browser all get there with this clean.
+  Six rounds were spent trying to close *that* class by scanning text, and each version
+  was defeated by an idiom its author had not imagined; the version before this one tried
+  to close it by *executing* the pipeline's steps, which meant `sudo apt-get`,
+  `cargo install`, and a call to the production CoreLink API on a developer's laptop in
+  every lane, for 4m22s of a 7m38s gate. Enumerating how a shell reaches an HTTP endpoint
+  is not winnable, and adding regexes for these two would restart that loop. Review of
+  `release.yml` covers them; this guard keeps the words being published in a reviewable
+  file and closes the flag set that *is* closed.
+  **Still outstanding, and not fixed by this change:** all 20 releases already published
+  on the mirror keep the false claim in their notes. The workflow fix reaches a published
+  tag only if that tag's run is repeated, and nobody re-runs an old release. Correcting
+  them means editing public content, which is an owner action and needs tooling reviewed
+  on its own terms — a first attempt was written and withdrawn from this change after
+  review found its target confirmation compared a variable against itself and a failed
+  release listing reported success having done nothing.
+- **Windows and Authenticode: the docs no longer demand a signature that does not
+  exist.** §4d told the reader a `Valid` `Get-AuthenticodeSignature` status "is
+  required", but Azure Trusted Signing is deferred and every shipped `.exe` is unsigned,
+  so the documented check always reported `NotSigned` — the same defect as the SLSA
+  claim, on the same security-sensitive path. §4d now says the check is not live, that
+  `NotSigned` is expected rather than evidence of tampering, and points at the signed
+  checksum manifest as the verification that works today, and the asset table now matches
+  the hedge §4c already carried. `docs/go-live/RUNBOOK-key-rotation-revocation.md` had
+  the same defect — it told a consumer verifying a key rotation to validate the
+  Authenticode chain and the macOS notarization ticket, neither of which exists — and
+  `docs/INSTALL.md` routes readers there when verification fails, so a corrected §4
+  was handing them straight into two checks that cannot pass.
+- **A re-run of a release tag now refreshes its notes.** The idempotent `--clobber` path
+  only re-uploaded assets, so a release published with incorrect notes kept them
+  permanently. Both the create and the re-run paths now render the same committed
+  `.github/release-notes.md`, and a failed refresh is fatal rather than a warning — a re-run
+  that cannot correct the notes has not achieved the idempotency it claims. Note the
+  consequence: the workflow is now authoritative over the release body, so hand-edits
+  made in the GitHub UI are overwritten by the next re-run.
 - **A `CLW_*` variable that is SET BUT EMPTY is now treated as ABSENT, not as a value (M12).**
   clap hands an empty env var to the program as `Some("")`, which short-circuited the whole
   resolution chain — beating BOTH `~/.clw/config.toml` and the built-in default. A missing secret

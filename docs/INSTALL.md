@@ -60,8 +60,11 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 Homebrew is the preferred path; this `curl` fallback verifies the minisign signature
 against the embedded trust-root (§4a) before installing. `install.sh` downloads the
-binary + the signed `SHA256SUMS` (+ `.minisig`) + `minisign.pub`, verifies the minisign
-signature over the checksum manifest, then the binary's SHA-256 (**never skippable**),
+binary + the signed `SHA256SUMS` (+ `.minisig`) and verifies the minisign signature over
+the checksum manifest against a trust root **embedded in the script** — it deliberately
+does NOT fetch `minisign.pub` from the download surface, so a compromised mirror cannot
+supply both the signature and the key that checks it. It then verifies the binary's
+SHA-256 (**never skippable**),
 strips the macOS quarantine attribute, and installs to `$HOME/.local/bin/clw`. See the
 [macOS quarantine note](#3-macos-quarantine-curl-path-only).
 
@@ -79,7 +82,7 @@ Invoke-WebRequest "$base/SHA256SUMS.minisig"  -OutFile "SHA256SUMS.minisig"
 Invoke-WebRequest "$base/minisign.pub"        -OutFile "minisign.pub"
 ```
 
-Then install it on `PATH` per [§5 Windows](#windows-powershell-1).
+Then install it on `PATH` per [§5 Windows](#windows-powershell).
 
 ---
 
@@ -89,9 +92,9 @@ Then install it on `PATH` per [§5 Windows](#windows-powershell-1).
 |----|------|---------------|------------|------------------|
 | macOS (Apple Silicon) | arm64 | `aarch64-apple-darwin` | `clw-<version>-aarch64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
 | macOS (Intel) | x86_64 | `x86_64-apple-darwin` | `clw-<version>-x86_64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
-| Windows | x86_64 | `x86_64-pc-windows-gnu` | `clw-<version>-x86_64-pc-windows-gnu.exe` | Azure Trusted Signing (Authenticode) → `Get-AuthenticodeSignature` |
-| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `clw-<version>-x86_64-unknown-linux-gnu` | minisign over `SHA256SUMS` |
-| Linux | arm64 | `aarch64-unknown-linux-gnu` | `clw-<version>-aarch64-unknown-linux-gnu` | minisign over `SHA256SUMS` |
+| Windows | x86_64 | `x86_64-pc-windows-gnu` | `clw-<version>-x86_64-pc-windows-gnu.exe` | minisign over `SHA256SUMS` (Authenticode near-term) |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `clw-<version>-x86_64-unknown-linux-gnu` | minisign over `SHA256SUMS` + per-binary `.minisig` |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` | `clw-<version>-aarch64-unknown-linux-gnu` | minisign over `SHA256SUMS` + per-binary `.minisig` |
 
 All assets live at:
 
@@ -105,7 +108,23 @@ Notes:
   (it cannot be runtime-tested there). See `docs/DISTRIBUTION.md`.
 - Every release publishes a single **signed checksum manifest** — `SHA256SUMS` and its
   minisign signature `SHA256SUMS.minisig` — plus the trust-root key `minisign.pub`,
-  covering all assets. (A `gh attestation` provenance statement rides along too.)
+  covering every binary and every bundled document. This manifest is the
+  **cross-platform signature-of-record** (the term `release.yml` itself uses) for every
+  target. The two Linux binaries additionally carry their own `.minisig`; the macOS and
+  Windows binaries are covered through the signed manifest alone, because per-binary
+  Developer-ID / Authenticode signing is deferred — see
+  [§4c](#4c-macos--gatekeeper--signature) and [§4d](#4d-windows--authenticode).
+- **`install.sh` is NOT in `SHA256SUMS`.** It is uploaded after the manifest is
+  checksummed, so the signed manifest does not cover it, and nothing else signs it
+  either. Its integrity rests on the transport alone (HTTPS to the mirror). The
+  trust-root key embedded in the script protects the **binary** it downloads, not the
+  script itself — a tampered `install.sh` would carry a tampered key. Read it before
+  piping it to a shell, which is good practice for any `curl | sh` regardless.
+- SLSA build-provenance attestation is **not** published today. The pipeline's
+  attestation step is gated to public repositories and this source repo is private,
+  so it is skipped on every release (owner waiver, 2026-06-18). Do not expect a
+  `gh attestation` statement; verify with `SHA256SUMS` + `minisign` as in
+  [§4](#4-verify-the-download-per-platform).
 - The macOS and Linux binaries ship as bare binaries (no `.zip`); Homebrew is the
   recommended way to get them on macOS/Linux.
 
@@ -183,12 +202,14 @@ shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
 A failure on either step means **do not run the binary** — treat it as a potential
 compromise and follow `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
 
-> Optional supply-chain check (any platform, needs the `gh` CLI): verify the build
-> provenance attestation published with the release:
->
-> ```sh
-> gh attestation verify clw-<version>-<target> --repo HuGR-Labs/clw-releases
-> ```
+> **Not available yet — do not run this.** A build-provenance attestation
+> (`gh attestation verify`) is the intended additional supply-chain check, but the
+> pipeline step that would mint it is gated to public repositories and this source
+> repo is private, so no attestation is published (owner waiver, 2026-06-18). The
+> command would fail with "no attestation found", which is expected and is **not**
+> evidence that your download is compromised. The signed `SHA256SUMS` manifest above
+> is the verification of record. This note will be replaced with the real command
+> when attestation ships.
 
 ### 4c. macOS — Gatekeeper / signature
 
@@ -204,12 +225,18 @@ brew path runs them unquarantined, and the `curl`/manual path strips quarantine 
 
 ### 4d. Windows — Authenticode
 
+**Not live yet.** Windows Authenticode signing (Azure Trusted Signing) is deferred, so
+every shipped `clw.exe` is unsigned and `Get-AuthenticodeSignature` reports `NotSigned`.
+That is **expected** and is not evidence that your download was tampered with — verify
+via the signed checksum manifest below instead.
+
+Once Authenticode signing is live, a `Valid` status will be the additional check:
+
 ```powershell
-# 'Valid' status, signed via the Azure Trusted Signing certificate, is required:
-Get-AuthenticodeSignature .\clw.exe | Format-List
+Get-AuthenticodeSignature .\clw.exe | Format-List   # 'Valid' once signing is live
 ```
 
-Also verify the checksum manifest (PowerShell):
+Verify the checksum manifest (PowerShell) — this is the check that works today:
 
 ```powershell
 (Get-FileHash .\clw.exe -Algorithm SHA256).Hash.ToLower()

@@ -92,10 +92,21 @@ signing impossible before the post is even written.
 ## Verifying a release after any rotation
 
 A consumer must be able to tell a legitimate rotation from an attack:
-- Windows: the Authenticode chain validates to the Azure Trusted Signing root.
-- macOS: `spctl -a -vv` / notarization ticket validates.
-- Linux: `minisign -V` against the **currently published** public key (and NOT against any key listed
-  in `REVOKED.txt`).
+- **All platforms, today:** `minisign -V` over `SHA256SUMS` against the **currently
+  published** public key (and NOT against any key listed in `REVOKED.txt`), then the
+  binary's SHA-256 against that manifest. This is the only verification that works on
+  every target right now, and `docs/INSTALL.md` §4 sends readers here when it fails.
+- **Windows — NOT AVAILABLE.** Authenticode signing (Azure Trusted Signing) is deferred,
+  so every shipped `.exe` is unsigned and the chain cannot validate. Do not tell a
+  consumer to check it; `Get-AuthenticodeSignature` reporting `NotSigned` is expected
+  and is not evidence of compromise.
+- **macOS — NOT AVAILABLE.** Developer-ID signing and notarization are deferred, so
+  `spctl -a -vv` will not report `accepted` and there is no notarization ticket to
+  validate.
+
+Reinstate the two platform checks above in the same change that actually ships those
+signing capabilities — not before. A verification step that always fails teaches the
+reader to ignore verification failures, which is the opposite of this runbook's purpose.
 - All: the **signed** SHA-256 checksums file matches, and its signature verifies under the same trust
   root as the binary.
 

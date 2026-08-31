@@ -49,6 +49,26 @@ if [ -n "$dead_org_hits" ]; then
 fi
 echo "dead-org-slug guard: clean (org = HuGR-Labs)"
 
+# --- RELEASE-NOTES GUARD (runs in EVERY lane, including docs-only) -----------
+# Keeps the text the release pipeline publishes to users in a reviewed FILE
+# (.github/release-notes.md) rather than a string inside release.yml, so that
+# changing it is an ordinary file diff rather than an edit nobody re-reads. Note the
+# limit: nothing stops a step from rewriting that file on the runner before it is
+# rendered, so this is not a guarantee that what users read is what review saw.
+#
+# Within release.yml: every literal `gh release create|edit` must pass
+# --notes-file "$NOTES_FILE" and none of gh's other notes-bearing flags; $NOTES_FILE
+# may be referenced nowhere else, and the rendered file's BASENAME is reserved to its
+# assignment line — which catches the literal path spelling, and only that; and the
+# full argv of both invocations is pinned to .github/release-publish.expected.
+# It does NOT cover a `gh()` shell function shadowing the binary, a non-bash `run:`
+# step, a path to the rendered file ASSEMBLED from a variable or across a quote
+# boundary, a step that rewrites .github/release-notes.md itself before the render,
+# or anything outside this one file — the script header names all four and
+# says why chasing them restarts a loop that already cost nine rounds. Review of
+# release.yml covers them.
+bash scripts/check-release-notes.sh
+
 # --- WORKFLOW-PERMISSIONS GUARD (runs in EVERY lane, including docs-only) -----
 # Every workflow must DECLARE a top-level `permissions:` block. A workflow that
 # declares nothing inherits the repository default, which is an ambient,

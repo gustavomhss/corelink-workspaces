@@ -1,0 +1,2 @@
+gh release edit "v${VERSION}" --repo HuGR-Labs/clw-releases --notes-file "$NOTES_FILE" ${PRERELEASE_FLAG}
+gh release create "v${VERSION}" release/* --repo HuGR-Labs/clw-releases --title "clw v${VERSION}" --notes-file "$NOTES_FILE" ${PRERELEASE_FLAG}

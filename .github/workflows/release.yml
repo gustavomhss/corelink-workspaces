@@ -730,9 +730,10 @@ jobs:
   # PUBLIC GitHub Release on the dedicated mirror repo `HuGR-Labs/clw-releases`
   # (the source repo `corelink-workspaces` is PRIVATE, so its own Release assets
   # are not public — see DISTRIBUTION-REWORK-PLAN §8 B1). After a real upload,
-  # add SLSA build-provenance attestation, then bump the Homebrew formula in
+  # add SLSA build-provenance attestation (SKIPPED on this private repo — see the
+  # step's waiver), then bump the Homebrew formula in
   # `HuGR-Labs/homebrew-clw` (real tags only). minisign stays the offline
-  # signature-of-record; attestation is the added provenance layer.
+  # signature-of-record; attestation WOULD BE the added provenance layer.
   # ---------------------------------------------------------------------------
   publish:
     name: checksum + publish
@@ -920,17 +921,69 @@ jobs:
             PRERELEASE_FLAG="--latest"
             echo "real tag — creating a latest Release on the mirror (formula bump follows)."
           fi
+          # The published release-notes body is NOT written here. It is the committed
+          # file .github/release-notes.md, rendered by substituting __VERSION__. That
+          # indirection is the whole control: the text every user reads on the Release
+          # page is a reviewed file in this repository, so changing it is a diff a
+          # human reads, not a string buried in a 1000-line workflow.
+          #
+          # Why: releases shipped for months advertising "SLSA provenance". The
+          # attestation step further below is gated to PUBLIC repos and this repo is
+          # private, so it ALWAYS skips (owner waiver, 2026-06-18) — the claim was
+          # false, and it pointed users at a `gh attestation verify` that cannot
+          # succeed. It survived because nobody reviews a `NOTES=` assignment.
+          #
+          # scripts/check-release-notes.sh keeps this indirection in place: it pins the
+          # full argv of the `gh release` calls below and rejects gh's other notes-bearing
+          # flags on them. It judges the SHAPE only; the TEXT lives in
+          # .github/release-notes.md so that a human reviews it, which is why it moved
+          # there. Two things it does NOT do, both named in the script header: stop a
+          # later line in this block from rewriting the RENDERED file through a path it
+          # assembles, and stop one from rewriting .github/release-notes.md ITSELF
+          # before the render. Either would publish text review never saw.
+          #
+          # Also worth knowing: the no-token dry-run exits above, BEFORE the render, so
+          # an `-rc.N` tag does not exercise the `sed` or either `--notes-file` call. The
+          # first execution of this code is a real vX.Y.Z.
+          #
+          # NOTE THE LIMIT: a re-run re-applies the current text, but this only reaches
+          # a tag whose workflow is actually re-run. Correcting notes on ALREADY-
+          # PUBLISHED tags is a separate one-off — see CHANGELOG.md [Unreleased].
+          NOTES_FILE="$RUNNER_TEMP/release-notes.rendered.md"
+          sed "s/__VERSION__/${VERSION}/g" .github/release-notes.md > "$NOTES_FILE"
           # Create the cross-repo Release and upload every assembled asset. If the
           # release already exists (a re-run of the same tag), upload --clobber
           # rather than fail — the tag is immutable but a re-run must be idempotent.
           if gh release view "v${VERSION}" --repo HuGR-Labs/clw-releases >/dev/null 2>&1; then
             echo "release v${VERSION} already exists on the mirror — uploading assets with --clobber."
             gh release upload "v${VERSION}" release/* --repo HuGR-Labs/clw-releases --clobber
+            # Re-apply the notes on a re-run. Without this, a release published with
+            # stale/incorrect notes keeps them forever, because --clobber only touches
+            # assets. This is FATAL on failure: wrong release notes are exactly the
+            # user-facing supply-chain defect the reviewed notes file exists to prevent,
+            # and a re-run that cannot correct them has not achieved the idempotency it
+            # claims. Treating it as best-effort is the same reasoning that let the
+            # false "SLSA provenance" line ship in the first place.
+            #
+            # Side effect worth knowing: this makes the workflow AUTHORITATIVE over the
+            # release body. Hand-edits made on GitHub (an added changelog link, a
+            # known-issue note) are overwritten by the next re-run — and CLAUDE.md
+            # records the transient-ENOTFOUND re-run as routine. Put durable prose in
+            # .github/release-notes.md, not in the web UI — that file IS the body, and
+            # editing it is the reviewed way to change what users read.
+            # ${PRERELEASE_FLAG} is passed here too, not just on create. `gh release
+            # edit` sends only the fields you name, and GitHub's update-release endpoint
+            # defaults `make_latest` to true — so an edit that names only the notes risks
+            # silently promoting a prerelease to Latest. Re-asserting the flag the tag
+            # was published with keeps the re-run idempotent for the release's STATE,
+            # not merely for its body.
+            gh release edit "v${VERSION}" --repo HuGR-Labs/clw-releases --notes-file "$NOTES_FILE" \
+              ${PRERELEASE_FLAG}
           else
             gh release create "v${VERSION}" release/* \
               --repo HuGR-Labs/clw-releases \
               --title "clw v${VERSION}" \
-              --notes "clw ${VERSION} — signed binaries (minisign SHA256SUMS.minisig + minisign.pub), CycloneDX SBOM, SLSA provenance. Proprietary (EULA governs use); binaries publicly downloadable, source closed. macOS: a direct browser download is Gatekeeper-blocked (binary not yet Apple-notarized) — install via 'brew' or install.sh (both strip quarantine), or run 'xattr -d com.apple.quarantine <asset>' after verifying the signature. See docs/INSTALL.md." \
+              --notes-file "$NOTES_FILE" \
               ${PRERELEASE_FLAG}
           fi
           echo "published release/ -> HuGR-Labs/clw-releases @ v${VERSION} (prerelease=${PRERELEASE})"
