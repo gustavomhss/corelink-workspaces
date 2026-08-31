@@ -133,6 +133,14 @@ for wf in $workflow_perms_exempt; do
 done
 echo "workflow-permissions guard: clean (all workflows declare 'permissions:'; exempt: ${workflow_perms_exempt})"
 
+# The lane classifier decides whether the Rust gates run at all, so it is itself
+# gated — in EVERY lane, before any classification happens, because a broken
+# classifier would otherwise route around the check that would have caught it.
+bash scripts/gate-lane-selftest.sh
+
+# shellcheck source=scripts/classify-lane.sh
+. scripts/classify-lane.sh
+
 SCOPE="full"
 if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
   base_ref="${GITHUB_BASE_REF:-main}"
@@ -143,19 +151,24 @@ if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
   else
     changed="$(git diff --name-only "origin/${base_ref}...HEAD")"
   fi
-  if [ -z "$changed" ]; then
-    echo "empty diff vs origin/${base_ref} — full lane (fail-safe)"
-  elif ! echo "$changed" | grep -qvE '(\.md$|^docs/)'; then
-    echo "SCOPED lane: docs-only diff — Rust gates not applicable"
-    echo "ALL GATES GREEN (docs-only)"
-    exit 0
-  elif echo "$changed" | grep -qE '^(Cargo\.(toml|lock)|deny\.toml|scripts/|\.github/|crates/clw-types/)'; then
-    echo "diff touches contract/workspace/CI surface — full lane (fail-safe)"
-  elif ! echo "$changed" | grep -qvE '^crates/'; then
-    SCOPE="$(echo "$changed" | grep -oE '^crates/[^/]+' | sort -u | sed 's|crates/||' | tr '\n' ' ')"
-  else
-    echo "diff reaches outside crates/ — full lane (fail-safe)"
-  fi
+  # The classification lives in scripts/classify-lane.sh so that
+  # scripts/gate-lane-selftest.sh can exercise THE REAL FUNCTION rather than a copy of
+  # it. It used to be inline here, and a wrong `docs` verdict skips every Rust gate and
+  # still prints ALL GATES GREEN — see that file's header for the incident.
+  lane="$(classify_lane "$changed")"
+  case "$lane" in
+    docs)
+      echo "SCOPED lane: docs-only diff — Rust gates not applicable"
+      echo "ALL GATES GREEN (docs-only)"
+      exit 0 ;;
+    crates:*)
+      SCOPE="${lane#crates:}" ;;
+    full)
+      echo "diff needs the full lane (contract/workspace/CI surface, outside crates/, or undetermined)" ;;
+    *)
+      echo "GATE FAILED: classify_lane returned an unrecognised verdict: $lane" >&2
+      exit 1 ;;
+  esac
 fi
 
 cargo fmt --all -- --check
