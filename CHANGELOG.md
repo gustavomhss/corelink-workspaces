@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### CI / Infrastructure
+- **Added `docs/RUNBOOK-ci-fallback.md`** — the written procedure for returning CI to
+  GitHub-hosted runners during a self-hosted outage. Carries the full `runs-on:` inventory
+  (19 `corelink` fabric jobs + the single `[self-hosted, macOS, X64]` release matrix), the exact
+  label-swap diff that unblocks merging, the measured hosted-minute cost (≈18 billed minutes per
+  PR push; ≈77 per release, 40 of them the ×10 macOS legs), and the gotchas — reverting PR #233
+  wholesale would also revert the clw-cli test-hermeticity fixes and delete `gate-check-selftest`;
+  the `CARGO_TARGET_DIR` persistent cache in `gates.sh` is vestigial (no `actions/cache` exists,
+  every run already compiles cold); and hosted Actions being *billable* is an unverified
+  precondition. States plainly that a `clw-mac-1` outage **stops releases** — the release matrix
+  has no label-swap fallback (`ci-use-host-toolchain.sh` hard-fails on hosted arm64 macOS and the
+  zig step is fail-closed), only a revert of the PR #234 shape that last shipped green on
+  2026-07-17. The runbook's own acceptance criterion 1 (a fresh hosted test PR) is recorded as
+  **UNMET** inside the document rather than claimed.
 - **Added `scripts/pre-merge-gate-check.sh`, ported from corelink-server.** Guards against a
   failure mode that bit both repos within two hours of each other: a CONFLICTING PR gets NO
   `pull_request` check runs at all (GitHub cannot build the merge ref) — not queued, not

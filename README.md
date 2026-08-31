@@ -262,6 +262,8 @@ for you to remove manually (e.g. `rm ./target/release/clw`).
 - [docs/usage.md](docs/usage.md) — Daily recipes, scripting patterns, conformance suite
 - [docs/SPEC-manifest.md](docs/SPEC-manifest.md) — Manifest format v1 (normative)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Crate graph and dataflows
+- [docs/RUNBOOK-ci-fallback.md](docs/RUNBOOK-ci-fallback.md) — Returning CI to GitHub-hosted
+  runners during a self-hosted outage (runner inventory, cost, what breaks)
 
 ---
 
