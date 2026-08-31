@@ -88,3 +88,83 @@ jobs:
           CLW_TENANT=smoke CLW_TOKEN=smoke-tok wine "$BIN" --json doctor >/dev/null
           echo "clw.exe --json doctor dispatched OK"
           echo "WINDOWS-SMOKE-OK (dispatch only; full NTFS/drive/ADS fidelity needs a real Windows runner)"
+
+      # M17 / WP-28. The Windows symlink copy-fallback must refuse a target
+      # directory that contains the link itself (`d/up -> ..`), which would
+      # otherwise recurse until MAX_PATH. The DECISION lives in a plain,
+      # target-independent predicate (clw-hydrate's `path_containment`) precisely
+      # so it is testable; this step runs that predicate's table on the real
+      # windows-gnu binary, under wine.
+      #
+      # SCOPE — read before trusting this step:
+      #   * PROVEN here: that the LEXICAL layer (`path_contains` and its
+      #     normalisation) computes the same answers when compiled for
+      #     windows-gnu and executed on that ABI. Also that clw-hydrate's
+      #     `#[cfg(windows)]` test code LINKS (the PR gate only type-checks it).
+      #   * NOT proven here, and do not read it as proven: NTFS behaviour. These
+      #     tests are pure computation over string literals — they assert OUR
+      #     model of Win32 folding, on wine, not what a real NTFS does.
+      #   * NOT proven here: the materializer, or layer 2 (`canonicalize`).
+      #     Driving a real `clw.exe hydrate` needs a live CAS/AC backend, which
+      #     this offline job has not got; the `#[cfg(windows)]` materializer test
+      #     (`self_referential_symlinks_rejected_on_windows`, the only tokio one)
+      #     and every `canonical_guard_*` test are tempdir/FS-semantics — exactly the
+      #     class this file's header records as NOT running trustworthily under
+      #     wine, and two of them need SeCreateSymbolicLinkPrivilege. They are
+      #     deliberately NOT filtered in, rather than run with
+      #     `continue-on-error`, which would be a gate in name only. They run for
+      #     real when the Phase-3 self-hosted Windows runner exists.
+      #
+      # The `lexical_` prefix is what keeps that separation honest: it selects
+      # the pure-computation tests and nothing else. An earlier revision filtered
+      # on `path_containment`, which dragged in all seven filesystem tests and
+      # made this step fail with exit 101 on every run.
+      - name: M17 — the lexical predicate runs on the windows binary
+        run: |
+          set -euo pipefail
+          SRC=crates/clw-hydrate/src/path_containment.rs
+
+          # ANTI-VACUITY. Every way of NOT getting something to check is a NAMED
+          # failure, never a skip and never a zero. The expected test count is
+          # derived from the SOURCE the step is checking, so this gate holds no
+          # second copy of the list: renaming a `lexical_` test out of the filter
+          # turns the lane red instead of silently shrinking what runs. (The
+          # previous revision asserted only ">= 1 passed", under which the whole
+          # table could stop running and the step would still print OK.)
+          test -f "$SRC" || { echo "::error::$SRC not found — this gate cannot read its own oracle"; exit 1; }
+          EXPECTED="$(grep -cE '^[[:space:]]+fn lexical_' "$SRC" || true)"
+          if [ "${EXPECTED:-0}" -eq 0 ]; then
+            echo "::error::found ZERO 'fn lexical_' tests in $SRC. Either they were all renamed, or this"
+            echo "::error::gate's reading of the file broke. A gate that checks nothing must not print OK."
+            exit 1
+          fi
+          echo "oracle: $SRC declares $EXPECTED lexical_ test(s)"
+
+          cargo test -p clw-hydrate --locked --target "$TGT" --no-run 2>&1 | tee /tmp/build.log
+          BIN="$(grep -oE 'target/[^ )]*clw_hydrate-[0-9a-f]+\.exe' /tmp/build.log | head -1)"
+          test -n "$BIN" || { echo "::error::could not find the clw_hydrate test .exe in the build log"; exit 1; }
+          test -f "$BIN" || { echo "::error::build log named $BIN but it does not exist"; exit 1; }
+          echo "running $BIN under wine (filter: lexical_)"
+          # Capture stdout AND stderr, and NEVER let the failure of this command
+          # abort the step before the output is printed: under `set -e` a bare
+          # `OUT="$(...)"` exits on a non-zero rc, so a panicking binary produced
+          # a red step with ZERO diagnostics. Print first, assert second.
+          set +e
+          OUT="$(wine "$BIN" lexical_ --test-threads=1 2>&1)"
+          RC=$?
+          set -e
+          echo "$OUT"
+          echo "wine exit code: $RC"
+          [ "$RC" -eq 0 ] \
+            || { echo "::error::clw_hydrate.exe exited $RC under wine (see output above)"; exit 1; }
+          # Assert EXACTLY the number the source declares, with zero failures.
+          # Adding a `lexical_` test raises both sides together, so the lane does
+          # not go red for growth — but a test dropping OUT of the filter (renamed,
+          # cfg'd away, #[ignore]d) no longer shrinks the run silently.
+          echo "$OUT" | grep -qE "^test result: ok\. ${EXPECTED} passed; 0 failed" || {
+            echo "::error::expected ${EXPECTED} passing lexical_ tests under wine (the count $SRC declares),"
+            echo "::error::but the run above did not report that. See the output for what actually ran."
+            exit 1
+          }
+          echo "M17-LEXICAL-OK on windows-gnu: ${EXPECTED}/${EXPECTED} lexical tests"
+          echo "  (layer 2 + materializer are NOT covered here — see the scope note above)"

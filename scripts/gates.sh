@@ -232,7 +232,16 @@ fi
 if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
   echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
   rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 || true
-  cargo check --workspace --target x86_64-pc-windows-gnu
+  # --all-targets is load-bearing (M17/WP-28): WITHOUT it, `cargo check` compiles
+  # only lib/bin targets, so every `#[cfg(windows)] #[test]` in the tree was never
+  # even TYPE-CHECKED by any lane — a systemic hole, not a per-WP detail. With it,
+  # cfg(windows) test code is at least compiled on every PR. (Most of it is still
+  # not RUN: this is a check, and windows.yml's wine job runs only the pure-lexical
+  # `lexical_` tests of the M17 predicate on the windows-gnu binary — the
+  # filesystem-touching ones do not run reliably under wine. Which is exactly why
+  # that predicate is a plain function whose table also runs under normal
+  # `cargo test` on unix.)
+  cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 else
   echo "CLW_SKIP_CROSS=1 — skipping cross-compile gate (local fast path only)"
 fi

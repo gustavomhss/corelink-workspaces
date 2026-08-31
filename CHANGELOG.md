@@ -2,7 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Windows: a symlink whose target directory contains the link itself is now rejected (M17).**
+  Windows has no unprivileged symlinks, so `hydrate` materialises a `Symlink` entry as a COPY of
+  its target. For a self-referential target — canonically `d/up -> ..` — the recursive copy walked
+  the tree it was writing into and re-read what it had just written, until it died on MAX_PATH or
+  filled the disk. The manifest is untrusted remote input, so this was a resource-exhaustion vector.
+  It is now refused with a clear `InvalidManifest` error. Also covers two shapes that a purely
+  lexical check misses: a trailing space or dot (Win32 strips them, so `.. ` *is* `..`) and
+  non-ASCII case (NTFS folds `ä`/`Ä` to one directory).
+
+  **This is a materializer rule, not a format change** — no manifest that is valid on unix became
+  invalid, and `d/up -> ..` still hydrates into a real symlink there.
+
+### Changed
+- **Windows only: the symlink copy-fallback now refuses to descend past 64 directory levels**
+  (`MAX_COPY_DEPTH`), as a fail-safe bound behind the M17 guard above — without it, any miss in
+  that guard is unbounded rather than merely wrong. A legitimate manifest whose symlinked directory
+  target nests deeper than 64 levels now fails to hydrate on Windows where it previously copied. No
+  realistic workspace approaches this; the constant can be raised if one ever does.
+
 ### CI / Infrastructure
+- **The windows-gnu cross-check now runs with `--all-targets`.** Without it, `cargo check` compiles
+  only lib/bin targets, so every `#[cfg(windows)] #[test]` in the tree was never type-checked by any
+  lane. Also added a `windows.yml` step that runs the M17 containment predicate on the real
+  windows-gnu binary under wine.
 - **Added `docs/RUNBOOK-ci-fallback.md`** — the written procedure for returning CI to
   GitHub-hosted runners during a self-hosted outage. Carries the full `runs-on:` inventory
   (19 `corelink` fabric jobs + the single `[self-hosted, macOS, X64]` release matrix), the exact

@@ -8,6 +8,11 @@
 
 pub use clw_types as types;
 
+// The Windows copy-fallback's self-reference guard. Deliberately NOT
+// `cfg(windows)`: it is a plain, target-independent predicate so its table test
+// runs under a normal `cargo test` on every platform (see the module docs).
+mod path_containment;
+
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -686,14 +691,7 @@ where
 
 #[cfg(windows)]
 fn materialize_symlink_as_copy(dest: &Path, path: &str, target: &str, link: &Path) -> Result<()> {
-    // The link's parent within `dest`; the target is resolved relative to it.
-    let link_parent = link.parent().unwrap_or(dest);
-    // `target` uses '/' separators (backslashes were rejected by validation);
-    // join component-by-component so it resolves correctly on Windows.
-    let mut resolved = link_parent.to_path_buf();
-    for comp in target.split('/') {
-        resolved.push(comp);
-    }
+    let resolved = path_containment::resolve_symlink_target(dest, target, link);
 
     let meta = std::fs::symlink_metadata(&resolved).map_err(|_| {
         ClwError::InvalidManifest(format!(
@@ -703,7 +701,40 @@ fn materialize_symlink_as_copy(dest: &Path, path: &str, target: &str, link: &Pat
     })?;
 
     if meta.file_type().is_dir() {
-        copy_dir_recursive(&resolved, link)?;
+        // M17: a DIRECTORY target that contains the link itself (canonically
+        // `d/up -> ..`) would make copy_dir_recursive walk into the tree it is
+        // writing, re-reading what it just wrote, until it dies on MAX_PATH or
+        // fills the disk. The manifest is untrusted remote input, so reject it
+        // here with a clear error instead. This is a MATERIALIZER rule, not a
+        // format rule: the same manifest stays valid (and materialises as a real
+        // symlink) on unix.
+        //
+        // The decision is the UNION of two independent checks — a lexical model
+        // of Win32 folding, and `fs::canonicalize` on both sides — and a positive
+        // from EITHER refuses the copy. Not a pre-filter plus an authority:
+        // neither layer subsumes the other, and the lexical one short-circuits,
+        // so for a trailing space or dot (`.. ` IS `..` to Win32) and for Unicode
+        // case (`Ä`/`ä`) it is OUR MODEL that answers, not the OS. What
+        // canonicalize adds is everything the model does not enumerate — 8.3
+        // aliases, junctions, NTFS's own case table. See the `path_containment`
+        // module docs, which are the authority on this split.
+        //
+        // FAIL-CLOSED: if either side cannot be canonicalised we refuse the entry
+        // rather than copy blind — an unresolvable path is precisely the case
+        // where the copy cannot be proven safe.
+        let would_recurse = path_containment::copy_would_recurse(&resolved, link).map_err(|e| {
+            ClwError::InvalidManifest(format!(
+                "cannot verify that the symlink target directory does not contain the \
+                     link itself ({e}); refusing to copy on Windows: link {path} -> {target}"
+            ))
+        })?;
+        if would_recurse {
+            return Err(ClwError::InvalidManifest(format!(
+                "symlink target directory contains the link itself; copying it on \
+                 Windows would recurse without bound: link {path} -> {target}"
+            )));
+        }
+        copy_dir_recursive(&resolved, link, 0)?;
     } else {
         // Regular file (or anything that is not a directory): copy its bytes.
         std::fs::copy(&resolved, link)?;
@@ -711,16 +742,52 @@ fn materialize_symlink_as_copy(dest: &Path, path: &str, target: &str, link: &Pat
     Ok(())
 }
 
-// Recursively copy the directory subtree at `src` to `dst` (Windows only).
-#[cfg(windows)]
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Maximum directory nesting the Windows symlink copy-fallback will follow.
+///
+/// This is a FAIL-SAFE BACKSTOP, not the guard. `copy_would_recurse` is supposed
+/// to have refused every self-referential copy before we get here — but that
+/// check is a single oracle over untrusted input (and a TOCTOU snapshot: a
+/// concurrent writer could re-point a directory between the check and this
+/// walk). Without a bound, any miss is UNBOUNDED rather than merely wrong. With
+/// one, a miss costs 64 levels and a clean error.
+///
+/// 64 is far deeper than any real workspace. It is NOT, however, generally
+/// reached before MAX_PATH: 64 levels of `up\` plus a real `dest` prefix is well
+/// past ~260 characters, so on a normal Windows system the runaway copy dies on
+/// MAX_PATH first and this cap only bites on short paths or where long paths are
+/// enabled. It is a guaranteed *upper* bound on the damage, not the first thing
+/// to fire.
+///
+/// BEHAVIOUR CHANGE (Windows only): a legitimate manifest whose symlinked
+/// directory target nests deeper than this now fails to hydrate, where it
+/// previously copied. No real workspace is anywhere near it; raise the constant
+/// if one ever is. Noted in CHANGELOG.md.
+const MAX_COPY_DEPTH: u32 = 64;
+
+// Recursively copy the directory subtree at `src` to `dst`, refusing to descend
+// past MAX_COPY_DEPTH.
+//
+// Only the Windows copy-fallback calls this, but — like the containment guard —
+// it is NOT `cfg(windows)`, so its backstop is exercised by a normal `cargo test`
+// on unix instead of being a bound nobody ever runs.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_dir_recursive(src: &Path, dst: &Path, depth: u32) -> Result<()> {
+    // `>=`, not `>`: `depth` is 0-based, so `depth == MAX_COPY_DEPTH` is already
+    // the 65th level. The doc says 64 and the code must mean 64.
+    if depth >= MAX_COPY_DEPTH {
+        return Err(ClwError::InvalidManifest(format!(
+            "symlink copy-fallback exceeded the maximum directory depth of \
+             {MAX_COPY_DEPTH} while copying {}; refusing to descend further",
+            src.display()
+        )));
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            copy_dir_recursive(&from, &to, depth + 1)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -1779,6 +1846,262 @@ mod tests {
             data,
             "the copy carries the target's bytes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7c (M17): the SELF-REFERENTIAL symlink `d/up -> ..`.
+    //
+    // The manifest is VALID (validate_symlink_target_contained accepts it: the
+    // `..` resolves to the workspace root, well inside the tree) and it stays
+    // valid — the unix half below hydrates it into a real symlink. Only the
+    // Windows COPY fallback has to refuse it, because copying the link's own
+    // ancestor into the link recurses until MAX_PATH.
+    // -----------------------------------------------------------------------
+
+    /// The three self-referential shapes, as (name, file entry, link, target).
+    ///
+    /// All three are ACCEPTED by `validate_symlink_target_contained` — verified,
+    /// and asserted below — so all three are reachable from a real manifest:
+    ///
+    /// * `plain`   — the base M17 case, `d/up -> ..`.
+    /// * `trailing`— BLOCKER 1: Win32 strips a trailing SPACE, so `.. ` IS `..`.
+    /// * `unicode` — BLOCKER 2: NTFS folds `Ä`/`ä` to one directory.
+    ///
+    /// The last two were let through by the first version of this guard.
+    const SELF_REF_SHAPES: &[(&str, &str, &str, &str)] = &[
+        ("plain", "d/f.txt", "d/up", ".."),
+        ("trailing-space", "d/sub/f.txt", "d/sub/up", ".. "),
+        ("unicode-case", "Ä/sub/f.txt", "Ä/sub/up", "../../ä/sub"),
+    ];
+
+    fn self_referential_symlink_fixture(
+        file_path: &str,
+        link: &str,
+        target: &str,
+    ) -> (Manifest, Digest, Vec<u8>) {
+        let data = b"payload";
+        let (d, bytes) = make_chunk(data);
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: data.len() as u64,
+            entries: vec![
+                Entry::File {
+                    path: file_path.into(),
+                    mode: 0o644,
+                    size: data.len() as u64,
+                    chunks: vec![ChunkRef {
+                        digest: d,
+                        size: data.len() as u64,
+                    }],
+                },
+                Entry::Symlink {
+                    path: link.into(),
+                    target: target.into(),
+                },
+            ],
+        };
+        (manifest, d, bytes)
+    }
+
+    /// Every shape the Windows materializer refuses is a VALID manifest. If this
+    /// ever fails, the rejection has leaked into the format and the invariant
+    /// ("no manifest valid on unix becomes invalid") is broken.
+    #[test]
+    fn every_self_referential_shape_is_a_valid_manifest() {
+        for (name, _file, link, target) in SELF_REF_SHAPES {
+            clw_types::validate_rel_path(link)
+                .unwrap_or_else(|e| panic!("{name}: link {link:?} must be a valid path: {e}"));
+            clw_types::validate_symlink_target_contained(link, target).unwrap_or_else(|e| {
+                panic!("{name}: {link:?} -> {target:?} must be a VALID manifest entry: {e}")
+            });
+        }
+    }
+
+    /// The materializer's ACTUAL decision, for all three shapes, on a real tree —
+    /// runnable on unix, where the `cfg(windows)` materializer itself is not.
+    ///
+    /// This drives the same two functions the materializer calls, in the same
+    /// order, on the same paths (`resolve_symlink_target` is shared code, not a
+    /// re-derivation), so a `true` here is precisely the refusal Windows makes.
+    ///
+    /// `Ok(true)` is asserted deliberately rather than "refuses somehow": the
+    /// fail-closed path would ALSO refuse the trailing-space shape on unix (the
+    /// literal directory `.. ` does not exist here), which would mask a
+    /// regression in the lexical layer. Demanding a positive DETECTION keeps
+    /// every row red-on-revert.
+    ///
+    /// What this does NOT prove: on unix the `true` comes from layer 1, our model
+    /// of Win32 folding. Layer 2 confirms it independently only on a real NTFS,
+    /// where `canonicalize` resolves `.. ` and `Ä` for us.
+    #[test]
+    fn materializer_decision_refuses_every_self_referential_shape() {
+        for (name, file, link_path, target) in SELF_REF_SHAPES {
+            let td = TempDir::new().unwrap();
+            let dest = td.path();
+            // Materialise the tree the file pass would have created (pass 3a runs
+            // before symlinks — M1.7), so the target really exists.
+            let file_parent = std::path::Path::new(file).parent().unwrap();
+            std::fs::create_dir_all(dest.join(file_parent)).unwrap();
+            std::fs::write(dest.join(file), b"payload").unwrap();
+
+            let link = dest.join(link_path);
+            let resolved = path_containment::resolve_symlink_target(dest, target, &link);
+
+            assert_eq!(
+                path_containment::copy_would_recurse(&resolved, &link).ok(),
+                Some(true),
+                "{name}: {link_path} -> {target:?} must be DETECTED as self-referential \
+                 (resolved={resolved:?}, link={link:?})"
+            );
+        }
+    }
+
+    /// The mirror image: the ordinary shapes the guard must let through, driven
+    /// the same way. Without this, "reject everything" would pass the test above.
+    #[test]
+    fn materializer_decision_allows_ordinary_directory_links() {
+        // (name, dirs to create, link, target)
+        let ok_shapes: &[(&str, &str, &str, &str)] = &[
+            ("sibling-dir", "src/x", "bin/link", "../src"),
+            ("nested-dir", "a/b/c", "a/link", "b/c"),
+            ("unicode-sibling", "ä/x", "Ö/link", "../ä"),
+        ];
+        for (name, dir, link_path, target) in ok_shapes {
+            let td = TempDir::new().unwrap();
+            let dest = td.path();
+            std::fs::create_dir_all(dest.join(dir)).unwrap();
+            let link = dest.join(link_path);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+
+            let resolved = path_containment::resolve_symlink_target(dest, target, &link);
+            assert_eq!(
+                path_containment::copy_would_recurse(&resolved, &link).ok(),
+                Some(false),
+                "{name}: {link_path} -> {target:?} is an ordinary copy and must be ALLOWED"
+            );
+        }
+    }
+
+    /// The FAIL-SAFE BACKSTOP: even if the containment guard were bypassed
+    /// entirely, the copy cannot run away — it stops at MAX_COPY_DEPTH with a
+    /// clean error instead of marching into MAX_PATH.
+    ///
+    /// This is the second oracle. A single lexical/canonical check over untrusted
+    /// input is not enough, and it is a TOCTOU snapshot besides; without a bound,
+    /// any miss is unbounded rather than merely wrong.
+    #[test]
+    fn copy_dir_recursive_is_depth_bounded() {
+        let td = TempDir::new().unwrap();
+
+        // Build a chain of `levels` nested directories under a fresh src, and
+        // return the copy's result. Pins the BOUNDARY, so an off-by-one in the
+        // cap check (`>` vs `>=`) cannot slip back in.
+        let attempt = |name: &str, levels: u32| -> Result<()> {
+            let src = td.path().join(name);
+            let mut deep = src.clone();
+            for i in 0..levels {
+                deep = deep.join(format!("l{i}"));
+            }
+            std::fs::create_dir_all(&deep).unwrap();
+            copy_dir_recursive(&src, &td.path().join(format!("{name}-dst")), 0)
+        };
+
+        // Exactly at the cap: allowed.
+        attempt("at-cap", MAX_COPY_DEPTH - 1).expect("a tree at the depth cap must still copy");
+
+        // One level past it: refused, cleanly.
+        let err = attempt("over-cap", MAX_COPY_DEPTH)
+            .expect_err("a tree deeper than the cap must be refused");
+        assert!(
+            matches!(err, ClwError::InvalidManifest(ref m) if m.contains("maximum directory depth")),
+            "expected the depth-cap refusal, got: {err}"
+        );
+
+        // Far past it: still refused, not a stack overflow.
+        assert!(attempt("way-over", MAX_COPY_DEPTH + 8).is_err());
+
+        // A tree within the cap still copies normally.
+        let shallow_src = td.path().join("ok-src");
+        std::fs::create_dir_all(shallow_src.join("a/b/c")).unwrap();
+        std::fs::write(shallow_src.join("a/b/c/f.txt"), b"hello").unwrap();
+        let shallow_dst = td.path().join("ok-dst");
+        copy_dir_recursive(&shallow_src, &shallow_dst, 0).unwrap();
+        assert_eq!(
+            std::fs::read(shallow_dst.join("a/b/c/f.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    /// INVARIANT: no manifest that is valid on unix becomes invalid. All three
+    /// shapes are legitimate relative intra-workspace links and still hydrate
+    /// here, as real symlinks with their target preserved verbatim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn self_referential_symlinks_still_hydrate_on_unix() {
+        for (name, file, link_path, target) in SELF_REF_SHAPES {
+            let (manifest, d, bytes) = self_referential_symlink_fixture(file, link_path, target);
+            let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+            let dest_dir = TempDir::new().unwrap();
+            let dest = dest_dir.path().join("out");
+            hydrate(&dest, &store, &cache, &HydrateOptions::new("test-ws"))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: must still hydrate on unix: {e}"));
+            let link = dest.join(link_path);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}: still a real symlink on unix"
+            );
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                std::path::Path::new(target),
+                "{name}: target preserved verbatim"
+            );
+        }
+    }
+
+    /// Windows counterpart: the copy-fallback REJECTS all three with a clear
+    /// error instead of recursing, and leaves no runaway tree behind.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn self_referential_symlinks_rejected_on_windows() {
+        // Sum of every file under `p` — an unbounded copy shows up here.
+        fn tree_bytes(p: &std::path::Path) -> u64 {
+            let mut total = 0;
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    match e.file_type() {
+                        Ok(t) if t.is_dir() => total += tree_bytes(&e.path()),
+                        _ => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                    }
+                }
+            }
+            total
+        }
+
+        for (name, file, link_path, target) in SELF_REF_SHAPES {
+            let (manifest, d, bytes) = self_referential_symlink_fixture(file, link_path, target);
+            let (store, _cache_dir, cache) = setup_store(&manifest, &[(d, bytes)]);
+            let dest_dir = TempDir::new().unwrap();
+            let dest = dest_dir.path().join("out");
+            let err = hydrate(&dest, &store, &cache, &HydrateOptions::new("test-ws"))
+                .await
+                .unwrap_err();
+            // Either the containment guard fired, or it could not be proven safe
+            // and we failed CLOSED. Both are refusals; neither is a copy.
+            assert!(
+                matches!(err, ClwError::InvalidManifest(ref m)
+                    if m.contains("contains the link itself")
+                        || m.contains("cannot verify")),
+                "{name}: expected an M17 refusal, got: {err}"
+            );
+            assert!(
+                tree_bytes(&dest) < 1024 * 1024,
+                "{name}: the aborted hydrate must not have copied a runaway tree"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
