@@ -38,6 +38,22 @@
   cross-platform release rework.
 
 ### Fixed
+- **The local cache's eviction is now an approximate LRU instead of FIFO (audit M22).** `gc` sorts
+  candidates oldest-`mtime`-first and the docs promised "LRU(mtime)", but nothing ever refreshed
+  an `mtime`: `get` read the blob without touching it and a `put` of an already-present blob
+  returned early as a silent no-op, so a blob's mtime was permanently its FIRST-WRITE time. That
+  inverted the intent — the hottest blobs (fetched earliest in a hydrate, then read on every run)
+  were the first evicted whenever the budget tightened, producing perpetual thrash of exactly the
+  working set the cache exists to hold. A `get` HIT and a repeat `put` now stamp the blob's mtime
+  to now via `std::fs::File::set_modified` (no new dependency). The refresh is strictly
+  best-effort: every failure is swallowed, so a read-only mount, a foreign-owned blob in a shared
+  cache, or a timestamp-less filesystem costs recency credit but can never turn a cache hit into
+  an error. The stamp is **amortised** — a blob refreshed within the last 60s is skipped — because
+  an unconditional `open(O_WRONLY)`+`futimens` measured at **+125% to +233%** over the bare
+  read+BLAKE3-rehash a `get` already pays, whereas the amortised form (a `stat`, and the write-mode
+  open only when genuinely stale) measured at **+7% to +64%**. The 60s resolution is why the policy
+  is documented as *approximate* LRU: two blobs used within the same minute may evict in either
+  order — a rounding error next to the FIFO it replaces.
 - **`clw ls --all` no longer mislabels native ActionCache values as "corrupt ref records."**
   A tenant's AC keyspace is shared three ways: workspace refs, `clw run` memo records, and raw
   native/Bazel ActionCache values (arbitrary non-JSON bytes). `list_refs` enumerates the whole

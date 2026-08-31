@@ -19,6 +19,24 @@
 //! requested [`Digest`] (disk corruption, partial write, etc.) the corrupt file is
 //! removed and `Ok(None)` is returned so the caller can fetch the blob from the remote.
 //!
+//! # Recency (mtime) and eviction — APPROXIMATE LRU
+//! [`LocalCache::gc`] evicts oldest-`mtime`-first, so `mtime` is the cache's
+//! recency signal. Both hit paths therefore **refresh** it: a [`LocalCache::get`]
+//! hit and a [`LocalCache::put`] of an already-present blob stamp the blob's mtime
+//! to "now". Without that refresh the mtime would be frozen at the time of FIRST
+//! WRITE and the policy would be FIFO, not LRU — evicting the hottest blobs
+//! (fetched earliest, used constantly) first and thrashing the very working set the
+//! cache exists to hold.
+//!
+//! Two deliberate weakenings, both stated so nothing here claims more than it does:
+//! * **Approximate.** The stamp is amortised — a blob already refreshed within
+//!   [`MTIME_REFRESH_INTERVAL`] is skipped (see [`touch_mtime_if_stale`]), because an
+//!   unconditional stamp costs about as much as the read it accompanies. So recency
+//!   is resolved to 60s: two blobs used inside the same minute may evict in either
+//!   order. It is `approximate LRU`, not exact LRU.
+//! * **Best-effort.** A failure to stamp NEVER turns a cache hit into an error; it
+//!   only costs that blob some recency credit.
+//!
 //! # Format versioning
 //! The cache root carries a version sentinel file ([`VERSION_FILE`]) holding the
 //! integer [`CACHE_FORMAT_VERSION`].  On [`LocalCache::new`] the sentinel is checked:
@@ -50,8 +68,11 @@ const VERSION_FILE: &str = ".clw-cache-version";
 /// is comfortably larger than any single workspace snapshot we expect (so eviction
 /// never thrashes a legitimate working set) yet bounds the steady-state footprint a
 /// long-lived developer machine accumulates. It is an LRU(mtime)-down-to-budget
-/// target, not a hard write rejection: a single hydrate/snapshot larger than this
-/// still completes; we just evict the coldest blobs back under budget afterward.
+/// target — an approximate LRU, because a cache HIT refreshes the blob's mtime (see
+/// [`touch_mtime_if_stale`]) rather than leaving it at the write time, to a 60s
+/// resolution. It is a target, not a hard write rejection: a single hydrate/snapshot
+/// larger than this still completes; we just evict the coldest blobs back under
+/// budget afterward.
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 /// Name of the environment knob that overrides [`DEFAULT_CACHE_BUDGET_BYTES`].
@@ -275,6 +296,13 @@ impl LocalCache {
         self.root.join("blobs").join(&hex[..2]).join(&hex)
     }
 
+    /// Refresh a blob's recency (mtime) after a cache HIT, amortised: a blob stamped
+    /// within the last [`MTIME_REFRESH_INTERVAL`] is left alone. See
+    /// [`touch_mtime_if_stale`].
+    fn touch(&self, path: &Path) {
+        touch_mtime_if_stale(path);
+    }
+
     fn shard_dir(&self, d: &Digest) -> PathBuf {
         let hex = d.to_hex();
         self.root.join("blobs").join(&hex[..2])
@@ -294,6 +322,11 @@ impl LocalCache {
     /// Returns `Ok(None)` when not cached.  If the file exists but its content
     /// does not hash to `d` (corruption), the file is removed and `Ok(None)` is
     /// returned (self-healing).
+    ///
+    /// A HIT refreshes the blob's mtime so [`gc`](Self::gc)'s oldest-first eviction
+    /// is an approximate LRU rather than FIFO (see the crate-level "Recency"
+    /// section). The refresh is amortised to [`MTIME_REFRESH_INTERVAL`] and is
+    /// best-effort — it can never fail the read.
     pub fn get(&self, d: &Digest) -> Result<Option<Vec<u8>>> {
         let path = self.blob_path(d);
         let bytes = match fs::read(&path) {
@@ -309,17 +342,28 @@ impl LocalCache {
             return Ok(None);
         }
 
+        // Verified HIT ⇒ stamp recency. Best-effort: `touch` swallows every error,
+        // so a read-only mount / foreign-owned blob / exotic fs still returns the
+        // bytes. (Deliberately AFTER verification: a corrupt blob is removed above
+        // and must never be credited with recency.)
+        self.touch(&path);
+
         Ok(Some(bytes))
     }
 
     /// Store `bytes` under digest `d`.
     ///
     /// Idempotent: if the blob is already present (same digest ⇒ same content),
-    /// this is a no-op.  Writes atomically via temp-file + rename within the
+    /// the content write is skipped — but the blob's mtime is still refreshed, since
+    /// re-putting a blob is a use of it and must not leave it looking cold to
+    /// [`gc`](Self::gc). Writes atomically via temp-file + rename within the
     /// same shard directory.
     pub fn put(&self, d: &Digest, bytes: &[u8]) -> Result<()> {
         let dest = self.blob_path(d);
         if dest.exists() {
+            // Already-present: no content write, but this IS a use — stamp recency
+            // (amortised + best-effort; never fails the put).
+            self.touch(&dest);
             return Ok(());
         }
 
@@ -519,6 +563,70 @@ fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
     // Name the dir on this (astronomically unlikely) retries-exhausted path too,
     // so every tempfile_in exit is diagnosable — preserves the AlreadyExists kind.
     Err(io_ctx("put: create temp (retries exhausted)", dir, e))
+}
+
+/// Recency granularity: a blob whose mtime is already newer than this is NOT
+/// re-stamped on a hit.
+///
+/// This is the amortisation that keeps the hit path cheap. Stamping unconditionally
+/// costs an `open(O_WRONLY)` + `futimens` on EVERY hit, which measured at roughly the
+/// cost of the whole read+BLAKE3-rehash a `get` already pays (a ~2x hit-path
+/// regression on macOS/APFS, where the write-mode `open` dominates). Checking first
+/// costs only a `stat`, which measured one to two orders of magnitude cheaper than
+/// that `open` (~12us vs ~644us per file on APFS), and in steady
+/// state (a blob read many times inside one hydrate/run) the stamp is skipped
+/// entirely. The price is that recency is tracked to a 60s granularity — two blobs
+/// used within the same minute may evict in either order — which is why the policy
+/// is documented as **approximate** LRU. 60s is far finer than the timescale on
+/// which an 8 GiB budget actually evicts, and infinitely finer than the FIFO it
+/// replaces.
+const MTIME_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Stamp `path`'s mtime to *now* **iff** it is older than [`MTIME_REFRESH_INTERVAL`]
+/// — the amortised form of [`touch_mtime`] used on the hit path.
+///
+/// The `stat` is best-effort in both directions: if it fails, or the timestamp is in
+/// the future (clock skew / a restored file), we fall through to the unconditional
+/// stamp, which pulls the blob back onto a sane "now".
+fn touch_mtime_if_stale(path: &Path) {
+    let already_fresh = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        // `duration_since` errors when the mtime is in the FUTURE (clock skew, a
+        // restored file); that is not "fresh", so it falls through to the stamp.
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age < MTIME_REFRESH_INTERVAL);
+    if already_fresh {
+        return; // skip the write-mode open entirely — this is the amortisation
+    }
+    touch_mtime(path);
+}
+
+/// Stamp `path`'s mtime to *now* — the cache's recency signal for
+/// [`LocalCache::gc`]'s oldest-first eviction.
+///
+/// # Why this exists
+/// `gc` sorts by mtime, but nothing else in the cache ever writes a blob twice
+/// (`get` only reads; a repeat `put` skips the content write), so without this the
+/// mtime would be frozen at first-write time and eviction would be FIFO — throwing
+/// out the hottest blobs first.
+///
+/// # Best-effort by construction
+/// Every failure is swallowed. The blob is already read/committed at the call site;
+/// losing a timestamp update only costs that blob some recency credit, whereas
+/// propagating the error would turn a perfectly good cache HIT into a hard failure.
+/// Real cases that fail here: a read-only mount, a blob owned by another uid in a
+/// shared cache, a filesystem without settable timestamps, or a concurrent evictor
+/// removing the blob between our read and this call.
+///
+/// Uses `std::fs::File::set_modified` (stable since 1.75) deliberately — the
+/// `filetime` crate stays a DEV-dependency only, so this adds no runtime
+/// supply-chain surface. The handle is opened `write(true)` (no truncate, no
+/// create) because POSIX `futimens` with explicit times needs write access.
+fn touch_mtime(path: &Path) {
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Attach the failing operation + path to an io error while preserving its
@@ -811,6 +919,192 @@ mod tests {
 
         // Suppress unused variable warning.
         let _ = base;
+    }
+
+    // -----------------------------------------------------------------------
+    // M22 (LRU, not FIFO): the recency helpers.
+    //
+    // FLAKINESS NOTE: `entries.sort_by_key` is STABLE, so blobs sharing an mtime
+    // tie-break on directory-walk order across the 256 shards — arbitrary. On a
+    // coarse-granularity fs (HFS+ 1s, some overlays, NFS) a tight write loop hands
+    // several blobs the SAME mtime and any "which one got evicted" assertion becomes
+    // a coin flip. So these tests NEVER rely on write order or on the clock: every
+    // mtime is set EXPLICITLY, 60s apart, via `filetime::set_file_mtime` (a
+    // dev-dependency; production code uses `File::set_modified`).
+    // -----------------------------------------------------------------------
+
+    /// Seed `n` distinct 10-byte blobs with mtimes 60s apart, oldest first.
+    /// Returns the digests in age order (index 0 = oldest).
+    fn seed_aged_blobs(cache: &LocalCache, n: usize) -> Vec<Digest> {
+        const BASE_UNIX: i64 = 1_600_000_000; // 2020-09-13, safely in the past
+        let mut digests = Vec::with_capacity(n);
+        for i in 0..n {
+            let data = format!("aged-blob-{i:03}").into_bytes();
+            assert_eq!(data.len(), 13, "payloads must be uniform for the size math");
+            let d = Digest::of_bytes(&data);
+            cache.put(&d, &data).unwrap();
+            // 60s spacing dwarfs any filesystem timestamp granularity.
+            let ft = FileTime::from_unix_time(BASE_UNIX + 60 * i as i64, 0);
+            set_file_mtime(cache.blob_path(&d), ft).unwrap();
+            digests.push(d);
+        }
+        digests
+    }
+
+    fn mtime_of(cache: &LocalCache, d: &Digest) -> std::time::SystemTime {
+        fs::metadata(cache.blob_path(d))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    #[test]
+    fn get_refreshes_mtime_so_eviction_is_lru_not_fifo() {
+        // The M22 regression: `get` used to read without touching the file, so mtime
+        // stayed the FIRST-WRITE time and eviction was FIFO — the hottest blob (the
+        // one fetched earliest and read constantly) was evicted FIRST. Here the
+        // oldest blob is the one being USED; after a `get` it must be the SAFEST.
+        let (_dir, cache) = make_cache();
+        let digests = seed_aged_blobs(&cache, 3); // 13 bytes each → 39 total
+
+        let before = mtime_of(&cache, &digests[0]);
+
+        // USE the oldest blob.
+        let got = cache.get(&digests[0]).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(b"aged-blob-000".as_slice()),
+            "the get itself must still return the bytes"
+        );
+
+        // Proof the bump actually happened (not survival for some unrelated reason).
+        let after = mtime_of(&cache, &digests[0]);
+        assert!(
+            after > before,
+            "get() on a HIT must strictly advance the blob's mtime: {before:?} -> {after:?}"
+        );
+
+        // 39 bytes total, cap at 30 → gc must free exactly one 13-byte blob.
+        let freed = cache.gc(30).unwrap();
+        assert_eq!(freed, 13, "gc should free exactly one blob");
+
+        // LRU: the ACCESSED blob survives; the next-oldest (untouched) is evicted.
+        assert!(
+            cache.has(&digests[0]),
+            "the recently-read blob must SURVIVE (FIFO would have evicted it)"
+        );
+        assert!(
+            !cache.has(&digests[1]),
+            "the next-oldest, unaccessed blob must be the one evicted"
+        );
+        assert!(cache.has(&digests[2]), "the newest blob must survive");
+    }
+
+    #[test]
+    fn put_of_present_blob_refreshes_mtime() {
+        // Symmetric case: a repeat `put` skips the content write (idempotent), but it
+        // is still a USE — it must not leave the blob looking cold to gc.
+        let (_dir, cache) = make_cache();
+        let digests = seed_aged_blobs(&cache, 3);
+
+        let before = mtime_of(&cache, &digests[0]);
+
+        // Re-put the oldest blob with identical bytes (the early-return path).
+        cache.put(&digests[0], b"aged-blob-000").unwrap();
+
+        let after = mtime_of(&cache, &digests[0]);
+        assert!(
+            after > before,
+            "put() of an already-present blob must strictly advance its mtime: \
+             {before:?} -> {after:?}"
+        );
+
+        // And it drives the same LRU outcome as a get.
+        let freed = cache.gc(30).unwrap();
+        assert_eq!(freed, 13);
+        assert!(cache.has(&digests[0]), "the re-put blob must survive");
+        assert!(!cache.has(&digests[1]), "the next-oldest must be evicted");
+        assert!(cache.has(&digests[2]));
+    }
+
+    #[test]
+    fn mtime_refresh_is_amortised_within_the_interval() {
+        // The stamp is APPROXIMATE LRU by design: a blob refreshed inside
+        // MTIME_REFRESH_INTERVAL is left alone, so the hot path pays a `stat` instead
+        // of an `open(O_WRONLY)`+`futimens` on every single hit. This pins that
+        // contract in both directions — stale blob bumps, fresh blob does not — so a
+        // future change to the interval cannot silently make the docs a lie.
+        let (_dir, cache) = make_cache();
+        let data = b"amortised";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+
+        // 1) Force STALE (an hour old, ≫ the 60s interval) → the hit must bump.
+        let stale = FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 3600,
+            0,
+        );
+        set_file_mtime(cache.blob_path(&d), stale).unwrap();
+        let before = mtime_of(&cache, &d);
+        cache.get(&d).unwrap().unwrap();
+        let after_stale = mtime_of(&cache, &d);
+        assert!(
+            after_stale > before,
+            "a stale blob must be re-stamped on a hit: {before:?} -> {after_stale:?}"
+        );
+
+        // 2) Now it is FRESH (just stamped) → further hits must NOT re-stamp.
+        for _ in 0..3 {
+            cache.get(&d).unwrap().unwrap();
+            cache.put(&d, data).unwrap();
+        }
+        assert_eq!(
+            mtime_of(&cache, &d),
+            after_stale,
+            "a blob stamped within MTIME_REFRESH_INTERVAL must not be re-stamped \
+             (this is the hot-path amortisation)"
+        );
+    }
+
+    #[test]
+    fn touch_mtime_never_fails_on_a_missing_path() {
+        // The helper is best-effort by contract: it must be a silent no-op for any
+        // path it cannot stamp (missing file, read-only mount, foreign-owned blob),
+        // because a cache HIT must never degrade into an error.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("definitely-not-here");
+        touch_mtime(&missing);
+
+        // And a `get` of a blob whose mtime cannot be advanced still returns bytes.
+        let cache = LocalCache::new(dir.path()).unwrap();
+        let data = b"still readable";
+        let d = Digest::of_bytes(data);
+        cache.put(&d, data).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // 0400: no write bit → the write(true) open inside touch_mtime fails.
+            fs::set_permissions(cache.blob_path(&d), fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        assert_eq!(
+            cache.get(&d).unwrap().as_deref(),
+            Some(data.as_slice()),
+            "a failed mtime refresh must NEVER turn a cache hit into an error"
+        );
+        // LOAD-BEARING: the stamp must never CREATE. `touch_mtime` opens with
+        // `.write(true)` and deliberately NOT `.create(true)`, which is the only
+        // reason a stamp racing `gc`'s unlink cannot resurrect an evicted blob as
+        // a zero-byte file named after a digest. A future "fix" that adds
+        // `.create(true)` to silence the swallowed ENOENT would keep every other
+        // assertion here green, so pin it explicitly.
+        assert!(
+            !missing.exists(),
+            "touch_mtime must never create the path — that would resurrect an evicted blob"
+        );
     }
 
     // -----------------------------------------------------------------------

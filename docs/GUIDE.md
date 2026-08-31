@@ -533,7 +533,7 @@ to split the workspace / trim inputs, not to reconfigure clw.)
 
 | Bound | Value | Effect when reached |
 |---|---|---|
-| **Local cache GC budget** | **8 GiB** (default) | The `~/.clw/cache` self-evicts (LRU by mtime, checked once per 256 writes) back under this ceiling. **Overridable via `CLW_CACHE_BUDGET_BYTES`** (raw byte count) — raise it for a working set larger than 8 GiB so warm blobs aren't evicted, or lower it on a disk-tight machine. It's a cache (a miss just re-fetches), never data loss. |
+| **Local cache GC budget** | **8 GiB** (default) | The `~/.clw/cache` self-evicts (approximate LRU by mtime — a cache hit refreshes the blob's mtime, so "least recently *used*" is what it means, resolved to 60s; checked once per 256 writes) back under this ceiling. **Overridable via `CLW_CACHE_BUDGET_BYTES`** (raw byte count) — raise it for a working set larger than 8 GiB so warm blobs aren't evicted, or lower it on a disk-tight machine. It's a cache (a miss just re-fetches), never data loss.  Note the recency resolution (60s) is calibrated for **this default**: lower the budget far enough that eviction happens on a sub-minute timescale and the 60s granularity swallows the recency signal, degrading the policy back toward FIFO. |
 | CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB (`CAS_BLOB_CAP_BYTES`). A manifest is one blob → a very large tree (path-length dependent) fails up-front with "too many entries". `clw run` SIGKILLs a child exceeding 5 MiB on stdout *or* stderr → exit 137. |
 | Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time); a file that grows past 16 MiB *between* the directory walk and the read is rejected (not silently slurped). |
 | Hydrate resource caps | ≤ **1M** entries · **100k** symlinks · **1 TiB** total · **64M** total chunks · **16M** chunks/file | A manifest exceeding any of these aborts the hydrate before writing (anti-OOM / anti-disk-fill / anti-symlink-bomb), budgeted against the *real* summed sizes, not the attacker-declared `total_size`. |
@@ -720,8 +720,12 @@ mechanism behind a row above (or the fine-grained guarantees the table doesn't s
 - **Warm content-addressed cache** (`~/.clw/cache`) — a sharded (256-way) L1 store; a hydrate serves chunks
   locally on later runs (`bytes_from_cache`).
 - **Self-healing** — every `get` re-hashes; a corrupt blob is removed and treated as a miss.
-- **GC-to-budget** — an 8 GiB default budget (override with `CLW_CACHE_BUDGET_BYTES`), LRU(mtime) eviction,
-  checked once per 256 writes so `put` stays cheap; in-flight `.tmp-*` files are excluded from the budget.
+- **GC-to-budget** — an 8 GiB default budget (override with `CLW_CACHE_BUDGET_BYTES`), **approximate**
+  LRU(mtime) eviction (a cache hit — a `get`, or a re-`put` of a blob already present — stamps the blob's
+  mtime, so eviction drops the least recently *used* blob and not merely the oldest *written* one; the stamp
+  is best-effort and amortised to a 60s resolution, so two blobs used within the same minute may evict in
+  either order), checked once per 256 writes so `put` stays cheap; in-flight `.tmp-*` files are excluded from
+  the budget.
 - **Cache-format versioning** — a sentinel invalidates content safely on an upgrade (never a stale replay).
 - **Owner-only perms + cross-process safety** — cache tree 0700, blob files 0600; atomic writes; concurrent
   processes don't clobber each other's in-flight puts.
