@@ -25,6 +25,15 @@ on:
     - cron: "17 6 * * 1"
   workflow_dispatch:
 
+# Minimum scope. Declaring ANY block resets every unnamed scope to `none`, so this
+# narrows GITHUB_TOKEN from the repository default (read on every scope) to read on
+# `contents` alone — the floor required by actions/checkout@v4. The single job
+# authenticates to PROD with service PATs (CLW_CI_* / CLW_PROBE_*), never with
+# GITHUB_TOKEN: no `gh` call, no artifact, no check write, no PR comment. Nothing to
+# elevate. A future job that needs more elevates on ITSELF, with a justification.
+permissions:
+  contents: read
+
 concurrency:
   group: live-journeys
   cancel-in-progress: false

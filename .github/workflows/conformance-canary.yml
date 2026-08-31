@@ -26,6 +26,17 @@ on:
   # Manual trigger for on-demand validation.
   workflow_dispatch:
 
+# Minimum scope. Declaring ANY block resets every unnamed scope to `none`, so this
+# narrows GITHUB_TOKEN from the repository default (read on every scope) to read on
+# `contents` alone — the floor required by actions/checkout@v4. The single job here
+# authenticates to PROD with a service PAT (CLW_CI_*), NOT with GITHUB_TOKEN: it
+# makes no `gh` call, uploads no artifact, writes no check. So no elevation is
+# granted. Note for the reader: canary-deadman.yml, which WATCHES this workflow's
+# run history via `gh run list`, is the lane that needs `actions: read` — that
+# permission belongs there, not here.
+permissions:
+  contents: read
+
 # Never run two canaries at once.
 concurrency:
   group: conformance-canary

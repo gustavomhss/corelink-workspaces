@@ -49,6 +49,70 @@ if [ -n "$dead_org_hits" ]; then
 fi
 echo "dead-org-slug guard: clean (org = HuGR-Labs)"
 
+# --- WORKFLOW-PERMISSIONS GUARD (runs in EVERY lane, including docs-only) -----
+# Every workflow must DECLARE a top-level `permissions:` block. A workflow that
+# declares nothing inherits the repository default, which is an ambient,
+# out-of-band setting a repo admin can widen at any time without touching this
+# repo — so "the default happens to be read today" is not an invariant, it is a
+# coincidence. Declaring the block in-tree pins the token scope to the file, where
+# it is reviewable in a diff, and (because declaring ANY block resets every
+# undeclared scope to `none`) narrows the token from "read on every scope" to
+# exactly the scopes the workflow names.
+#
+# The assertion is about PRESENCE, not value: a lane that legitimately needs a
+# different top-level scope (canary-deadman.yml needs `actions: read` to read
+# other workflows' run history) declares that instead — the point is that the
+# scope is written down, per job where possible, with a justification.
+#
+# EXEMPT (temporary, named — never a wildcard): release.yml is owned by an
+# in-flight work package (WP-08b) that adds its permissions block; editing it
+# here would collide. When WP-08b lands, this list must go back to empty — the
+# retirement notice below says so out loud.
+workflow_perms_exempt='release.yml'
+missing_perms=""
+overbroad_perms=""
+# BOTH extensions. GitHub runs `.yml` and `.yaml` alike; globbing only `*.yml`
+# let a permissions-less `evil.yaml` sit in the directory with this gate green —
+# found in review, and it defeated the one invariant this guard exists to create.
+# The `[ -e ]` guard is because an unmatched glob stays literal here.
+for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+  [ -e "$wf" ] || continue
+  case " $workflow_perms_exempt " in *" $(basename "$wf") "*) continue ;; esac
+  grep -q '^permissions:' "$wf" || missing_perms="${missing_perms}${wf}"$'\n'
+  # PRESENCE is the assertion, with one exception: `write-all` is strictly worse
+  # than the read-all default this guard exists to stop relying on, so blessing it
+  # would make declaring a block a downgrade. A lane needing write says which
+  # scope, per job.
+  grep -qE '^permissions:[[:space:]]*write-all[[:space:]]*$' "$wf" \
+    && overbroad_perms="${overbroad_perms}${wf}"$'\n'
+done
+if [ -n "$missing_perms" ]; then
+  echo "GATE FAILED: workflow(s) without a top-level 'permissions:' block —" >&2
+  echo "the GITHUB_TOKEN scope must be declared in-tree, not inherited from the repo default:" >&2
+  printf '%s' "$missing_perms" >&2
+  exit 1
+fi
+if [ -n "$overbroad_perms" ]; then
+  echo "GATE FAILED: workflow(s) declare 'permissions: write-all' —" >&2
+  echo "that is wider than the repository's read-all default, so declaring it is a" >&2
+  echo "downgrade. Name the scopes the workflow needs, per job:" >&2
+  printf '%s' "$overbroad_perms" >&2
+  exit 1
+fi
+# Self-retiring nudge. NON-fatal, but not for the reason first written here: the
+# claim was that a fatal notice would turn WP-08b red on the run that fixes it,
+# which is wrong — WP-08b deletes this exemption in the same commit that adds
+# release.yml's block, so a fatal notice would be atomically green. It is
+# non-fatal because a gate that fails on someone else's correct change, purely to
+# chase a stale list, trains people to ignore it. The follow-up is tracked in the
+# work package, not by this line.
+for wf in $workflow_perms_exempt; do
+  if [ -f ".github/workflows/$wf" ] && grep -q '^permissions:' ".github/workflows/$wf"; then
+    echo "NOTE: .github/workflows/$wf now declares 'permissions:' — remove it from workflow_perms_exempt in scripts/gates.sh"
+  fi
+done
+echo "workflow-permissions guard: clean (all workflows declare 'permissions:'; exempt: ${workflow_perms_exempt})"
+
 SCOPE="full"
 if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
   base_ref="${GITHUB_BASE_REF:-main}"

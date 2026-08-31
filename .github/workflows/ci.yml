@@ -10,6 +10,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Minimum scope for the whole workflow. Declaring ANY block resets every scope the
+# block does not name to `none`, so this narrows GITHUB_TOKEN from the repository
+# default (read on every scope) to read on `contents` alone. `contents: read` is the
+# floor because every job here runs actions/checkout@v4, which clones via the token.
+# No job in this workflow calls `gh`, uploads/downloads artifacts, writes a check,
+# or comments on a PR — so nothing needs an elevation, and none is granted. A job
+# that later needs more must elevate LOCALLY (a `permissions:` block on that job)
+# with a written justification, never by widening this one.
+permissions:
+  contents: read
+
 env:
   CARGO_BUILD_JOBS: "4"
   CARGO_TERM_COLOR: always

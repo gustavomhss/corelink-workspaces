@@ -40,6 +40,20 @@ on:
   # this is the on-demand "give me a fresh per-step evidence report" button.
   workflow_dispatch:
 
+# Minimum scope. Declaring ANY block resets every unnamed scope to `none`, so this
+# narrows GITHUB_TOKEN from the repository default (read on every scope) to read on
+# `contents` alone — the floor required by actions/checkout@v4. The job talks to PROD
+# with the per-persona service PATs (CLW_CI_*), not with GITHUB_TOKEN, and makes no
+# `gh` call and writes no check.
+#
+# The evidence upload deliberately gets NO elevation: actions/upload-artifact@v4
+# writes through the per-run ACTIONS_RUNTIME_TOKEN (the artifact service), not
+# through GITHUB_TOKEN, so it needs no `actions:` scope. Granting `actions: write`
+# here would be scope this lane never spends. (Read-and-verified, not inferred from
+# a green run: an unexercised permission is invisible to a run.)
+permissions:
+  contents: read
+
 concurrency:
   group: e2e-evidence
   cancel-in-progress: false
