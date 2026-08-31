@@ -243,7 +243,63 @@ jobs:
           else
             case "$code" in
               0) echo "no surviving mutants among the ${{ steps.count.outputs.listed }} generated for this diff" ;;
-              2) echo "::error::SURVIVING mutants in this diff: a fault was injected into code this PR touches and the suite still passed. See the uploaded report for the exact mutants, then add the assertions that kill them."; exit 2 ;;
+              2)
+                # A survivor whose phases cost almost nothing relative to the
+                # BASELINE was never compiled: the code it mutated is `cfg`'d out on
+                # this target. cargo-mutants cannot tell "the tests failed to kill
+                # this" from "this was excluded from the build" and reports the second
+                # as the first. PR #247 hit it — 17 survivors, all `#[cfg(windows)]`,
+                # sixteen at `0s build + 0s test` against a `110s build + 27s test`
+                # baseline.
+                #
+                # Those verdicts are UNANSWERABLE, not unkilled: no assertion written
+                # on this runner kills a mutant in code this runner does not compile.
+                # Telling an author to "add the assertions that kill them" is how a
+                # lane gets muted, which is how the weekly lane this replaced died.
+                #
+                # RATIO, not a constant. An absolute "< 1s" is a machine- and
+                # repo-dependent threshold: review measured 6 of 7 build phases here at
+                # 0.37-0.95s, safe today only because this repo is bimodal (sub-second
+                # outcomes are all Unviable, which the MissedMutant filter drops, while
+                # every Build+Test outcome is 20-38s). On a smaller or faster crate a
+                # REAL survivor would land under a second and its author would be told
+                # to add a ledger entry instead of writing the test — failure in the
+                # dangerous direction. `.outcomes[]` carries the Baseline scenario with
+                # its own durations, so 5% of that is machine-independent and needs no
+                # new tooling.
+                #
+                # `| numbers` is load-bearing. If the schema renames the field,
+                # `[.phase_results[]?.duration]` is `[null, null]` — length 2, and
+                # `null < 1` is TRUE in jq — so the obvious expression would relabel
+                # EVERY survivor as uncompiled. Filtering to numbers makes a renamed
+                # field yield an EMPTY array, which falls through to the ordinary
+                # message. Verified against a real outcomes.json, three ways: correct
+                # field -> 1, renamed duration -> 0, renamed summary -> 0.
+                uncompiled=0; missed=0
+                if [ -f mutants.out/outcomes.json ]; then
+                  missed=$(jq '[.outcomes[]? | select(.summary=="MissedMutant")] | length' \
+                             mutants.out/outcomes.json 2>/dev/null || echo 0)
+                  uncompiled=$(jq '
+                    ([.outcomes[]? | select(.scenario? == "Baseline")
+                      | [.phase_results[]?.duration|numbers] | add] | first) as $base
+                    | [.outcomes[]? | select(.summary=="MissedMutant")
+                       | select(([.phase_results[]?.duration|numbers]|length) > 0)
+                       | select(([.phase_results[]?.duration|numbers] | add)
+                                < (if ($base|type) == "number" and $base > 0
+                                   then $base * 0.05 else 1 end))]
+                    | length' mutants.out/outcomes.json 2>/dev/null || echo 0)
+                fi
+                # BOTH messages when the diff has both kinds. An exclusive if/else
+                # hides a real survivor behind any single cfg'd-out one and tells its
+                # author NOT to write the test that would kill it — review demonstrated
+                # exactly that with a 1-and-1 diff.
+                if [ "${uncompiled:-0}" -gt 0 ]; then
+                  echo "::error::${uncompiled} surviving mutant(s) were NEVER COMPILED (phases cost ~nothing against the baseline) — they sit in code this runner cfg's out, so the suite passing says nothing about them. UNANSWERABLE, not unkilled: add an entry to .cargo/mutants.toml with a written reason. Do not write tests for THOSE."
+                fi
+                if [ "${missed:-0}" -gt "${uncompiled:-0}" ] || [ "${uncompiled:-0}" -eq 0 ]; then
+                  echo "::error::SURVIVING mutants in this diff: a fault was injected into code this PR touches and the suite still passed. See the uploaded report for the exact mutants, then add the assertions that kill them."
+                fi
+                exit 2 ;;
               3) echo "::error::mutants TIMED OUT even at ${MUT_TIMEOUTS}. A timeout is not a kill — the lane could not decide, so it must not report success. Usually an injected fault caused an unbounded loop the tests do not bound."; exit 3 ;;
               1) echo "::error::cargo-mutants rejected its arguments (exit 1) — this lane is misconfigured, not your code."; exit 1 ;;
               4) echo "::error::the UNMUTATED baseline tests failed (exit 4). Not a mutation finding — the suite itself is red or flaky on this runner, which also affects the required gate. Fix the test, never this lane's exit contract."; exit 4 ;;

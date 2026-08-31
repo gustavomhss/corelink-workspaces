@@ -1,0 +1,67 @@
+# cargo-mutants configuration.
+#
+# WHY THIS FILE EXISTS — the lane cannot tell "the tests failed to kill this" from
+# "this was cfg'd out of the build", and reports the second as the first.
+#
+# PR #247's mutation run: 17 survivors, ALL of them `#[cfg(windows)]` code, on a lane
+# that runs `runs-on: corelink` — Linux. Sixteen of them, in `crates/clw-win-acl`,
+# reported `0s build + 0s test` against a `110s build + 27s test` baseline: the mutant
+# was never compiled, so the suite "passing" says nothing about it. The seventeenth,
+# `clw-cli/src/config.rs:762`'s `warn_if_windows_acl_failed`, is worse in a quieter
+# way — it reported `4s build + 36s test`, i.e. the whole suite ran, pointlessly,
+# against an artefact the mutation could not change, because the function does not
+# exist on this target.
+#
+# The lane's own instruction — "add the assertions that kill them" — is therefore not
+# actionable: no assertion written on Linux can kill a mutant in code Linux does not
+# compile. Leaving it red teaches people to ignore the lane, which is exactly how the
+# weekly lane it replaced died.
+#
+# This is the same seam SECURITY.md documents from the other direction: "rustc strips
+# inactive `cfg` before linting, so `unsafe` under a `cfg(target_os)` that no lane
+# compiles is invisible", and three of the five shipped targets are linted by no lane.
+# Mutation testing hits it from the other side.
+#
+# EXCLUSIONS ARE A LEDGER, NOT A SETTING. Each entry names what it removes and why,
+# and is valid only while the reason holds. The same shape as `CFG_ATTR_OK` in
+# `scripts/check-unsafe-posture.sh`: the bar for adding one is written down, and
+# adding one is a reviewed act.
+exclude_globs = [
+    # Entirely `#[cfg(windows)]` — its own crate docs say "The whole module is
+    # cfg(windows)". On the Linux mutation runner nothing here is compiled, so every
+    # mutant is reported MISSED at 0s build + 0s test. RETIRE THIS ENTRY when a
+    # Windows mutation runner exists; until then a mutant here is unanswerable, not
+    # unkilled. Note the crate is NOT unguarded: its source tree is hash-pinned in
+    # `.github/win-acl-sources.expected`, so a change to it is a fixture diff a human
+    # reads. Review teeth-tested that: injecting the exact `==` -> `!=` mutation
+    # cargo-mutants generates turns the pin from exit 0 to `GATE FAILED: … no longer
+    # matches`. The honest caveat is that a pin detects CHANGE, not correctness.
+    #
+    # RETIREMENT IS EFFECTIVELY PERMANENT, so read it as a standing exclusion rather
+    # than a temporary one: `windows.yml` runs `runs-on: corelink` — Linux with mingw
+    # and wine — and no Windows host runner exists in this org. The entry retires if
+    # one appears.
+    #
+    # ALSO KNOWN: a PR touching ONLY this crate now lists zero mutants and the lane
+    # skips green. The hash pin on the required gate is what covers that case, not
+    # this lane.
+    #
+    # This IS testable on a non-Windows host, contrary to what an earlier version of
+    # this comment said: cargo-mutants is syntactic (syn-based) and never evaluates
+    # `cfg`, which is precisely WHY sixteen Windows mutants were generated on a Linux
+    # runner. Review confirmed the ledger removes exactly the 17 mutants of PR #247's
+    # tree and nothing else (1438 -> 1421).
+    "crates/clw-win-acl/**",
+]
+
+# Named-function exclusions, for cfg-divergent items inside files that are NOT
+# themselves cfg-divergent. `crates/clw-cli/src/config.rs` is mostly the
+# plaintext-PAT handling code and MUST stay under mutation testing; only this one
+# function is `#[cfg(windows)]`, so the exclusion is by name rather than by path.
+exclude_re = [
+    # `#[cfg(windows)]` (config.rs:761). On Linux it does not exist, so mutating it
+    # changes no compiled artefact — and unlike the clw-win-acl mutants, this one does
+    # not even look suspicious: it reported `4s build + 36s test`, the whole suite
+    # running pointlessly against an unchanged binary. RETIRE with the glob above.
+    "warn_if_windows_acl_failed",
+]
