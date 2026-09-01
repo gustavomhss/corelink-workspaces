@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # release-guards.sh — pure, offline-testable decisions used by release.yml.
 #
-# WP-0A extracts the decisions without changing release policy. `release_kind` is
-# wired immediately because it replaces the workflow's existing tag parser exactly.
-# The other functions are tested seams for the follow-on policy WPs that will wire
-# them into release.yml: WP-04 (tag ancestry), WP-05 (trust root/self-verification)
-# and WP-13b (quota JSON parsing). Keeping those calls out of release.yml here is
-# deliberate: merely extracting a guard must not make a previously-tolerated release
-# fatal, or vice versa.
+# WP-0A extracted these decisions without changing release policy. `release_kind`
+# replaced the workflow's existing tag parser exactly. WP-05 now wires the release-
+# file and self-verification decisions into release.yml. The remaining tested seams
+# stay reserved for their own policy WPs: WP-04 (tag ancestry) and WP-13b (quota JSON
+# parsing). Keeping those calls out of release.yml here avoids anticipating either WP.
 
 set -uo pipefail
 
@@ -38,16 +36,15 @@ release_kind() {
   fi
 }
 
-# require_trust_root <kind> <path>
-# A missing trust root blocks a real release and remains tolerated for an rc.
-# WP-05 wires this tested decision into release.yml; WP-0A only establishes the seam.
-require_trust_root() {
-  local kind="${1:-invalid}" path="${2:-}"
+# _require_release_file <kind> <path> <role>
+# Missing release files block a real release and remain tolerated for an rc dry-run.
+_require_release_file() {
+  local kind="${1:-invalid}" path="${2:-}" role="${3:-release file}"
 
   case "$kind" in
     real|rc) ;;
     *)
-      _release_guard_fail "invalid release kind '$kind' while checking trust root '${path:-minisign.pub}'"
+      _release_guard_fail "invalid release kind '$kind' while checking ${role} '${path:-empty}'"
       return
       ;;
   esac
@@ -58,18 +55,30 @@ require_trust_root() {
 
   case "$kind" in
     real)
-      _release_guard_fail "required release trust root '${path:-minisign.pub}' is absent (expected minisign.pub); refusing a real release"
+      _release_guard_fail "required ${role} '${path:-empty}' is absent; refusing a real release"
       ;;
     rc)
-      _release_guard_warn "release trust root '${path:-minisign.pub}' is absent; rc remains a tolerant dry-run"
+      _release_guard_warn "${role} '${path:-empty}' is absent; rc remains a tolerant dry-run"
       return 0
       ;;
   esac
 }
 
+# require_trust_root <kind> <path>
+require_trust_root() {
+  _require_release_file "${1:-invalid}" "${2:-}" "release trust root"
+}
+
+# require_release_file <kind> <path>
+# Used for legal files that must ship with a real release (EULA.md and NOTICE).
+require_release_file() {
+  _require_release_file "${1:-invalid}" "${2:-}" "release file"
+}
+
 # require_selfverify_ok <kind> <verification-exit-code>
-# A failed signature self-verification blocks a real release and is tolerated for rc.
-# WP-05 wires this into the workflow after the minisign invocation.
+# Once signature verification runs, a non-zero result is fatal for both real and rc.
+# An rc may omit the trust root and skip verification, but it may never turn an
+# executed cryptographic failure into a warning; that preserves workflow behavior.
 require_selfverify_ok() {
   local kind="${1:-invalid}" rc="${2:-}"
 
@@ -89,15 +98,7 @@ require_selfverify_ok() {
       ;;
   esac
 
-  case "$kind" in
-    real)
-      _release_guard_fail "signature self-verification failed with exit ${rc}; refusing a real release"
-      ;;
-    rc)
-      _release_guard_warn "signature self-verification failed with exit ${rc}; rc remains a tolerant dry-run"
-      return 0
-      ;;
-  esac
+  _release_guard_fail "signature self-verification failed with exit ${rc}; refusing ${kind} release artifacts"
 }
 
 # assert_tag_is_ancestor <tag-commit> <base-ref>

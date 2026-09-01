@@ -74,6 +74,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
+      kind: ${{ steps.version.outputs.kind }}
       # rc-vs-real classification — computed ONCE here so downstream jobs never
       # re-parse the tag (a loose re-parse keying on `-rc.` with the dot would
       # mis-class `v0.1.0-rc6` as a real release). `prerelease` is the string
@@ -127,6 +128,7 @@ jobs:
           esac
           # Strip the leading 'v' for downstream artifact naming.
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
           # Classify rc-vs-real ONCE, here, off the SAME validated tag (the regex
           # above already accepted only `-rc.N` / `-rcN`). Any tag whose core
           # carries an `-rc` suffix is a PRERELEASE; a bare vX.Y.Z is a real
@@ -764,6 +766,8 @@ jobs:
       attestations: write
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
+      # Canonical release kind from preflight. Do not re-parse the tag here.
+      KIND: ${{ needs.preflight.outputs.kind }}
       # rc-vs-real, classified ONCE in preflight (never re-parsed here). "true"
       # for an `-rc` tag (=> --prerelease + NO formula bump), "false" for a real
       # vX.Y.Z (=> latest release + formula bump).
@@ -806,9 +810,16 @@ jobs:
           # binaries — and stage them HERE, before the checksum step, so they are
           # covered by SHA256SUMS (previously copied in the publish step, after
           # checksumming, so they shipped unverifiable).
-          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true
-          [ -f EULA.md ] && cp EULA.md release/ || true
-          [ -f NOTICE ] && cp NOTICE release/ || true
+          # shellcheck source=scripts/release-guards.sh
+          . scripts/release-guards.sh
+          require_trust_root "$KIND" docs/minisign.pub
+          require_release_file "$KIND" EULA.md
+          require_release_file "$KIND" NOTICE
+          for release_file in docs/minisign.pub EULA.md NOTICE; do
+            if [ -f "$release_file" ]; then
+              cp "$release_file" release/
+            fi
+          done
           ls -la release/
 
       # Generate the per-release third-party attribution bundle that NOTICE
@@ -881,11 +892,18 @@ jobs:
           # pubkey. Fails loudly if docs/minisign.pub does not correspond to the
           # signing key — otherwise we would publish a trust root that rejects our
           # own signatures. (cwd is release/, so the committed key is ../docs/.)
+          # shellcheck source=scripts/release-guards.sh
+          . ../scripts/release-guards.sh
           if [ -f ../docs/minisign.pub ]; then
-            minisign -V -p ../docs/minisign.pub -m SHA256SUMS
+            verify_rc=0
+            minisign -V -p ../docs/minisign.pub -m SHA256SUMS || verify_rc=$?
+            require_selfverify_ok "$KIND" "$verify_rc"
             echo "SHA256SUMS verified against committed docs/minisign.pub"
           else
-            echo "::warning::docs/minisign.pub absent — cannot verify the signature against the published trust root; commit the minisign public key alongside the secret."
+            # The collect step already classifies this as fatal for real and
+            # tolerated for rc. Re-assert it here so this step is independently
+            # fail-closed if its ordering or workspace assumptions ever change.
+            require_trust_root "$KIND" ../docs/minisign.pub
           fi
 
       # =======================================================================

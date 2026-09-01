@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # release-guards-selftest.sh — offline proof for release.yml's pure decisions.
+# The single-quoted shell/YAML fixtures below intentionally preserve `$...` for the
+# child shell or workflow file under test; expanding them in this harness is a bug.
+# shellcheck disable=SC2016
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 GUARDS="$PWD/scripts/release-guards.sh"
+WORKFLOW="$PWD/.github/workflows/release.yml"
 # shellcheck source=scripts/release-guards.sh
 . "$GUARDS"
 
@@ -21,11 +25,25 @@ EXPECTED=(
   "A4 rc tolerates absent trust root"
   "present trust root passes"
   "invalid kind fails even with a present trust root"
+  "real release requires EULA.md"
+  "rc tolerates absent EULA.md"
+  "real release requires NOTICE"
+  "rc tolerates absent NOTICE"
   "A5 failed real self-verification is fatal"
   "successful real self-verification passes"
-  "rc tolerates failed self-verification"
+  "failed rc self-verification is fatal"
+  "successful rc self-verification passes"
   "malformed self-verification status fails closed"
   "invalid kind fails even after successful verification"
+  "WP-05 preflight exposes canonical kind"
+  "WP-05 preflight emits canonical kind"
+  "WP-05 publish consumes canonical kind"
+  "WP-05 trust root guard is wired"
+  "WP-05 EULA guard is wired"
+  "WP-05 NOTICE guard is wired"
+  "WP-05 self-verification guard is wired"
+  "WP-05 self-verification rechecks absent trust root"
+  "WP-05 legacy tolerant trust-root copy is absent"
   "A6 commit on main is an ancestor"
   "A6 orphan is rejected"
   "A6 unmerged branch commit is rejected"
@@ -37,7 +55,9 @@ EXPECTED=(
   "malformed quota body is invalid"
   "missing quota field is invalid"
   "A9 reverted strict branch makes A3 pass incorrectly"
+  "A9 reverted strict branch makes EULA pass incorrectly"
   "A9 reverted strict branch makes A5 pass incorrectly"
+  "A9 reverted strict branch makes rc self-verification pass incorrectly"
   "A9 reverted strict branch makes A6 pass incorrectly"
 )
 if [ "${CLW_RELEASE_GUARDS_SKIP_NEGATIVE_CONTROLS:-0}" != "1" ]; then
@@ -45,7 +65,10 @@ if [ "${CLW_RELEASE_GUARDS_SKIP_NEGATIVE_CONTROLS:-0}" != "1" ]; then
     "negative-control child baseline passes"
     "negative control catches a trivial same-name A7 probe"
     "negative control catches a trivial same-name A8 probe"
-    "negative control catches trivial same-name A9 probes"
+    "negative control catches a trivial same-name A9 file probe"
+    "negative control catches a trivial same-name A9 selfverify probe"
+    "negative control catches missing WP-05 workflow wiring"
+    "negative control catches missing WP-05 trust-root recheck"
   )
 fi
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/clw-release-guards.XXXXXX")"
@@ -100,9 +123,20 @@ expect_status_stderr() {
   fi
 }
 
+expect_file_count() {
+  local name="$1" expected="$2" file="$3" needle="$4" got
+  RAN+=("$name")
+  got="$(grep -cxF -- "$needle" "$file" || true)"
+  if [ "$got" -eq "$expected" ]; then
+    ok "$name"
+  else
+    bad "$name — expected $expected occurrence(s), got $got: $needle"
+  fi
+}
+
 replace_line_once() {
   local file="$1" needle="$2" replacement="$3" scratch="$4" count
-  count="$(grep -cF -- "$needle" "$file" || true)"
+  count="$(grep -cxF -- "$needle" "$file" || true)"
   if [ "$count" -ne 1 ]; then
     printf 'sabotage setup expected one production line, found %s: %s\n' \
       "$count" "$needle" >&2
@@ -120,13 +154,14 @@ expect_recursive_negative_control() {
   local child_test child_output child_plain rc=0 needle replacement
   RAN+=("$name")
   child_dir="$TMPROOT/negative-control-$sabotage"
-  mkdir -p "$child_dir/scripts"
+  mkdir -p "$child_dir/scripts" "$child_dir/.github/workflows"
   child_guard="$child_dir/scripts/release-guards.sh"
   child_test="$child_dir/scripts/release-guards-selftest.sh"
   child_output="$child_dir/child-output"
   child_plain="$child_dir/child-output-plain"
   cp "$GUARDS" "$child_guard"
   cp "$PWD/scripts/release-guards-selftest.sh" "$child_test"
+  cp "$WORKFLOW" "$child_dir/.github/workflows/release.yml"
 
   case "$sabotage" in
     baseline) ;;
@@ -146,11 +181,37 @@ expect_recursive_negative_control() {
         return
       fi
       ;;
-    a9)
-      needle='      _release_guard_fail "required release trust root '\''${path:-minisign.pub}'\'' is absent (expected minisign.pub); refusing a real release"'
-      replacement='      _release_guard_fail "required release trust root '\''${path:-minisign.pub}'\'' is absent (expected minisign.pub); refusing a real release"; return 1 # NEGATIVE_CONTROL_A9_REVERT_INEFFECTIVE'
+    a9-file)
+      needle='      _release_guard_fail "required ${role} '\''${path:-empty}'\'' is absent; refusing a real release"'
+      replacement='      _release_guard_fail "required ${role} '\''${path:-empty}'\'' is absent; refusing a real release"; return 1 # NEGATIVE_CONTROL_A9_REVERT_INEFFECTIVE'
       if ! replace_line_once "$child_guard" "$needle" "$replacement" "$child_guard.tmp"; then
-        bad "$name — A9 sabotage did not apply exactly once"
+        bad "$name — A9 file sabotage did not apply exactly once"
+        return
+      fi
+      ;;
+    a9-selfverify)
+      needle='  _release_guard_fail "signature self-verification failed with exit ${rc}; refusing ${kind} release artifacts"'
+      replacement='  _release_guard_fail "signature self-verification failed with exit ${rc}; refusing ${kind} release artifacts"; return 1 # NEGATIVE_CONTROL_A9_REVERT_INEFFECTIVE'
+      if ! replace_line_once "$child_guard" "$needle" "$replacement" "$child_guard.tmp"; then
+        bad "$name — A9 selfverify sabotage did not apply exactly once"
+        return
+      fi
+      ;;
+    wp05-wire)
+      needle='            require_selfverify_ok "$KIND" "$verify_rc"'
+      replacement='            : # NEGATIVE_CONTROL_WP05_SELFVERIFY_UNWIRED'
+      if ! replace_line_once "$child_dir/.github/workflows/release.yml" \
+        "$needle" "$replacement" "$child_dir/release.yml.tmp"; then
+        bad "$name — WP-05 wiring sabotage did not apply exactly once"
+        return
+      fi
+      ;;
+    wp05-recheck)
+      needle='            require_trust_root "$KIND" ../docs/minisign.pub'
+      replacement='            : # NEGATIVE_CONTROL_WP05_TRUST_ROOT_RECHECK_UNWIRED'
+      if ! replace_line_once "$child_dir/.github/workflows/release.yml" \
+        "$needle" "$replacement" "$child_dir/release.yml.tmp"; then
+        bad "$name — WP-05 trust-root recheck sabotage did not apply exactly once"
         return
       fi
       ;;
@@ -202,18 +263,51 @@ expect_status "present trust root passes" 0 \
   require_trust_root real "$TMPROOT/present/minisign.pub"
 expect_status "invalid kind fails even with a present trust root" 1 \
   require_trust_root invalid "$TMPROOT/present/minisign.pub"
+expect_status_stderr "real release requires EULA.md" 1 EULA.md \
+  require_release_file real "$TMPROOT/missing/EULA.md"
+expect_status "rc tolerates absent EULA.md" 0 \
+  require_release_file rc "$TMPROOT/missing/EULA.md"
+expect_status_stderr "real release requires NOTICE" 1 NOTICE \
+  require_release_file real "$TMPROOT/missing/NOTICE"
+expect_status "rc tolerates absent NOTICE" 0 \
+  require_release_file rc "$TMPROOT/missing/NOTICE"
 
-# A5 — pin both sides of the self-verification result and the rc tolerance seam.
+# A5 — an executed verification is authoritative for both release kinds. An rc may
+# skip when the trust root is absent, but a non-zero minisign result remains fatal.
 expect_status "A5 failed real self-verification is fatal" 1 \
   require_selfverify_ok real 1
 expect_status "successful real self-verification passes" 0 \
   require_selfverify_ok real 0
-expect_status "rc tolerates failed self-verification" 0 \
+expect_status "failed rc self-verification is fatal" 1 \
   require_selfverify_ok rc 1
+expect_status "successful rc self-verification passes" 0 \
+  require_selfverify_ok rc 0
 expect_status "malformed self-verification status fails closed" 1 \
   require_selfverify_ok real not-a-status
 expect_status "invalid kind fails even after successful verification" 1 \
   require_selfverify_ok invalid 0
+
+# The pure decisions are only useful if release.yml carries the one canonical kind
+# from preflight into publish and invokes every WP-05 guard. Pin the exact wiring so
+# deleting a call cannot leave this unit test green while the release fails open.
+expect_file_count "WP-05 preflight exposes canonical kind" 1 "$WORKFLOW" \
+  '      kind: ${{ steps.version.outputs.kind }}'
+expect_file_count "WP-05 preflight emits canonical kind" 1 "$WORKFLOW" \
+  '          echo "kind=$KIND" >> "$GITHUB_OUTPUT"'
+expect_file_count "WP-05 publish consumes canonical kind" 1 "$WORKFLOW" \
+  '      KIND: ${{ needs.preflight.outputs.kind }}'
+expect_file_count "WP-05 trust root guard is wired" 1 "$WORKFLOW" \
+  '          require_trust_root "$KIND" docs/minisign.pub'
+expect_file_count "WP-05 EULA guard is wired" 1 "$WORKFLOW" \
+  '          require_release_file "$KIND" EULA.md'
+expect_file_count "WP-05 NOTICE guard is wired" 1 "$WORKFLOW" \
+  '          require_release_file "$KIND" NOTICE'
+expect_file_count "WP-05 self-verification guard is wired" 1 "$WORKFLOW" \
+  '            require_selfverify_ok "$KIND" "$verify_rc"'
+expect_file_count "WP-05 self-verification rechecks absent trust root" 1 "$WORKFLOW" \
+  '            require_trust_root "$KIND" ../docs/minisign.pub'
+expect_file_count "WP-05 legacy tolerant trust-root copy is absent" 0 "$WORKFLOW" \
+  '          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true'
 
 # A6/A7 — construct the complete ancestry graph offline. `feature_sha` descends
 # from main but is not merged into it; `orphan_sha` shares no ancestry at all.
@@ -260,8 +354,12 @@ else
     "$GUARDS" >"$MUTANT"
   expect_status "A9 reverted strict branch makes A3 pass incorrectly" 0 \
     bash -c '. "$1" && require_trust_root real "$2"' _ "$MUTANT" "$MISSING"
+  expect_status "A9 reverted strict branch makes EULA pass incorrectly" 0 \
+    bash -c '. "$1" && require_release_file real "$2"' _ "$MUTANT" "$TMPROOT/missing/EULA.md"
   expect_status "A9 reverted strict branch makes A5 pass incorrectly" 0 \
     bash -c '. "$1" && require_selfverify_ok real 1' _ "$MUTANT"
+  expect_status "A9 reverted strict branch makes rc self-verification pass incorrectly" 0 \
+    bash -c '. "$1" && require_selfverify_ok rc 1' _ "$MUTANT"
   expect_status "A9 reverted strict branch makes A6 pass incorrectly" 0 \
     bash -c 'cd "$1" && . "$2" && assert_tag_is_ancestor "$3" refs/heads/main' \
     _ "$REPO" "$MUTANT" "$feature_sha"
@@ -279,8 +377,17 @@ if [ "${CLW_RELEASE_GUARDS_SKIP_NEGATIVE_CONTROLS:-0}" != "1" ]; then
     "negative control catches a trivial same-name A8 probe" a8 \
     "A8 pretty-printed unmetered quota"
   expect_recursive_negative_control \
-    "negative control catches trivial same-name A9 probes" a9 \
+    "negative control catches a trivial same-name A9 file probe" a9-file \
     "A9 reverted strict branch makes A3 pass incorrectly"
+  expect_recursive_negative_control \
+    "negative control catches a trivial same-name A9 selfverify probe" a9-selfverify \
+    "A9 reverted strict branch makes A5 pass incorrectly"
+  expect_recursive_negative_control \
+    "negative control catches missing WP-05 workflow wiring" wp05-wire \
+    "WP-05 self-verification guard is wired"
+  expect_recursive_negative_control \
+    "negative control catches missing WP-05 trust-root recheck" wp05-recheck \
+    "WP-05 self-verification rechecks absent trust root"
 fi
 
 # Report functional failures before checking completeness. Otherwise a real guard
