@@ -24,6 +24,9 @@ permissions:
 env:
   CARGO_BUILD_JOBS: "4"
   CARGO_TERM_COLOR: always
+  # Expressions are data, never shell source. Keep the ref out of `run:` so a
+  # future event-field change cannot turn the DCO fetch into shell injection.
+  BASE_REF: ${{ github.base_ref || 'main' }}
 
 jobs:
   gates:
@@ -69,9 +72,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: fetch base ref
-        run: git fetch origin ${{ github.base_ref || 'main' }} --no-tags
+        run: git fetch origin "$BASE_REF" --no-tags
       - name: DCO trailer check
-        run: bash scripts/dco-check.sh origin/${{ github.base_ref || 'main' }}
+        run: bash scripts/dco-check.sh "origin/$BASE_REF"
 
   gate-check-selftest:
     # Same `corelink` ephemeral fabric — pure bash + python3, no toolchain (zero hosted

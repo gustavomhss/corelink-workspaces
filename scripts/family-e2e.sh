@@ -117,7 +117,10 @@ done
 echo
 echo "================ family-e2e live matrix ================"
 for line in "${RESULT[@]}"; do printf '  %-12s %s\n' "${line% *}" "${line#* }"; done
-for t in "${missing[@]}"; do printf '  %-12s %s\n' "$t" "SKIP (no creds)"; done
+# Bash 3.2 treats an empty declared array as unbound under `set -u`; this is
+# intentionally the conditional-array expansion, so a complete six-tier matrix
+# reaches its final green report instead of failing after all tests pass.
+for t in "${missing[@]+"${missing[@]}"}"; do printf '  %-12s %s\n' "$t" "SKIP (no creds)"; done
 echo "======================================================="
 echo "ran $present_count tier(s); $fail_total failed; ${#missing[@]} skipped (no creds)"
 [ "$fail_total" -eq 0 ] || exit 1

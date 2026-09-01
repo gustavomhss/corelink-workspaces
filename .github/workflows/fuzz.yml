@@ -52,11 +52,11 @@ jobs:
           rustup toolchain install nightly --profile minimal --no-self-update
           rustup component add --toolchain nightly rust-src   # -Z build-std needs rust-src
 
-      - name: install cargo-fuzz
+      - name: install cargo-fuzz 0.13.2
         # NOT a first-class taiki-e/install-action tool (its cargo-binstall fallback for
         # cargo-fuzz is unreliable) — install deterministically from source. The cargo-fuzz
         # CLI builds on stable; only RUNNING targets needs nightly (done below).
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
 
       # 5 minutes per target. cargo-fuzz operates on the fuzz/ package (detached
       # workspace at repo root); run from the repo root, which is where fuzz/ lives.

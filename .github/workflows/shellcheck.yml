@@ -1,20 +1,20 @@
-# Shellcheck lane — lint the distribution + CI shell scripts.
+# Lint lane — lint the distribution + CI shell scripts and every workflow.
 #
 # `scripts/install.sh` is the PUBLIC curl-pipe fallback a customer runs to install clw; a
 # broken script there is a real user hazard, and the release/gate scripts are load-bearing.
-# They were never shellcheck-gated. This runs shellcheck on all of scripts/*.sh.
+# They were never shellcheck-gated. This runs shellcheck on all of scripts/*.sh;
+# actionlint checks the workflow syntax and expressions that orchestrate them.
 #
 # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
 # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The corelink image
 # does NOT bake shellcheck, so the job installs it via apt (passwordless sudo + apt are
 # present on the box). Additive — does not touch the required gates/dco checks. Runs on
-# PRs that touch scripts + push-to-main + dispatch.
+# every PR so a workflow-only change cannot evade actionlint, plus main + dispatch.
 
-name: shellcheck
+name: lint
 
 on:
   pull_request:
-    paths: ["scripts/**", ".github/workflows/shellcheck.yml"]
   push:
     branches: [main]
   workflow_dispatch:
@@ -23,8 +23,8 @@ permissions:
   contents: read
 
 jobs:
-  shellcheck:
-    name: shellcheck scripts/*.sh
+  lint:
+    name: shellcheck + actionlint
     runs-on: corelink
     timeout-minutes: 10
     steps:
@@ -33,9 +33,30 @@ jobs:
       # passwordless sudo + apt — see the runner Dockerfile).
       - name: install shellcheck (not baked into the corelink image)
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: install actionlint 1.7.12 (checksum-pinned prebuilt)
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$(mktemp)"
+          bin_dir="$RUNNER_TEMP/actionlint-1.7.12"
+          trap 'rm -f "$archive"' EXIT
+          curl -fsSL \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir" actionlint
+          echo "$bin_dir" >> "$GITHUB_PATH"
       - name: shellcheck (warning level — errors + warnings fail)
         run: |
           set -euo pipefail
           shellcheck --version
           shellcheck -S warning scripts/*.sh
           echo "all scripts/*.sh pass shellcheck"
+      - name: actionlint (workflows + corelink runner label)
+        run: |
+          set -euo pipefail
+          actionlint -version
+          actionlint
+          echo "all workflows pass actionlint"

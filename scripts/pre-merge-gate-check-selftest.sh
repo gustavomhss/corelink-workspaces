@@ -3,12 +3,14 @@
 # actually refuses in every direction it claims to, not just that it "runs".
 # A merge-safety script that has never been shown to refuse is not evidence of
 # anything, so this stubs `gh` (PATH-shadowed, no network) and asserts both the
-# exit code and the presence of the right message for five scenarios:
+# exit code and the presence of the right message for seven scenarios:
 #   1. CONFLICTING          -> exit non-zero, prints the rebase instruction
 #   2. UNKNOWN               -> exit non-zero
 #   3. zero checks           -> exit non-zero
 #   4. an always-present gate missing from the check list -> exit non-zero
-#   5. healthy (mergeable + all gates present + all green) -> exit 0
+#   5. renamed `llvm-cov` check -> exit non-zero (the substring contract matters)
+#   6. head changes while checks are read -> exit non-zero
+#   7. healthy (mergeable + all gates present + all green) -> exit 0 and prints CAS
 #
 # Run directly: bash scripts/pre-merge-gate-check-selftest.sh
 set -euo pipefail
@@ -25,7 +27,7 @@ fail_count=0
 HEALTHY_CHECKS='[
   {"name":"gates","bucket":"pass","link":""},
   {"name":"dco","bucket":"pass","link":""},
-  {"name":"llvm-cov (report-only)","bucket":"pass","link":""},
+  {"name":"llvm-cov (floor 88%)","bucket":"pass","link":""},
   {"name":"shellcheck scripts/*.sh","bucket":"pass","link":""}
 ]'
 
@@ -35,11 +37,18 @@ HEALTHY_CHECKS='[
 # fall through to a real `gh` and hit the network).
 run_case() {
   local mergeable="$1" mergestatus="$2" prstate="$3" checks_json="$4"
+  local head_before="${5:-aaaaaaaa}" head_after="${6:-${5:-aaaaaaaa}}"
   cat > "$STUB_DIR/gh" <<STUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "pr view")
-    echo '$mergeable $mergestatus $prstate'
+    case " \$* " in
+      *" mergeable,mergeStateStatus,state,headRefOid "*)
+        echo '$mergeable $mergestatus $prstate $head_before'
+        ;;
+      *" headRefOid "*) echo '$head_after' ;;
+      *) echo "unexpected pr view fields: \$*" >&2; exit 97 ;;
+    esac
     ;;
   "pr checks")
     cat <<'JSON'
@@ -94,6 +103,12 @@ assert_allows() {
     fail_count=$((fail_count + 1))
     return
   fi
+  if ! printf '%s' "$out" | grep -qF -- "--match-head-commit"; then
+    echo "  ✗ FAIL [$desc]: exit 0 but did not print the head-pinned merge command"
+    echo "$out" | sed 's/^/      /'
+    fail_count=$((fail_count + 1))
+    return
+  fi
   echo "  ✓ PASS [$desc]: allowed (exit=0)"
 }
 
@@ -115,18 +130,32 @@ assert_refuses "zero checks" "reports NO checks at all" \
 # 4. an always-present gate missing (dco absent from an otherwise-green list)
 MISSING_DCO_CHECKS='[
   {"name":"gates","bucket":"pass","link":""},
-  {"name":"llvm-cov (report-only)","bucket":"pass","link":""}
+  {"name":"llvm-cov (floor 88%)","bucket":"pass","link":""}
 ]'
 assert_refuses "always-present gate missing (dco)" "always-present gates never ran" \
   "MERGEABLE" "CLEAN" "OPEN" "$MISSING_DCO_CHECKS"
 
-# 5. healthy: mergeable + all three always-present gates present + all green
+# 5. Preserve the substring matcher: a generic coverage name does not prove the
+# llvm-cov floor actually ran and must be refused.
+RENAMED_COVERAGE_CHECKS='[
+  {"name":"gates","bucket":"pass","link":""},
+  {"name":"dco","bucket":"pass","link":""},
+  {"name":"coverage","bucket":"pass","link":""}
+]'
+assert_refuses "llvm-cov substring lost (coverage)" "always-present gates never ran" \
+  "MERGEABLE" "CLEAN" "OPEN" "$RENAMED_COVERAGE_CHECKS"
+
+# 6. A force-push between the PR metadata and checks reads invalidates the read.
+assert_refuses "head changed while checks were read" "head changed while checks were being read" \
+  "MERGEABLE" "CLEAN" "OPEN" "$HEALTHY_CHECKS" "aaaaaaaa" "bbbbbbbb"
+
+# 7. healthy: mergeable + all three always-present gates present + all green
 assert_allows "healthy" \
-  "MERGEABLE" "CLEAN" "OPEN" "$HEALTHY_CHECKS"
+  "MERGEABLE" "CLEAN" "OPEN" "$HEALTHY_CHECKS" "aaaaaaaa" "aaaaaaaa"
 
 echo "==============================="
 if [ "$fail_count" -ne 0 ]; then
   echo "$fail_count self-test case(s) FAILED — pre-merge-gate-check.sh is not trustworthy as-is." >&2
   exit 1
 fi
-echo "all 5 self-test cases passed"
+echo "all 7 self-test cases passed"

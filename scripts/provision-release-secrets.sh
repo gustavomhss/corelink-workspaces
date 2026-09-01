@@ -27,6 +27,11 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# This owner-run script may be invoked from anywhere. Resolve the public key
+# from this script's checkout, never from the caller's cwd or another repository.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MINISIGN_PUB="$REPO_ROOT/docs/minisign.pub"
+
 # ---- preflight --------------------------------------------------------------
 bold "clw release-secret provisioning"
 command -v gh  >/dev/null 2>&1 || die "gh (GitHub CLI) not found — install it first."
@@ -66,7 +71,7 @@ if ask_yn "Provision the minisign key + password now?"; then
   else
     # minisign -G prompts (twice) for the encryption password on the tty.
     # Remember the password you type here — it IS MINISIGN_PASSWORD below.
-    minisign -G -p docs/minisign.pub -s "$KEY"
+    minisign -G -p "$MINISIGN_PUB" -s "$KEY"
     chmod 600 "$KEY"
     ok "generated $KEY + docs/minisign.pub"
   fi
