@@ -163,6 +163,7 @@ bash scripts/deadman-selftest.sh
 # gated — in EVERY lane, before any classification happens, because a broken
 # classifier would otherwise route around the check that would have caught it.
 bash scripts/gate-lane-selftest.sh
+bash scripts/mutation-verdict-selftest.sh
 
 # shellcheck source=scripts/classify-lane.sh
 . scripts/classify-lane.sh

@@ -53,9 +53,10 @@ cargo +nightly fuzz run fuzz_validate_symlink_target -- -max_total_time=300
 
 ## Mutation (`cargo-mutants`)
 Injects faults and re-runs the tests; a **surviving** mutant (`missed`) is a change the suite failed to
-catch — a real test gap. Whole-workspace and slow, so it runs **weekly**, sharded across a matrix. It is
-report-only today (uploads the survivor report per shard). A harness fault (the unmutated tests fail /
-bad args) does fail the job — that is a real break.
+catch — a real test gap. It runs **per-PR and blocking**, scoped to the PR's own diff. A harness fault
+(the unmutated tests fail / bad args) also fails the job — that is a real break. It replaced a weekly
+sharded whole-workspace sweep in WP-34; that history, and the exhaustive sweep that survives it, are
+below.
 
 Run locally:
 ```
@@ -75,6 +76,20 @@ cargo mutants --workspace --in-diff pr.diff
 rename-only change generates nothing to inject, and `cargo mutants` exits 0 in that case — so the lane
 asks `--list` first and reports "nothing was verified" rather than claiming the tests are adequate. It
 does **not** fail: adding tests is the right thing to do and must not redden a PR.
+
+**Survivors in code this runner truly did not compile are unanswerable here, but timing does not prove
+that.** cargo-mutants is syn-based and can generate `#[cfg(windows)]` mutants on Linux, reporting them as
+`MissedMutant`. However, it can also baseline several packages and test a mutant only in its own package,
+so a real survivor in a small package may finish far faster than the aggregate baseline.
+`scripts/mutation-verdict.sh` therefore uses unusually cheap complete Build+Test timings only as a
+**POSSIBLY_UNCOMPILED** triage hint. Every `MissedMutant` remains **SURVIVORS** and actionable until the
+uploaded build logs provide separate evidence that the mutated source was absent from the build. Only
+then may `.cargo/mutants.toml` record the exclusion with a written reason. Missing, partial, failed or
+unrecognised timing does not even raise the hint. This fail-safe contract is covered by
+`scripts/mutation-verdict-selftest.sh` in the required gate, because the mutation lane itself only runs on
+Rust diffs that yield mutants and so cannot be relied on to exercise it. When the ledger is what produced
+a zero, the INCONCLUSIVE report says so and gives the count — a ledger-manufactured zero and a genuinely
+mutation-free diff must not read the same.
 
 **The exhaustive sweep** — for triaging the survivor backlog (critical crates first: `clw-types`,
 `clw-manifest`, `clw-hydrate`, `clw-client` — the untrusted-input, containment, atomicity and retry/cap

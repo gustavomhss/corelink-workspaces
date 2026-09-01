@@ -213,6 +213,40 @@ jobs:
           echo "listed=${n:-0}" >> "$GITHUB_OUTPUT"
           echo "mutants listed for this diff: ${n}"
 
+          # A ledger-manufactured zero and a genuinely mutation-free diff both print
+          # "no mutants". They mean opposite things, and the second is the one that
+          # would hide 17 excluded mutants behind a normal-looking INCONCLUSIVE — the
+          # shape PR #247 has. So ask again WITHOUT the ledger and report the delta.
+          # Advisory: a failure here must not fail the lane, since the real count above
+          # already succeeded. But it must not fail SILENTLY either — discarding the
+          # status would make a dead probe and a genuinely unexcluded diff print the
+          # same thing, which is the exact vacuity this step exists to remove. So the
+          # status is captured and an unknown is reported as unknown.
+          set +e
+          # stdout ONLY, matching the gating count above (`--list > mutant-list.txt`).
+          # With 2>&1 a single cargo warning line would inflate this count and put a
+          # wrong number in front of the author on the very path that exists to stop
+          # a misleading zero.
+          raw_out="$(cargo mutants --workspace --in-diff pr.diff --list --no-config 2>/dev/null)"
+          raw_rc=$?
+          set -e
+          if [ "$raw_rc" -ne 0 ]; then
+            excluded="unknown"
+            echo "::warning::could not re-list without .cargo/mutants.toml (exit ${raw_rc}), so the ledger-exclusion count is unknown for this run. The gating count above is unaffected."
+          else
+            raw="$(printf '%s\n' "$raw_out" | grep -c . || true)"
+            case "${raw}" in ''|*[!0-9]*) raw=0 ;; esac
+            excluded=$(( raw - ${n:-0} ))
+            if [ "$excluded" -lt 0 ]; then
+              # .cargo/mutants.toml ADDED mutants rather than removing them, so it now
+              # carries something other than exclusions and "removed N" would be false.
+              echo "::warning::re-listing without .cargo/mutants.toml yielded FEWER mutants (${raw}) than with it (${n:-0}). That file no longer only excludes, so the delta is not reportable as an exclusion count."
+              excluded="unknown"
+            fi
+            echo "mutants with .cargo/mutants.toml ignored entirely (--no-config): ${raw}"
+          fi
+          echo "excluded=${excluded}" >> "$GITHUB_OUTPUT"
+
       - name: cargo-mutants
         id: run
         if: env.MODE == 'workspace' || (steps.diff.outputs.run == 'true' && steps.count.outputs.listed != '0')
@@ -244,61 +278,22 @@ jobs:
             case "$code" in
               0) echo "no surviving mutants among the ${{ steps.count.outputs.listed }} generated for this diff" ;;
               2)
-                # A survivor whose phases cost almost nothing relative to the
-                # BASELINE was never compiled: the code it mutated is `cfg`'d out on
-                # this target. cargo-mutants cannot tell "the tests failed to kill
-                # this" from "this was excluded from the build" and reports the second
-                # as the first. PR #247 hit it — 17 survivors, all `#[cfg(windows)]`,
-                # sixteen at `0s build + 0s test` against a `110s build + 27s test`
-                # baseline.
-                #
-                # Those verdicts are UNANSWERABLE, not unkilled: no assertion written
-                # on this runner kills a mutant in code this runner does not compile.
-                # Telling an author to "add the assertions that kill them" is how a
-                # lane gets muted, which is how the weekly lane this replaced died.
-                #
-                # RATIO, not a constant. An absolute "< 1s" is a machine- and
-                # repo-dependent threshold: review measured 6 of 7 build phases here at
-                # 0.37-0.95s, safe today only because this repo is bimodal (sub-second
-                # outcomes are all Unviable, which the MissedMutant filter drops, while
-                # every Build+Test outcome is 20-38s). On a smaller or faster crate a
-                # REAL survivor would land under a second and its author would be told
-                # to add a ledger entry instead of writing the test — failure in the
-                # dangerous direction. `.outcomes[]` carries the Baseline scenario with
-                # its own durations, so 5% of that is machine-independent and needs no
-                # new tooling.
-                #
-                # `| numbers` is load-bearing. If the schema renames the field,
-                # `[.phase_results[]?.duration]` is `[null, null]` — length 2, and
-                # `null < 1` is TRUE in jq — so the obvious expression would relabel
-                # EVERY survivor as uncompiled. Filtering to numbers makes a renamed
-                # field yield an EMPTY array, which falls through to the ordinary
-                # message. Verified against a real outcomes.json, three ways: correct
-                # field -> 1, renamed duration -> 0, renamed summary -> 0.
-                uncompiled=0; missed=0
-                if [ -f mutants.out/outcomes.json ]; then
-                  missed=$(jq '[.outcomes[]? | select(.summary=="MissedMutant")] | length' \
-                             mutants.out/outcomes.json 2>/dev/null || echo 0)
-                  uncompiled=$(jq '
-                    ([.outcomes[]? | select(.scenario? == "Baseline")
-                      | [.phase_results[]?.duration|numbers] | add] | first) as $base
-                    | [.outcomes[]? | select(.summary=="MissedMutant")
-                       | select(([.phase_results[]?.duration|numbers]|length) > 0)
-                       | select(([.phase_results[]?.duration|numbers] | add)
-                                < (if ($base|type) == "number" and $base > 0
-                                   then $base * 0.05 else 1 end))]
-                    | length' mutants.out/outcomes.json 2>/dev/null || echo 0)
-                fi
-                # BOTH messages when the diff has both kinds. An exclusive if/else
-                # hides a real survivor behind any single cfg'd-out one and tells its
-                # author NOT to write the test that would kill it — review demonstrated
-                # exactly that with a 1-and-1 diff.
-                if [ "${uncompiled:-0}" -gt 0 ]; then
-                  echo "::error::${uncompiled} surviving mutant(s) were NEVER COMPILED (phases cost ~nothing against the baseline) — they sit in code this runner cfg's out, so the suite passing says nothing about them. UNANSWERABLE, not unkilled: add an entry to .cargo/mutants.toml with a written reason. Do not write tests for THOSE."
-                fi
-                if [ "${missed:-0}" -gt "${uncompiled:-0}" ] || [ "${uncompiled:-0}" -eq 0 ]; then
-                  echo "::error::SURVIVING mutants in this diff: a fault was injected into code this PR touches and the suite still passed. See the uploaded report for the exact mutants, then add the assertions that kill them."
-                fi
+                # Very cheap phases can identify outcomes worth checking for cfg-out, but
+                # timing alone cannot prove that: the baseline may cover multiple packages
+                # while a mutant tests only its own, smaller package. The diagnostic lives
+                # in scripts/mutation-verdict.sh and never excuses a survivor without
+                # separate build evidence. Do not reimplement it here: its required-gate
+                # self-test asserts this exact call and field order.
+                read -r missed possible_uncompiled verdict_rest <<<"$(bash scripts/mutation-verdict.sh mutants.out/outcomes.json)"
+                verdict="${verdict_rest}"
+                case " ${verdict} " in
+                  *" POSSIBLY_UNCOMPILED "*)
+                    echo "::warning::${possible_uncompiled} surviving mutant(s) completed unusually quickly relative to the baseline. This can indicate cfg-out code, but it can also be a real survivor in a smaller package. Inspect the uploaded build logs; timing alone is not evidence for a .cargo/mutants.toml exclusion." ;;
+                esac
+                case " ${verdict} " in
+                  *" SURVIVORS "*)
+                    echo "::error::SURVIVING mutants in this diff (${missed} MissedMutant outcome(s), ${possible_uncompiled} flagged for build-log inspection): a fault was injected into code this PR touches and the suite still passed. See the uploaded report and logs. Add assertions that kill them unless separate build evidence proves the mutated code was not compiled." ;;
+                esac
                 exit 2 ;;
               3) echo "::error::mutants TIMED OUT even at ${MUT_TIMEOUTS}. A timeout is not a kill — the lane could not decide, so it must not report success. Usually an injected fault caused an unbounded loop the tests do not bound."; exit 3 ;;
               1) echo "::error::cargo-mutants rejected its arguments (exit 1) — this lane is misconfigured, not your code."; exit 1 ;;
@@ -339,6 +334,19 @@ jobs:
             echo "This diff touches Rust but yields **no mutants** (\`cargo mutants --list\` returned 0)."
             echo "That is normal for a test-only, comment-only or rename-only change."
             echo ""
+            excluded="${{ steps.count.outputs.excluded }}"
+            if [ "$excluded" = "unknown" ]; then
+              echo "**Whether the ledger produced this zero could not be determined** —"
+              echo "the re-list without \`.cargo/mutants.toml\` did not succeed. Read that file"
+              echo "before treating this as \"nothing to test here\"."
+              echo ""
+            elif [ "${excluded:-0}" -gt 0 ] 2>/dev/null; then
+              echo "**\`.cargo/mutants.toml\` removed ${excluded} mutant(s)** that this diff would otherwise"
+              echo "have yielded, so this zero is that file's doing, not a property of the diff. Read its"
+              echo "written reasons before treating this as \"nothing to test here\". (The delta is measured"
+              echo "with \`--no-config\`, which ignores the whole file; today it holds only exclusions.)"
+              echo ""
+            fi
             echo "**Nothing was verified.** This lane is not asserting that the tests are adequate —"
             echo "it is reporting that it had nothing to inject here."
           } | tee -a "$GITHUB_STEP_SUMMARY"
