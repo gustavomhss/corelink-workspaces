@@ -69,9 +69,13 @@ check "a big diff with Rust LAST is not docs-only" full "$big_rust_last"
 
 check "a small diff with Rust is not docs-only" full "docs/a.md
 crates/clw-cli/src/config.rs"
-check "a genuinely docs-only diff still is"      docs "docs/a.md
+check "a genuinely Markdown-only diff still is"  docs "docs/a.md
 README.md
-docs/nested/b.md"
+docs/nested/FOO.md"
+check "the published trust root is never docs-only" full "docs/minisign.pub"
+check "a docs image is never docs-only"             full "docs/diagram.png"
+check "a docs YAML file is never docs-only"         full "docs/site.yml"
+check "a Markdown file below docs/ remains docs-only" docs "docs/FOO.md"
 check "the CONTRACT crate escalates to the full lane" full "crates/clw-types/src/lib.rs"
 check "a workflow change escalates to the full lane" full ".github/workflows/ci.yml"
 check "a script change escalates to the full lane"  full "scripts/gates.sh"

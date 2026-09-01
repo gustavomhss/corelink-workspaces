@@ -181,6 +181,10 @@ bash scripts/deadman-selftest.sh
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken
 # classifier would otherwise route around the check that would have caught it.
+# The published minisign key is also load-bearing: it must not drift from the
+# installer pin, even when a PR would otherwise take the Markdown-only fast exit.
+bash scripts/check-minisign-trust-root.sh
+bash scripts/minisign-trust-root-selftest.sh
 bash scripts/gate-lane-selftest.sh
 bash scripts/mutation-verdict-selftest.sh
 
@@ -299,6 +303,7 @@ else
   # is tested through its top-level consumers too. (main is always full-lane regardless.)
   # Union the changed crates with the sink crates, de-duped by NAME (a change to
   # clw-cli / clw-integration-tests must not pass `-p` for it twice).
+  # shellcheck disable=SC2086 # SCOPE deliberately contains a space-separated package set.
   crate_set="$(printf '%s\n' $SCOPE clw-cli clw-integration-tests | sort -u | tr '\n' ' ')"
   pkgs=""
   for c in $crate_set; do pkgs="$pkgs -p $c"; done

@@ -41,8 +41,11 @@ classify_lane() {
   # caller reaches on a shallow clone or a missing merge base.
   [ -n "$changed" ] || { printf 'full\n'; return 0; }
 
-  # docs-only: every path is a .md file or lives under docs/.
-  if ! grep -qvE '(\.md$|^docs/)' <<<"$changed"; then printf 'docs\n'; return 0; fi
+  # docs-only: EVERY path must be Markdown. `docs/` is not itself a safe surface:
+  # docs/minisign.pub is the published trust root, while images and YAML can change
+  # rendered or consumed release material. Keep the here-string: a pipe to grep -q
+  # can turn a large adversarial diff into a false docs verdict through EPIPE.
+  if ! grep -qvE '\.md$' <<<"$changed"; then printf 'docs\n'; return 0; fi
 
   # The contract, the workspace manifests, the supply-chain policy inputs and anything
   # under scripts/ or .github/ escalate to the full lane. INVARIANT: the full lane is
