@@ -31,22 +31,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Windows-only Win32 FFI used to ACL-restrict the PAT-bearing ~/.clw/config.toml
-# (and ~/.clw dir) to the current owner — the Windows analogue of the unix
-# 0600/0700 hardening, which is a no-op there. Target-scoped to cfg(windows) so
-# it never enters the unix build/lock/`cargo deny` graph. MIT/Apache-2.0
-# (already in deny.toml [licenses].allow + about.toml accepted). Feature modules
-# below are the minimal set for: current-process token + user-SID lookup
-# (Threading), ACL build (Security), the named-object DACL apply (Authorization),
-# local heap alloc for the SID buffer (Memory), and shared Win32 types (Foundation).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_Threading",
-    "Win32_System_Memory",
-] }
+# The one audited `unsafe` block in the workspace lives in this crate, not here.
+# See crates/clw-win-acl/src/lib.rs for why it was split out: it lets clw-cli —
+# the crate that handles the plaintext PAT — sit at `forbid`, where the compiler
+# enforces the posture and no regex is in the trust path.
+clw-win-acl = { workspace = true }
 
 [dev-dependencies]
 # Pre-added by the lead (wave-0) so W14-e2e never edits this file (conflict defusal).
@@ -61,3 +51,11 @@ async-trait = { workspace = true }
 # Property-based robustness tests (config-line parser never panics on arbitrary
 # input). Already a workspace dev-dep; no new external crate enters the graph.
 proptest = { workspace = true }
+
+# clw-cli inherits the workspace lints, which include
+# `unsafe_code = "forbid"`. It used to sit at `deny` so that one Windows-DACL
+# block could be `#[allow]`ed inside it — which put all 8,554 lines of this
+# crate somewhere `unsafe` could be reintroduced with the compiler silent.
+# The block now lives in `clw-win-acl`; this crate is back under the compiler.
+[lints]
+workspace = true

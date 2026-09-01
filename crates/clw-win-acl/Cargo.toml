@@ -1,0 +1,41 @@
+[package]
+name = "clw-win-acl"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Windows-only Win32 FFI used to ACL-restrict the PAT-bearing ~/.clw/config.toml
+# (and the ~/.clw dir) to the current owner — the Windows analogue of the unix
+# 0600/0700 hardening, which is a no-op there. Target-scoped to cfg(windows) so
+# it never enters the unix build/lock/`cargo deny` graph. MIT/Apache-2.0
+# (already in deny.toml [licenses].allow + about.toml accepted). The feature
+# modules are the minimal set for: current-process token + user-SID lookup
+# (Threading), ACL build (Security), the named-object DACL apply
+# (Authorization), and shared Win32 types (Foundation).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+# This crate deliberately does NOT use `[lints] workspace = true`.
+#
+# The workspace sets `unsafe_code = "forbid"`, which by definition cannot be
+# locally re-allowed, and cargo additionally rejects mixing
+# `lints.workspace = true` with a local override. This crate holds the one
+# audited `unsafe` block in the workspace (the Windows DACL FFI in `src/imp.rs`),
+# so it restates the lint at `deny`: the same deny-by-default posture, but
+# overridable at a single reviewed call site.
+#
+# It is the ONLY member allowed to sit at `deny`, and
+# `scripts/check-unsafe-posture.sh` enforces that. Every other member inherits
+# `forbid`, where the compiler is the enforcement. Keeping this crate tiny is the
+# point — see the crate-level docs in `src/lib.rs`.
+#
+# If new workspace lints are added, mirror them here.
+[lints.rust]
+unsafe_code = "deny"

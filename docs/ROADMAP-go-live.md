@@ -88,7 +88,8 @@
 ## Exit gate — "impeccable go-live" (100% green before tag)
 
 1. Standing audit **merged** *and its own defects fixed* (M0/M0.5); zero known HIGH/MED findings open.
-2. **Compiles + tests green on every target platform**, incl. Windows; zero `unsafe`, zero prod-path `unwrap/expect/panic`, zero `TODO/FIXME/best-effort` in shipped code.
+2. **Compiles + tests green on every target platform**, incl. Windows; zero `unsafe` except the one audited `clw-win-acl` Windows-DACL block
+   (enforced by the `unsafe_code` workspace lint — see SECURITY.md), zero prod-path `unwrap/expect/panic`, zero `TODO/FIXME/best-effort` in shipped code.
 3. Every tracked deferral closed (or a logged human waiver — none expected).
 4. Signed, reproducible binaries for all targets (HSM/cloud signing); public install (Homebrew tap / `install.sh` / Windows `.exe`) **and** clean **uninstall** verified per platform; no founder-machine hack.
 5. Supply chain clean: `cargo-deny` + `cargo-audit` green; SBOM published; **signed** checksums; valid license posture (no invalid-SPDX `UNLICENSED`); all crates `publish=false`.

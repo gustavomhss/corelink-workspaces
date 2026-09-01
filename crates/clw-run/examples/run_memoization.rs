@@ -18,11 +18,20 @@
 //!
 //! It prints what it did at each step and exits 0 on success.
 
+// Everything in this example except the non-unix `main` stub is unix-only, because
+// the journey it demonstrates shells out to /bin/sh. The imports are gated with it:
+// an example must still have a `main` on every target, so the file cannot carry a
+// crate-level `#![cfg(unix)]` the way the live conformance suites now do.
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use clw_run::types::{AcTransport, CasTransport, ClwError, Digest, Result};
+#[cfg(unix)]
 use clw_run::{run_memoized, RunOptions};
 
 // ---------------------------------------------------------------------------
@@ -41,12 +50,18 @@ use clw_run::{run_memoized, RunOptions};
 // code — exactly how a real downstream user would wire their own transport.
 // ---------------------------------------------------------------------------
 
+// cfg(unix) like its only consumer, `main` below. Without this the helper is dead
+// code on every other target, which the windows-gnu clippy lane reports as an
+// error under -D warnings. Gating the definition where its use is gated is the
+// structural fix; an #[allow(dead_code)] would only hide the divergence.
+#[cfg(unix)]
 #[derive(Clone, Default)]
 struct MemStore {
     cas: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     ac: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl CasTransport for MemStore {
     async fn exists(&self, digest: &Digest) -> Result<bool> {
@@ -83,6 +98,7 @@ impl CasTransport for MemStore {
     }
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl AcTransport for MemStore {
     async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {

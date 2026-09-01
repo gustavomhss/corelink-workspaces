@@ -9,6 +9,7 @@ members = [
     "crates/clw-snapshot",
     "crates/clw-hydrate",
     "crates/clw-run",
+    "crates/clw-win-acl",
     "crates/clw-cli",
     "crates/clw-integration-tests",
     "crates/clw-conformance",
@@ -29,6 +30,17 @@ edition = "2021"
 license = "LicenseRef-Proprietary"
 repository = "https://github.com/HuGR-Labs/corelink-workspaces"
 
+# Mechanized enforcement of the "no `unsafe`" posture claimed in SECURITY.md /
+# docs/THREAT-MODEL.md. `forbid` is workspace-wide and CANNOT be locally
+# re-allowed, so no crate can silently reintroduce `unsafe`. The single audited
+# exception (the Windows DACL FFI in clw-win-acl) restates this as `deny` in that
+# crate's own `[lints]` table and carries exactly one `#[allow(unsafe_code)]`. That
+# crate's whole source tree is hash-pinned in .github/win-acl-sources.expected,
+# because it is the one place an attribute can reintroduce `unsafe` with the
+# compiler silent — everywhere else a permission attribute is error[E0453].
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 clw-types = { path = "crates/clw-types" }
 clw-chunk = { path = "crates/clw-chunk" }
@@ -38,6 +50,7 @@ clw-cache = { path = "crates/clw-cache" }
 clw-snapshot = { path = "crates/clw-snapshot" }
 clw-hydrate = { path = "crates/clw-hydrate" }
 clw-run = { path = "crates/clw-run" }
+clw-win-acl = { path = "crates/clw-win-acl" }
 assert_cmd = "2"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }

@@ -22,3 +22,6 @@ tokio = { workspace = true }
 # Property-based robustness tests (list-envelope JSON parsers never panic on
 # arbitrary bytes). Already a workspace dev-dep; no new external crate.
 proptest = { workspace = true }
+
+[lints]
+workspace = true

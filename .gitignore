@@ -25,3 +25,7 @@ docs/handoff/
 # committed at repo root it goes stale the moment the PR moves, and CLAUDE.md
 # rules out committing working state.
 WP-*-PR-BODY.md
+
+# Content-addressed claim store written by a local analysis tool — live tool state on
+# disk, never repo content. (227 of these were swept into this branch by a `git add -A`.)
+.atlas/

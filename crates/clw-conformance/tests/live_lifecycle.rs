@@ -32,7 +32,20 @@
 //!   CLW_CONFORMANCE_REQUIRE=1 CLW_TENANT=<tenant> CLW_TOKEN=<pat> \
 //!     cargo test -p clw-conformance --features live
 
-#![cfg(feature = "live")]
+// UNIX-ONLY, and stated here rather than repeated on every item. THIS FILE holds one
+// test and it was already individually `#[cfg(unix)]`, so on a non-unix target the file
+// compiled to nothing but its helpers — dead code, and NO WINDOWS COVERAGE AT ALL with
+// nothing saying so. Adding `cargo clippy --all-targets --all-features --target
+// x86_64-pc-windows-gnu -D warnings` to the gate surfaced it as a wall of dead-code
+// errors.
+//
+// Because the gate here really is universal, hoisting it to the file loses no coverage
+// and makes the non-coverage the first thing a reader sees. That is NOT true of
+// live_journeys.rs — two of its journeys DO compile on Windows, so it keeps per-item
+// gates; see the note at the top of that file. It is also not a FIX for this gap: this
+// lifecycle still does not run on Windows. Suppressing the warnings with
+// `#[allow(dead_code)]` would have hidden it again, which is how it survived this long.
+#![cfg(all(feature = "live", unix))]
 
 use clw_client::HttpClient;
 use clw_types::{AcTransport, ClwError, Config, Digest};
@@ -134,7 +147,6 @@ fn is_capability_unavailable(err: &ClwError) -> bool {
 /// Build a real workspace tree in `root`: a small known-bytes text file, an
 /// executable `exec.sh` (0o755), a symlink, and ONE larger multi-chunk file
 /// (5 MiB of deterministic bytes) so chunking + multi-chunk upload is exercised.
-#[cfg(unix)]
 fn build_workspace(root: &std::path::Path, suffix: &str) -> WorkspaceFixture {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -180,7 +192,6 @@ fn build_workspace(root: &std::path::Path, suffix: &str) -> WorkspaceFixture {
     }
 }
 
-#[cfg(unix)]
 struct WorkspaceFixture {
     small_bytes: Vec<u8>,
     exec_bytes: Vec<u8>,
@@ -207,7 +218,6 @@ struct WorkspaceFixture {
 ///
 /// SKIPS cleanly (green) without creds; SKIPS if a LIVE endpoint returns a
 /// 405/501-unavailable state (unless `CLW_CONFORMANCE_REQUIRE=1`).
-#[cfg(unix)]
 #[tokio::test]
 async fn full_lifecycle_roundtrip_live() {
     use clw_cache::LocalCache;
@@ -432,7 +442,6 @@ async fn full_lifecycle_roundtrip_live() {
 /// Best-effort delete of the AC ref this test created. Mirrors the cleanup
 /// discipline in `live_conformance.rs`: ignore every error (idempotent,
 /// 405/501-unavailable, transient). NEVER touches anything but this one key.
-#[cfg(unix)]
 async fn best_effort_cleanup(client: &HttpClient, ref_key: &Digest) -> Result<(), ()> {
     let _ = AcTransport::delete(client, ref_key).await;
     Ok(())

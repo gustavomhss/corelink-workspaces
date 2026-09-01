@@ -92,6 +92,17 @@ crates/clw-cli/src/config.rs"
 # deleted, so removing them changes no verdict. `crates/clw-types/` does not: without
 # it a contract-crate PR narrows to `crates:clw-types` and stops running the
 # supply-chain gates. It was the one term with a unique effect and the one untested.
+# A MEMBER MANIFEST escalates, because it is a supply-chain input and the full lane is
+# the only one that runs `cargo deny` and `cargo audit`. The escalation regex was
+# anchored to the ROOT manifest, so a PR editing only `crates/<x>/Cargo.toml` skipped
+# both; that was WP-16's round-1 hole and it survived into the extracted classifier
+# unpinned. Source files in the same crate must still narrow, or the term is too wide.
+# (An earlier version of this comment justified the term by the `[lints] workspace =
+# true` opt-in instead. That reason is wrong: `check-unsafe-posture.sh` runs in EVERY
+# lane before classification, so the opt-in is guarded regardless of the verdict.)
+check "a member manifest escalates to the full lane" full "crates/clw-cli/Cargo.toml"
+check "member SOURCE still narrows"      "crates:clw-cli " "crates/clw-cli/src/x.rs"
+
 check "clw-types alone does not narrow to crates:"  full "crates/clw-types/src/lib.rs"
 check "clw-types mixed with another crate is full"  full "crates/clw-types/src/lib.rs
 crates/clw-cli/src/config.rs"

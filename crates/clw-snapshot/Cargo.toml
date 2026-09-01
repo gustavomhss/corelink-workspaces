@@ -19,3 +19,6 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+
+[lints]
+workspace = true

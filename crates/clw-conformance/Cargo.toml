@@ -22,3 +22,6 @@ serde_json = { workspace = true }
 [features]
 # Live conformance against corelink-api.humangr.com — requires CLW_TOKEN. Never on in CI default lane.
 live = []
+
+[lints]
+workspace = true

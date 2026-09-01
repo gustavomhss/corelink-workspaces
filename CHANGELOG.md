@@ -40,6 +40,95 @@
   zig step is fail-closed), only a revert of the PR #234 shape that last shipped green on
   2026-07-17. The runbook's own acceptance criterion 1 (a fresh hosted test PR) is recorded as
   **UNMET** inside the document rather than claimed.
+- **The "no `unsafe`" posture is now a lint plus a gate, not a sentence in a doc.**
+  `SECURITY.md` and `docs/THREAT-MODEL.md` claimed the shipped crates contain zero
+  `unsafe`. That was false — one audited Windows-DACL block existed — and nothing
+  enforced any version of the claim. Added `[workspace.lints.rust] unsafe_code =
+  "forbid"` with every member opting in. The lint reaches every kind of crate root,
+  verified by injecting `unsafe {}` into one of each and watching the compiler reject
+  it: `lib.rs`, `src/bin/*.rs`, `tests/*.rs` and `benches/*.rs`.
+  **The DACL block moved into its own crate, `clw-win-acl`.** `forbid` cannot be
+  locally re-allowed, so whichever crate holds that block must sit at `deny` instead —
+  and a `deny` crate is precisely where `unsafe` can be reintroduced with the compiler
+  silent. It is now pinned BYTE FOR BYTE against `.github/win-acl-sources.expected`, so
+  any change to it is a fixture diff a person reads — the regex that used to police it
+  is GONE, not tightened. Leaving the block in `clw-cli` put 8,554 lines under that
+  regex, and cold review found a spelling it did not model,
+  `#[cfg_attr(all(), allow(unsafe_code))]`, which ran `unsafe` in the shipped binary
+  with `cargo fmt`, full-workspace `cargo clippy -D warnings` and the guard all green.
+  The new crate is ~180 lines and holds nothing else; `clw-cli`, the crate that
+  handles the plaintext PAT, is back under `forbid` where the compiler enforces it.
+  Shrinking what the regex must be right about was the only fix here that removes a
+  regex from the trust path rather than patching it again.
+  **Three more things the compiler does not see**, each now asserted:
+  `unsafe_code` is suppressed inside EXTERNAL macro expansions, so a
+  `#[macro_export] macro_rules!` body in one member expanding into another compiles
+  clean under `forbid` at both sites — the workspace defines no macros, so the guard
+  asserts zero and an author adding one must argue for it there; a crate detached by
+  `workspace.exclude` or its own `[workspace]` table stays a path dependency linked
+  into the binary while leaving `cargo metadata`, so the set of in-repo manifests must
+  equal the member set; and the source walk no longer follows a hardcoded `crates/`
+  path or silently skips symlinked directories.
+  **How the guard got here, in order, because the pattern is the point.** Five
+  generations were written and each was broken by review. An attribute counter fell to
+  `#[allow(unsafe_code, dead_code)]`, to extra whitespace, and to
+  `#[expect(unsafe_code)]`, which is not the same attribute. A token scan replaced it
+  and fell to an `unsafe` split across a line break (grep is line-oriented), only
+  looked under `crates/`, and raised false positives on doc comments. A lint-level
+  assertion fell to the required string sitting in a *comment*; a member opt-in check
+  written as `grep -q 'workspace = true'` could not fail at all, because
+  `version.workspace = true` appears in every manifest in the repo. Each of those is
+  the same mistake: matching TEXT where a PARSER or the COMPILER was the right tool.
+  The guard now parses manifests with `tomllib`, takes the member list from
+  `cargo metadata` (a failed enumeration is a hard failure, not zero iterations and a
+  clean report), and leaves finding `unsafe` to the compiler, which does it exactly.
+  **In-repo cargo configs are now held to an ALLOWLIST, which is empty.** A cargo
+  config decides both what is handed to the compiler and what RUNS as it.
+  `[build] rustflags = ["--cap-lints", "allow"]` demotes every lint in every workspace
+  crate — `forbid` included — to `allow`; `rustc-wrapper`, `rustc-workspace-wrapper`
+  and `rustc` reach the same end through a shim script, and can scope it to a single
+  crate. Both verified end to end: `unsafe` running in the shipped binary with the
+  guard, `cargo fmt --check`, host `clippy -D warnings` and the windows-gnu cross lane
+  all clean. The first version of this check named three dangerous keys and review
+  simply used a fourth, so it asserts instead that NO key is set that is not written
+  down — every `.cargo/` directory in the tree, not just the root, since cargo
+  discovers config by walking cwd upward. The guard's directory traversals were
+  consolidated into ONE helper (`walk_or_fail`) that FAILS on a symlinked directory
+  rather than skipping it — they used to disagree, and the newest and most
+  security-critical of them failed OPEN on the construct the oldest already failed
+  closed on: `ln -s ci/cargo-cfg .cargo` is
+  one committable line that hid a capping config from the walk while cargo read it
+  normally, and "we did not look there" had been reported as "there is nothing there". `RUSTFLAGS` and `RUSTC_WRAPPER` in the
+  AMBIENT ENVIRONMENT do the same and are NOT closable from inside a repository; both
+  are now named as uncovered.
+  **`scripts/selftest-unsafe-posture.sh` is new and replays the corpus** against a copy
+  of the tree: one clean baseline, every recorded bypass as a case that must be
+  rejected (most pinning WHICH check must fire) and one asserting a symlinked `target/`
+  stays permitted, so fail-closed does not become fail-on-everything. The suite reports
+  its own totals; no count is carried here, because it went stale three times. The corpus previously
+  existed only in commit prose, which is why five of the seven rounds reopened an
+  earlier round's fix. One case compiles the real tree as the sentinel for anything
+  that defangs the lint wholesale; its reach is exactly the crates `-p` compiles, so it
+  builds `clw-cli`, the crate that ships. The full lane runs it — **~117s on a cold dev
+  box, 14.0s in CI** (the latter on the 39-case revision); the gap is the
+  `CARGO_TARGET_DIR` the job's earlier steps have already populated.
+  A green suite means the recorded bypasses are still closed and nothing more: it
+  reported 30/30 on a tree whose binary ran `unsafe` behind a crate-scoped compiler
+  wrapper, and 39/39 on another behind a symlinked `.cargo`.
+  Separately, the scoped-lane escalation regex was anchored to the ROOT `Cargo.toml`
+  only, so a PR editing just `crates/*/Cargo.toml` could delete the enforcement and
+  take the fast lane.
+  A claim held up only by review attention is not a control, which is this change's
+  own thesis — and `SECURITY.md` now also states plainly what remains uncovered:
+  **platform-conditional code, which is the widest hole — three of the five targets
+  `release.yml` ships (both macOS targets and `aarch64-unknown-linux-gnu`) are linted
+  by no lane at all**; lint capping from the environment; `unsafe` added inside the
+  audited block itself; third-party and `[patch]` code; proc-macro expansions; and
+  `fuzz/`. (`build.rs` left that list — the guard now asserts none exists, rather than
+  observing it in prose.)
+  Also dropped the `Win32_System_Memory` windows-sys feature, dead since the SID
+  buffer moved from `LocalAlloc` to `Vec<u64>` — confirmed by a clean
+  `--target x86_64-pc-windows-gnu` build without it.
 - **Added `scripts/pre-merge-gate-check.sh`, ported from corelink-server.** Guards against a
   failure mode that bit both repos within two hours of each other: a CONFLICTING PR gets NO
   `pull_request` check runs at all (GitHub cannot build the merge ref) — not queued, not
@@ -286,8 +375,11 @@ gate). See `docs/TESTING.md` for the index + the measure→ratchet→gate postur
   a floor is active and blocks a regression (deterministic, not flaky).
 - **Fuzz lane** (`fuzz.yml`, nightly) — runs the previously-dormant `cargo-fuzz` harness (the `clw-types`
   untrusted-input targets: symlink-target / rel-path / manifest-parse / digest-from-hex); a crash is red.
-- **Mutation lane** (`mutation.yml`, weekly) — `cargo-mutants` whole-workspace, report-only; survivors feed a
-  follow-on that adds killing tests, then flips to block new survivors per-PR.
+- **Mutation lane** (`mutation.yml`) — `cargo-mutants`. This entry described the weekly
+  whole-workspace form and a follow-on that would "flip to block new survivors per-PR";
+  that follow-on has since landed, so the per-PR `--in-diff` lane IS the lane now and
+  the weekly sweep is gone. See the later entry for why (the six 300-minute shards were
+  being evicted by the runner fabric and were much of what starved it).
 - **Property round-trip** (`crates/clw-integration-tests/tests/roundtrip_prop.rs`, in the gate) — proptest
   arbitrary trees (unicode/space names, nested dirs, empty+multi-byte files, exec bits, in-tree symlinks) →
   `snapshot→hydrate` asserted byte-identical with structure/mode/symlink-target preserved.

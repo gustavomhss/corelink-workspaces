@@ -76,8 +76,7 @@ pub async fn run(args: InitArgs, cfg: ResolvedConfig, json: bool) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        harden_dir_0700, merge_config_pairs, read_config_pairs, render_config,
-        write_config_file_0600,
+        merge_config_pairs, read_config_pairs, render_config, write_config_file_0600,
     };
 
     // -----------------------------------------------------------------------
@@ -168,6 +167,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn harden_dir_is_0700() {
+        // Imported HERE, not at module scope: its only user is this cfg(unix) test, so
+        // a module-scope import is dead on every other target.
+        use crate::config::harden_dir_0700;
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::TempDir::new().unwrap();

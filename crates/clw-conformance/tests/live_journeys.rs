@@ -37,11 +37,35 @@
 //! cred-ticket trio. Destructive journeys also need the `clw` binary built
 //! (`cargo build -p clw-cli`). Scheduled lane: CLW_CONFORMANCE_REQUIRE=1 …
 
+// WINDOWS COVERAGE, stated once here because it was invisible before and that is how
+// it survived. SEVEN of the nine journeys in this file are `#[cfg(unix)]` — they build
+// fixtures with unix permissions and symlinks — so on any non-unix target they are not
+// merely skipped, they do not exist. TWO do compile and run there:
+// `cred_ticket_redeems_against_the_real_fabric` and
+// `replica_lag_false_orphan_prune_abort_needs_a_server_hook`.
+//
+// A previous revision hoisted the gate to the whole file (`#![cfg(all(feature = "live",
+// unix))]`). That was tidier and strictly worse: it took those two tests OFF Windows to
+// make a comment true, inside a change whose whole argument is that hiding a gap is how
+// gaps survive. So the gate stays per-item, and the HELPERS carry `#[cfg(unix)]` where
+// their users are — never `#[allow(dead_code)]`, which is what would let the next
+// widening of this gap pass unnoticed.
+//
+// Closing the gap for the other seven is separate work; it is not done here.
 #![cfg(feature = "live")]
 
 use clw_client::{redeem_cred_ticket, HttpClient};
-use clw_types::{AcTransport, CasTransport, ClwError, Config, Digest};
-use std::path::{Path, PathBuf};
+use clw_types::{AcTransport, ClwError, Config};
+use std::path::PathBuf;
+
+// Imports reached only by the unix-gated journeys, gated where their users are rather
+// than blanketed with `#[allow(unused_imports)]` — suppressing these is how the missing
+// Windows coverage stayed invisible for so long.
+#[cfg(unix)]
+use clw_types::{CasTransport, Digest};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -51,6 +75,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Read runtime env into a `Config` for the PRIMARY identity. `None` (+ skip
 /// notice) when `CLW_TOKEN`/`CLW_TENANT` is absent or empty.
+#[cfg(unix)]
 fn try_config() -> Option<Config> {
     config_from(
         "CLW_TOKEN",
@@ -60,6 +85,7 @@ fn try_config() -> Option<Config> {
 
 /// Build a `Config` reading the PAT from `token_var` (so a second identity can be
 /// supplied via `CLW_TOKEN_B`), sharing the same `CLW_TENANT`/`CLW_ENDPOINT`.
+#[cfg(unix)]
 fn config_from(token_var: &str, skip_reason: &str) -> Option<Config> {
     // An absent CI secret surfaces as an empty string, not unset — treat empty as
     // absent (else HttpClient::new takes the creds-present branch and panics).
@@ -85,6 +111,7 @@ fn config_from(token_var: &str, skip_reason: &str) -> Option<Config> {
     }
 }
 
+#[cfg(unix)]
 fn try_client() -> Option<(HttpClient, String)> {
     let cfg = try_config()?;
     let tenant = cfg.tenant.clone();
@@ -94,6 +121,7 @@ fn try_client() -> Option<(HttpClient, String)> {
 /// A SECOND identity (distinct PAT via `CLW_TOKEN_B`) on the SAME tenant, for the
 /// team-share journey. Returns `None` (soft-skip, never a require-fail) when
 /// `CLW_TOKEN_B` is absent — the second PAT is optional even under REQUIRE=1.
+#[cfg(unix)]
 fn try_second_client() -> Option<HttpClient> {
     let token = std::env::var("CLW_TOKEN_B").ok().filter(|s| !s.is_empty());
     let tenant = std::env::var("CLW_TENANT").ok().filter(|s| !s.is_empty());
@@ -116,6 +144,7 @@ fn try_second_client() -> Option<HttpClient> {
     )
 }
 
+#[cfg(unix)]
 fn require_live() -> bool {
     matches!(
         std::env::var("CLW_CONFORMANCE_REQUIRE").as_deref(),
@@ -123,6 +152,7 @@ fn require_live() -> bool {
     )
 }
 
+#[cfg(unix)]
 fn skip_or_fail(reason: &str) {
     if require_live() {
         panic!("CONFORMANCE REQUIRED but a journey skipped: {reason} (CLW_CONFORMANCE_REQUIRE=1 forbids skips)");
@@ -132,6 +162,7 @@ fn skip_or_fail(reason: &str) {
 
 /// Unique per-run suffix (pid + full epoch nanos) so keys never collide between
 /// invocations. (`subsec_nanos` would wrap every second — a real bug we avoid.)
+#[cfg(unix)]
 fn run_suffix() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -163,6 +194,7 @@ fn is_backend_unavailable(err: &ClwError) -> bool {
 
 /// Best-effort delete of an AC ref this suite created. Ignores every error
 /// (idempotent / 405-501 / transient). NEVER touches anything but the given key.
+#[cfg(unix)]
 async fn cleanup(client: &HttpClient, ref_key: &Digest) {
     let _ = AcTransport::delete(client, ref_key).await;
 }
@@ -496,6 +528,7 @@ fn soft_skip(reason: &str) {
 }
 
 /// A `(tenant, token)` pair from two env vars, or `None` if either is unset/empty.
+#[cfg(unix)]
 fn env_pair(tenant_var: &str, token_var: &str) -> Option<(String, String)> {
     let t = std::env::var(tenant_var).ok().filter(|s| !s.is_empty())?;
     let k = std::env::var(token_var).ok().filter(|s| !s.is_empty())?;
@@ -520,6 +553,7 @@ fn client_for(tenant: &str, token: &str) -> HttpClient {
 /// Locate the built `clw` binary next to the test exe (`target/<profile>/clw[.exe]`,
 /// built by the lane's `cargo build -p clw-cli`). `None` → soft-skip the binary
 /// journeys rather than fail (a plain `cargo test -p clw-conformance` won't build it).
+#[cfg(unix)]
 fn clw_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let profile_dir = exe.parent()?.parent()?; // .../deps -> .../<profile>
@@ -529,6 +563,7 @@ fn clw_binary() -> Option<PathBuf> {
 }
 
 /// Spawn the real `clw` binary against the live endpoint with the given identity.
+#[cfg(unix)]
 fn clw_cmd(bin: &Path, tenant: &str, token: &str, cache: &Path) -> std::process::Command {
     let endpoint = std::env::var("CLW_ENDPOINT")
         .ok()

@@ -44,7 +44,28 @@
    written **`0600`**, `~/.clw` and the cache root **`0700`** (not umask-dependent);
    endpoint must be **`https://`** (loopback exception via **exact-host** check —
    `127.0.0.1`/`localhost`/`[::1]`, never a prefix match). *(audit H2, M2, M0.5 CRIT)*
-6. **No `unsafe`.** Shipped crates contain **zero** `unsafe`. Reject any addition.
+6. **No `unsafe`.** Shipped crates contain **zero** `unsafe` **except one audited
+   block** — the `cfg(windows)` DACL FFI in `crates/clw-win-acl/src/imp.rs`, a crate
+   that exists only to hold it so that `clw-cli` can stay at `forbid`.
+   `[workspace.lints.rust] unsafe_code = "forbid"` mechanizes this; `clw-win-acl`
+   — and only it — restates the lint as `deny` so that one block can carry the
+   single `#[allow(unsafe_code)]`. In every other crate a permission attribute is
+   `error[E0453]`, so the compiler rejects it however it is spelled; and
+   `clw-win-acl`'s whole source tree is hash-pinned in
+   `.github/win-acl-sources.expected`, so any change there is a fixture diff.
+   Reject any addition on sight — a crate dropping `[lints] workspace = true`, a pin
+   update whose accompanying source change you have not read, or **ANY `.cargo/config`
+   or `.cargo/config.toml`, anywhere in the tree, setting ANY key**. Not just
+   `rustflags`: a reviewer told to watch for `rustflags` waves through
+   `rustc-wrapper = "scripts/shim.sh"`, which replaces the compiler and can cap the
+   lint for one crate — that exact line got `unsafe` into the shipped binary past a
+   previous round with every gate green. The guard enforces an empty allowlist, so any
+   such file is a deliberate, reviewed exception; if you approve one, read the program
+   it names. **A symlinked directory is the same finding**: `ln -s ci/cargo-cfg .cargo`
+   put a capping config somewhere the guard's walk would not go, with every gate green —
+   the walks now fail on one, so treat any new directory symlink as a red flag rather
+   than tidiness. `RUSTFLAGS` / `RUSTC_WRAPPER` in the environment do the same and are
+   outside what any in-repo check can reach.
 7. **No prod-path `unwrap`/`expect`/`panic`** and no `TODO`/`FIXME`/`best-effort`
    in shipped code. Tests may use them; production paths may not.
 8. **Windows still compiles.** If the diff touches any OS-sensitive construct

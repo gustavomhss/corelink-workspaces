@@ -26,3 +26,6 @@ tempfile = { workspace = true }
 [[bin]]
 name = "clw-e2e"
 path = "src/bin/e2e.rs"
+
+[lints]
+workspace = true

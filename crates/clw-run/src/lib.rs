@@ -1993,12 +1993,14 @@ mod tests {
     /// backend on writes AFTER the child already succeeded. `get`/`exists` stay fast
     /// + empty so `run_memoized` takes the cache-MISS path and executes the child.
     #[derive(Clone)]
+    #[cfg(unix)]
     struct SlowPutStore {
         inner: FakeStore,
         put_delay: std::time::Duration,
     }
 
     #[async_trait::async_trait]
+    #[cfg(unix)]
     impl CasTransport for SlowPutStore {
         async fn exists(&self, digest: &Digest) -> Result<bool> {
             CasTransport::exists(&self.inner, digest).await
@@ -2019,6 +2021,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    #[cfg(unix)]
     impl AcTransport for SlowPutStore {
         async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {
             AcTransport::get(&self.inner, key).await

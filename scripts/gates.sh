@@ -17,6 +17,10 @@
 # so a PR that edits either is re-checked against the supply-chain gates instead
 # of slipping through the SCOPED lane. main is always full-lane as the backstop.
 set -euo pipefail
+# Run from the repo root regardless of the caller's cwd. Without this the gate
+# silently ran against a DIFFERENT worktree when invoked with a `cd` that did not
+# stick — a green that meant nothing.
+cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 # Persistent target dir on CI (outside the runner's _work checkout, immune to clean):
@@ -132,6 +136,21 @@ for wf in $workflow_perms_exempt; do
   fi
 done
 echo "workflow-permissions guard: clean (all workflows declare 'permissions:'; exempt: ${workflow_perms_exempt})"
+# --- UNSAFE-POSTURE GUARD (runs in EVERY lane, including docs-only) ----------
+# Protects the CONFIGURATION that makes the compiler enforce "no `unsafe` outside
+# one audited crate". The compiler is the oracle WITHIN a crate: with the workspace
+# lint at `forbid`, the clippy run below rejects `unsafe` in any target of any
+# inheriting member, exactly — but only for the crates and targets some lane actually
+# compiles, and only while something is still running the real rustc with the real
+# lint level. This guard covers the seven places that leaves open: the lint
+# configuration itself; any in-repo cargo config, which decides what runs AS the
+# compiler and what is handed to it; crates detached from the workspace; a compiled
+# target rooted outside its member directory; build scripts; external macro
+# expansions; and source pulled in by `include!` / `#[path]` / `cfg_attr`. It parses
+# manifests and cargo configs with tomllib rather than grepping, because three grep
+# generations were each broken by review. See the script header and SECURITY.md —
+# both of which also name what NONE of this reaches.
+bash scripts/check-unsafe-posture.sh
 
 # --- DEADMAN-REGISTRY GUARD (runs in EVERY lane, including docs-only) --------
 # Every SCHEDULED workflow must be registered in canary-deadman.yml's lane
@@ -207,6 +226,34 @@ if [ "$SCOPE" = "full" ]; then
   # `live` path here needs no network. (test stays default-features — see below — so
   # the live suite is not RUN without a backend.)
   cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Replay the cold-review bypass corpus against the unsafe-posture guard. Five
+  # generations of that guard were each defeated by a construct the previous one
+  # had not modelled, and the corpus existed only in commit prose — so a rewrite
+  # could reopen any of them silently, which is exactly what four of the six rounds
+  # did. RUNTIME IS ENVIRONMENT-DEPENDENT AND THE TWO NUMBERS ARE 10x APART, so
+  # quoting one of them alone has now been wrong three times in a row:
+  #   * ~117s wall on a cold 8-worker dev box. Contended, it measures much
+  #     higher — a reviewer got 159.85s at load-avg 37 — so treat the cold figure as the
+  #     floor, not the cost you will see.
+  #   * 14.0s in CI, 4 workers (run 33361045294: 05:36:11.34 -> 05:36:25.32), on an
+  #     earlier, smaller revision of the corpus. Every case added since is a
+  #     guard-oracle case with no compile in it, so treat this as a FLOOR. Carrying a
+  #     case count here is what went stale three times; the suite prints its own.
+  # The gap is not noise: CI=true exports a shared CARGO_TARGET_DIR that every
+  # self-test case inherits, and by the time the suite runs, the steps above it in
+  # THIS job have already populated that directory — so the one case that compiles
+  # the real tree finds most of the graph built, while a local run gives each case
+  # its own empty target dir. (Shared within the job, not across runs:
+  # docs/RUNBOOK-ci-fallback.md records that no actions/cache exists and every CI
+  # run starts cold.) That is why widening that case from `-p clw-types` to
+  # `-p clw-cli` cost 109s locally and ~4s on the box in the merge path.
+  # Earlier revisions of this comment claimed ~11s (a warm-box figure) and then
+  # 70-80s (a cold-box figure), each stated as if it were THE cost. Say which box.
+  # Also: the suite copies the tree per case, so anything large and tracked shows up
+  # here once per case — untracking 227 stray files moved a 30-case run from ~172s
+  # to ~72s. Worth checking before blaming a case.
+  bash scripts/selftest-unsafe-posture.sh
   cargo test --workspace
   # Supply-chain gates are a whole-workspace concern — full lane only.
   # INVARIANT: this is the only lane that runs them, so their inputs (Cargo.lock,
@@ -264,7 +311,8 @@ fi
 # Cross-platform COMPILE gate — UNIVERSAL tripwire (runs in BOTH lanes). CI runs on a
 # Linux (ubuntu) GitHub-hosted runner, which natively compiles the entire `cfg(unix)`
 # path; the one cfg-DIVERGENT target — Windows (`cfg(windows)` vs `cfg(unix)`) — is
-# cross-CHECKED here (a `cargo check`, type-check only, so no cross-linker/CC is needed)
+# cross-LINTED here (`cargo clippy -D warnings`; CI installs gcc-mingw-w64-x86-64 for it,
+# because ring's C build does need a cross-CC — the older comment said none was needed)
 # so Windows breakage is caught at PR time, not only on main's post-merge full lane
 # (a `#[cfg(windows)]` break inside a scoped-lane crate change used to slip the required
 # gate). Per-OS NATIVE release binaries are built by release.yml's matrix.
@@ -272,16 +320,29 @@ fi
 if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
   echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
   rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 || true
-  # --all-targets is load-bearing (M17/WP-28): WITHOUT it, `cargo check` compiles
-  # only lib/bin targets, so every `#[cfg(windows)] #[test]` in the tree was never
-  # even TYPE-CHECKED by any lane — a systemic hole, not a per-WP detail. With it,
-  # cfg(windows) test code is at least compiled on every PR. (Most of it is still
-  # not RUN: this is a check, and windows.yml's wine job runs only the pure-lexical
-  # `lexical_` tests of the M17 predicate on the windows-gnu binary — the
-  # filesystem-touching ones do not run reliably under wine. Which is exactly why
-  # that predicate is a plain function whose table also runs under normal
-  # `cargo test` on unix.)
-  cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+  # clippy, not check, and at the SAME -D warnings bar as the host lane — and with
+  # --all-targets. Both halves are strengthenings from different work packages and
+  # both reasons still hold:
+  #   * --all-targets (M17/WP-28): without it `cargo check` compiles only lib/bin
+  #     targets, so every `#[cfg(windows)] #[test]` in the tree was never even
+  #     TYPE-CHECKED by any lane — a systemic hole, not a per-WP detail.
+  #   * clippy over check (WP-16): `cargo check` let a real clippy error ride in
+  #     crates/clw-win-acl — the one crate in the workspace that contains `unsafe`,
+  #     and the only one host clippy never compiles, because it is entirely
+  #     cfg(windows).
+  #   * rustc strips inactive `cfg` before linting, so `unsafe_code = "forbid"` only
+  #     fires on code compiled for a target some lane actually builds. Linting this
+  #     target as well as the host closes windows-gnu. It does NOT close every
+  #     target: a `#[cfg(target_os = "macos")]` block is still unlinted by any lane
+  #     here, and SECURITY.md says so rather than implying otherwise.
+  #
+  # Most cfg(windows) code is still not RUN here: this lints, and windows.yml's wine
+  # job runs only the pure-lexical `lexical_` tests of the M17 predicate on the
+  # windows-gnu binary — the filesystem-touching ones do not run reliably under
+  # wine. Which is why that predicate is a plain function whose table also runs
+  # under normal `cargo test` on unix.
+  cargo clippy --workspace --all-targets --all-features \
+    --target x86_64-pc-windows-gnu -- -D warnings
 else
   echo "CLW_SKIP_CROSS=1 — skipping cross-compile gate (local fast path only)"
 fi

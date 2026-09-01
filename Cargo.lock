@@ -337,6 +337,7 @@ dependencies = [
  "clw-run",
  "clw-snapshot",
  "clw-types",
+ "clw-win-acl",
  "futures",
  "proptest",
  "serde_json",
@@ -344,7 +345,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -478,6 +478,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "clw-win-acl"
+version = "0.1.11"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

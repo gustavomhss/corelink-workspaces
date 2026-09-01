@@ -22,3 +22,6 @@ tokio = { workspace = true }
 # snapshot -> hydrate round-trip. clw-hydrate does not depend on clw-snapshot at
 # runtime; this dev-dep exists solely so the example can exercise both halves.
 clw-snapshot = { workspace = true }
+
+[lints]
+workspace = true

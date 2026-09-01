@@ -22,3 +22,6 @@ reqwest = { workspace = true }
 proptest = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"
+
+[lints]
+workspace = true

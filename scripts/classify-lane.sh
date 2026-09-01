@@ -48,7 +48,18 @@ classify_lane() {
   # under scripts/ or .github/ escalate to the full lane. INVARIANT: the full lane is
   # the only one that runs `cargo deny` and `cargo audit`, so their inputs must be
   # listed here or a PR editing them would skip them.
-  if grep -qE '^(Cargo\.(toml|lock)|deny\.toml|scripts/|\.github/|crates/clw-types/)' <<<"$changed"; then
+  # `crates/[^/]+/Cargo\.toml` is WP-16's term. A member manifest is a SUPPLY-CHAIN
+  # input — it can add, bump or re-source a dependency — and the full lane is the only
+  # one that runs `cargo deny` and `cargo audit`. The regex was anchored to the ROOT
+  # manifest, so a PR editing only `crates/<x>/Cargo.toml` skipped both.
+  #
+  # NOT the reason, though an earlier version of this comment claimed it was: the
+  # `[lints] workspace = true` opt-in that applies `unsafe_code = "forbid"` also lives
+  # in these files, but `scripts/gates.sh` runs `check-unsafe-posture.sh`
+  # UNCONDITIONALLY, before any classification, in every lane including docs-only — so
+  # deleting an opt-in is caught whatever lane this returns. Review proved it. The
+  # supply-chain reason stands on its own; the other was a guess that read well.
+  if grep -qE '^(Cargo\.(toml|lock)|deny\.toml|scripts/|\.github/|crates/clw-types/|crates/[^/]+/Cargo\.toml)' <<<"$changed"; then
     printf 'full\n'; return 0
   fi
 

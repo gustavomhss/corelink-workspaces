@@ -23,3 +23,6 @@ async-trait = { workspace = true }
 # Property-based robustness tests (RunRecord parse never panics on arbitrary
 # bytes). Already a workspace dev-dep; no new external crate.
 proptest = { workspace = true }
+
+[lints]
+workspace = true
