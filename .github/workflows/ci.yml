@@ -85,3 +85,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: pre-merge-gate-check self-test
         run: bash scripts/pre-merge-gate-check-selftest.sh
+
+  release-guards-selftest:
+    # Pure bash + git + jq, fully offline. Exercises release security decisions on
+    # every PR without spending a tag or touching release/publish credentials.
+    runs-on: corelink
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: release guards self-test
+        run: bash scripts/release-guards-selftest.sh

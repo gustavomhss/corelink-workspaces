@@ -110,11 +110,21 @@ jobs:
         id: version
         run: |
           set -euo pipefail
+          # shellcheck source=scripts/release-guards.sh
+          . scripts/release-guards.sh
           TAG="${GITHUB_REF_NAME}"
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.?[0-9]+)?$'; then
-            echo "::error::tag '$TAG' is not a semver release tag (expected vX.Y.Z or vX.Y.Z-rc.N)"
-            exit 1
-          fi
+          KIND="$(release_kind "$TAG")"
+          case "$KIND" in
+            invalid)
+              echo "::error::tag '$TAG' is not a semver release tag (expected vX.Y.Z or vX.Y.Z-rc.N)"
+              exit 1
+              ;;
+            rc|real) ;;
+            *)
+              echo "::error::release_kind returned unknown verdict '$KIND' for tag '$TAG'"
+              exit 1
+              ;;
+          esac
           # Strip the leading 'v' for downstream artifact naming.
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           # Classify rc-vs-real ONCE, here, off the SAME validated tag (the regex
@@ -122,7 +132,7 @@ jobs:
           # carries an `-rc` suffix is a PRERELEASE; a bare vX.Y.Z is a real
           # release. The publish job reuses this output verbatim — it never
           # re-parses the tag (see preflight.outputs.prerelease).
-          if printf '%s' "$TAG" | grep -Eq -- '-rc\.?[0-9]+$'; then
+          if [ "$KIND" = "rc" ]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
