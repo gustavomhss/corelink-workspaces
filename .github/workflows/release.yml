@@ -140,6 +140,31 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # A real release is only valid when its tag commit is already reachable
+      # from origin/main. Fetch main explicitly: a tag checkout alone cannot
+      # prove that ref is present, and an unresolvable base must fail closed.
+      # RC tags deliberately skip this guard so they can exercise the pipeline
+      # from a release branch before it has merged to main.
+      - name: assert real tag is ancestral of origin/main
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/release-guards.sh
+          . scripts/release-guards.sh
+          KIND="${{ steps.version.outputs.kind }}"
+          case "$KIND" in
+            real)
+              git fetch origin main --no-tags
+              assert_tag_is_ancestor "$GITHUB_SHA" origin/main
+              ;;
+            rc)
+              echo "rc tag: ancestry guard skipped; release candidates may originate outside main"
+              ;;
+            *)
+              echo "::error::unknown release kind '$KIND' while checking tag ancestry"
+              exit 1
+              ;;
+          esac
+
       # The git tag must equal the workspace Cargo version — prevents shipping a
       # binary whose --version disagrees with the release tag.
       - name: assert tag matches workspace Cargo version

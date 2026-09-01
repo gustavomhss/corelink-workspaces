@@ -44,6 +44,10 @@ EXPECTED=(
   "WP-05 self-verification guard is wired"
   "WP-05 self-verification rechecks absent trust root"
   "WP-05 legacy tolerant trust-root copy is absent"
+  "WP-04 real-tag ancestry preflight exists"
+  "WP-04 real tags fetch origin/main explicitly"
+  "WP-04 real tags assert ancestry against origin/main"
+  "WP-04 rc tags explicitly skip ancestry guard"
   "A6 commit on main is an ancestor"
   "A6 orphan is rejected"
   "A6 unmerged branch commit is rejected"
@@ -69,6 +73,9 @@ if [ "${CLW_RELEASE_GUARDS_SKIP_NEGATIVE_CONTROLS:-0}" != "1" ]; then
     "negative control catches a trivial same-name A9 selfverify probe"
     "negative control catches missing WP-05 workflow wiring"
     "negative control catches missing WP-05 trust-root recheck"
+    "negative control catches missing WP-04 main fetch"
+    "negative control catches missing WP-04 ancestry assertion"
+    "negative control catches missing WP-04 rc exemption"
   )
 fi
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/clw-release-guards.XXXXXX")"
@@ -215,6 +222,33 @@ expect_recursive_negative_control() {
         return
       fi
       ;;
+    wp04-fetch)
+      needle='              git fetch origin main --no-tags'
+      replacement='              : # NEGATIVE_CONTROL_WP04_MAIN_FETCH_UNWIRED'
+      if ! replace_line_once "$child_dir/.github/workflows/release.yml" \
+        "$needle" "$replacement" "$child_dir/release.yml.tmp"; then
+        bad "$name — WP-04 main-fetch sabotage did not apply exactly once"
+        return
+      fi
+      ;;
+    wp04-assert)
+      needle='              assert_tag_is_ancestor "$GITHUB_SHA" origin/main'
+      replacement='              : # NEGATIVE_CONTROL_WP04_ANCESTRY_ASSERTION_UNWIRED'
+      if ! replace_line_once "$child_dir/.github/workflows/release.yml" \
+        "$needle" "$replacement" "$child_dir/release.yml.tmp"; then
+        bad "$name — WP-04 ancestry-assertion sabotage did not apply exactly once"
+        return
+      fi
+      ;;
+    wp04-rc-skip)
+      needle='              echo "rc tag: ancestry guard skipped; release candidates may originate outside main"'
+      replacement='              : # NEGATIVE_CONTROL_WP04_RC_EXEMPTION_UNWIRED'
+      if ! replace_line_once "$child_dir/.github/workflows/release.yml" \
+        "$needle" "$replacement" "$child_dir/release.yml.tmp"; then
+        bad "$name — WP-04 rc-exemption sabotage did not apply exactly once"
+        return
+      fi
+      ;;
     *)
       bad "$name — unknown sabotage '$sabotage'"
       return
@@ -309,6 +343,18 @@ expect_file_count "WP-05 self-verification rechecks absent trust root" 1 "$WORKF
 expect_file_count "WP-05 legacy tolerant trust-root copy is absent" 0 "$WORKFLOW" \
   '          [ -f docs/minisign.pub ] && cp docs/minisign.pub release/ || true'
 
+# WP-04 connects the already-tested pure ancestry guard to the only release entry
+# point. These exact pins make a detached call, a missing fetch, or an accidental
+# RC hard-fail visible on every PR without creating or publishing a real tag.
+expect_file_count "WP-04 real-tag ancestry preflight exists" 1 "$WORKFLOW" \
+  '      - name: assert real tag is ancestral of origin/main'
+expect_file_count "WP-04 real tags fetch origin/main explicitly" 1 "$WORKFLOW" \
+  '              git fetch origin main --no-tags'
+expect_file_count "WP-04 real tags assert ancestry against origin/main" 1 "$WORKFLOW" \
+  '              assert_tag_is_ancestor "$GITHUB_SHA" origin/main'
+expect_file_count "WP-04 rc tags explicitly skip ancestry guard" 1 "$WORKFLOW" \
+  '              echo "rc tag: ancestry guard skipped; release candidates may originate outside main"'
+
 # A6/A7 — construct the complete ancestry graph offline. `feature_sha` descends
 # from main but is not merged into it; `orphan_sha` shares no ancestry at all.
 REPO="$TMPROOT/repo"
@@ -388,6 +434,15 @@ if [ "${CLW_RELEASE_GUARDS_SKIP_NEGATIVE_CONTROLS:-0}" != "1" ]; then
   expect_recursive_negative_control \
     "negative control catches missing WP-05 trust-root recheck" wp05-recheck \
     "WP-05 self-verification rechecks absent trust root"
+  expect_recursive_negative_control \
+    "negative control catches missing WP-04 main fetch" wp04-fetch \
+    "WP-04 real tags fetch origin/main explicitly"
+  expect_recursive_negative_control \
+    "negative control catches missing WP-04 ancestry assertion" wp04-assert \
+    "WP-04 real tags assert ancestry against origin/main"
+  expect_recursive_negative_control \
+    "negative control catches missing WP-04 rc exemption" wp04-rc-skip \
+    "WP-04 rc tags explicitly skip ancestry guard"
 fi
 
 # Report functional failures before checking completeness. Otherwise a real guard
