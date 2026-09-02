@@ -56,6 +56,11 @@ proptest = { workspace = true }
 # dev-dependency: production `clw` never links the evidence harness.
 clw-e2e-evidence = { path = "../clw-e2e-evidence" }
 
+# Safe Unix PTY + nonblocking-FD wrappers for the interactive `rm` e2e proof.
+# `openpty` is unavailable in nix on AIX, so this follows the test's cfg gate.
+[target.'cfg(all(unix, not(target_os = "aix")))'.dev-dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "term"] }
+
 # clw-cli inherits the workspace lints, which include
 # `unsafe_code = "forbid"`. It used to sit at `deny` so that one Windows-DACL
 # block could be `#[allow]`ed inside it — which put all 8,554 lines of this

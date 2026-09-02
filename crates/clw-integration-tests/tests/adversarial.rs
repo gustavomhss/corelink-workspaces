@@ -16,11 +16,10 @@
 //! UNIX-ONLY: shares the symlink/mode fixtures with `http_integration.rs`.
 #![cfg(unix)]
 
-use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -33,11 +32,13 @@ use clw_types::{
     AcTransport, CasTransport, ClwError, Config, Digest, Manifest, RefRecord, CAS_BLOB_CAP_BYTES,
 };
 
+mod common;
+
+use common::{auth_ok, mount_hostile, Behavior, TEST_PAT};
+
 // ---------------------------------------------------------------------------
 // Shared constants / helpers
 // ---------------------------------------------------------------------------
-
-const TEST_PAT: &str = "test-pat";
 
 /// Per-test tenant keeps wiremock routes + the in-memory store isolated so the
 /// suite is parallel-safe. Each test passes a unique tenant string.
@@ -48,22 +49,6 @@ fn cfg(endpoint: String, tenant: &str, cache_dir: PathBuf) -> Config {
         token: TEST_PAT.to_string(),
         cache_dir,
     }
-}
-
-fn last_segment(url: &wiremock::http::Url) -> String {
-    url.path_segments()
-        .and_then(|mut s| s.next_back())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn auth_ok(request: &Request) -> bool {
-    request
-        .headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|a| a == format!("Bearer {TEST_PAT}"))
-        .unwrap_or(false)
 }
 
 /// A digest whose bytes hash to it (so the client's integrity check passes).
@@ -86,179 +71,6 @@ fn seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
         out.push(z as u8);
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// HostileResponder — a configurable, stateful, programmable misbehaving server
-// ---------------------------------------------------------------------------
-
-/// One thing a route can be told to do on a given request.
-#[derive(Clone)]
-enum Behavior {
-    /// Normal in-memory CAS/AC semantics (PUT stores, GET/HEAD reads).
-    Normal,
-    /// Return this raw status with no body.
-    Status(u16),
-    /// Return 200 with this exact body — used to inject a WRONG body for a digest.
-    Body200(Vec<u8>),
-    /// Return 429 with an optional `Retry-After: <secs>` header.
-    Throttle { retry_after: Option<u64> },
-}
-
-/// A programmable responder shared (via `Arc`) across the routes of one tenant.
-///
-/// `script[route]` is a per-route queue of behaviors consumed one per matching
-/// request; once drained the route falls back to `Normal`. `counts[route]`
-/// counts requests seen on that route. The in-memory `cas`/`ac` stores give
-/// real content-addressed semantics so snapshots/hydrates round-trip.
-#[derive(Clone)]
-struct HostileResponder {
-    cas: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    ac: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    /// route name → queue of behaviors (front = next request).
-    script: Arc<Mutex<HashMap<&'static str, Vec<Behavior>>>>,
-    counts: Arc<Mutex<HashMap<&'static str, Arc<AtomicUsize>>>>,
-}
-
-impl HostileResponder {
-    fn new() -> Self {
-        Self {
-            cas: Arc::new(Mutex::new(HashMap::new())),
-            ac: Arc::new(Mutex::new(HashMap::new())),
-            script: Arc::new(Mutex::new(HashMap::new())),
-            counts: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn counter(&self, route: &'static str) -> Arc<AtomicUsize> {
-        Arc::clone(
-            self.counts
-                .lock()
-                .unwrap()
-                .entry(route)
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
-        )
-    }
-
-    fn count_of(&self, route: &'static str) -> usize {
-        self.counter(route).load(Ordering::SeqCst)
-    }
-
-    /// Program a queue of behaviors for a route (consumed one per request).
-    fn program(&self, route: &'static str, behaviors: Vec<Behavior>) {
-        self.script.lock().unwrap().insert(route, behaviors);
-    }
-
-    /// Pop the next scripted behavior for `route`, or `Normal` once drained.
-    fn next_behavior(&self, route: &'static str) -> Behavior {
-        let mut s = self.script.lock().unwrap();
-        match s.get_mut(route) {
-            Some(q) if !q.is_empty() => q.remove(0),
-            _ => Behavior::Normal,
-        }
-    }
-
-    fn route_responder(&self, route: &'static str, kind: RouteKind) -> RouteResponder {
-        RouteResponder {
-            inner: self.clone(),
-            route,
-            kind,
-            counter: self.counter(route),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RouteKind {
-    Cas,
-    Ac,
-}
-
-/// A `Respond` impl bound to a single route name + kind, sharing the parent's
-/// stores/script/counters.
-#[derive(Clone)]
-struct RouteResponder {
-    inner: HostileResponder,
-    route: &'static str,
-    kind: RouteKind,
-    counter: Arc<AtomicUsize>,
-}
-
-impl Respond for RouteResponder {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.counter.fetch_add(1, Ordering::SeqCst);
-
-        if !auth_ok(request) {
-            return ResponseTemplate::new(401);
-        }
-
-        match self.inner.next_behavior(self.route) {
-            Behavior::Status(s) => return ResponseTemplate::new(s),
-            Behavior::Body200(b) => return ResponseTemplate::new(200).set_body_bytes(b),
-            Behavior::Throttle { retry_after } => {
-                let mut t = ResponseTemplate::new(429);
-                if let Some(secs) = retry_after {
-                    t = t.append_header("Retry-After", secs.to_string().as_str());
-                }
-                return t;
-            }
-            Behavior::Normal => {}
-        }
-
-        // Normal content-addressed semantics.
-        let store = match self.kind {
-            RouteKind::Cas => &self.inner.cas,
-            RouteKind::Ac => &self.inner.ac,
-        };
-        let key = last_segment(&request.url);
-        match request.method.as_str() {
-            "PUT" => {
-                store.lock().unwrap().insert(key, request.body.clone());
-                ResponseTemplate::new(201)
-            }
-            "HEAD" => {
-                if store.lock().unwrap().contains_key(&key) {
-                    ResponseTemplate::new(200)
-                } else {
-                    ResponseTemplate::new(404)
-                }
-            }
-            "GET" => match store.lock().unwrap().get(&key) {
-                Some(d) => ResponseTemplate::new(200).set_body_bytes(d.clone()),
-                None => ResponseTemplate::new(404),
-            },
-            "DELETE" => {
-                store.lock().unwrap().remove(&key);
-                ResponseTemplate::new(204)
-            }
-            _ => ResponseTemplate::new(405),
-        }
-    }
-}
-
-/// Mount the four object routes (CAS GET/PUT/HEAD/DELETE, AC GET/PUT/DELETE) of a
-/// `HostileResponder` for `tenant`. LIST routes are mounted separately per-test.
-/// Returns the responder so the test can program behaviors + read counters.
-async fn mount_hostile(server: &MockServer, tenant: &str) -> HostileResponder {
-    let h = HostileResponder::new();
-    let cas_obj = format!("/v1/cas/{tenant}/[a-f0-9]{{64}}");
-    let ac_obj = format!("/v1/ac/{tenant}/[a-f0-9]{{64}}");
-
-    for m in ["PUT", "GET", "HEAD", "DELETE"] {
-        Mock::given(method(m))
-            .and(path_regex(&cas_obj))
-            .respond_with(h.route_responder("cas", RouteKind::Cas))
-            .mount(server)
-            .await;
-    }
-    for m in ["PUT", "GET", "DELETE"] {
-        Mock::given(method(m))
-            .and(path_regex(&ac_obj))
-            .respond_with(h.route_responder("ac", RouteKind::Ac))
-            .mount(server)
-            .await;
-    }
-    h
 }
 
 // ---------------------------------------------------------------------------

@@ -17,12 +17,21 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child as StdChild, Command as StdCommand, ExitStatus as StdExitStatus};
+use std::process::{Child as StdChild, Command as StdCommand, ExitStatus as StdExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+#[cfg(not(target_os = "aix"))]
+use nix::errno::Errno;
+#[cfg(not(target_os = "aix"))]
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+#[cfg(not(target_os = "aix"))]
+use nix::pty::openpty;
 use serde_json::json;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, path_regex};
@@ -553,6 +562,106 @@ impl Drop for ProcessGroupCleanup {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Run the real `clw` binary with all three standard streams attached to a
+/// Unix PTY.  The answer is written to the PTY master immediately, so a test
+/// cannot hang waiting for a prompt; the child is polled with a hard deadline
+/// and killed if it does not terminate.  PTY output is returned for diagnostics
+/// and to prove that the interactive prompt was actually reached.
+#[cfg(not(target_os = "aix"))]
+fn run_rm_under_pty(
+    endpoint: &str,
+    cache_dir: &std::path::Path,
+    name: &str,
+    answer: &str,
+) -> (std::process::ExitStatus, String) {
+    let pty = openpty(None, None).expect("open PTY");
+    let mut master = File::from(pty.master);
+    let slave = File::from(pty.slave);
+
+    let stdin = slave.try_clone().expect("clone PTY slave for stdin");
+    let stdout = slave.try_clone().expect("clone PTY slave for stdout");
+    let stderr = slave;
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin("clw"));
+    cmd.args(["rm", "--name", name])
+        .env("CLW_ENDPOINT", endpoint)
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache_dir.to_str().unwrap())
+        .env_remove("CLW_REF_DOMAIN")
+        .env_remove("CORELINK_ENDPOINT")
+        .env_remove("CORELINK_TENANT")
+        .env_remove("CORELINK_TOKEN")
+        .env_remove("CLW_CRED_TICKET")
+        .env_remove("CLW_LEASE_ID")
+        .env_remove("CLW_FABRIC_ENDPOINT")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = cmd.spawn().expect("spawn clw under PTY");
+
+    // Canonical PTY input is line-buffered, so the newline is enough to release
+    // `read_line` whether or not the child has printed the prompt yet.
+    master
+        .write_all(answer.as_bytes())
+        .expect("write confirmation answer to PTY");
+    master.flush().expect("flush confirmation answer to PTY");
+
+    // A non-blocking master lets us drain diagnostics while polling the child;
+    // this avoids both pipe/PTY back-pressure and an unbounded wait on a broken
+    // child.  The output is intentionally merged because stdout and stderr share
+    // the same terminal in a real interactive invocation.
+    let flags = fcntl(&master, FcntlArg::F_GETFL).expect("get PTY status flags");
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(&master, FcntlArg::F_SETFL(flags)).expect("set PTY nonblocking");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut output = Vec::new();
+    let mut status = None;
+    while Instant::now() < deadline {
+        let mut buf = [0_u8; 1024];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Linux reports EIO once the PTY slave closes; BSDs commonly
+                // report EOF. Both mean there is no more terminal output.
+                Err(e) if e.raw_os_error() == Some(Errno::EIO as i32) => break,
+                Err(e) => panic!("read PTY output: {e}"),
+            }
+        }
+        if let Some(child_status) = child.try_wait().expect("poll clw under PTY") {
+            status = Some(child_status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let status = match status {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let killed = child.wait().expect("reap timed-out clw PTY child");
+            panic!(
+                "clw rm did not terminate within 5s (killed with {killed:?}); PTY output: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    };
+
+    // Give the kernel one bounded chance to deliver the final diagnostic bytes
+    // after process exit. This is not part of synchronization with the child.
+    std::thread::sleep(Duration::from_millis(20));
+    let mut buf = [0_u8; 1024];
+    while let Ok(n) = master.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..n]);
+    }
+    (status, String::from_utf8_lossy(&output).into_owned())
 }
 
 /// The 64-hex AC store key for a workspace `name` — the exact `ref_key` the binary
@@ -1982,6 +2091,74 @@ async fn rm_deletes_ref_is_idempotent_and_requires_yes() {
 }
 
 // ---------------------------------------------------------------------------
+// WP38d: interactive rm confirmation is proven with the real binary + Unix PTY.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "aix"))]
+#[tokio::test]
+async fn rm_pty_y_deletes_and_n_refuses_without_delete() {
+    // The affirmative path must observe an actual terminal on stdin. A pipe-fed
+    // `Command::output` would exercise only the non-TTY refusal branch.
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+    let ws_y = "e2e-rm-pty-yes";
+    let _src_y = snapshot_tiny(&server.uri(), cache.path(), ws_y);
+    let rk_y = ref_key_hex(ws_y);
+    assert!(ac.lock().unwrap().contains_key(&rk_y));
+
+    let (status_y, transcript_y) = run_rm_under_pty(&server.uri(), cache.path(), ws_y, "y\n");
+    assert!(
+        status_y.success(),
+        "PTY `y` confirmation must exit 0; transcript: {transcript_y}"
+    );
+    assert!(
+        transcript_y.contains("cannot be undone"),
+        "PTY run must reach the interactive confirmation prompt; transcript: {transcript_y}"
+    );
+    assert!(
+        !ac.lock().unwrap().contains_key(&rk_y),
+        "PTY `y` confirmation must delete the ref"
+    );
+    let requests_y = server.received_requests().await.unwrap();
+    assert!(
+        requests_y.iter().any(|request| {
+            request.method.as_str() == "DELETE" && request.url.path().ends_with(&rk_y)
+        }),
+        "PTY `y` confirmation must issue DELETE /v1/ac/{{tenant}}/{{ref_key}}; requests: {requests_y:?}"
+    );
+
+    // Keep the recorder mounted and take a baseline after the second snapshot so
+    // the `n` proof is isolated from the preceding journeys. A declined
+    // confirmation must fail before constructing the HTTP client, hence it must
+    // make no request at all and leave the ref in the state written by snapshot.
+    let ws_n = "e2e-rm-pty-no";
+    let _src_n = snapshot_tiny(&server.uri(), cache.path(), ws_n);
+    let rk_n = ref_key_hex(ws_n);
+    assert!(ac.lock().unwrap().contains_key(&rk_n));
+    let requests_before_n = server.received_requests().await.unwrap().len();
+
+    let (status_n, transcript_n) = run_rm_under_pty(&server.uri(), cache.path(), ws_n, "n\n");
+    assert!(
+        !status_n.success(),
+        "PTY `n` confirmation must exit non-zero; transcript: {transcript_n}"
+    );
+    assert!(
+        transcript_n.contains("cannot be undone"),
+        "PTY `n` run must reach the interactive confirmation prompt; transcript: {transcript_n}"
+    );
+    assert!(
+        ac.lock().unwrap().contains_key(&rk_n),
+        "PTY `n` confirmation must leave the ref unchanged"
+    );
+    let requests_n = server.received_requests().await.unwrap();
+    assert!(
+        requests_n.len() == requests_before_n,
+        "PTY `n` confirmation must not issue DELETE or any other request: {requests_n:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test: ls --all — lists refs, drops them after rm, tolerates a corrupt record
 // ---------------------------------------------------------------------------
 
@@ -3118,6 +3295,117 @@ async fn hydrate_refuses_manifest_declaring_over_total_bytes_cap() {
     assert!(
         !dest.exists(),
         "a refused hydrate must NOT materialize a partial destination tree"
+    );
+}
+
+/// A named ref can be structurally valid while the CAS body under one of its chunk
+/// keys has been corrupted. The real binary must reject that body before it reaches
+/// either the destination or the local cache. Keep the corrupt body the SAME length
+/// as the honest one: this is specifically a digest-integrity proof, not a declared
+/// chunk-size rejection.
+#[tokio::test]
+async fn hydrate_rejects_corrupt_cas_chunk_without_publishing_or_caching_it() {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink(&server, true).await;
+    let cache = TempDir::new().unwrap();
+
+    let honest = b"expected chunk bytes";
+    let corrupt = b"corrupted chunk byte";
+    assert_eq!(
+        honest.len(),
+        corrupt.len(),
+        "fixture must isolate digest verification from the chunk-size guard"
+    );
+    let chunk = clw_types::Digest::of_bytes(honest);
+    assert_ne!(
+        clw_types::Digest::of_bytes(corrupt),
+        chunk,
+        "fixture body must not hash to the manifest's chunk digest"
+    );
+
+    let manifest = clw_types::Manifest {
+        version: clw_types::MANIFEST_VERSION,
+        total_size: honest.len() as u64,
+        entries: vec![clw_types::Entry::File {
+            path: "payload.bin".to_string(),
+            mode: 0o644,
+            size: honest.len() as u64,
+            chunks: vec![clw_types::ChunkRef {
+                digest: chunk,
+                size: honest.len() as u64,
+            }],
+        }],
+    };
+    let manifest_bytes = manifest.canonical_bytes().unwrap();
+    let root = clw_types::Digest::of_bytes(&manifest_bytes);
+    cas.lock().unwrap().insert(root.to_hex(), manifest_bytes);
+    // Deliberately serve a same-length foreign body at the valid chunk key.
+    cas.lock().unwrap().insert(chunk.to_hex(), corrupt.to_vec());
+
+    let name = "e2e-corrupt-cas-chunk";
+    let record = clw_types::RefRecord {
+        name: name.to_string(),
+        root,
+        manifest_size: manifest.canonical_bytes().unwrap().len() as u64,
+        created_at_unix: 0,
+        parent: None,
+        tool_version: "test".to_string(),
+    };
+    ac.lock()
+        .unwrap()
+        .insert(ref_key_hex(name), record.to_bytes().unwrap());
+
+    let dest_root = TempDir::new().unwrap();
+    let dest = dest_root.path().join("out");
+    let out = clw_cmd(&server.uri(), cache.path())
+        .args(["hydrate", dest.to_str().unwrap(), "--name", name])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "a corrupt CAS chunk must make the real hydrate binary fail, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_ascii_lowercase().contains("integrity") || stderr.contains(&chunk.to_hex()),
+        "the failure must expose useful integrity/digest context, got:\n{stderr}"
+    );
+    assert!(
+        !dest.join("payload.bin").exists(),
+        "a corrupt chunk must never be published as the destination file"
+    );
+
+    let chunk_hex = chunk.to_hex();
+    let cached_blob = cache
+        .path()
+        .join("blobs")
+        .join(&chunk_hex[..2])
+        .join(&chunk_hex);
+    assert!(
+        !cached_blob.exists(),
+        "a corrupt chunk must never be committed under its digest in the cache"
+    );
+
+    fn has_tmp_stray(root: &std::path::Path, prefix: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_string_lossy().starts_with(prefix)
+                || (entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    && has_tmp_stray(&entry.path(), prefix))
+        })
+    }
+
+    assert!(
+        !has_tmp_stray(&dest, ".clw-tmp-"),
+        "a failed hydrate must not leave a destination temp-file stray"
+    );
+    assert!(
+        !has_tmp_stray(cache.path(), ".tmp-"),
+        "a rejected cache write must not leave a cache temp-file stray"
     );
 }
 
