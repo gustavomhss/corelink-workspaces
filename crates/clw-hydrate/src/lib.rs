@@ -16,7 +16,7 @@ mod path_containment;
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -40,9 +40,8 @@ use clw_types::{
 
 /// Maximum number of manifest entries a single hydrate will accept.
 ///
-/// Rationale (anti-OOM / anti-enumeration-bomb): every entry is iterated, and
-/// `File` entries are cloned into an in-memory `Vec` before materialisation, so
-/// the entry count bounds our peak allocation and the number of filesystem
+/// Rationale (anti-OOM / anti-enumeration-bomb): every entry is iterated, so the
+/// entry count bounds the manifest bookkeeping and number of filesystem
 /// operations. One million entries is larger than any real workspace we expect
 /// (the Linux kernel tree is ~80k files) yet small enough that the per-entry
 /// bookkeeping stays well within memory. A manifest above this cap is rejected
@@ -66,8 +65,7 @@ const MAX_HYDRATE_TOTAL_BYTES: u64 = 1 << 40; // 1 TiB
 ///
 /// Rationale (anti-OOM): `MAX_MANIFEST_ENTRIES` bounds the entry COUNT but NOT the
 /// chunk list WITHIN one entry — a single `File` entry with a billion-element
-/// `chunks` Vec defeats the per-entry allocation bound (every `ChunkRef` is cloned
-/// into the in-memory file-entry vector before materialisation). With the snapshot
+/// `chunks` Vec defeats the per-entry allocation bound. With the snapshot
 /// chunker's minimum chunk size, 1 TiB of content (`MAX_HYDRATE_TOTAL_BYTES`) is on
 /// the order of tens of millions of chunks; 64M is generously above any legitimate
 /// manifest yet finite. Enforced up-front, before the file-entry vector is built.
@@ -150,6 +148,24 @@ fn enforce_per_file_chunk_cap(path: &str, chunk_count: usize) -> Result<()> {
 /// and rejected before any filesystem work, so a pathological manifest never
 /// produces a partial destination.
 const MAX_SYMLINK_ENTRIES: usize = 100_000;
+
+/// Maximum number of fetched chunks retained for one file before they are
+/// handed to its blocking writer. This is deliberately independent of the
+/// user-selected file/request concurrency: at most this many 4 MiB chunks are
+/// being fetched, plus the one-element writer queue, per materialised file.
+const PER_FILE_FETCH_CAP: usize = 8;
+
+/// The producer-to-writer handoff is intentionally tiny. It applies
+/// backpressure to fetches while allowing one write to overlap the next fetch.
+const FILE_WRITE_QUEUE_CAPACITY: usize = 1;
+
+fn normalized_concurrency(concurrency: usize) -> usize {
+    concurrency.max(1)
+}
+
+fn per_file_fetch_concurrency(concurrency: usize) -> usize {
+    normalized_concurrency(concurrency).min(PER_FILE_FETCH_CAP)
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -414,9 +430,10 @@ where
     let bfc = Arc::clone(&bytes_from_cache);
     let bfd = Arc::clone(&bytes_downloaded);
     let fc = Arc::clone(&files_count);
-    // Same knob hydrate uses across files, threaded down for per-file chunk
-    // concurrency (M9).
-    let concurrency = opts.concurrency;
+    // A caller may pass zero. `buffered(0)` makes no progress, so normalize the
+    // outer file concurrency at the boundary as well as the per-file fetch
+    // concurrency below.
+    let concurrency = normalized_concurrency(opts.concurrency);
 
     // Build a stream of futures — one per file, borrowing from `manifest`.
     // Each future returns (bytes_from_cache, bytes_downloaded) for that file.
@@ -454,7 +471,7 @@ where
     });
 
     // Drive the stream with bounded concurrency.
-    let mut buffered = stream.buffer_unordered(opts.concurrency);
+    let mut buffered = stream.buffer_unordered(concurrency);
     while let Some(result) = buffered.next().await {
         result?;
     }
@@ -552,6 +569,89 @@ impl Drop for TmpFileGuard {
 // Returns (bytes_from_cache, bytes_downloaded) tallied across all chunks.
 // ---------------------------------------------------------------------------
 
+/// Messages accepted by the one blocking writer assigned to a materialised
+/// file. In particular, closing the channel is *not* success: only `Finish`
+/// authorizes publishing the temporary file.
+enum FileWrite {
+    Chunk(Vec<u8>),
+    Finish,
+    #[cfg(test)]
+    FailWrite,
+    #[cfg(test)]
+    BlockFor(std::time::Duration),
+}
+
+/// Start a single blocking filesystem consumer for one file.
+///
+/// The async side retains all borrowed transport/cache state and only sends
+/// owned bytes. The closure owns every blocking resource (`PathBuf`, `File`,
+/// and `TmpFileGuard`), so cancellation or a failed fetch closes the queue and
+/// causes the guard to remove the uncommitted temp. A final path is published
+/// only after an explicit [`FileWrite::Finish`].
+fn spawn_file_writer(
+    tmp_path: PathBuf,
+    abs: PathBuf,
+    parent: PathBuf,
+    mode: u32,
+) -> (
+    tokio::sync::mpsc::Sender<FileWrite>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(FILE_WRITE_QUEUE_CAPACITY);
+    let writer = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+
+        std::fs::create_dir_all(&parent)?;
+        let mut tmp_guard = TmpFileGuard {
+            path: Some(tmp_path.clone()),
+        };
+        let mut file = std::fs::File::create(&tmp_path)?;
+
+        while let Some(message) = rx.blocking_recv() {
+            match message {
+                FileWrite::Chunk(data) => file.write_all(&data)?,
+                FileWrite::Finish => {
+                    // Publishing is deliberately a positive protocol message,
+                    // never an EOF side effect. Keep the established durability
+                    // and metadata order intact.
+                    file.flush()?;
+                    file.sync_all()?;
+                    drop(file);
+                    std::fs::rename(&tmp_path, &abs)?;
+                    tmp_guard.disarm();
+                    if let Ok(dir) = std::fs::File::open(&parent) {
+                        let _ = dir.sync_all();
+                    }
+                    #[cfg(unix)]
+                    {
+                        let perms = std::fs::Permissions::from_mode(mode & 0o777);
+                        std::fs::set_permissions(&abs, perms)?;
+                    }
+                    #[cfg(windows)]
+                    let _ = mode;
+                    return Ok(());
+                }
+                #[cfg(test)]
+                FileWrite::FailWrite => {
+                    return Err(ClwError::Io(std::io::Error::other(
+                        "injected blocking writer failure",
+                    )));
+                }
+                #[cfg(test)]
+                FileWrite::BlockFor(duration) => std::thread::sleep(duration),
+            }
+        }
+
+        // EOF is an abort, including cancellation and a failed fetch/send. The
+        // guard removes the temp as this closure returns; no partial final name
+        // can have been published because Finish was never received.
+        Err(ClwError::Transport(
+            "blocking file writer closed before Finish".into(),
+        ))
+    });
+    (tx, writer)
+}
+
 async fn materialize_file<C>(
     dest: &Path,
     rel_path: &str,
@@ -571,7 +671,6 @@ where
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| dest.to_path_buf());
-    std::fs::create_dir_all(&parent)?;
     let tmp_path = {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -587,22 +686,15 @@ where
         let tid = std::thread::current().id();
         parent.join(format!(".clw-tmp-{tid:?}-{nanos}-{seq}"))
     };
-    // LOW (temp cleanup): arm a drop-guard so any early return below removes the
-    // partially-written temp instead of leaking a `.clw-tmp-*` stray.
-    let mut tmp_guard = TmpFileGuard {
-        path: Some(tmp_path.clone()),
-    };
-    let mut bytes_from_cache: u64 = 0;
-    let mut bytes_downloaded: u64 = 0;
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        // M9: fetch this file's chunks with BOUNDED concurrency, but consume the
-        // results IN ORDER so the sequential in-offset writes stay byte-exact.
-        // `buffered(N)` keeps up to N fetches in flight (memory bounded — never a
-        // `collect` of the whole file) yet yields them in the chunk order, so a
-        // workspace of a FEW LARGE files no longer downloads at 1-deep. The
-        // concurrency knob is the same one hydrate uses across files.
+    let (tx, writer) = spawn_file_writer(tmp_path, abs, parent, mode);
+
+    // Fetches remain entirely on the async side, preserving their manifest
+    // order through `buffered`. P independently caps buffered chunk payloads;
+    // the Q=1 channel adds at most one more 4 MiB payload per file.
+    let fetch_concurrency = per_file_fetch_concurrency(concurrency);
+    let producer_result = async {
+        let mut bytes_from_cache: u64 = 0;
+        let mut bytes_downloaded: u64 = 0;
         let mut fetches = futures::stream::iter(chunks.iter().map(|chunk| {
             let digest = chunk.digest;
             let size = chunk.size;
@@ -611,19 +703,12 @@ where
                 Ok::<(Vec<u8>, bool, Digest, u64), ClwError>((data, from_cache, digest, size))
             }
         }))
-        .buffered(concurrency.max(1));
+        .buffered(fetch_concurrency);
 
         while let Some(res) = fetches.next().await {
             let (data, from_cache, digest, size) = res?;
-            // FIX F1 (integrity): the per-chunk digest is already re-verified in
-            // fetch_chunk, but a chunk's ACTUAL byte length is never checked against
-            // its DECLARED `ChunkRef.size`. The disk-fill budget (pass 2c) sums the
-            // declared sizes, so a transport returning more/fewer bytes than declared
-            // would defeat that budget and/or write a file that disagrees with the
-            // manifest. Reject any length mismatch as an integrity error naming the
-            // chunk. (Digest verification alone does NOT make this redundant: it
-            // proves the bytes hash to `chunk.digest`, but the manifest's own
-            // `ChunkRef.size` can still disagree with those bytes' length.)
+            // The digest was verified by fetch_chunk; the declared length is a
+            // separate manifest invariant and must be checked before enqueueing.
             if data.len() as u64 != size {
                 return Err(ClwError::InvalidManifest(format!(
                     "chunk {} for file {rel_path:?} returned {} byte(s) but the manifest \
@@ -633,42 +718,31 @@ where
                     size
                 )));
             }
+            tx.send(FileWrite::Chunk(data)).await.map_err(|_| {
+                ClwError::Transport("blocking file writer stopped before Finish".into())
+            })?;
             if from_cache {
                 bytes_from_cache += size;
             } else {
                 bytes_downloaded += size;
             }
-            f.write_all(&data)?;
         }
-        f.flush()?;
-        // M7 (durability): flush only reaches the page cache. fsync the data
-        // blocks BEFORE the rename so a power loss cannot leave the final-named
-        // file readable-but-zero/stale (hydrate never re-hashes on read, so a torn
-        // file would be silently trusted). sync_all covers data + metadata.
-        f.sync_all()?;
+        tx.send(FileWrite::Finish).await.map_err(|_| {
+            ClwError::Transport("blocking file writer stopped before Finish".into())
+        })?;
+        Ok::<(u64, u64), ClwError>((bytes_from_cache, bytes_downloaded))
     }
-    std::fs::rename(&tmp_path, &abs)?;
-    // The temp has been renamed into place — nothing to clean up.
-    tmp_guard.disarm();
-    // M7 (durability): best-effort fsync of the parent directory so the rename
-    // itself is durable (the new dir entry survives a crash). Some platforms /
-    // filesystems return an error for a directory fsync (e.g. Windows cannot fsync
-    // a directory handle opened this way); that is non-fatal, so ignore it.
-    if let Ok(dir) = std::fs::File::open(&parent) {
-        let _ = dir.sync_all();
-    }
-    // SECURITY (M1.7): mask to permission bits only. An untrusted manifest must
-    // not be able to create setuid/setgid/sticky files — strip everything above
-    // the low 9 permission bits (0o777).
-    #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(mode & 0o777);
-        std::fs::set_permissions(&abs, perms)?;
-    }
-    // On Windows there is no unix mode concept: applying mode bits is a no-op,
-    // so we skip set_permissions entirely. `mode` is consumed only on unix.
-    #[cfg(windows)]
-    let _ = mode;
+    .await;
+
+    // On any producer failure (including cancellation), closing Q tells the
+    // writer to abort and its guard removes the temp. We still await the handle
+    // on ordinary error paths so cleanup is complete before returning.
+    drop(tx);
+    let writer_result = writer.await.map_err(|error| {
+        ClwError::Transport(format!("blocking file writer task failed: {error}"))
+    })?;
+    let (bytes_from_cache, bytes_downloaded) = producer_result?;
+    writer_result?;
     // Diagnostic channel (M5.1): per-file cache-hit vs download split on stderr.
     tracing::debug!(
         path = rel_path,
@@ -2327,6 +2401,38 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("multi.bin")).unwrap(), expected);
     }
 
+    #[tokio::test]
+    async fn zero_file_concurrency_is_normalized_to_one() {
+        let (digest, bytes) = make_chunk(b"zero-is-one");
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: bytes.len() as u64,
+            entries: vec![Entry::File {
+                path: "one.bin".into(),
+                mode: 0o644,
+                size: bytes.len() as u64,
+                chunks: vec![ChunkRef {
+                    digest,
+                    size: bytes.len() as u64,
+                }],
+            }],
+        };
+        let (store, _cache_dir, cache) = setup_store(&manifest, &[(digest, bytes.clone())]);
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("out");
+        let mut opts = HydrateOptions::new("test-ws");
+        opts.concurrency = 0;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            hydrate(&dest, &store, &cache, &opts),
+        )
+        .await
+        .expect("N=0 must not stall buffer_unordered")
+        .unwrap();
+        assert_eq!(std::fs::read(dest.join("one.bin")).unwrap(), bytes);
+    }
+
     // -----------------------------------------------------------------------
     // Test 12 (M9): a multi-chunk file fetches its chunks with BOUNDED
     // CONCURRENCY but writes them IN ORDER. The CAS below has INVERTED per-chunk
@@ -2367,6 +2473,91 @@ mod tests {
             self.cas.lock().unwrap().remove(digest);
             Ok(())
         }
+        async fn list_blobs(&self) -> Result<Vec<Digest>> {
+            Ok(self.cas.lock().unwrap().keys().copied().collect())
+        }
+    }
+
+    /// A CAS fake that holds every fetch until the test releases it and records
+    /// the true maximum in-flight count. This makes the per-file P cap
+    /// observable rather than merely testing a helper constant.
+    struct CappedFetchStore {
+        cas: Mutex<HashMap<Digest, Vec<u8>>>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        reached_cap: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    impl CappedFetchStore {
+        fn new() -> Self {
+            Self {
+                cas: Mutex::new(HashMap::new()),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                reached_cap: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                released: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        async fn wait_until_released(&self) {
+            use std::sync::atomic::Ordering;
+
+            while !self.released.load(Ordering::Acquire) {
+                let wake = self.release.notified();
+                if self.released.load(Ordering::Acquire) {
+                    break;
+                }
+                wake.await;
+            }
+        }
+
+        fn release_all(&self) {
+            use std::sync::atomic::Ordering;
+
+            self.released.store(true, Ordering::Release);
+            self.release.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CasTransport for CappedFetchStore {
+        async fn exists(&self, digest: &Digest) -> Result<bool> {
+            Ok(self.cas.lock().unwrap().contains_key(digest))
+        }
+
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+
+            let bytes = self
+                .cas
+                .lock()
+                .unwrap()
+                .get(digest)
+                .cloned()
+                .ok_or(ClwError::NotFound(*digest))?;
+            let in_flight = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::AcqRel);
+            if in_flight == PER_FILE_FETCH_CAP {
+                self.reached_cap.notify_one();
+            }
+            self.wait_until_released().await;
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            Ok(bytes)
+        }
+
+        async fn put(&self, digest: &Digest, bytes: Vec<u8>) -> Result<()> {
+            self.cas.lock().unwrap().insert(*digest, bytes);
+            Ok(())
+        }
+
+        async fn delete(&self, digest: &Digest) -> Result<()> {
+            self.cas.lock().unwrap().remove(digest);
+            Ok(())
+        }
+
         async fn list_blobs(&self) -> Result<Vec<Digest>> {
             Ok(self.cas.lock().unwrap().keys().copied().collect())
         }
@@ -2416,6 +2607,163 @@ mod tests {
         );
         assert_eq!(from_cache, 0, "all chunks were cache misses");
         assert_eq!(downloaded, expected.len() as u64, "all bytes downloaded");
+    }
+
+    #[tokio::test]
+    async fn per_file_fetches_never_exceed_cap_under_huge_requested_concurrency() {
+        use std::sync::atomic::Ordering;
+
+        const CHUNK_COUNT: usize = PER_FILE_FETCH_CAP + 5;
+        let store = CappedFetchStore::new();
+        let mut chunks = Vec::with_capacity(CHUNK_COUNT);
+        let mut expected = Vec::new();
+        for i in 0..CHUNK_COUNT {
+            let bytes = format!("cap-probe-{i:02}").into_bytes();
+            let digest = Digest::of_bytes(&bytes);
+            store.cas.lock().unwrap().insert(digest, bytes.clone());
+            chunks.push(ChunkRef {
+                digest,
+                size: bytes.len() as u64,
+            });
+            expected.extend_from_slice(&bytes);
+        }
+
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let materialize = materialize_file(
+            dest_dir.path(),
+            "capped.bin",
+            0o644,
+            &chunks,
+            usize::MAX,
+            &store,
+            &cache,
+        );
+        tokio::pin!(materialize);
+        // Register before driving materialize so the Notify cannot lose the
+        // cap-reaching event. With raw requested concurrency this records >P
+        // before control returns here, making the test red on that regression.
+        let reached_cap = store.reached_cap.notified();
+        tokio::pin!(reached_cap);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut reached_cap => {},
+                result = &mut materialize => panic!("materialize completed before reaching P: {result:?}"),
+            }
+        })
+        .await
+        .expect("P fetches should become in-flight promptly");
+        assert_eq!(
+            store.max_in_flight.load(Ordering::Acquire),
+            PER_FILE_FETCH_CAP,
+            "P, not the caller's huge N, must bound real in-flight fetches"
+        );
+
+        store.release_all();
+        materialize.await.unwrap();
+        assert_eq!(
+            std::fs::read(dest_dir.path().join("capped.bin")).unwrap(),
+            expected
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WP42: the blocking writer's protocol is commit-on-Finish. These direct
+    // tests keep failure/cancellation timing deterministic without exposing a
+    // production payload or transport seam.
+    // -----------------------------------------------------------------------
+
+    fn assert_no_tmp_or_final(parent: &Path, final_path: &Path) {
+        assert!(
+            !final_path.exists(),
+            "an aborted writer must not publish a partial final file"
+        );
+        assert!(
+            std::fs::read_dir(parent).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clw-tmp-")),
+            "an aborted writer must eventually remove its temporary file"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_eof_without_finish_aborts_and_cleans_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("out.bin");
+        let tmp_path = parent.join(".clw-tmp-eof");
+        let (tx, writer) = spawn_file_writer(tmp_path, final_path.clone(), parent.clone(), 0o644);
+
+        tx.send(FileWrite::Chunk(b"partial".to_vec()))
+            .await
+            .unwrap();
+        drop(tx); // cancellation/fetch failure closes Q without the commit message
+        let err = writer.await.unwrap().unwrap_err();
+        assert!(matches!(err, ClwError::Transport(_)));
+        assert_no_tmp_or_final(&parent, &final_path);
+    }
+
+    #[tokio::test]
+    async fn injected_writer_failure_leaves_no_final_or_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("out.bin");
+        let tmp_path = parent.join(".clw-tmp-fail");
+        let (tx, writer) = spawn_file_writer(tmp_path, final_path.clone(), parent.clone(), 0o644);
+
+        tx.send(FileWrite::Chunk(b"partial".to_vec()))
+            .await
+            .unwrap();
+        tx.send(FileWrite::FailWrite).await.unwrap();
+        drop(tx);
+        let err = writer.await.unwrap().unwrap_err();
+        assert!(matches!(err, ClwError::Io(_)));
+        assert_no_tmp_or_final(&parent, &final_path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_writer_keeps_current_thread_runtime_responsive() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("out.bin");
+        let tmp_path = parent.join(".clw-tmp-heartbeat");
+        let (tx, writer) = spawn_file_writer(tmp_path, final_path, parent, 0o644);
+        let done = Arc::new(AtomicBool::new(false));
+        let beats = Arc::new(AtomicUsize::new(0));
+        let heartbeat_done = Arc::clone(&done);
+        let heartbeat_beats = Arc::clone(&beats);
+        let heartbeat = tokio::spawn(async move {
+            while !heartbeat_done.load(Ordering::Relaxed) {
+                heartbeat_beats.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        tx.send(FileWrite::BlockFor(std::time::Duration::from_millis(100)))
+            .await
+            .unwrap();
+        tx.send(FileWrite::Finish).await.unwrap();
+        drop(tx);
+        writer.await.unwrap().unwrap();
+        done.store(true, Ordering::Relaxed);
+        heartbeat.await.unwrap();
+        assert!(
+            beats.load(Ordering::Relaxed) > 1,
+            "a blocking file operation must not starve a current-thread runtime"
+        );
+    }
+
+    #[test]
+    fn file_and_fetch_concurrency_are_normalized_and_bounded() {
+        assert_eq!(normalized_concurrency(0), 1, "N=0 must make progress");
+        assert_eq!(per_file_fetch_concurrency(0), 1);
+        assert_eq!(per_file_fetch_concurrency(usize::MAX), PER_FILE_FETCH_CAP);
+        assert_eq!(FILE_WRITE_QUEUE_CAPACITY, 1, "Q must remain one chunk");
     }
 
     // -----------------------------------------------------------------------
