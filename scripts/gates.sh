@@ -231,7 +231,7 @@ pr_credential_null_selftest() {
   mkdir -p "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows"
   cp "$repo_root/.github/workflows/ci.yml" "$repo_root/.github/workflows/coverage.yml" \
     "$repo_root/.github/workflows/mutation.yml" "$repo_root/.github/workflows/shellcheck.yml" \
-    "$repo_root/.github/workflows/windows.yml" \
+    "$repo_root/.github/workflows/windows.yml" "$repo_root/.github/workflows/pr-title.yml" \
     "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/"
 
   if "$script" --assert-pr-credential-null --workflow-dir "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows" >/dev/null; then
@@ -588,6 +588,7 @@ bash scripts/deadman-registry.sh check
 bash scripts/deadman-selftest.sh
 bash scripts/workflow-permissions-selftest.sh
 bash scripts/fuzz-selftest.sh
+bash scripts/pr-title-workflow-selftest.sh
 
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken

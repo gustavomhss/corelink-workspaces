@@ -3,14 +3,15 @@
 # actually refuses in every direction it claims to, not just that it "runs".
 # A merge-safety script that has never been shown to refuse is not evidence of
 # anything, so this stubs `gh` (PATH-shadowed, no network) and asserts both the
-# exit code and the presence of the right message for seven scenarios:
+# exit code and the presence of the right message for eight scenarios:
 #   1. CONFLICTING          -> exit non-zero, prints the rebase instruction
 #   2. UNKNOWN               -> exit non-zero
 #   3. zero checks           -> exit non-zero
 #   4. an always-present gate missing from the check list -> exit non-zero
-#   5. renamed `llvm-cov` check -> exit non-zero (the substring contract matters)
-#   6. head changes while checks are read -> exit non-zero
-#   7. healthy (mergeable + all gates present + all green) -> exit 0 and prints CAS
+#   5. `pr-title` missing -> exit non-zero
+#   6. renamed `llvm-cov` check -> exit non-zero (the substring contract matters)
+#   7. head changes while checks are read -> exit non-zero
+#   8. healthy (mergeable + all gates present + all green) -> exit 0 and prints CAS
 #
 # Run directly: bash scripts/pre-merge-gate-check-selftest.sh
 set -euo pipefail
@@ -22,12 +23,13 @@ trap 'rm -rf "$STUB_DIR"' EXIT
 
 fail_count=0
 
-# healthy check list: the three always-present gates (Defense 2) plus one
+# healthy check list: the four always-present gates (Defense 2) plus one
 # ordinary check, all passing.
 HEALTHY_CHECKS='[
   {"name":"gates","bucket":"pass","link":""},
   {"name":"dco","bucket":"pass","link":""},
   {"name":"llvm-cov (floor 88%)","bucket":"pass","link":""},
+  {"name":"pr-title","bucket":"pass","link":""},
   {"name":"shellcheck scripts/*.sh","bucket":"pass","link":""}
 ]'
 
@@ -135,21 +137,32 @@ MISSING_DCO_CHECKS='[
 assert_refuses "always-present gate missing (dco)" "always-present gates never ran" \
   "MERGEABLE" "CLEAN" "OPEN" "$MISSING_DCO_CHECKS"
 
-# 5. Preserve the substring matcher: a generic coverage name does not prove the
+# 5. The trusted metadata title check is also required-present; without it a
+# title edit could land without its squash subject being checked.
+MISSING_PR_TITLE_CHECKS='[
+  {"name":"gates","bucket":"pass","link":""},
+  {"name":"dco","bucket":"pass","link":""},
+  {"name":"llvm-cov (floor 88%)","bucket":"pass","link":""}
+]'
+assert_refuses "always-present gate missing (pr-title)" "pr-title" \
+  "MERGEABLE" "CLEAN" "OPEN" "$MISSING_PR_TITLE_CHECKS"
+
+# 6. Preserve the substring matcher: a generic coverage name does not prove the
 # llvm-cov floor actually ran and must be refused.
 RENAMED_COVERAGE_CHECKS='[
   {"name":"gates","bucket":"pass","link":""},
   {"name":"dco","bucket":"pass","link":""},
+  {"name":"pr-title","bucket":"pass","link":""},
   {"name":"coverage","bucket":"pass","link":""}
 ]'
 assert_refuses "llvm-cov substring lost (coverage)" "always-present gates never ran" \
   "MERGEABLE" "CLEAN" "OPEN" "$RENAMED_COVERAGE_CHECKS"
 
-# 6. A force-push between the PR metadata and checks reads invalidates the read.
+# 7. A force-push between the PR metadata and checks reads invalidates the read.
 assert_refuses "head changed while checks were read" "head changed while checks were being read" \
   "MERGEABLE" "CLEAN" "OPEN" "$HEALTHY_CHECKS" "aaaaaaaa" "bbbbbbbb"
 
-# 7. healthy: mergeable + all three always-present gates present + all green
+# 8. healthy: mergeable + all four always-present gates present + all green
 assert_allows "healthy" \
   "MERGEABLE" "CLEAN" "OPEN" "$HEALTHY_CHECKS" "aaaaaaaa" "aaaaaaaa"
 
@@ -158,4 +171,4 @@ if [ "$fail_count" -ne 0 ]; then
   echo "$fail_count self-test case(s) FAILED — pre-merge-gate-check.sh is not trustworthy as-is." >&2
   exit 1
 fi
-echo "all 7 self-test cases passed"
+echo "all 8 self-test cases passed"

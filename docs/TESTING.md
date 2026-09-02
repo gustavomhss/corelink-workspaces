@@ -11,7 +11,7 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 
 ## Workflow and test lanes
 
-This is the complete inventory of the 13 versioned workflow files. Unless noted, jobs run on
+This is the complete inventory of the 14 versioned workflow files. Unless noted, jobs run on
 [`corelink`](../.github/workflows/ci.yml), the ephemeral CoreLink runner fabric; they are not
 GitHub-hosted `ubuntu-latest` or `windows-latest` jobs. The one physical-runner exception is the
 release build job on `[self-hosted, macOS, X64]`.
@@ -19,6 +19,7 @@ release build job on `[self-hosted, macOS, X64]`.
 | Lane | Workflow | Cadence | What it proves / enforcement |
 |---|---|---|---|
 | **Required gate + DCO** | [`ci.yml`](../.github/workflows/ci.yml) | PR, push to `main`, dispatch | `gates.sh`, DCO, and guard self-tests; the round-trip property test runs inside `gates.sh`. |
+| **Required PR title** | [`pr-title.yml`](../.github/workflows/pr-title.yml) | PR opened, synchronized, reopened, or title edited | Validates the squash-merge title against the G4 Conventional Commit vocabulary from a trusted base-SHA checkout; PR code never runs. |
 | **Coverage** | [`coverage.yml`](../.github/workflows/coverage.yml) | PR, push to `main`, dispatch | Default-feature workspace line coverage, excluding `clw-e2e-evidence`; an active 88% floor makes a lower result red. |
 | **Fuzz** | [`fuzz.yml`](../.github/workflows/fuzz.yml) | daily 08:00 UTC, dispatch | Six live untrusted-input fuzz targets; after cache bootstrap, a crash or no restored-corpus `cov:` gain over the cold seed is red. |
 | **Mutation** | [`mutation.yml`](../.github/workflows/mutation.yml) | PR, dispatch | Per-PR `diff` mode fails the job on a survivor, timeout, or harness fault; dispatched `workspace` backlog sweeps remain report-only for survivors/timeouts. |

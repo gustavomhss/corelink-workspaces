@@ -1,0 +1,51 @@
+# Trusted metadata gate for the subject that survives squash-merge. This runs
+# only the BASE workflow and checks out only the BASE SHA: PR code never runs.
+name: pr-title
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # CI_CREDENTIAL_NULL_GUARD: workflow-env
+  CLW_CRED_TICKET: ""
+  CLW_LEASE_ID: ""
+  CLW_FABRIC_ENDPOINT: ""
+
+jobs:
+  pr-title:
+    runs-on: corelink
+    timeout-minutes: 5
+    steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
+      # v4.2.2, immutable commit pin. The base checkout supplies trusted scripts.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: prove trusted PR-title workflow policy
+        run: bash scripts/pr-title-workflow-selftest.sh
+      - name: PR title checker self-test
+        run: bash scripts/pr-title-check-selftest.sh
+      - name: Conventional Commits PR title
+        # Keep untrusted event data out of shell source: PR_TITLE is data only.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: bash scripts/pr-title-check.sh

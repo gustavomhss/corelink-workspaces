@@ -1003,7 +1003,7 @@ Dividido do WP-20 da v1 (11 achados, ~10 documentos — grande demais para revis
 
 **S.** Um commit (ou título de PR) fora de Conventional Commits não entra em `main`.
 
-**Δ.** Check no `ci.yml` ao lado do `dco`, validando o título do PR (que é o que vira a mensagem no squash-merge) contra o padrão. **[v3]** Validar o **título do PR**, não os commits do branch: o fluxo do repo é squash-merge, então a mensagem que sobrevive é a do PR; gatear commits intermediários seria atrito sem retorno.
+**Δ.** Workflow dedicado e confiável `pr-title.yml` em `pull_request_target`, validando o título do PR (que é o que vira a mensagem no squash-merge) contra o padrão. Ele faz checkout **somente** do `base.sha`, com pin imutável e sem credenciais persistidas, antes de executar o checker; código do head do PR nunca roda nesse gate. **[v3]** Validar o **título do PR**, não os commits do branch: o fluxo do repo é squash-merge, então a mensagem que sobrevive é a do PR; gatear commits intermediários seria atrito sem retorno. A formulação original “no `ci.yml` ao lado do `dco`” foi substituída por esta exceção segura: naquele workflow `pull_request`, um PR poderia alterar o checker e auto-certificar o próprio título. O primeiro PR que introduz `pr-title.yml` precisa de bootstrap waiver/cold review, porque um workflow `pull_request_target` só fica ativo depois de chegar à branch base.
 
 **I.** Não bloqueia commits WIP no branch. G4.
 

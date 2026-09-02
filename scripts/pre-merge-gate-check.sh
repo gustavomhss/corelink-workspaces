@@ -14,8 +14,8 @@
 # Why this exists: `pull_request` workflows build and run on the MERGE REF.
 # When a PR conflicts with its base, GitHub cannot construct that ref, so it
 # creates NO check runs at all for those workflows — not queued, not failed,
-# ABSENT. `pull_request_target` workflows (if any) run on the BASE branch, so
-# those still fire regardless. That asymmetry means `gh pr checks` on a
+# ABSENT. The trusted `pr-title.yml` `pull_request_target` workflow runs on the
+# BASE branch, so it still fires regardless. That asymmetry means `gh pr checks` on a
 # conflicting PR can report "nothing failing" — which reads as green to both a
 # human and a script — while none of the load-bearing gates ran at all.
 #
@@ -59,7 +59,8 @@ if [ "$mergeable" != "MERGEABLE" ]; then
   if [ "$mergeable" = "CONFLICTING" ]; then
     echo "     A CONFLICTING PR gets NO \`pull_request\` checks at all: those run on"
     echo "     the merge ref, which GitHub cannot build. Any green you see below is"
-    echo "     \`pull_request_target\` metadata jobs only — it proves NOTHING."
+    echo "     \`pull_request_target\` metadata job(s) only — the title may be checked, but"
+    echo "     source gates have proven NOTHING."
     echo
     echo "     Fix:  git rebase origin/main && git push --force-with-lease"
     echo "     Then re-run this script and wait for the real checks to appear."
@@ -124,31 +125,33 @@ for c in sorted(data, key=lambda x: order.get(x.get("bucket"), 0)):
 print()
 
 # ── Defense 2: the real gates must be PRESENT, not merely not-failing ─────────
-# Chosen by reading .github/workflows/*.yml for a bare `on: pull_request` with
-# NO `paths:` filter — the only two such workflows in this repo are:
+# Chosen by reading .github/workflows/*.yml for an unconditional trigger — the
+# two `pull_request` workflows and one trusted `pull_request_target` workflow are:
 #   - ci.yml       (jobs: `gates`, `dco`)          on: pull_request  (no paths)
 #   - coverage.yml (job: `llvm-cov (floor 88%)`)    on: pull_request  (no paths)
+#   - pr-title.yml (job: `pr-title`)                 on: pull_request_target (no paths)
 # Every other pull_request-triggered workflow (shellcheck.yml, windows.yml) is
 # `paths:`-filtered, so it legitimately does not run on every PR and cannot be
-# used as an always-present signal. If any of the three below is missing, the
-# pull_request workflows did not fire and the rest of this list is metadata
-# jobs that gate nothing. Substring match keeps this robust against job-name
+# used as an always-present signal. If any of the four below is missing, the
+# relevant required workflow did not fire. The trusted title job alone cannot
+# prove that source gates ran; missing source gates remain blocking. Substring match keeps this robust against job-name
 # edits ("dco" -> "dco-check", "gates" -> "gates (fmt+clippy+test)").
 #
 # Keep this list SMALL and path-filter-free. Adding a path-filtered gate here
 # would make the script fail on PRs that legitimately skip it — turning a
 # fail-open into a fail-noisy, which gets the whole check disabled by the next
 # person in a hurry.
-REQUIRED_PRESENT = ["dco", "gates", "llvm-cov"]
+REQUIRED_PRESENT = ["dco", "gates", "llvm-cov", "pr-title"]
 names = " ".join(c.get("name", "").lower() for c in data)
 missing = [g for g in REQUIRED_PRESENT if g not in names]
 if missing:
     print(f"  ⛔ DO NOT MERGE PR #{pr} — the always-present gates never ran: "
           f"{', '.join(missing)}.")
-    print("     ci.yml (gates, dco) and coverage.yml (llvm-cov) trigger on a bare")
-    print("     `on: pull_request` with no `paths:` filter, so their ABSENCE means")
-    print("     the pull_request workflows did not fire for this head sha. The")
-    print("     checks listed above (if any) gate nothing.")
+    print("     ci.yml (gates, dco), coverage.yml (llvm-cov), and pr-title.yml")
+    print("     (pr-title) have no paths filter. The first two trigger on")
+    print("     `pull_request`; pr-title is trusted `pull_request_target` metadata.")
+    print("     Their absence is blocking. In particular, a title-only result never")
+    print("     proves that the source gates ran for this head sha.")
     print("     Usual cause: the PR conflicts, or the head sha was force-pushed")
     print("     while runs were being created. Rebase, push, and re-run.")
     sys.exit(1)
