@@ -29,6 +29,7 @@ use clw_manifest::walk;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Result, CAS_BLOB_CAP_BYTES};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tokio::io::AsyncReadExt as _;
 
 // ---------------------------------------------------------------------------
 // Public constants + types (frozen anchor)
@@ -174,6 +175,32 @@ fn file_mode(meta: &std::fs::Metadata) -> u32 {
     }
 }
 
+/// Fixed-size buffer used when a run key needs a file's content digest. Keeping
+/// the buffer bounded prevents declared inputs and tool binaries from being
+/// allocated in full solely to derive their BLAKE3 identity.
+const FILE_DIGEST_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Compute a file's BLAKE3 digest without retaining its whole contents.
+///
+/// The result is deliberately byte-for-byte identical to [`Digest::of_bytes`].
+/// Callers choose how to handle I/O failures: declared inputs propagate them,
+/// while tool resolution preserves its established metadata/literal fallback.
+async fn digest_file(path: &Path) -> std::io::Result<Digest> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; FILE_DIGEST_BUFFER_BYTES];
+
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(Digest(*hasher.finalize().as_bytes()))
+}
+
 /// True if `cmd0` is a path (resolve directly) rather than a bare name to look up
 /// on `PATH`. Cross-platform: matches a forward slash (every platform), the OS
 /// path separator (`\` on Windows), and absolute paths incl. Windows drive-letters
@@ -236,11 +263,10 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
     let Some(path) = candidate else {
         return format!("literal:{cmd0}");
     };
-    // Read via tokio::fs so the (potentially large) toolchain binary is not read
-    // with a BLOCKING std::fs call on the async worker (matches how the inputs
-    // above are digested).
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => format!("digest:{}", Digest::of_bytes(&bytes).to_hex()),
+    // Stream via tokio::fs so a potentially large toolchain binary is neither
+    // read with a blocking std::fs call nor allocated in full on the async worker.
+    match digest_file(&path).await {
+        Ok(digest) => format!("digest:{}", digest.to_hex()),
         Err(_) => {
             // The file EXISTS but is unreadable (e.g. exec-only / no read bit —
             // exec and read are independent perms on unix). A content-free
@@ -318,8 +344,7 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
             for entry in walked {
                 match entry {
                     clw_manifest::WalkedEntry::File(f) => {
-                        let content = tokio::fs::read(&f.abs).await?;
-                        let digest = Digest::of_bytes(&content);
+                        let digest = digest_file(&f.abs).await?;
                         let entry_rel = format!("{}/{}", rel, norm_sep(&f.rel));
                         // FIX 2: fold the file's mode (perm bits) into the value so a
                         // `chmod +x` on a declared input changes the key even though
@@ -358,8 +383,7 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
             }
         } else {
             // Regular file: digest bytes + fold in the unix mode (FIX 2).
-            let content = tokio::fs::read(&abs).await?;
-            let digest = Digest::of_bytes(&content);
+            let digest = digest_file(&abs).await?;
             input_pairs.push([
                 rel.clone(),
                 format!("{}:{:o}", digest.to_hex(), file_mode(&meta)),
@@ -575,6 +599,9 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     for var in SECRET_ENV_VARS {
         command.env_remove(var);
     }
+    // A caller may cancel `run_memoized` while the command is still running.
+    // Tie the direct child to this future so dropping it does not leak that child.
+    command.kill_on_drop(true);
     let mut child = command.spawn()?;
 
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
@@ -765,6 +792,100 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    /// Best-effort test-fixture cleanup for a process whose PID is published to a file.
+    ///
+    /// The cancellation and backgrounded-grandchild regressions deliberately keep
+    /// a process alive. If an assertion fails after it announces itself, this guard
+    /// ensures the test cannot strand that exact fixture process while unwinding.
+    #[cfg(unix)]
+    struct PublishedPidCleanup {
+        pid_file: std::path::PathBuf,
+        pid: Option<u32>,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl PublishedPidCleanup {
+        fn new(pid_file: std::path::PathBuf) -> Self {
+            Self {
+                pid_file,
+                pid: None,
+                armed: true,
+            }
+        }
+
+        fn record(&mut self, pid: u32) {
+            self.pid = Some(pid);
+        }
+
+        fn disarm(&mut self) {
+            self.pid = None;
+            self.armed = false;
+        }
+
+        fn published_pid(&self) -> Option<u32> {
+            self.pid.or_else(|| {
+                std::fs::read_to_string(&self.pid_file)
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+        }
+
+        fn terminate(&mut self) -> bool {
+            let terminated = self.published_pid().is_some_and(|pid| {
+                std::process::Command::new("/bin/kill")
+                    .arg("-KILL")
+                    .arg(pid.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
+            if terminated {
+                self.disarm();
+            }
+            terminated
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PublishedPidCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self.terminate();
+            }
+        }
+    }
+
+    /// Aborting a Tokio task is what drops its `run_memoized` future. Keep that
+    /// cancellation path armed through assertion unwinding too.
+    #[cfg(unix)]
+    struct AbortOnDrop {
+        handle: Option<tokio::task::JoinHandle<Result<RunOutcome>>>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.handle {
+                handle.abort();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pid_is_running(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     #[test]
     fn is_run_record_distinguishes_run_records_from_refs_and_garbage() {
         let d = "ab".repeat(32);
@@ -936,6 +1057,69 @@ mod tests {
         assert!(looks_like_path("dir/tool"));
     }
 
+    #[tokio::test]
+    async fn streamed_file_digest_matches_in_memory_for_empty_multi_buffer_and_large_files() {
+        let dir = TempDir::new().unwrap();
+        let cases = [
+            ("empty", Vec::new()),
+            (
+                "multi-buffer",
+                (0..FILE_DIGEST_BUFFER_BYTES * 3 + 17)
+                    .map(|i| (i % 251) as u8)
+                    .collect(),
+            ),
+            (
+                "large",
+                (0..FILE_DIGEST_BUFFER_BYTES * 64 + 19)
+                    .map(|i| (i % 239) as u8)
+                    .collect(),
+            ),
+        ];
+
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                digest_file(&path).await.unwrap(),
+                Digest::of_bytes(&bytes),
+                "streamed digest must match Digest::of_bytes for {name}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_input_and_tool_content_changes_invalidate_the_run_key() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        let input = cwd.join("input");
+        let tool_path = cwd.join("tool");
+        std::fs::write(&input, b"input-v1").unwrap();
+        std::fs::write(&tool_path, b"tool-v1").unwrap();
+
+        let tool = tool_path.to_string_lossy().into_owned();
+        let opts = RunOptions {
+            inputs: vec!["input".to_string()],
+            command: vec![tool, "argument".to_string()],
+            env_keys: vec![],
+        };
+        let original = compute_key(cwd, &opts).await.unwrap();
+
+        std::fs::write(&input, b"input-v2").unwrap();
+        let input_changed = compute_key(cwd, &opts).await.unwrap();
+        assert_ne!(
+            original, input_changed,
+            "declared input content is in the key"
+        );
+
+        std::fs::write(&input, b"input-v1").unwrap();
+        std::fs::write(&tool_path, b"tool-v2").unwrap();
+        let tool_changed = compute_key(cwd, &opts).await.unwrap();
+        assert_ne!(
+            original, tool_changed,
+            "tool content identity is in the key"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_only_tool_uses_metadata_not_content_free_literal() {
@@ -1057,6 +1241,98 @@ mod tests {
         assert!(AcTransport::get(&store, &key).await.unwrap().is_none());
         // Idempotent: deleting an absent key is still Ok.
         AcTransport::delete(&store, &key).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation lifecycle: dropping `run_memoized` must clean up its DIRECT
+    // child. This intentionally says nothing about descendants or signal-forwarding
+    // semantics; it observes only that the PID spawned by run_memoized disappears.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)] // /bin/sh + /bin/sleep + /bin/kill
+    #[tokio::test]
+    async fn dropping_run_memoized_kills_its_direct_child() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("input.txt"), b"x").unwrap();
+        let pid_file = cwd.join("child.pid");
+        let ready_file = cwd.join("child.ready");
+        let mut child_cleanup = PublishedPidCleanup::new(pid_file.clone());
+
+        let opts = RunOptions {
+            inputs: vec!["input.txt".to_string()],
+            // The shell reports its exact PID, then execs `/bin/sleep`: the blocked
+            // process retains the direct child's PID and has no descendant to test.
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '%s\\n' \"$$\" > \"$1\"; printf 'ready\\n' > \"$2\"; exec /bin/sleep 300"
+                    .to_string(),
+                "clw-cancellation-child".to_string(),
+                pid_file.to_string_lossy().into_owned(),
+                ready_file.to_string_lossy().into_owned(),
+            ],
+            env_keys: vec![],
+        };
+        let store = FakeStore::default();
+        let task_cwd = cwd.to_path_buf();
+        let task_store = store.clone();
+        let mut task = AbortOnDrop {
+            handle: Some(tokio::spawn(async move {
+                run_memoized(&task_cwd, &task_store, &opts).await
+            })),
+        };
+
+        // Wait for a complete marker rather than racing the child startup. The
+        // timeout keeps a regression from hanging the test binary indefinitely.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(std::fs::read_to_string(&ready_file), Ok(ref ready) if ready == "ready\n") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("direct child must publish its ready marker");
+
+        let pid_text = std::fs::read_to_string(&pid_file).expect("direct child must publish PID");
+        let pid: u32 = pid_text
+            .trim()
+            .parse()
+            .expect("PID marker must contain an unsigned PID");
+        assert_eq!(pid_text, format!("{pid}\n"), "PID marker must be exact");
+        child_cleanup.record(pid);
+        assert!(
+            pid_is_running(pid),
+            "published direct child PID must be live"
+        );
+
+        // Aborting the task drops the in-flight run_memoized future, which drops
+        // its Tokio Child. `kill_on_drop(true)` is the behavior under test.
+        task.handle
+            .as_ref()
+            .expect("cancellation task must still be owned by its RAII guard")
+            .abort();
+        let cancelled = task
+            .handle
+            .take()
+            .expect("cancellation task handle must be present")
+            .await
+            .expect_err("aborted run_memoized task must not complete normally");
+        assert!(cancelled.is_cancelled(), "task must report cancellation");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !pid_is_running(pid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("dropping run_memoized must remove the direct child PID promptly");
+        child_cleanup.disarm();
     }
 
     // -----------------------------------------------------------------------
@@ -1939,14 +2215,20 @@ mod tests {
         let cwd = tmp.path();
         std::fs::write(cwd.join("in.txt"), b"x").unwrap();
         let store = FakeStore::default();
+        let pid_file = cwd.join("backgrounded-grandchild.pid");
+        let mut grandchild_cleanup = PublishedPidCleanup::new(pid_file.clone());
 
         let opts = RunOptions {
             inputs: vec!["in.txt".to_string()],
             command: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                // Background a long sleep (inherits the pipes) then exit 0.
-                "sleep 300 & exit 0".to_string(),
+                // Background a long sleep (inherits the pipes), publish its exact
+                // PID through positional $1, then exit 0. Passing the path as an
+                // argument avoids shell interpolation of the temporary directory.
+                "sleep 300 & printf '%s\\n' \"$!\" > \"$1\"; exit 0".to_string(),
+                "clw-backgrounded-grandchild".to_string(),
+                pid_file.to_string_lossy().into_owned(),
             ],
             env_keys: vec![],
         };
@@ -1968,6 +2250,34 @@ mod tests {
             outcome.stdout.is_empty(),
             "the child wrote no stdout of its own"
         );
+
+        let pid_text = std::fs::read_to_string(&pid_file)
+            .expect("backgrounded grandchild must publish its exact PID");
+        let pid: u32 = pid_text
+            .trim()
+            .parse()
+            .expect("backgrounded grandchild PID marker must be an unsigned PID");
+        assert_eq!(pid_text, format!("{pid}\n"), "PID marker must be exact");
+        grandchild_cleanup.record(pid);
+        assert!(
+            pid_is_running(pid),
+            "published backgrounded grandchild PID must be live"
+        );
+
+        assert!(
+            grandchild_cleanup.terminate(),
+            "test fixture cleanup must signal the exact published grandchild PID"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !pid_is_running(pid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("backgrounded grandchild must exit promptly after fixture cleanup");
     }
 
     // -----------------------------------------------------------------------
