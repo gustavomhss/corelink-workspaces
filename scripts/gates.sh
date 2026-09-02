@@ -587,6 +587,7 @@ bash scripts/deadman-registry.sh check
 # full marks. Offline; no network.
 bash scripts/deadman-selftest.sh
 bash scripts/workflow-permissions-selftest.sh
+bash scripts/fuzz-selftest.sh
 
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken

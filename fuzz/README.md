@@ -28,8 +28,10 @@ cargo install cargo-fuzz
 ```sh
 cargo +nightly fuzz run fuzz_manifest_from_bytes
 cargo +nightly fuzz run fuzz_validate_rel_path
-cargo +nightly fuzz run fuzz_validate_symlink_target
+cargo +nightly fuzz run fuzz_validate_symlink_target_contained
 cargo +nightly fuzz run fuzz_digest_from_hex
+cargo +nightly fuzz run fuzz_ref_record_from_bytes
+cargo +nightly fuzz run fuzz_validate_tenant
 ```
 
 A target runs until it finds a crash or you stop it (Ctrl-C). To bound a CI run,
@@ -51,5 +53,20 @@ cargo +nightly fuzz run fuzz_manifest_from_bytes fuzz/artifacts/fuzz_manifest_fr
 | --- | --- | --- |
 | `fuzz_manifest_from_bytes` | `Manifest::from_bytes` (JSON parse + path/symlink/drive-letter validation) | remote CAS manifest blob |
 | `fuzz_validate_rel_path` | `validate_rel_path` | each manifest entry path |
-| `fuzz_validate_symlink_target` | `validate_symlink_target` | symlink entry targets |
+| `fuzz_validate_symlink_target_contained` | `validate_symlink_target_contained` | each symlink's clean path + target |
 | `fuzz_digest_from_hex` | `Digest::from_hex` | manifest / RefRecord / URL digests |
+| `fuzz_ref_record_from_bytes` | `RefRecord::from_bytes` | remote AC ref record |
+| `fuzz_validate_tenant` | `validate_tenant` | tenant interpolated into CAS/AC URLs |
+
+## Seeded, persistent corpus
+
+Every target has a small, tracked seed in `fuzz/corpus/<target>/seed`. The
+nightly workflow restores the newest successful corpus for that target before
+fuzzing, then saves successful coverage discoveries under a fresh immutable
+cache key. On a cache miss, the tracked seed is the complete initial corpus and
+the run bootstraps the next cache. Every restored run evaluates the persistent
+and seed-only corpora with the same no-mutation budget and fails unless the
+former has a larger maximum libFuzzer `cov:` count. A cache is never
+overwritten; the next run starts from the latest corpus selected by its restore
+prefix. Reproducers remain separate under `fuzz/artifacts/` and are uploaded
+only when a target fails.

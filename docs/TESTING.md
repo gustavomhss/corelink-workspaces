@@ -20,7 +20,7 @@ release build job on `[self-hosted, macOS, X64]`.
 |---|---|---|---|
 | **Required gate + DCO** | [`ci.yml`](../.github/workflows/ci.yml) | PR, push to `main`, dispatch | `gates.sh`, DCO, and guard self-tests; the round-trip property test runs inside `gates.sh`. |
 | **Coverage** | [`coverage.yml`](../.github/workflows/coverage.yml) | PR, push to `main`, dispatch | Default-feature workspace line coverage, excluding `clw-e2e-evidence`; an active 88% floor makes a lower result red. |
-| **Fuzz** | [`fuzz.yml`](../.github/workflows/fuzz.yml) | daily 08:00 UTC, dispatch | Four untrusted-input fuzz targets; a crash is red. |
+| **Fuzz** | [`fuzz.yml`](../.github/workflows/fuzz.yml) | daily 08:00 UTC, dispatch | Six live untrusted-input fuzz targets; after cache bootstrap, a crash or no restored-corpus `cov:` gain over the cold seed is red. |
 | **Mutation** | [`mutation.yml`](../.github/workflows/mutation.yml) | PR, dispatch | Per-PR `diff` mode fails the job on a survivor, timeout, or harness fault; dispatched `workspace` backlog sweeps remain report-only for survivors/timeouts. |
 | **Stress / scale** | [`stress.yml`](../.github/workflows/stress.yml) | Mondays 02:00 UTC, dispatch | 2 GiB, 25k-file success, 40k-file expected-cap rejection, deep/wide, 64-way, and 2,000 property cases; a crash, hang, OOM, or mismatch is red. |
 | **Windows binary smoke** | [`windows.yml`](../.github/workflows/windows.yml) | relevant PRs, push to `main`, dispatch | Builds the shipped `windows-gnu` binary with MinGW and runs its smoke checks under Wine on `corelink`; it is not a hosted or full-fidelity Windows-runtime lane. |
@@ -47,14 +47,18 @@ cargo llvm-cov --workspace --html && open target/llvm-cov/html/index.html
 
 ## Fuzz (`cargo-fuzz`, nightly)
 The `fuzz/` package is a **detached, out-of-workspace** cargo-fuzz project (nightly-only, so the stable
-gate never sees libfuzzer). Four targets fuzz the untrusted-input surface of `clw-types` — the
+gate never sees libfuzzer). Six targets fuzz the live untrusted-input surface of `clw-types` — the
 path-escape / manifest-parse attack surface:
-`fuzz_validate_symlink_target`, `fuzz_validate_rel_path`, `fuzz_manifest_from_bytes`, `fuzz_digest_from_hex`.
-The lane runs each for 5 minutes nightly; a crash fails the run and uploads the reproducing input.
+`fuzz_validate_symlink_target_contained`, `fuzz_validate_rel_path`, `fuzz_manifest_from_bytes`,
+`fuzz_digest_from_hex`, `fuzz_ref_record_from_bytes`, and `fuzz_validate_tenant`. The lane restores
+each target's persistent corpus. A first cache miss fuzzes the tracked seed and saves the discoveries;
+every restored run evaluates that corpus and a seed-only cold corpus with the same no-mutation input
+budget, requiring the restored maximum libFuzzer `cov:` count to be larger before it performs another
+deterministic fuzzing budget. A crash fails the run and uploads the reproducing input.
 
 Run locally (needs nightly + `cargo install cargo-fuzz`):
 ```
-cargo +nightly fuzz run fuzz_validate_symlink_target -- -max_total_time=300
+bash scripts/fuzz-coverage-check.sh fuzz_validate_symlink_target_contained true
 ```
 
 ## Mutation (`cargo-mutants`)

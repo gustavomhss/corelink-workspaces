@@ -52,8 +52,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_validate_symlink_target"
-path = "fuzz_targets/fuzz_validate_symlink_target.rs"
+name = "fuzz_validate_symlink_target_contained"
+path = "fuzz_targets/fuzz_validate_symlink_target_contained.rs"
 test = false
 doc = false
 bench = false
@@ -61,6 +61,20 @@ bench = false
 [[bin]]
 name = "fuzz_digest_from_hex"
 path = "fuzz_targets/fuzz_digest_from_hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ref_record_from_bytes"
+path = "fuzz_targets/fuzz_ref_record_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_validate_tenant"
+path = "fuzz_targets/fuzz_validate_tenant.rs"
 test = false
 doc = false
 bench = false

@@ -1,6 +1,6 @@
 # Fuzz lane — actually RUN the cargo-fuzz harness that already exists but was dormant.
 #
-# Part of the test-rigor wave. The 4 targets under fuzz/ fuzz the UNTRUSTED-input
+# Part of the test-rigor wave. The 6 targets under fuzz/ fuzz the UNTRUSTED-input
 # parsers/validators of clw-types (the path-escape / manifest-parse attack surface).
 # They were only runnable via the opt-in local lane; this schedules them so a crash
 # becomes a VISIBLE red instead of a latent bug.
@@ -30,12 +30,30 @@ concurrency:
 permissions:
   contents: read
 
+# Fuzzing compiles and executes repository-controlled code on the CoreLink
+# fabric. Never let the fabric's ambient broker identity reach it.
+env:
+  # CI_CREDENTIAL_NULL_GUARD: workflow-env
+  CLW_CRED_TICKET: ""
+  CLW_LEASE_ID: ""
+  CLW_FABRIC_ENDPOINT: ""
+
 jobs:
   supply-chain:
     name: fuzz supply-chain
     runs-on: corelink
     timeout-minutes: 30
     steps:
+      - name: assert broker credentials are absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::fuzz broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -70,10 +88,25 @@ jobs:
         target:
           - fuzz_manifest_from_bytes
           - fuzz_validate_rel_path
-          - fuzz_validate_symlink_target
+          - fuzz_validate_symlink_target_contained
           - fuzz_digest_from_hex
+          - fuzz_ref_record_from_bytes
+          - fuzz_validate_tenant
     steps:
+      - name: assert broker credentials are absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::fuzz broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
+
+      - name: verify fuzz target and seed-corpus inventory
+        run: bash scripts/fuzz-selftest.sh
 
       - name: install nightly toolchain (cargo-fuzz requires it)
         run: |
@@ -90,29 +123,40 @@ jobs:
           set -euo pipefail
           (cd fuzz && cargo metadata --locked --format-version 1 >/dev/null)
 
+      # The GitHub Actions API's refs/tags/v4.2.4 reports this immutable commit
+      # SHA (verified 2026-09-02):
+      # https://api.github.com/repos/actions/cache/git/ref/tags/v4.2.4
+      # Restore and save are separate because a cache key is immutable. Every
+      # successful run restores the newest target corpus then saves its growth
+      # under this run's fresh key; no successful corpus is overwritten.
+      - name: restore persistent corpus (${{ matrix.target }})
+        id: corpus-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-v1-${{ matrix.target }}-
+
       - name: install cargo-fuzz 0.13.2
         # NOT a first-class taiki-e/install-action tool (its cargo-binstall fallback for
         # cargo-fuzz is unreliable) — install deterministically from source. The cargo-fuzz
         # CLI builds on stable; only RUNNING targets needs nightly (done below).
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
-      # 5 minutes per target. cargo-fuzz operates on the fuzz/ package (detached
-      # workspace at repo root); run from the repo root, which is where fuzz/ lives.
-      - name: fuzz ${{ matrix.target }} (5 min)
-        run: |
-          set -euo pipefail
-          lock_before="$(sha256sum fuzz/Cargo.lock | awk '{print $1}')"
-          set +e
-          cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time=300 -rss_limit_mb=4096
-          fuzz_exit=$?
-          set -e
-          lock_after="$(sha256sum fuzz/Cargo.lock | awk '{print $1}')"
-          if [ "$lock_before" != "$lock_after" ]; then
-            echo "::error::cargo-fuzz changed fuzz/Cargo.lock despite the locked metadata preflight" >&2
-            git diff -- fuzz/Cargo.lock >&2 || true
-            exit 1
-          fi
-          exit "$fuzz_exit"
+      # A cache miss bootstraps from the tracked seed and is saved. On every
+      # restored run, the helper evaluates the seed-only and restored corpora
+      # with the same no-mutation budget before further fuzzing, and requires
+      # the restored corpus's maximum `cov:` count to be strictly greater.
+      - name: fuzz ${{ matrix.target }} and prove restored-corpus coverage
+        run: bash scripts/fuzz-coverage-check.sh "${{ matrix.target }}" "${{ steps.corpus-cache.outputs.cache-matched-key != '' }}"
+
+      - name: save persistent corpus (${{ matrix.target }})
+        if: success()
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-v1-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # On a crash the step above fails (set -e); capture the reproducing input +
       # corpus so the failure is reproducible from the run artifacts.
