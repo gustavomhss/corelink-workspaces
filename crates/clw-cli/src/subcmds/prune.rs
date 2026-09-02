@@ -20,6 +20,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
+use crate::subcmds::helpers::{capability_unavailable, is_capability_unavailable};
 use crate::subcmds::status::map_auth_error;
 
 #[derive(Debug, Args)]
@@ -419,29 +420,6 @@ fn live_set_incomplete_lagging_replica(ref_label: &str) -> ClwError {
 /// [`compute_live_set`] for an unresolvable ref.
 fn is_live_set_incomplete(err: &ClwError) -> bool {
     matches!(err, ClwError::Message(msg) if msg.contains("live set is incomplete"))
-}
-
-/// True if the error is the server-regression case (the client maps 405/501 to a
-/// `Transport` error carrying the `405/501` token for a LIVE capability).
-fn is_capability_unavailable(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
-}
-
-/// Render the server-regression case. ALWAYS fails (non-zero exit) so a
-/// destructive command that did nothing never reports success — in `--json` mode
-/// the structured note is printed first, then the error propagates (same exit
-/// code as human mode).
-fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
-    let msg = format!(
-        "{capability} failed: corelink-server capability {dep} is LIVE but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)"
-    );
-    if json {
-        println!(
-            "{}",
-            json!({ "error": "capability-unavailable", "note": msg })
-        );
-    }
-    Err(ClwError::Transport(msg))
 }
 
 // ---------------------------------------------------------------------------

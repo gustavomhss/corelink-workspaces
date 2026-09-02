@@ -9,12 +9,18 @@
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_types::{ref_key_in, AcTransport, CasTransport, ClwError, Manifest, RefRecord};
+use clw_types::{ref_key_in, AcTransport, CasTransport, ClwError, Config, Manifest, RefRecord};
 use futures::stream::{self, StreamExt};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
+use crate::subcmds::helpers::{capability_unavailable, is_capability_unavailable};
 use crate::subcmds::status::{map_auth_error, map_missing_manifest};
+
+// Keep the existing crate-local path used by the JSON contract golden while
+// sourcing the builder from the shared generic renderer.
+#[cfg(test)]
+pub(crate) use crate::subcmds::helpers::build_capability_unavailable_json;
 
 #[derive(Debug, Args)]
 #[command(about = "List ref info for a workspace name, or every ref with --all")]
@@ -33,10 +39,33 @@ pub struct LsArgs {
     pub all: bool,
 }
 
-pub async fn run(args: LsArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
+pub async fn run(
+    args: LsArgs,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+) -> Result<(), ClwError> {
+    run_with_client_factory(args, cfg, json, concurrency, HttpClient::with_concurrency).await
+}
+
+/// Production boundary for `ls`: the `--all` branch constructs its client through
+/// this injected factory before handing it to the bounded listing dispatcher.
+/// Keeping the factory at this boundary makes the CLI selection and dispatcher
+/// testable together without a live HTTP server.
+async fn run_with_client_factory<C, BuildClient>(
+    args: LsArgs,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+    build_client: BuildClient,
+) -> Result<(), ClwError>
+where
+    C: AcTransport,
+    BuildClient: FnOnce(Config, usize) -> Result<C, ClwError>,
+{
     match (&args.name, args.all) {
         (Some(name), false) => run_one(name, cfg, json).await,
-        (None, true) => run_all(cfg, json).await,
+        (None, true) => run_all(cfg.clw_config, json, concurrency, build_client).await,
         // clap's `conflicts_with` already rejects `--name X --all`; this guards
         // the `neither` case with an actionable message instead of a panic.
         // FIX 5: point a bare `clw ls` at `--help` so the user can discover the flags.
@@ -116,9 +145,19 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
 /// In `--json` each genuinely-corrupt record is a structured `{key, error}` entry
 /// under `errors` so a machine caller sees the partial-listing rather than a hard
 /// failure. Partial output is strictly better than no output for a listing.
-async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
-    let tenant = cfg.clw_config.tenant.clone();
-    let client = HttpClient::new(cfg.clw_config)?;
+async fn run_all<C, BuildClient>(
+    cfg: Config,
+    json: bool,
+    requested_concurrency: usize,
+    build_client: BuildClient,
+) -> Result<(), ClwError>
+where
+    C: AcTransport,
+    BuildClient: FnOnce(Config, usize) -> Result<C, ClwError>,
+{
+    let tenant = cfg.tenant.clone();
+    let concurrency = all_fetch_concurrency(requested_concurrency);
+    let client = build_client(cfg, concurrency.http_client_limit)?;
 
     let keys = match AcTransport::list_refs(&client).await {
         Ok(keys) => keys,
@@ -149,8 +188,10 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     // sequential round-trips — on a real 46-ref tenant that was ~46 back-to-back requests
     // (and with a ~1s/request backend, ~46 s). The client's AIMD Governor still caps the
     // true in-flight count and applies 429 backpressure, so this is a latency win, not a
-    // thundering herd. Results are re-sorted to enumeration order for a deterministic list.
-    const LS_FETCH_CONCURRENCY: usize = 16;
+    // thundering herd. The same user-selected limit is supplied to the HTTP
+    // governor and this dispatcher: neither layer may silently widen or narrow
+    // `--concurrency`. Results are re-sorted to enumeration order for a
+    // deterministic list.
 
     // Per-key outcome. `Box<RefRecord>` keeps the enum small (clippy large-variant).
     enum Fetched {
@@ -204,7 +245,7 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
             }
         },
     ))
-    .buffer_unordered(LS_FETCH_CONCURRENCY)
+    .buffer_unordered(concurrency.fetch_dispatcher_limit)
     .collect()
     .await;
 
@@ -261,6 +302,24 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     Ok(())
 }
 
+/// The one concurrency decision for `ls --all`'s HTTP-client builder and its
+/// bounded record-fetch dispatcher. Keep both fields equal: a different value
+/// would make the CLI report one limit while the other layer silently imposes
+/// another. Like the other network commands, zero is clamped to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllFetchConcurrency {
+    http_client_limit: usize,
+    fetch_dispatcher_limit: usize,
+}
+
+fn all_fetch_concurrency(requested: usize) -> AllFetchConcurrency {
+    let limit = requested.max(1);
+    AllFetchConcurrency {
+        http_client_limit: limit,
+        fetch_dispatcher_limit: limit,
+    }
+}
+
 /// FIX 4: the workspace-not-found message, shared with hydrate/status. Beyond
 /// "snapshot first or check --tenant" it now points at `--ref-domain`: a
 /// runner-produced ref lives in the `runner` keyspace, so a user-domain lookup of
@@ -301,25 +360,6 @@ fn format_unix_utc(secs: u64) -> String {
     let year = if month <= 2 { y + 1 } else { y };
 
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} UTC")
-}
-
-/// True if the error is the server-regression case (the client maps 405/501 to a
-/// `Transport` error carrying the `405/501` token for a LIVE capability).
-fn is_capability_unavailable(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
-}
-
-/// Render the server-regression case. ALWAYS fails (non-zero exit) so a script
-/// never mistakes a server regression for "tenant has no refs" — in `--json`
-/// mode the structured note is printed first, then the error propagates.
-fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(), ClwError> {
-    let msg = format!(
-        "{capability} failed: corelink-server capability {dep} is LIVE but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)"
-    );
-    if json {
-        println!("{}", build_capability_unavailable_json(&msg));
-    }
-    Err(ClwError::Transport(msg))
 }
 
 /// Build the single-reference JSON response.
@@ -376,11 +416,6 @@ pub(crate) fn build_all_json(
         "skipped": errors.len(),
         "errors": errors,
     })
-}
-
-/// Build the structured failure note emitted before `ls --all` returns an error.
-pub(crate) fn build_capability_unavailable_json(message: &str) -> serde_json::Value {
-    json!({ "error": "capability-unavailable", "note": message })
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +514,162 @@ mod tests {
         assert!(capability_unavailable(false, "ref enumeration", "D-7").is_err());
     }
 
-    use clw_types::{Digest, RefRecord};
+    #[test]
+    fn ls_all_concurrency_clamps_zero_and_propagates_one_value_to_builder_and_dispatcher() {
+        assert_eq!(
+            all_fetch_concurrency(0),
+            AllFetchConcurrency {
+                http_client_limit: 1,
+                fetch_dispatcher_limit: 1,
+            }
+        );
+        assert_eq!(
+            all_fetch_concurrency(1),
+            AllFetchConcurrency {
+                http_client_limit: 1,
+                fetch_dispatcher_limit: 1,
+            }
+        );
+        assert_eq!(
+            all_fetch_concurrency(13),
+            AllFetchConcurrency {
+                http_client_limit: 13,
+                fetch_dispatcher_limit: 13,
+            }
+        );
+    }
+
+    use clw_types::{Digest, RefDomain, RefRecord};
+
+    #[derive(Clone)]
+    struct BlockingListClient {
+        keys: Vec<Digest>,
+        started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcTransport for BlockingListClient {
+        async fn get(&self, _key: &Digest) -> Result<Option<Vec<u8>>, ClwError> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.entered.send(());
+            let permit = self.release.acquire().await.map_err(|_| {
+                ClwError::Transport("test dispatcher release semaphore was closed".to_string())
+            })?;
+            drop(permit);
+            Ok(None)
+        }
+
+        async fn put(&self, _key: &Digest, _value: Vec<u8>) -> Result<(), ClwError> {
+            unreachable!("ls --all does not write AC records")
+        }
+
+        async fn delete(&self, _key: &Digest) -> Result<(), ClwError> {
+            unreachable!("ls --all does not delete AC records")
+        }
+
+        async fn list_refs(&self) -> Result<Vec<Digest>, ClwError> {
+            Ok(self.keys.clone())
+        }
+    }
+
+    fn list_test_config() -> Config {
+        Config {
+            endpoint: "http://127.0.0.1:9".to_string(),
+            tenant: "test-tenant".to_string(),
+            token: "test-token".to_string(),
+            cache_dir: std::path::PathBuf::from("/nonexistent/ls-all-test-cache"),
+        }
+    }
+
+    fn resolved_list_test_config() -> ResolvedConfig {
+        ResolvedConfig {
+            clw_config: list_test_config(),
+            ref_domain: RefDomain::User,
+            ref_domain_invalid: None,
+            broker: None,
+        }
+    }
+
+    /// Exercises the production `run` boundary and `run_all` dispatcher through
+    /// the client-builder seam. The fake's `get` futures never complete until
+    /// this test releases them, so the observed starts are an exact scheduler
+    /// bound, not a timing estimate. This goes red if either the builder falls
+    /// back to `HttpClient::new` or the dispatcher regresses to a fixed bound
+    /// such as 16.
+    #[tokio::test]
+    async fn production_ls_all_forwards_clamped_concurrency_to_builder_and_dispatcher() {
+        const KEY_COUNT: usize = 17;
+
+        let harness = async {
+            for (requested, expected) in [(0, 1), (1, 1), (13, 13)] {
+                let keys = (0..KEY_COUNT)
+                    .map(|n| Digest::of_bytes(format!("key-{n}").as_bytes()))
+                    .collect();
+                let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+                let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+                let client = BlockingListClient {
+                    keys,
+                    started: std::sync::Arc::clone(&started),
+                    entered,
+                    release: std::sync::Arc::clone(&release),
+                };
+                let built_with =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+                let built_with_for_factory = std::sync::Arc::clone(&built_with);
+
+                let listing = run_with_client_factory(
+                    LsArgs {
+                        name: None,
+                        all: true,
+                    },
+                    resolved_list_test_config(),
+                    false,
+                    requested,
+                    move |_cfg, limit| {
+                        built_with_for_factory.store(limit, std::sync::atomic::Ordering::SeqCst);
+                        Ok(client)
+                    },
+                );
+                tokio::pin!(listing);
+
+                for _ in 0..expected {
+                    tokio::select! {
+                        entry = entered_rx.recv() => {
+                            entry.expect("the production dispatcher must start each allowed fetch");
+                        }
+                        result = &mut listing => {
+                            panic!("the blocked production listing returned early: {result:?}");
+                        }
+                    }
+                }
+                assert_eq!(
+                    built_with.load(std::sync::atomic::Ordering::SeqCst),
+                    expected,
+                    "requested {requested} must reach the HTTP-client builder"
+                );
+                assert_eq!(
+                    started.load(std::sync::atomic::Ordering::SeqCst),
+                    expected,
+                    "requested {requested} must bound the production fetch dispatcher"
+                );
+
+                release.add_permits(KEY_COUNT);
+                listing
+                    .await
+                    .expect("released fake ref fetches must complete");
+            }
+        };
+
+        // Guard only against a broken scheduler causing this test harness to
+        // wait forever; it is NOT a throughput or latency assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(1), harness)
+            .await
+            .expect("bounded ls --all concurrency harness timed out");
+    }
 
     fn good_record(name: &str) -> Vec<u8> {
         RefRecord {

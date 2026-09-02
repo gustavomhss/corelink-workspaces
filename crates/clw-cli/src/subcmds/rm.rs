@@ -12,6 +12,8 @@ use clw_types::{ref_key_in, AcTransport, ClwError, Digest, RefDomain};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
+use crate::subcmds::helpers::is_capability_unavailable;
+use crate::subcmds::status::map_auth_error;
 
 #[derive(Debug, Args)]
 #[command(about = "Delete a workspace ref — by name, or by raw key (--ref-key) for a dangling ref")]
@@ -163,25 +165,6 @@ fn capability_unavailable(json: bool) -> Result<(), ClwError> {
         );
     }
     Err(ClwError::Transport(msg))
-}
-
-/// True if the error is the server-regression case (the client maps 405/501 to a
-/// `Transport` error whose message carries the `405/501` token for a LIVE
-/// capability).
-fn is_capability_unavailable(err: &ClwError) -> bool {
-    matches!(err, ClwError::Transport(msg) if msg.contains("405/501"))
-}
-
-/// Rewrite a raw `Auth` error into an actionable transport message (mirrors
-/// `ls`/`status`); pass everything else through.
-fn map_auth_error(err: ClwError) -> ClwError {
-    if matches!(err, ClwError::Auth) {
-        ClwError::Message(
-            "authentication failed — check CLW_TOKEN or ~/.clw/config.toml".to_string(),
-        )
-    } else {
-        err
-    }
 }
 
 /// Prompt for confirmation before deleting a ref. Returns `false` immediately if

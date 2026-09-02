@@ -507,14 +507,18 @@ the tool.
 ## `--concurrency` — throttling CoreLink requests
 
 `--concurrency` (default `8`; `0` is clamped to `1`) sets the per-invocation
-ceiling for concurrent CoreLink requests in `snapshot`, `hydrate`, `prune`, and
-`erase`. It is a CLI flag only: there is no `CLW_CONCURRENCY` environment variable
-or config-file setting. Lower it if you are hitting rate limits; the client also
-honors `Retry-After` and adapts concurrency downward (AIMD) on HTTP 429 on its own.
+ceiling for concurrent CoreLink requests in `snapshot`, `hydrate`, `ls --all`,
+`prune`, and `erase`. For `ls --all`, the same value bounds both the HTTP client
+and the concurrent ref-record fetches; it does not apply to the one-record
+`ls --name` lookup. It is a CLI flag only: there is no `CLW_CONCURRENCY`
+environment variable or config-file setting. Lower it if you are hitting rate
+limits; the client also honors `Retry-After` and adapts concurrency downward
+(AIMD) on HTTP 429 on its own.
 
 ```sh
 clw --concurrency 4 snapshot --name myapp-dev
 clw --concurrency 4 hydrate ~/workspace/myapp --name myapp-dev
+clw --concurrency 4 ls --all
 ```
 
 ---

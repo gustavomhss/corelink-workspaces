@@ -191,8 +191,10 @@ wrapped command owns stdout; `clw completions` rejects `--json` because it emits
 shell source rather than JSON. `--no-color` disables ANSI color;
 color is also auto-disabled when `NO_COLOR` is set or stdout is not a TTY.
 `--concurrency` sets the per-invocation CoreLink request ceiling for `snapshot`,
-`hydrate`, `prune`, and `erase` (lower it if you hit rate limits). It is a CLI
-flag only, with no environment-variable or config-file counterpart.
+`hydrate`, `ls --all`, `prune`, and `erase` (lower it if you hit rate limits).
+For `ls --all`, it bounds both the HTTP client and the concurrent ref fetches;
+it does not apply to the one-record `ls --name` lookup. It is a CLI flag only,
+with no environment-variable or config-file counterpart.
 
 **No telemetry.** clw collects **no usage data** and has **no mechanism** to send
 any — it never phones home. The only data it transmits is the workspace content

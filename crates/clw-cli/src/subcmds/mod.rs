@@ -4,6 +4,7 @@ pub mod auth;
 pub mod completions;
 pub mod doctor;
 pub mod erase;
+pub(crate) mod helpers;
 pub mod hydrate;
 pub mod init;
 pub mod ls;

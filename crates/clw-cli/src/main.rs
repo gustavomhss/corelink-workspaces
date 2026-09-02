@@ -96,12 +96,12 @@ pub struct Cli {
     )]
     pub no_color: bool,
 
-    /// Max concurrent CoreLink requests for snapshot, hydrate, prune, and erase.
+    /// Max concurrent CoreLink requests for snapshot, hydrate, `ls --all`, prune, and erase.
     #[arg(
         long,
         global = true,
         default_value_t = 8,
-        help = "Max concurrent CoreLink requests for snapshot/hydrate/prune/erase (lower it if you hit rate limits)"
+        help = "Max concurrent CoreLink requests for snapshot/hydrate/ls --all/prune/erase (lower it if you hit rate limits)"
     )]
     pub concurrency: usize,
 
@@ -601,7 +601,7 @@ async fn dispatch(
         // not honor the global `--concurrency`. `json` is threaded in only so it
         // can emit a one-line stderr hint when `--json` is passed (P6).
         Commands::Run(args) => subcmds::run::run(args, cfg, json).await,
-        Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
+        Commands::Ls(args) => subcmds::ls::run(args, cfg, json, concurrency).await,
         Commands::Rm(args) => subcmds::rm::run(args, cfg, json).await,
         Commands::Prune(args) => subcmds::prune::run(args, cfg, json, concurrency).await,
         Commands::Erase(args) => subcmds::erase::run(args, cfg, json, concurrency).await,
@@ -903,6 +903,13 @@ mod tests {
             }
             other => panic!("expected Ls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_concurrency_reaches_ls_all() {
+        let cli = Cli::try_parse_from(["clw", "--concurrency", "13", "ls", "--all"]).unwrap();
+        assert_eq!(cli.concurrency, 13);
+        assert!(matches!(cli.command, Commands::Ls(ref args) if args.all));
     }
 
     #[test]
