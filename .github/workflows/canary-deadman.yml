@@ -16,9 +16,9 @@
 #     of the set it watches: if this workflow stops running, its own entry stops
 #     being evaluated and the silence is indistinguishable from health. That is why
 #     canary-deadman.yml is excluded from the registry below by name rather than by
-#     accident. Closing that self-blindness needs an observer OUTSIDE this repo's
-#     Actions scheduler and is tracked as WP-36 — until WP-36 lands, nothing here
-#     detects a dead deadman.
+#     accident. No observer outside this repo's Actions scheduler is configured;
+#     this limitation is documented in docs/OBSERVABILITY.md (WP-36). Nothing here
+#     detects a dead deadman when this workflow itself cannot run.
 #
 # Independent safety net for prod-breakage finding #4 (prod-health monitoring must
 # not be able to go dark unnoticed).

@@ -32,6 +32,17 @@ v0.1.7 (2026-07-10) closes the external-symlink LOW. v0.1.5 shipped `clw hydrate
   `CARGO_HOME=$HOME/.clw-ci-rust/cargo RUSTUP_HOME=$HOME/.clw-ci-rust/rustup $HOME/.clw-ci-rust/cargo/bin/cargo`.
   Pinned `RUST_TOOLCHAIN` (currently 1.91.1). Cross-builds use cargo-zigbuild (ziglang in an isolated venv).
 
+## Observability limitation (WP-36)
+
+As of 2026-09-01, no observer outside GitHub Actions is configured or tested: there is no owner-Mac cron,
+third-party heartbeat service, webhook/pager, or independent alert channel. The in-platform deadman only
+checks whether registered scheduled lanes have recent completed runs and successful conclusions; it cannot
+prove GitHub Actions scheduler or CoreLink fabric ingestion/liveness. Because the deadman itself runs on
+that Actions/fabric path and reports through GitHub, an outage there can silence both the watcher and its
+alert. See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md). This is a documented limitation, not an
+external liveness mitigation or a claim that WP-36's observer exists; a future Mac or third-party cron is
+only a possible path until it is independently deployed and tested.
+
 ## Repo conventions (enforced — do not relearn the hard way)
 - **DCO: commit with `-s`** (sign-off gate blocks otherwise). Conventional Commits for titles.
 - **Flow (main is branch-protected — no direct-to-main):** as of 2026-07-09 `main` requires the `gates` +

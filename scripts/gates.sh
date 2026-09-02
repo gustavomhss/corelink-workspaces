@@ -578,9 +578,8 @@ bash scripts/check-unsafe-posture.sh
 # EXPLICITLY NOT COVERED: the deadman's own liveness. A dead-man's-switch cannot be
 # an element of the set it watches — if canary-deadman.yml stops running, its entry
 # stops being evaluated and the silence looks like health. It is excluded from the
-# registry by name (and registering it is a hard failure). An observer outside this
-# repo's Actions scheduler is tracked as WP-36; until then, nothing detects a dead
-# deadman.
+# registry by name (and registering it is a hard failure). No observer outside this
+# repo's Actions scheduler is configured; see docs/OBSERVABILITY.md (WP-36).
 bash scripts/deadman-registry.sh check
 # And the gate's own teeth: plant every defect class it claims to catch against a
 # copy of the REAL workflows dir and assert it goes red AND names the thing — plus

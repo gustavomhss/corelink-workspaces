@@ -92,7 +92,7 @@ lanes() {
       *.yml|*.yaml) : ;;
       *) fatal "registry row '$line' names '$wf', which is not a .yml/.yaml workflow file." ;;
     esac
-    [ "$wf" != "$DEADMAN_WF" ] || fatal "the registry lists $DEADMAN_WF itself. A dead-man's-switch cannot be an element of the set it watches: if it stops running, its own entry stops being evaluated. Its liveness is out of scope here — see WP-36."
+    [ "$wf" != "$DEADMAN_WF" ] || fatal "the registry lists $DEADMAN_WF itself. A dead-man's-switch cannot be an element of the set it watches: if it stops running, its own entry stops being evaluated. Its liveness is out of scope here — see WP-36 and docs/OBSERVABILITY.md."
     [ -f "$WF_DIR/$wf" ] || fatal "registry row '$line' names $wf, which does not exist in $WF_DIR — the deadman would be watching a workflow that is not there."
     case "$hours" in
       ''|*[!0-9]*) fatal "registry row '$line' has a non-integer window '$hours'." ;;
@@ -333,7 +333,7 @@ watch() {
   days_since_last_tag
 
   emit ""
-  emit "Scope: this watches that THE WATCHING RUNS. It is NOT evidence the system is alive — a lane can be fresh, green, and asserting nothing. The deadman's OWN liveness is out of scope (WP-36)."
+  emit "Scope: this watches that THE WATCHING RUNS. It is NOT evidence the system is alive — a lane can be fresh, green, and asserting nothing. The deadman's OWN liveness is out of scope (WP-36; see docs/OBSERVABILITY.md)."
 
   if [ "$failures" -gt 0 ]; then
     echo "::error::DEAD-MAN'S-SWITCH: $failures lane(s) failed — see the annotations above."
