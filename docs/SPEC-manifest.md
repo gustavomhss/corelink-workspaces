@@ -3,7 +3,10 @@
 **Specification status:** Normative  
 **Version:** 1  
 **Date:** 2026-06-04  
-**Source of truth:** `crates/clw-types/src/lib.rs` (hash fe251941)
+**Source of truth:** the frozen
+[`crates/clw-types/src/lib.rs`](https://github.com/HuGR-Labs/corelink-workspaces/blob/2df125f0a2a040dc77f2fa277cfa4f914cdd3f06/crates/clw-types/src/lib.rs)
+contract at immutable WP-40 baseline commit `2df125f0a2a040dc77f2fa277cfa4f914cdd3f06`.
+This commit reference is intentionally used instead of a file-content hash that must be manually refreshed.
 
 ---
 
@@ -210,17 +213,20 @@ reject it with HTTP 413). See §6.2.
 
 ### 6.1 Ref key derivation
 
-A workspace ref named `name` is stored in the AC under the key:
+A workspace ref named `name` is stored in the AC under the key for its selected ref domain:
 
 ```
-ref_key(name) = BLAKE3(REF_KEY_DOMAIN || name)
-             = BLAKE3("clw/ref/v1/" || name)
+ref_key(user, name)   = BLAKE3("clw/ref/v1/" || name)
+ref_key(runner, name) = BLAKE3("clw/ref/runner/v1/" || name)
 ```
 
-where `||` denotes byte concatenation and `REF_KEY_DOMAIN = "clw/ref/v1/"`.
+where `||` denotes byte concatenation. `user` is the default; `runner` is selected by the frozen
+`CLW_REF_DOMAIN=runner` / `--ref-domain runner` runners seam. The domain separator is part of the
+BLAKE3 preimage, so the two keyspaces are disjoint by construction.
 
-The domain prefix provides namespace separation: `ref_key("x")` MUST NOT equal
-`BLAKE3("x")`. Implementations MUST use this exact derivation.
+The domain prefix provides namespace separation: for either domain, `ref_key("x")` MUST NOT equal
+`BLAKE3("x")`. The user and runner derivations are domain-separated and form the client contract's
+disjoint keyspaces. Implementations MUST use these exact derivations.
 
 ### 6.2 RefRecord format
 
@@ -295,10 +301,16 @@ Authorization: Bearer <token>
 A missing or invalid token results in HTTP 401. Implementations MUST surface 401
 as an authentication error and MUST NOT retry with the same token.
 
-The PAT MUST be sourced from `CLW_TOKEN` environment variable, `~/.clw/config.toml`,
-or a CLI flag (in precedence order: flag > env > config). The PAT MUST NEVER be
-logged, included in error messages, or written to any file other than the
-designated config location.
+The static PAT MUST be sourced from `CLW_TOKEN` environment variable, `~/.clw/config.toml`,
+or a CLI flag (in precedence order: flag > env > config). A static PAT MUST NEVER be logged or
+included in error messages, and MAY be written only to the designated static-token config location.
+When selected by the current command gate, the runner C2c path instead redeems its single-use credential
+ticket for a scoped per-job PAT before CAS/AC use; it does not send the ticket as that bearer token.
+A C2c ticket MUST NEVER be logged,
+included in error messages, or written to `~/.clw/config.toml` or any other file. A redeemed PAT is
+initially held in process memory; commands that persist a resolved identity can write that PAT to the
+designated static-token config location. The current redemption gate is documented in
+[`CLI-CONTRACT.md`](CLI-CONTRACT.md).
 
 ### 7.3 CAS integrity — clients MUST verify
 
@@ -336,7 +348,7 @@ making a network request when the limit would be exceeded.
 | 5.1 | Chunks MUST use FastCDC with frozen parameters. |
 | 5.3 | Chunking parameters MUST NOT be changed without a lead decision record. |
 | 5.4 | Every chunk MUST be < 5 MiB. |
-| 6.1 | Ref key MUST be `BLAKE3("clw/ref/v1/" || name)`. |
+| 6.1 | Ref key MUST be `BLAKE3("clw/ref/v1/" || name)` in the user domain or `BLAKE3("clw/ref/runner/v1/" || name)` in the runner domain. |
 | 6.3 | v1 concurrency is atomic put-if-absent (201 new / 200 idempotent / 409 divergent), not last-write-wins; future MAY add a CAS token. |
 | 7.2 | All requests MUST use `Authorization: Bearer <token>`. PAT MUST NEVER be logged. |
 | 7.3 | Clients MUST verify BLAKE3 digest on every CAS GET response. |

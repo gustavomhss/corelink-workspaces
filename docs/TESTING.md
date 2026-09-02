@@ -9,28 +9,34 @@ compiles and the tests pass; these lanes prove the tests are **adequate**.
 > then a floor is set and the lane starts blocking a regression, then it ratchets upward. Fuzzing is
 > the exception — a crash always blocks (it is a defect, not a metric).
 
-## The three lanes
+## Workflow and test lanes
 
-| Lane | Workflow | Cadence | What it proves | Blocks? |
-|---|---|---|---|---|
-| **Coverage** | `.github/workflows/coverage.yml` | every PR + push-main + dispatch | how much code a test actually executes | report-only → floor (Phase 1b) → required (1c) |
-| **Fuzz** | `.github/workflows/fuzz.yml` | nightly + dispatch | the untrusted-input parsers never panic/UB on arbitrary bytes | **yes — a crash is red** |
-| **Mutation** | `.github/workflows/mutation.yml` | every PR + dispatch (`mode: workspace\|diff`) | the tests actually *kill* injected faults (not just run) | a survivor in the PR's own diff turns the lane **red** — but red ≠ blocked: it is not (yet) a required check |
-| **Round-trip (property)** | `crates/clw-integration-tests/tests/roundtrip_prop.rs` | every PR (32 cases) + weekly exhaustive (2000) | `snapshot→hydrate` is byte-identical on ARBITRARY trees | gate test — red on any fidelity break |
-| **Stress / scale** | `.github/workflows/stress.yml` | weekly + dispatch | the lifecycle survives magnitude (GB file, 100k files, deep+wide, 64-way concurrency) | **yes — crash/hang/OOM/mismatch is red** |
-| **Windows runtime** | `.github/workflows/windows.yml` | PR (crates/scripts) + push-main + dispatch | the workspace test suite RUNS on Windows (was compile-only) — path/mode/symlink-copy-fallback behavior | red on any Windows test failure |
-| **Shellcheck** | `.github/workflows/shellcheck.yml` | PR (scripts) + push-main + dispatch | the distribution + CI shell scripts (incl. the public `install.sh`) lint clean | red on any shellcheck warning |
-| **E2E evidence** | `.github/workflows/e2e-evidence.yml` | **manual only** (`workflow_dispatch`) | the REAL `clw` binary, driven as a user (argv+env) against prod, emits a per-step evidence report | required primary-cred journey skip is red (`REQUIRE_PROD=1`); report artifact always uploaded |
+This is the complete inventory of the 13 versioned workflow files. Unless noted, jobs run on
+[`corelink`](../.github/workflows/ci.yml), the ephemeral CoreLink runner fabric; they are not
+GitHub-hosted `ubuntu-latest` or `windows-latest` jobs. The one physical-runner exception is the
+release build job on `[self-hosted, macOS, X64]`.
 
-They run on github-hosted runners and are **additive** — they do not touch the required `gates`/`dco`
-checks (except the round-trip property test, which runs inside the gate). The Windows lane runs on
-`windows-latest` (gnu toolchain, matching the shipped binary); everything else on `ubuntu-latest`.
+| Lane | Workflow | Cadence | What it proves / enforcement |
+|---|---|---|---|
+| **Required gate + DCO** | [`ci.yml`](../.github/workflows/ci.yml) | PR, push to `main`, dispatch | `gates.sh`, DCO, and guard self-tests; the round-trip property test runs inside `gates.sh`. |
+| **Coverage** | [`coverage.yml`](../.github/workflows/coverage.yml) | PR, push to `main`, dispatch | Default-feature workspace line coverage, excluding `clw-e2e-evidence`; an active 88% floor makes a lower result red. |
+| **Fuzz** | [`fuzz.yml`](../.github/workflows/fuzz.yml) | daily 08:00 UTC, dispatch | Four untrusted-input fuzz targets; a crash is red. |
+| **Mutation** | [`mutation.yml`](../.github/workflows/mutation.yml) | PR, dispatch | Per-PR `diff` mode fails the job on a survivor, timeout, or harness fault; dispatched `workspace` backlog sweeps remain report-only for survivors/timeouts. |
+| **Stress / scale** | [`stress.yml`](../.github/workflows/stress.yml) | Mondays 02:00 UTC, dispatch | 2 GiB, 25k-file success, 40k-file expected-cap rejection, deep/wide, 64-way, and 2,000 property cases; a crash, hang, OOM, or mismatch is red. |
+| **Windows binary smoke** | [`windows.yml`](../.github/workflows/windows.yml) | relevant PRs, push to `main`, dispatch | Builds the shipped `windows-gnu` binary with MinGW and runs its smoke checks under Wine on `corelink`; it is not a hosted or full-fidelity Windows-runtime lane. |
+| **Shell lint** | [`shellcheck.yml`](../.github/workflows/shellcheck.yml) | PR, push to `main`, dispatch | Shellcheck for distribution and CI scripts. |
+| **E2E evidence** | [`e2e-evidence.yml`](../.github/workflows/e2e-evidence.yml) | dispatch only | Real `clw` binary, argv+env, and evidence report; a required primary-credential skip is red. |
+| **Conformance canary** | [`conformance-canary.yml`](../.github/workflows/conformance-canary.yml) | daily 13:00 UTC, dispatch | Live API conformance against its canary credentials. |
+| **Live journeys** | [`live-journeys.yml`](../.github/workflows/live-journeys.yml) | Mondays 06:17 UTC, dispatch | Live production journey suite; a required primary-credential skip is red. |
+| **Metered-probe canary** | [`metered-probe-canary.yml`](../.github/workflows/metered-probe-canary.yml) | Mondays 12:00 UTC, dispatch | A dedicated low-ceiling tenant reaches and verifies the production 402 boundary. |
+| **Canary deadman** | [`canary-deadman.yml`](../.github/workflows/canary-deadman.yml) | daily 16:00 UTC, dispatch | Registered scheduled lanes exist, are fresh, and conclude successfully; its own liveness remains out of scope. |
+| **Release** | [`release.yml`](../.github/workflows/release.yml) | `v*` tag push | Preflight, release checks, signing/build/publish flow; non-build jobs run on `corelink`, while the cross-target build/signing host is the physical macOS runner. |
 
 ## Coverage (`cargo-llvm-cov`)
-Measures total line coverage on the whole workspace (default-features — the `live` conformance suite is
-not run without a backend). Report-only today: it prints the total % to the job summary and uploads
-`lcov.info` + JSON. **Phase 1b**: set `COVERAGE_FLOOR` = `floor(baseline)` in the workflow's final step
-and flip it to `exit 1` on a drop (deterministic, not flaky). **Phase 1c**: promote to a required check.
+Measures total line coverage on the whole workspace with default features (the `live` conformance suite
+is not compiled or run without a backend). [`coverage.yml`](../.github/workflows/coverage.yml) uploads
+`lcov.info` + JSON and actively enforces `FLOOR=88`: a result below 88% exits 1. The workflow check is
+not yet a branch-protection required check, but the floor itself is already a deterministic hard gate.
 
 Run locally:
 ```
@@ -53,8 +59,9 @@ cargo +nightly fuzz run fuzz_validate_symlink_target -- -max_total_time=300
 
 ## Mutation (`cargo-mutants`)
 Injects faults and re-runs the tests; a **surviving** mutant (`missed`) is a change the suite failed to
-catch — a real test gap. It runs **per-PR and blocking**, scoped to the PR's own diff. A harness fault
-(the unmutated tests fail / bad args) also fails the job — that is a real break. It replaced a weekly
+catch — a real test gap. It runs per-PR, scoped to the PR's own diff; a survivor or harness fault
+(the unmutated tests fail / bad args) makes that workflow job red. The check is not yet required by
+branch protection. It replaced a weekly
 sharded whole-workspace sweep in WP-34; that history, and the exhaustive sweep that survives it, are
 below.
 
@@ -114,13 +121,14 @@ generates arbitrary workspace trees (varied unicode/space names, nested dirs, em
 exec bits, in-tree symlinks) and asserts `snapshot→hydrate` is byte-identical with structure + mode +
 symlink target preserved. It runs in the gate at 32 cases; the stress lane cranks `PROPTEST_CASES=2000`.
 
-`crates/clw-integration-tests/tests/stress.rs` holds the `#[ignore]`d **scale** scenarios (GB file, 100k
-files, deep+wide tree, N-way concurrency) run by `stress.yml` at aggressive magnitude via env
-(`CLW_STRESS_BIG_BYTES` / `_FILES` / `_DEPTH` / `_WIDE` / `_CONC`). Both use in-process/disk-backed stores
-(no HTTP, no quota). Run locally:
+`crates/clw-integration-tests/tests/stress.rs` holds the `#[ignore]`d **scale** scenarios. The scheduled
+[`stress.yml`](../.github/workflows/stress.yml) job uses a 2 GiB file, 25,000 files that must round-trip,
+40,000 files that must fail cleanly at the manifest cap, depth 500, width 20,000, and 64 concurrent flows;
+its separate property job runs 2,000 cases. Both use in-process/disk-backed stores (no HTTP, no quota).
+Run locally:
 ```
 cargo test -p clw-integration-tests --test stress -- --ignored          # moderate defaults
-CLW_STRESS_FILES=100000 cargo test -p clw-integration-tests --test stress -- --ignored --nocapture
+CLW_STRESS_FILES=25000 CLW_STRESS_FILES_OVERCAP=40000 cargo test -p clw-integration-tests --test stress -- --ignored --nocapture
 ```
 Fault-injection / chaos E2E (5xx/429/corrupt-body/mid-op-401, large round-trip, concurrency) already lives
 in `tests/adversarial.rs` and runs in the gate.

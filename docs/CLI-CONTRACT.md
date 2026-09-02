@@ -30,52 +30,76 @@ and `Config::resolve()` succeeds from env alone:
 
 | Env var | Meaning | Source |
 |---|---|---|
-| `CLW_ENDPOINT` | API base URL | `crates/clw-cli/src/main.rs:31` |
-| `CLW_TENANT` | tenant id (carried in the URL path) | `:40` |
-| `CLW_TOKEN` | PAT (`Authorization: Bearer`) — redacted in all logs/Debug | `:49` |
-| `CLW_CACHE_DIR` | local cache dir | `:58` |
-| `CLW_REF_DOMAIN` | **(PROPOSED, see below)** ref keyspace selector: `user` (default) or `runner` | — |
+| `CLW_ENDPOINT` | API base URL | [`main.rs`](../crates/clw-cli/src/main.rs) |
+| `CLW_TENANT` | tenant id (carried in the URL path) | [`main.rs`](../crates/clw-cli/src/main.rs) |
+| `CLW_TOKEN` | Static PAT for the developer/default and legacy runner paths (`Authorization: Bearer`) — redacted in all logs/Debug | [`main.rs`](../crates/clw-cli/src/main.rs) |
+| `CLW_CACHE_DIR` | local cache dir | [`main.rs`](../crates/clw-cli/src/main.rs) |
+| `CLW_REF_DOMAIN` | **FROZEN (2026-06-16):** ref keyspace selector: `user` (default) or `runner` | [`main.rs`](../crates/clw-cli/src/main.rs), [`clw-types`](../crates/clw-types/src/lib.rs) |
+| `CLW_CRED_TICKET` | C2c runner-only, single-use credential-broker ticket — **not** a PAT | [`config.rs`](../crates/clw-cli/src/config.rs) |
+| `CLW_LEASE_ID` | C2c lease binding; required with a non-empty ticket | [`config.rs`](../crates/clw-cli/src/config.rs) |
+| `CLW_FABRIC_ENDPOINT` | C2c credential-broker base URL; required with a non-empty ticket | [`config.rs`](../crates/clw-cli/src/config.rs) |
 
 A `CLW_*` var that is **set but EMPTY counts as ABSENT** (M12) — resolution falls through to the
 config file and then the default, so a missing CI secret yields the actionable "missing token/tenant"
 (exit 2, no request) instead of an empty `Bearer ` on the wire. Same rule as the `CORELINK_*` aliases.
 
-The per-job, short-TTL, CAS+AC-scoped PAT is **injected at dispatch time** (server **D-9**, FROZEN).
-clw never sets `x-corelink-tenant-id` — PAT + tenant-in-path is the sole client tenant authority.
+The default path uses the static PAT. C2c redemption is **command-gated**, not a property of every
+runner-domain invocation: its ordinary purpose is a command that will make a CAS/AC call. With a non-empty,
+lease-bound `CLW_CRED_TICKET`, the gate redeems once at trusted boot for a scoped per-job CAS PAT; a missing
+lease id/fabric endpoint or failed redemption is fail-closed and never falls back to `CLW_TOKEN`. The ticket
+itself is not sent as the CAS/AC bearer token. The current
+[`command_redeems_credential`](../crates/clw-cli/src/main.rs) classifier explicitly does **not** redeem for
+`doctor`, `auth whoami`, `auth logout`, or `uninstall`; `completions`, `--help`, and `--version` exit before
+credential resolution. As shipped, that classifier still selects `init`, `auth login`, and `auth rotate`,
+although they do not currently make CAS/AC calls; that is an implementation fact, not an integration
+requirement (tracked by WP43b). `clw` never sets `x-corelink-tenant-id` — the resolved bearer token plus
+tenant-in-path is the sole client tenant authority. See [`config.rs`](../crates/clw-cli/src/config.rs).
 
 ## Auth + exit semantics
 - `Authorization: Bearer <PAT>` + tenant-in-URL-path. Never `x-corelink-tenant-id` (server-internal).
 - An expired/invalid PAT → a **non-retryable** auth error (clw does **not** self-re-mint; the
-  dispatcher re-mints per D-9). Exit code is non-zero; config/usage/transport/auth errors exit `2`.
+  dispatcher re-mints per D-9). For commands other than `clw run`, config/usage/transport/auth errors
+  exit `2`; `clw run` has the distinct wrapper outcomes below.
 - **`clw run` is exit-code-transparent** (load-bearing for a CI runner): it **propagates the wrapped
-  command's exit code** (`std::process::exit(child_code)`), with a signal-killed child mapped to
-  `128 + signal` (POSIX; SIGTERM → 143), never -1/255. A **clw-internal failure where the child never
-  ran** (config / transport / hydrate / cache error) exits the **reserved code `125`** (the
+  command's exit code** (`std::process::exit(child_code)`). On Unix, a child killed by a known signal maps
+  to `128 + signal` (SIGTERM → 143); an unavailable signal number, and every non-Unix no-code status, map
+  to `255`. A **clw-internal failure where the child never ran** (config / transport / hydrate / cache
+  error) exits the **reserved code `125`** (the
   docker / `env` / `timeout` "wrapper itself failed" convention) — distinct from any child passthrough —
   so a runner classifies `125 → clw-failed`, any other code → the child's own result. (A clap *usage*
   error on `clw run` — malformed args, child never ran — exits `2` per clap; the runner builds the argv,
-  so that is not expected in practice.) A non-zero run is **not** memoized — a failing job never poisons
-  the cache. **Full frozen surface + exit table: `docs/CLI-SURFACE-EXIT-FREEZE.md`.**
+  so that is not expected in practice.) If `clw` kills a child for captured output over the CAS cap, the
+  distinct internal outcome is `137` (`128 + SIGKILL`), not `125`. A non-zero run is **not** memoized — a
+  failing job never poisons the cache. **Full frozen surface + exit table: `docs/CLI-SURFACE-EXIT-FREEZE.md`.**
 
 ## `clw run` memoization scope (v0.1)
-The run cache key is derived **only** from: the declared `--input` path digests (+ unix mode bits), the
-declared `--env` variable **names** (and their current presence/value), the command vector + the resolved
-identity of `command[0]`, and the **canonicalized working directory**. Two runs that differ only in cwd get
-different keys (no cross-workspace stale replay). **Undeclared environment variables are the caller's
-responsibility:** clw does **not** sandbox the child environment in v0.1 (the child inherits the full
-ambient env — no `env_clear`), so any env var that affects the command's output **must** be declared via
-`--env` or it is invisible to the key and may replay a stale result. Child-env sandboxing (`env_clear` +
-allowlist) is a tracked post-beta hardening, deliberately out of scope for the `v0.1.0` line.
+The run cache key is derived **only** from: the declared `--input` path digests (and Unix mode bits),
+the declared `--env` variable **names** (and their current presence/value), the command vector + the
+resolved identity of `command[0]`, and the **canonicalized working directory**. Two runs that differ
+only in cwd get different keys (no cross-workspace stale replay). On a successful zero-exit miss,
+`clw` makes a bounded best-effort cache write: the tenant's AC record contains only the captured
+stdout/stderr blob digests plus exit code. A hit fetches and replays those streams — it neither captures
+nor reconstructs output files. This behavior is defined by [`clw-run`](../crates/clw-run/src/lib.rs).
+
+**Undeclared non-secret environment variables are the caller's responsibility:** `clw` does not call
+`env_clear`, so they remain ambient and any one that affects output **must** be declared via `--env` or
+it is invisible to the key and may replay stale output. Before spawning the untrusted child, `clw` removes
+its credential-bearing variables (`CLW_TOKEN`/`CORELINK_TOKEN`, credential ticket, lease id, and fabric
+endpoint aliases); non-secret `CLW_*` configuration remains available. A complete child-environment
+allowlist is a tracked post-beta hardening, deliberately out of scope for the `v0.1.0` line.
 
 ## JSON output
 The family-relevant verbs support `--json` for machine parsing (content-address root, cache
 hit/miss, byte counts). Pin against the documented fields in `docs/usage.md`; fields are additive
 within the `v0.1.0` line.
 
-## ⚠️ Ref namespacing — PROPOSED contract (see `docs/REPLY-to-runners-TL-2026-06-16.md`)
-clw's ref key is `BLAKE3(REF_KEY_DOMAIN ‖ name)` with a **single fixed** `REF_KEY_DOMAIN =
-"clw/ref/v1/"` (a protocol-version separator, **not** a per-producer field). To give runner refs a
-**collision-proof-by-construction** namespace, clw will reserve a second domain
-`"clw/ref/runner/v1/"`, selected via `CLW_REF_DOMAIN=runner`. A consumer without that selector can
-never produce a runner-domain key regardless of `name`. **Frozen contract; implementation lands as a
-gated change.**
+## Ref namespacing — **FROZEN (2026-06-16)**
+
+The frozen runners seam selects one of two domain separators in
+[`ref_key_in`](../crates/clw-types/src/lib.rs): `user` (the default) uses
+`BLAKE3("clw/ref/v1/" ‖ name)` and `runner` uses
+`BLAKE3("clw/ref/runner/v1/" ‖ name)`. `CLW_REF_DOMAIN=runner` (or
+`--ref-domain runner`) therefore selects a runner-only AC keyspace that is disjoint by construction;
+a client using the default domain cannot produce a runner-domain key for any name. Only `user` and
+`runner` are accepted; another value is a configuration error (exit 2). The runners fabric sets the
+runner selector at dispatch time.

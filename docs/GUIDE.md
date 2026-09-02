@@ -978,10 +978,11 @@ about it. All of it is **client-side and on by default; there is nothing to conf
   a committed `fuzz/Cargo.lock` lock the supply chain. Correctness is proven, not assumed, by additive lanes:
   **in-tree fuzzing** of every untrusted-input parser (manifest / ref-record / run-record decode, `Digest::from_hex`,
   the `validate_*` path/symlink checks — proptest, 1k cases/PR, 50k under `CLW_FUZZ_GATE=1`), a **coverage floor**
-  (≈ 88% line, per-PR, blocks a regression), **weekly mutation testing** (does a test actually *kill* an injected
-  fault), a **property round-trip** test (arbitrary trees snapshot→hydrate byte-identical), a **stress lane**
-  (GB file / 100k files / 64-way concurrency), a **Windows-runtime lane** (the suite actually *runs* on
-  `windows-latest`, not just compiles), and **shellcheck** over the shipped shell scripts. A **daily
+  (88% line, per-PR, blocks a regression), **per-PR diff mutation testing** (does a test actually *kill* an injected
+  fault; dispatched whole-workspace sweeps are report-oriented), a **property round-trip** test (arbitrary trees
+  snapshot→hydrate byte-identical), a **stress lane** (2 GiB / 25k success / 40k expected-cap rejection / 64-way
+  concurrency), a **Windows binary smoke** (Linux `corelink` + MinGW build + limited Wine execution, not
+  `windows-latest`), and **shellcheck** over the shipped shell scripts. A **daily
   live-conformance canary** runs the full prod round-trip against the real backend in honest mode. **Signing is
   fail-closed:** a real `vX.Y.Z` with the minisign secret absent hard-errors (`exit 1`) instead of publishing
   unsigned. (Details: `docs/TESTING.md`.)
