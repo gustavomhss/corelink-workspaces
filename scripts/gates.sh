@@ -475,11 +475,42 @@ esac
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
-# Persistent target dir on CI (outside the runner's _work checkout, immune to clean):
-if [ "${CI:-}" = "true" ]; then
-  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/ci-cache/clw-target}"
-  mkdir -p "$CARGO_TARGET_DIR"
-fi
+# CI jobs start cold: there is deliberately no actions/cache build cache. Give every
+# Cargo command in THIS gates invocation one target directory, but key it to the
+# GitHub run attempt under the runner's temporary area. This preserves intra-job
+# reuse (including the unsafe-posture compiler sentinel) without pretending that a
+# runner's $HOME survives another job.
+configure_ci_cargo_target_dir() {
+  [ "${CI:-}" = "true" ] || return 0
+
+  local run_id="${GITHUB_RUN_ID:-}" run_attempt="${GITHUB_RUN_ATTEMPT:-}"
+  local runner_tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]] || [[ ! "$run_attempt" =~ ^[0-9]+$ ]]; then
+    echo "GATE FAILED: CI must provide numeric GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT for a job-local Cargo target" >&2
+    return 1
+  fi
+
+  # Do not inherit a runner-level target path: it can be a stale persistent cache.
+  CARGO_TARGET_DIR="${runner_tmp%/}/clw-gates-target-${run_id}-${run_attempt}"
+  export CARGO_TARGET_DIR
+  mkdir -p -- "$CARGO_TARGET_DIR"
+  echo "CI Cargo target: job-local ${CARGO_TARGET_DIR} (shared by this gates invocation; never a cross-run cache)"
+}
+
+print_ci_cargo_target_dir() {
+  configure_ci_cargo_target_dir
+  printf '%s\n' "${CARGO_TARGET_DIR:-}"
+}
+
+case "${1:-}" in
+  --print-ci-cargo-target-dir)
+    [ "$#" -eq 1 ] || { echo "usage: $0 --print-ci-cargo-target-dir" >&2; exit 2; }
+    print_ci_cargo_target_dir
+    exit 0
+    ;;
+esac
+
+configure_ci_cargo_target_dir
 
 # --- DEAD-ORG-SLUG GUARD (runs in EVERY lane, including docs-only) -----------
 # The GitHub org moved `humangr-labs` -> `HumanGuardrail` -> `HuGR-Labs` (2026-08-01).
@@ -589,6 +620,7 @@ bash scripts/deadman-selftest.sh
 bash scripts/workflow-permissions-selftest.sh
 bash scripts/fuzz-selftest.sh
 bash scripts/pr-title-workflow-selftest.sh
+bash scripts/ci-build-target-selftest.sh
 
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken
@@ -664,13 +696,12 @@ if [ "$SCOPE" = "full" ]; then
   #     earlier, smaller revision of the corpus. Every case added since is a
   #     guard-oracle case with no compile in it, so treat this as a FLOOR. Carrying a
   #     case count here is what went stale three times; the suite prints its own.
-  # The gap is not noise: CI=true exports a shared CARGO_TARGET_DIR that every
-  # self-test case inherits, and by the time the suite runs, the steps above it in
-  # THIS job have already populated that directory — so the one case that compiles
-  # the real tree finds most of the graph built, while a local run gives each case
-  # its own empty target dir. (Shared within the job, not across runs:
-  # docs/RUNBOOK-ci-fallback.md records that no actions/cache exists and every CI
-  # run starts cold.) That is why widening that case from `-p clw-types` to
+  # The gap is not noise: CI assigns a job-local CARGO_TARGET_DIR that every self-test
+  # case inherits, and by the time the suite runs, the steps above it in THIS job have
+  # already populated that directory — so the one case that compiles the real tree
+  # finds most of the graph built, while a local run gives each case its own empty
+  # target dir. It is deliberately not a cross-run cache: no actions/cache exists and
+  # every CI job starts cold. That is why widening that case from `-p clw-types` to
   # `-p clw-cli` cost 109s locally and ~4s on the box in the merge path.
   # Earlier revisions of this comment claimed ~11s (a warm-box figure) and then
   # 70-80s (a cold-box figure), each stated as if it were THE cost. Say which box.

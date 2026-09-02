@@ -165,9 +165,9 @@ out-of-scope / residual-risk list.
   number as if it were the cost has been wrong three times: **~117s on a cold dev box**
   against **14.0s in CI** (that CI figure was measured on an earlier, smaller revision
   of the corpus, and every case added since is a guard-oracle case with no compile in
-  it — so treat it as a floor, not as the current cost), because `gates.sh` exports
-  a shared `CARGO_TARGET_DIR` when `CI=true` that the earlier steps of the same job have
-  already populated — shared within a job, not across runs.
+  it — so treat it as a floor, not as the current cost), because `gates.sh` assigns a
+  job-local `CARGO_TARGET_DIR` that the earlier steps of the same job have already
+  populated. It is shared only within that job; CI has no cross-run build cache.
   A green suite means the RECORDED bypasses are
   still closed; it has never meant there are no others, and that has now been shown
   twice — 30/30 on a tree whose binary ran `unsafe` behind a crate-scoped wrapper, then

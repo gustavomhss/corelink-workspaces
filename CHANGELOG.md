@@ -27,6 +27,9 @@
   realistic workspace approaches this; the constant can be raised if one ever does.
 
 ### CI / Infrastructure
+- CI build targets are now explicitly job-local and keyed to the GitHub run attempt:
+  Cargo commands within one gate reuse compilation, but CI makes no cross-run cache
+  claim (and has no `actions/cache` build cache).
 - **The windows-gnu cross-check now runs with `--all-targets`.** Without it, `cargo check` compiles
   only lib/bin targets, so every `#[cfg(windows)] #[test]` in the tree was never type-checked by any
   lane. Also added a `windows.yml` step that runs the M17 containment predicate on the real

@@ -40,9 +40,9 @@ GUARD=scripts/check-unsafe-posture.sh
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# Deliberately NO shared CARGO_TARGET_DIR. The synthetic workspaces have no
-# dependencies, so each builds in well under a second on its own, and sharing a
-# target dir would only make them queue on cargo's lock.
+# This harness does not create a target directory of its own. In CI it inherits the
+# gates invocation's job-local target so the real-tree compiler sentinel can reuse the
+# earlier clippy build; locally each copied workspace uses its own default target.
 
 # Cases are independent — each mutates its own copy of the tree — so they run
 # CONCURRENTLY. Serially this suite was 2 minutes, which is too much to put in front
@@ -186,8 +186,8 @@ _run_case() {
       #
       # COST, because it should be a deliberate choice and not a surprise: 109s cold
       # locally, against 21s for the clw-types version. On CI it is close to free —
-      # gates.sh exports a shared CARGO_TARGET_DIR when CI=true that every case
-      # inherits and the job's earlier steps have already populated, so the whole
+      # gates.sh assigns a job-local shared CARGO_TARGET_DIR that every case inherits
+      # and the job's earlier steps have already populated, so the whole
       # suite measured 14.0s there WITH this case widened (9.85s was the narrower
       # `-p clw-types` suite; the ~4s delta is this change). The expensive box is the
       # developer's; the box that pays in the merge path is warm.

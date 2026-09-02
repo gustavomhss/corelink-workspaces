@@ -214,23 +214,13 @@ docs-only fast path.
 Verified against the tree and against the last hosted runs. In descending order of how
 much it will surprise you.
 
-1. **`gates.sh`'s persistent-cache assumption is already dead — this is NOT a new
-   breakage.** `scripts/gates.sh` lines 23–25 read:
-   ```sh
-   if [ "${CI:-}" = "true" ]; then
-     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/ci-cache/clw-target}"
-     mkdir -p "$CARGO_TARGET_DIR"
-   ```
-   The script **creates** the directory (`mkdir -p`); it does not require it to
-   pre-exist, so nothing fails. But the *intent* — a warm target dir surviving between
-   runs — is not satisfied on `corelink` either: each job gets its own ephemeral
-   microVM (distinct runner names per job in the same run, e.g. `cf-runner-acac4906` /
-   `cf-runner-ccbe1553` / `cf-runner-99fe751c` in run `32791835263`), and **there is no
-   `actions/cache` step anywhere in `.github/workflows/`**. Every CI run today already
-   compiles cold. Moving to hosted therefore costs nothing extra here — the measured
+1. **Builds are cold per CI job by design — this is NOT a new breakage.** `gates.sh`
+   assigns `CARGO_TARGET_DIR` under `RUNNER_TEMP`, keyed to `GITHUB_RUN_ID` and attempt.
+   Cargo commands (including the unsafe-posture compiler sentinel) reuse it within that
+   gates invocation, but a later run gets a different directory. There is no
+   `actions/cache` build-cache step anywhere in `.github/workflows/`; each CI job starts
+   cold. Moving to hosted therefore costs nothing extra here — the measured
    hosted-vs-fabric delta in §7 is ~1.5 min, which is CPU, not cache.
-   *(Historical note: this assumption dates from the 2026-06 self-hosted-Mac topology and
-   was flagged for removal in `docs/go-live/WP-BRIEFS.md`; it was never removed.)*
 
 2. **The host-toolchain assumption is Mac-only and does not apply here.** The Linux lanes
    provision Rust with `rustup show` against the image's preinstalled rustup, which works
@@ -504,9 +494,8 @@ these were fixed by this work package (docs-only scope).
    `ci.yml` has a bare `on: pull_request` with no `paths:` filter, so all three of its
    jobs run on every PR, but the pre-merge guard only asserts the presence of `dco`,
    `gates`, and `llvm-cov`. A silently-absent `gate-check-selftest` would not be caught.
-6. **The `CARGO_TARGET_DIR` persistent-cache assumption is vestigial** (§5.1) — flagged
-   for removal in `docs/go-live/WP-BRIEFS.md` back in the M2.x wave, never removed, and
-   now satisfied by nothing on any runner.
+6. **There is no cross-run build cache** (§5.1). The job-local `CARGO_TARGET_DIR` is
+   intentional intra-job reuse only; do not mistake it for an `actions/cache` restore.
 
 ---
 
