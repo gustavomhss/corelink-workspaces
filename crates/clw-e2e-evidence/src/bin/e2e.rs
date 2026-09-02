@@ -11,11 +11,12 @@
 //!   CLW_E2E_OUT   report output dir (default: ./e2e-reports)
 //!   CLW_ENDPOINT / CLW_TENANT / CLW_TOKEN  the target + identity (token optional →
 //!                 prod journeys are SKIPPED, an offline-only report is still produced)
-//!   CLW_E2E_REQUIRE_PROD=1  make a skipped PRIMARY-cred prod journey a hard failure (CI
-//!                 uses this so the pipeline can never silently stop exercising prod —
-//!                 canary-blind). An OPTIONAL skip (J4's 2nd identity, J5's throwaway
-//!                 erase tenant) is reported but never trips REQUIRE, so the lane is green
-//!                 with just the primary PAT.
+//!   CLW_E2E_REQUIRE_PROD=1  make a skipped PRIMARY-cred prod journey a hard failure for
+//!                 callers that select primary-only coverage (avoids canary-blindness).
+//!                 An OPTIONAL skip does not trip `REQUIRE_PROD`; it does trip
+//!                 `REQUIRE_ALL` when that stricter mode is selected.
+//!   CLW_E2E_REQUIRE_ALL=1   make ANY skipped journey a hard failure. This is stricter
+//!                 than `REQUIRE_PROD`: it also requires the optional persona inputs.
 //!   CLW_TOKEN_B                       a 2nd identity → the team story (optional).
 //!   CLW_E2E_ERASE_TENANT / _TOKEN     a throwaway tenant → the offboarding story (optional).
 //!   CLW_E2E_QUOTA_TENANT / _TOKEN     a low-ceiling tenant → the quota story (optional).
@@ -25,7 +26,7 @@
 //! (security), Ravi (automation), Omar (offboarding), Nadia (quota); plus J9 adversarial vs
 //! a local hostile backend and JE efficiency, both always. J8 (cred-ticket) + J10/J11
 //! (cross-platform) land as follow-ons. A skip is counted separately from a pass — required
-//! vs optional — so an absent-creds run can never be reported as green.
+//! vs optional — so the report always distinguishes unavailable live coverage from a pass.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,7 +117,7 @@ fn main() {
                 "NOTE: CLW_TOKEN/CLW_TENANT absent → prod journeys skipped (offline-only report)"
             );
             let need = "CLW_TOKEN + CLW_TENANT";
-            // The primary-cred persona stories (a skip here trips CLW_E2E_REQUIRE_PROD).
+            // The primary-cred persona stories: a skip trips REQUIRE_PROD and REQUIRE_ALL.
             journeys.push(journeys::skipped_journey(
                 "marina-ships-orders-api",
                 "a backend engineer's real week: snapshot → hydrate → iterate → conflict → run → clean up",
@@ -132,7 +133,8 @@ fn main() {
                 "automation: exit-code passthrough, reserved 125, runner ref-domain disjointness",
                 need,
             ));
-            // The extra-infra persona stories (optional skips — never trip REQUIRE).
+            // The extra-infra persona stories: optional under REQUIRE_PROD, but a skip
+            // still trips REQUIRE_ALL in the strict evidence workflow.
             journeys.push(journeys::skipped_optional_journey(
                 "team-shares-billing-service",
                 "two identities: cross-identity read/dedup, create-only conflict, concurrent convergence",
@@ -172,12 +174,11 @@ fn main() {
     std::fs::write(&html_path, &html).expect("write html");
 
     // Count passes / skips / failures SEPARATELY — a skipped journey (no creds) is never
-    // folded into "passed", so an absent-creds run can never masquerade as green (the
-    // canary-blind failure mode). `CLW_E2E_REQUIRE_PROD=1` (set in CI) makes a skipped
-    // PRIMARY-cred prod journey a hard failure, so the pipeline can't silently stop
-    // exercising prod. An OPTIONAL skip (J4's 2nd identity, J5's throwaway erase tenant)
-    // is reported but never trips REQUIRE — so the lane is green with just the primary
-    // PAT (mirrors the conformance suite's soft-skip / the live-journeys lane).
+    // folded into "passed", so the report never disguises unavailable live coverage as a
+    // pass. `CLW_E2E_REQUIRE_PROD=1` makes a skipped PRIMARY-cred
+    // prod journey a hard failure, while optional skips remain soft for normal prod mode.
+    // `CLW_E2E_REQUIRE_ALL=1` is the CI strict mode: every skip, including optional
+    // personas, is a hard failure.
     let passed = journeys.iter().filter(|j| !j.skipped && j.passed()).count();
     let failed = journeys
         .iter()
@@ -186,22 +187,40 @@ fn main() {
     let skipped = journeys.iter().filter(|j| j.skipped).count();
     let required_skipped = journeys.iter().filter(|j| j.skipped && !j.optional).count();
     let require_prod = std::env::var("CLW_E2E_REQUIRE_PROD").ok().as_deref() == Some("1");
-    let require_violated = require_prod && required_skipped > 0;
+    let require_all = std::env::var("CLW_E2E_REQUIRE_ALL").ok().as_deref() == Some("1");
+    let require_prod_violated = require_prod && required_skipped > 0;
+    let require_all_violated = require_all && skipped > 0;
+    let require_violated =
+        skip_requirements_violated(skipped, required_skipped, require_prod, require_all);
     eprintln!(
         "evidence: {passed} passed, {skipped} skipped ({required_skipped} required), {failed} failed → {} · {}",
         md_path.display(),
         html_path.display()
     );
-    if require_violated {
+    if require_prod_violated {
         eprintln!(
             "FAIL: CLW_E2E_REQUIRE_PROD=1 but {required_skipped} primary-cred prod journey(s) were skipped (creds absent)"
         );
+    }
+    if require_all_violated {
+        eprintln!("FAIL: CLW_E2E_REQUIRE_ALL=1 but {skipped} journey(s) were skipped");
     }
     std::process::exit(if failed == 0 && !require_violated {
         0
     } else {
         1
     });
+}
+
+/// Whether the selected strictness modes turn the observed skips into a non-zero exit.
+/// `REQUIRE_PROD` intentionally ignores optional skips; `REQUIRE_ALL` does not.
+fn skip_requirements_violated(
+    skipped: usize,
+    required_skipped: usize,
+    require_prod: bool,
+    require_all: bool,
+) -> bool {
+    (require_prod && required_skipped > 0) || (require_all && skipped > 0)
 }
 
 /// Run a journey builder, converting a panic (e.g. a fixture-setup failure) into a
@@ -285,18 +304,13 @@ fn smoke_offline(bin: &Path) -> Journey {
     );
     j.push(comp);
 
-    // doctor runs on an empty config and MUST report the token as a marker, never the
-    // value. (The tenant IS shown in full by design — that is not a secret.) HOME is
-    // sandboxed to an empty temp dir so this self-test reads NO operator config and stays
-    // deterministic — the report never bleeds the machine's real ~/.clw.
-    let sandbox_home =
-        std::env::temp_dir().join(format!("clw-e2e-smoke-home-{}", std::process::id()));
-    std::fs::create_dir_all(&sandbox_home).ok();
-    let sandbox_home_s = sandbox_home.to_string_lossy().into_owned();
+    // doctor runs in Runner's owned HOME sandbox and MUST report the token as a marker,
+    // never the value. (The tenant IS shown in full by design — that is not a secret.)
+    // This self-test therefore reads NO operator config and stays deterministic.
     let mut doc = r.step(
         "doctor --json",
         &["--json", "doctor"],
-        &[("HOME", &sandbox_home_s, false)],
+        &[],
         ExpectExit::Eq(0),
     );
     let marker =
@@ -313,7 +327,6 @@ fn smoke_offline(bin: &Path) -> Journey {
     );
     j.push(doc);
 
-    let _ = std::fs::remove_dir_all(&sandbox_home);
     j
 }
 
@@ -643,4 +656,24 @@ fn now_iso() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("epoch {secs} (UTC)")
+}
+
+#[cfg(test)]
+mod skip_mode_tests {
+    use super::skip_requirements_violated;
+
+    #[test]
+    fn require_all_rejects_an_optional_skip() {
+        assert!(skip_requirements_violated(1, 0, false, true));
+    }
+
+    #[test]
+    fn require_prod_rejects_a_required_skip() {
+        assert!(skip_requirements_violated(1, 1, true, false));
+    }
+
+    #[test]
+    fn normal_prod_mode_allows_an_optional_skip() {
+        assert!(!skip_requirements_violated(1, 0, true, false));
+    }
 }

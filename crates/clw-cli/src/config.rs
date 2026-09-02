@@ -848,6 +848,7 @@ pub(crate) fn render_config(pairs: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clw_e2e_evidence::E2E_ENV_HYGIENE_VARS;
     use std::io::Write as _;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1253,39 +1254,14 @@ cache_dir = "~/.clw/cache"
         }
     }
 
-    /// The COMPLETE credential/config env namespace that
-    /// [`ResolvedConfig::resolve`] + [`ResolvedConfig::resolve_lenient`] consult:
-    /// the clap `env=` bindings on `Cli` (CLW_*) plus the `corelink_env` fallbacks
-    /// (CORELINK_*) plus the C2c credential-broker trio. A resolve test MUST
-    /// neutralize ALL of these, not merely the few it sets — otherwise an ambient
-    /// value silently changes the resolution path and the test goes red for a reason
-    /// unrelated to its assertion. This is not hypothetical: a `runs-on: corelink`
-    /// fabric box injects the broker trio (CLW_CRED_TICKET/CLW_LEASE_ID/
-    /// CLW_FABRIC_ENDPOINT) into every job's env-0, and a developer may have
-    /// CLW_TENANT/CLW_TOKEN exported — both made these tests flake red until they
-    /// isolated the full set. Keep this list in lockstep with `resolve`.
-    const CRED_ENV_VARS: &[&str] = &[
-        "CLW_ENDPOINT",
-        "CLW_TENANT",
-        "CLW_TOKEN",
-        "CLW_CACHE_DIR",
-        "CLW_REF_DOMAIN",
-        "CORELINK_ENDPOINT",
-        "CORELINK_TENANT",
-        "CORELINK_TOKEN",
-        "CLW_CRED_TICKET",
-        "CLW_LEASE_ID",
-        "CLW_FABRIC_ENDPOINT",
-    ];
-
     impl VarGuard {
-        /// Snapshot the FULL [`CRED_ENV_VARS`] namespace and CLEAR every one, so a
+        /// Snapshot the shared FULL credential namespace and CLEAR every one, so a
         /// resolve test starts from a known-empty credential environment regardless
         /// of what the host/CI injected; the originals are restored on drop. Hold
         /// [`ENV_LOCK`] for the whole test.
         fn isolate() -> Self {
-            let g = Self::capture(CRED_ENV_VARS);
-            for &n in CRED_ENV_VARS {
+            let g = Self::capture(E2E_ENV_HYGIENE_VARS);
+            for &n in E2E_ENV_HYGIENE_VARS {
                 std::env::remove_var(n);
             }
             g

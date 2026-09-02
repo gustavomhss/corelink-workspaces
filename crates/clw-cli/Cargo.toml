@@ -52,6 +52,9 @@ async-trait = { workspace = true }
 # Property-based robustness tests (config-line parser never panics on arbitrary
 # input). Already a workspace dev-dep; no new external crate enters the graph.
 proptest = { workspace = true }
+# Shared child-environment hygiene list used by CLI-only tests. This stays a
+# dev-dependency: production `clw` never links the evidence harness.
+clw-e2e-evidence = { path = "../clw-e2e-evidence" }
 
 # clw-cli inherits the workspace lints, which include
 # `unsafe_code = "forbid"`. It used to sit at `deny` so that one Windows-DACL

@@ -23,19 +23,7 @@ const SECRET_TOKEN: &str = "portable-secret-token-DO-NOT-LEAK";
 /// deterministic regardless of what the host/CI environment carries.
 fn clw_bin() -> Command {
     let mut cmd = Command::cargo_bin("clw").unwrap();
-    for v in [
-        "CLW_ENDPOINT",
-        "CLW_TENANT",
-        "CLW_TOKEN",
-        "CLW_CACHE_DIR",
-        "CLW_REF_DOMAIN",
-        "CORELINK_ENDPOINT",
-        "CORELINK_TENANT",
-        "CORELINK_TOKEN",
-        "CLW_CRED_TICKET",
-        "CLW_LEASE_ID",
-        "CLW_FABRIC_ENDPOINT",
-    ] {
+    for &v in clw_e2e_evidence::E2E_ENV_HYGIENE_VARS {
         cmd.env_remove(v);
     }
     cmd

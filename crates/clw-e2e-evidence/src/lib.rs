@@ -23,6 +23,28 @@ pub mod hostile;
 pub mod journeys;
 pub mod report;
 
+/// Environment names that can select a `clw` identity or runner credential path.
+///
+/// User-simulating tests must remove this complete set from each child before
+/// installing the identity for that step. In particular, an inherited
+/// `CLW_REF_DOMAIN=runner` plus the credential-broker trio could otherwise redeem
+/// a real single-use ticket instead of using the identity the test supplied.
+/// This is test/evidence hygiene only; it is deliberately distinct from
+/// `clw-run`'s security-critical `SECRET_ENV_VARS` child-process boundary.
+pub const E2E_ENV_HYGIENE_VARS: &[&str] = &[
+    "CLW_ENDPOINT",
+    "CLW_TENANT",
+    "CLW_TOKEN",
+    "CLW_CACHE_DIR",
+    "CLW_REF_DOMAIN",
+    "CORELINK_ENDPOINT",
+    "CORELINK_TENANT",
+    "CORELINK_TOKEN",
+    "CLW_CRED_TICKET",
+    "CLW_LEASE_ID",
+    "CLW_FABRIC_ENDPOINT",
+];
+
 /// A secret (PAT, ticket) that must never appear in captured output, the report, a
 /// log, or a `Debug`. Its value is registered as a [`Runner`] redaction and scrubbed
 /// from every captured string before it is stored.
@@ -283,10 +305,10 @@ pub struct Journey {
     pub skipped: bool,
     /// True when a skip is EXPECTED-optional: the journey needs EXTRA infra beyond the
     /// primary PAT (a second identity for J4, a throwaway erase tenant for J5). An
-    /// optional skip is still reported truthfully but does NOT trip `CLW_E2E_REQUIRE_PROD`
-    /// — mirroring the conformance suite's `soft_skip`, so the lane is green with just
-    /// the primary credential. A REQUIRED skip (a primary-cred journey that couldn't run)
-    /// DOES trip REQUIRE. Only meaningful when `skipped` is true.
+    /// optional skip is still reported truthfully and does NOT trip
+    /// `CLW_E2E_REQUIRE_PROD`, so a caller selecting only that mode may accept it. It DOES
+    /// trip `CLW_E2E_REQUIRE_ALL`. A REQUIRED skip (a primary-cred journey that couldn't
+    /// run) trips both modes when selected. Only meaningful when `skipped` is true.
     #[serde(default)]
     pub optional: bool,
 }
@@ -340,6 +362,9 @@ pub struct Runner {
     tenant: String,
     token: Secret,
     cache_dir: PathBuf,
+    /// Per-runner config home. It lives under the caller-owned cache root so no
+    /// evidence step can read an operator's real `~/.clw/config.toml`.
+    sandbox_home: PathBuf,
     redactions: Vec<String>,
 }
 
@@ -362,13 +387,16 @@ impl Runner {
         if let Some(userinfo) = endpoint_userinfo(&endpoint) {
             redactions.push(userinfo);
         }
+        let cache_dir = cache_dir.into();
+        let sandbox_home = cache_dir.join("e2e-home");
         Runner {
             bin: bin.into(),
             endpoint,
             target_label: target_label.into(),
             tenant: tenant.into(),
             token,
-            cache_dir: cache_dir.into(),
+            cache_dir,
+            sandbox_home,
             redactions,
         }
     }
@@ -405,7 +433,9 @@ impl Runner {
     /// Run one user step: spawn `clw <args>` with the identity env, capture
     /// everything, redact secrets, parse JSON, and return the evidence. `extra_env`
     /// is `(KEY, VALUE, is_secret)` — secret values are shown as `<redacted>` in the
-    /// report and scrubbed from output.
+    /// report and scrubbed from output. Entries are applied after the harness's
+    /// identity and HOME sandbox intentionally: individual security/config stories
+    /// use that last-wins seam to exercise an explicit child-only override.
     pub fn step(
         &self,
         label: impl Into<String>,
@@ -414,11 +444,22 @@ impl Runner {
         expected_exit: ExpectExit,
     ) -> StepEvidence {
         let mut cmd = Command::new(&self.bin);
+        // Start each child from a known-empty identity. A `corelink` runner may
+        // inject this namespace into env-0, including a single-use broker ticket.
+        // Remove it BEFORE setting this step's explicit identity below.
+        for var in E2E_ENV_HYGIENE_VARS {
+            cmd.env_remove(var);
+        }
+        // Deterministic, non-interactive: no ambient log filter or user config.
+        // The directory is created here (rather than during construction) so a
+        // Runner remains cheap until it actually launches a child.
+        std::fs::create_dir_all(&self.sandbox_home).expect("create evidence runner HOME sandbox");
         cmd.args(args)
             .env("CLW_ENDPOINT", &self.endpoint)
             .env("CLW_TENANT", &self.tenant)
             .env("CLW_TOKEN", self.token.expose())
             .env("CLW_CACHE_DIR", &self.cache_dir)
+            .env("HOME", &self.sandbox_home)
             // Deterministic, non-interactive: no TTY, no color, no ambient RUST_LOG.
             .env("NO_COLOR", "1")
             .env_remove("RUST_LOG");
@@ -539,11 +580,72 @@ fn endpoint_userinfo(ep: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(unix, windows))]
+    use std::sync::Mutex;
+
+    // Process environment is shared by every test thread. These focused inherited-env
+    // regressions are the only tests in this crate that mutate it, so serialize them
+    // and restore every value with `EnvGuard` before releasing the lock.
+    #[cfg(any(unix, windows))]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(any(unix, windows))]
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl EnvGuard {
+        fn poison(names: &'static [&'static str]) -> Self {
+            let saved = names.iter().map(|&n| (n, std::env::var_os(n))).collect();
+            for &name in names {
+                std::env::set_var(name, format!("inherited-{name}"));
+            }
+            Self { saved }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn secret_debug_is_redacted() {
         let s = Secret::new("core-abc123");
         assert_eq!(format!("{s:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn e2e_env_hygiene_vars_are_the_exact_identity_set() {
+        // Keep this expected set independent of the shared constant. A missing
+        // broker/legacy name would otherwise make every consumer agree on the same
+        // incomplete hygiene boundary.
+        let mut expected = vec![
+            "CLW_ENDPOINT",
+            "CLW_TENANT",
+            "CLW_TOKEN",
+            "CLW_CACHE_DIR",
+            "CLW_REF_DOMAIN",
+            "CORELINK_ENDPOINT",
+            "CORELINK_TENANT",
+            "CORELINK_TOKEN",
+            "CLW_CRED_TICKET",
+            "CLW_LEASE_ID",
+            "CLW_FABRIC_ENDPOINT",
+        ];
+        let mut actual = E2E_ENV_HYGIENE_VARS.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+        assert_eq!(E2E_ENV_HYGIENE_VARS.len(), 11);
     }
 
     #[test]
@@ -615,16 +717,180 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn runner_removes_poisoned_inherited_identity_environment() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _poison = EnvGuard::poison(E2E_ENV_HYGIENE_VARS);
+        // RUST_LOG is deliberately outside the shared identity list, but still must
+        // not alter evidence output through an inherited diagnostic filter.
+        let _rust_log = EnvGuard::poison(&["RUST_LOG"]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let r = Runner::new(
+            "/bin/sh",
+            "https://explicit.example",
+            "test",
+            "explicit-tenant",
+            Secret::new("explicit-token"),
+            temp.path().join("cache"),
+        );
+
+        let ev = r.step("dump child env", &["-c", "env"], &[], ExpectExit::Eq(0));
+
+        assert!(
+            !ev.stdout.contains("inherited-"),
+            "a child must not inherit any poisoned identity value: {}",
+            ev.stdout
+        );
+        assert!(
+            !ev.stdout.contains("RUST_LOG="),
+            "a child must not inherit RUST_LOG: {}",
+            ev.stdout
+        );
+        for &name in &E2E_ENV_HYGIENE_VARS[4..] {
+            assert!(
+                !ev.stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "{name} must be absent unless a step explicitly adds it: {}",
+                ev.stdout
+            );
+        }
+        assert!(ev.stdout.contains("CLW_ENDPOINT=https://explicit.example"));
+        assert!(ev.stdout.contains("CLW_TENANT=explicit-tenant"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_uses_a_deterministic_owned_home_sandbox() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _poison = EnvGuard::poison(&["HOME"]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = temp.path().join("cache");
+        let expected_home = cache.join("e2e-home");
+        let r = Runner::new("/bin/sh", "https://x", "test", "t", Secret::new(""), &cache);
+
+        let ev = r.step(
+            "print HOME",
+            &["-c", "printf %s \"$HOME\""],
+            &[],
+            ExpectExit::Eq(0),
+        );
+
+        assert_eq!(ev.stdout, expected_home.to_string_lossy().into_owned());
+        assert!(expected_home.is_dir(), "Runner must create its owned HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_extra_env_intentionally_overrides_after_hygiene() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _poison = EnvGuard::poison(E2E_ENV_HYGIENE_VARS);
+        let _home = EnvGuard::poison(&["HOME"]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = temp.path().join("cache");
+        let intentional_home = temp.path().join("security-story-home");
+        let intentional_home_s = intentional_home.to_string_lossy().into_owned();
+        let r = Runner::new("/bin/sh", "https://x", "test", "t", Secret::new(""), &cache);
+
+        let ev = r.step(
+            "explicit child-only overrides",
+            &["-c", "env"],
+            &[
+                ("HOME", &intentional_home_s, false),
+                ("CLW_REF_DOMAIN", "runner", false),
+            ],
+            ExpectExit::Eq(0),
+        );
+
+        assert!(
+            !ev.stdout.contains("inherited-"),
+            "base inherited identity values must still be stripped: {}",
+            ev.stdout
+        );
+        assert!(ev.stdout.contains(&format!("HOME={intentional_home_s}")));
+        assert!(ev.stdout.contains("CLW_REF_DOMAIN=runner"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runner_removes_poisoned_inherited_identity_environment() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _poison = EnvGuard::poison(E2E_ENV_HYGIENE_VARS);
+        let _rust_log = EnvGuard::poison(&["RUST_LOG"]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let r = Runner::new(
+            "cmd",
+            "https://explicit.example",
+            "test",
+            "explicit-tenant",
+            Secret::new("explicit-token"),
+            temp.path().join("cache"),
+        );
+
+        let ev = r.step("dump child env", &["/C", "set"], &[], ExpectExit::Eq(0));
+
+        assert!(
+            !ev.stdout.contains("inherited-"),
+            "a child must not inherit any poisoned identity value: {}",
+            ev.stdout
+        );
+        assert!(
+            !ev.stdout.contains("RUST_LOG="),
+            "a child must not inherit RUST_LOG: {}",
+            ev.stdout
+        );
+        for &name in &E2E_ENV_HYGIENE_VARS[4..] {
+            assert!(
+                !ev.stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "{name} must be absent unless a step explicitly adds it: {}",
+                ev.stdout
+            );
+        }
+        assert!(ev.stdout.contains("CLW_ENDPOINT=https://explicit.example"));
+        assert!(ev.stdout.contains("CLW_TENANT=explicit-tenant"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runner_uses_a_deterministic_owned_home_sandbox() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _poison = EnvGuard::poison(&["HOME"]);
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = temp.path().join("cache");
+        let expected_home = cache.join("e2e-home");
+        let expected_home_s = expected_home.to_string_lossy().into_owned();
+        let r = Runner::new("cmd", "https://x", "test", "t", Secret::new(""), &cache);
+
+        let ev = r.step("print HOME", &["/C", "echo %HOME%"], &[], ExpectExit::Eq(0));
+
+        assert_eq!(ev.stdout.trim_end(), expected_home_s);
+        assert!(expected_home.is_dir(), "Runner must create its owned HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn leaked_secret_detects_a_raw_token_echo_yet_report_stays_scrubbed() {
         // The real primitive J1/J7 rely on: if clw echoed the PAT, `leaked_secret` is
         // true (non-vacuous), but the STORED evidence is still scrubbed to `<redacted>`.
+        let cache = tempfile::TempDir::new().unwrap();
         let r = Runner::new(
             "/bin/sh",
             "https://x",
             "test",
             "t",
             Secret::new("core-LEAK-XYZ"),
-            "/tmp/c",
+            cache.path(),
         );
         let ev = r.step(
             "echo the token",
@@ -643,13 +909,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn no_leak_when_the_command_does_not_echo_the_token() {
+        let cache = tempfile::TempDir::new().unwrap();
         let r = Runner::new(
             "/bin/sh",
             "https://x",
             "test",
             "t",
             Secret::new("core-SAFE-XYZ"),
-            "/tmp/c",
+            cache.path(),
         );
         let ev = r.step("silent", &["-c", "printf hello"], &[], ExpectExit::Eq(0));
         assert!(!ev.leaked_secret);
@@ -661,13 +928,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn leaked_secret_detects_a_raw_token_echo_yet_report_stays_scrubbed() {
+        let cache = tempfile::TempDir::new().unwrap();
         let r = Runner::new(
             "cmd",
             "https://x",
             "test",
             "t",
             Secret::new("core-LEAK-XYZ"),
-            std::env::temp_dir(),
+            cache.path(),
         );
         let ev = r.step(
             "echo the token",
@@ -686,13 +954,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn no_leak_when_the_command_does_not_echo_the_token() {
+        let cache = tempfile::TempDir::new().unwrap();
         let r = Runner::new(
             "cmd",
             "https://x",
             "test",
             "t",
             Secret::new("core-SAFE-XYZ"),
-            std::env::temp_dir(),
+            cache.path(),
         );
         let ev = r.step("silent", &["/C", "echo hello"], &[], ExpectExit::Eq(0));
         assert!(!ev.leaked_secret);

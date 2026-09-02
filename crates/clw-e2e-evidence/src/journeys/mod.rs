@@ -135,16 +135,17 @@ pub fn second_token() -> Option<Secret> {
 
 /// A single "skipped — needs live creds" step, so a journey run with no identity still
 /// renders a truthful report entry (Info, never a false Pass or a panic). This is a
-/// REQUIRED skip: under `CLW_E2E_REQUIRE_PROD=1` it is a hard failure (the primary-cred
-/// journeys must always run in CI, or the lane is canary-blind).
+/// REQUIRED skip: it is a hard failure under `CLW_E2E_REQUIRE_PROD=1` and
+/// `CLW_E2E_REQUIRE_ALL=1`; the primary-cred journeys must always run in CI.
 pub fn skipped_journey(name: &str, about: &str, need: &str) -> Journey {
     build_skip(name, about, need, false)
 }
 
 /// Like [`skipped_journey`] but the skip is EXPECTED-optional: the journey needs extra
 /// infra beyond the primary PAT (J4's second identity, J5's throwaway erase tenant). It
-/// is reported truthfully but does NOT trip `CLW_E2E_REQUIRE_PROD` — so the CI lane is
-/// green with just the primary credential (mirrors the conformance suite's `soft_skip`).
+/// is reported truthfully and does NOT trip `CLW_E2E_REQUIRE_PROD`, but it DOES trip
+/// `CLW_E2E_REQUIRE_ALL`. Therefore callers selecting only `REQUIRE_PROD` may accept it;
+/// the strict evidence workflow selects `REQUIRE_ALL` and rejects every skip.
 pub fn skipped_optional_journey(name: &str, about: &str, need: &str) -> Journey {
     build_skip(name, about, need, true)
 }

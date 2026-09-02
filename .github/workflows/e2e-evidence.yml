@@ -13,20 +13,19 @@
 #   CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT   primary identity → Marina (solo),
 #                                                     Dana (security), Ravi (automation). REQUIRED.
 #   CLW_CI_TOKEN_B                                    a 2nd identity (same tenant) → the TEAM
-#                                                     persona (Priya+Sam). OPTIONAL.
+#                                                     persona (Priya+Sam). REQUIRED by this lane.
 #   CLW_CI_ERASE_TENANT / CLW_CI_ERASE_TOKEN          a dedicated throwaway tenant → the
-#                                                     OFFBOARDING persona (Omar). OPTIONAL; the
+#                                                     OFFBOARDING persona (Omar). REQUIRED by this lane; the
 #                                                     erase is REAL, so it must be a throwaway ≠
 #                                                     the primary tenant (the harness fences both).
 #   CLW_CI_QUOTA_TENANT / CLW_CI_QUOTA_TOKEN          a dedicated $-ceilinged tenant → the QUOTA
-#                                                     persona (Nadia → real 402). OPTIONAL; also
+#                                                     persona (Nadia → real 402). REQUIRED by this lane; also
 #                                                     fenced ≠ primary (a snapshot here is meant to
 #                                                     hit the budget wall — never the primary).
 #
-# CLW_E2E_REQUIRE_PROD=1 makes a skipped PRIMARY-cred journey a HARD failure (so the lane can
-# never silently stop exercising prod — canary-blind). The team / offboarding / quota personas
-# are OPTIONAL skips: reported but never require-failing, so the lane is green with just the
-# primary PAT.
+# This workflow enables both CLW_E2E_REQUIRE_PROD=1 and CLW_E2E_REQUIRE_ALL=1: every skipped
+# persona is a HARD failure after its evidence is recorded. `REQUIRE_PROD` retains its narrower
+# primary-only behavior for non-strict callers; `REQUIRE_ALL` is what makes this lane complete.
 #
 # The report artifact is uploaded ALWAYS (even on a red run) — a failed run is exactly
 # when the evidence matters most.
@@ -87,15 +86,15 @@ jobs:
       - name: build clw + the e2e evidence runner
         run: cargo build -p clw-cli -p clw-e2e-evidence --bins
 
-      - name: run the evidence journeys against prod (REQUIRE_PROD=1)
+      - name: run the evidence journeys against prod (REQUIRE_ALL=1)
         env:
           # Map the CI service identity onto the harness env names (same wiring +
           # SAME secrets as the live-journeys lane).
           CLW_TOKEN: ${{ secrets.CLW_CI_TOKEN }}
           CLW_TENANT: ${{ secrets.CLW_CI_TENANT }}
           CLW_ENDPOINT: ${{ secrets.CLW_CI_ENDPOINT }}
-          # OPTIONAL extra infra — when absent, only the team / offboarding / quota persona
-          # soft-skips (the lane still passes on the primary PAT alone).
+          # Required in this strict lane: the runner treats EVERY skip, including a
+          # team/offboarding/quota persona missing its dedicated input, as a failure.
           CLW_TOKEN_B: ${{ secrets.CLW_CI_TOKEN_B }}
           CLW_E2E_ERASE_TENANT: ${{ secrets.CLW_CI_ERASE_TENANT }}
           CLW_E2E_ERASE_TOKEN: ${{ secrets.CLW_CI_ERASE_TOKEN }}
@@ -108,18 +107,22 @@ jobs:
           CLW_CRED_TICKET: ""
           CLW_LEASE_ID: ""
           CLW_FABRIC_ENDPOINT: ""
-          # A skipped PRIMARY-cred journey is a hard failure; team/offboarding/quota optional-skip.
+          # Keep normal prod semantics available to ad-hoc callers, while this CI lane
+          # deliberately requires the complete persona matrix and rejects any skip.
           CLW_E2E_REQUIRE_PROD: "1"
+          CLW_E2E_REQUIRE_ALL: "1"
           CLW_E2E_OUT: e2e-reports
         run: |
           set -euo pipefail
           if [ -z "${CLW_TOKEN:-}" ]; then
-            echo "::error::CLW_CI_TOKEN absent — the e2e-evidence lane REQUIRES the primary PAT (CLW_E2E_REQUIRE_PROD=1). Provision the CI service PAT secret."
+            echo "::error::CLW_CI_TOKEN absent — the strict e2e-evidence lane requires the primary PAT (REQUIRE_PROD=1 and REQUIRE_ALL=1). Provision the CI service PAT secret."
             exit 1
           fi
-          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — the TEAM persona (Priya+Sam) soft-skips."
-          [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — the OFFBOARDING persona (Omar) soft-skips (needs a throwaway tenant ≠ primary; the erase is real)."
-          [ -z "${CLW_E2E_QUOTA_TENANT:-}" ] && echo "::warning::CLW_CI_QUOTA_TENANT absent — the QUOTA persona (Nadia) soft-skips (needs a dedicated \$-ceilinged tenant ≠ primary to trip a real 402)."
+          [ -z "${CLW_TOKEN_B:-}" ] && echo "::warning::CLW_CI_TOKEN_B absent — REQUIRE_ALL=1 will fail after recording the TEAM skip."
+          [ -z "${CLW_E2E_ERASE_TENANT:-}" ] && echo "::warning::CLW_CI_ERASE_TENANT absent — REQUIRE_ALL=1 will fail after recording the OFFBOARDING skip."
+          [ -z "${CLW_E2E_ERASE_TOKEN:-}" ] && echo "::warning::CLW_CI_ERASE_TOKEN absent — REQUIRE_ALL=1 will fail after recording the OFFBOARDING skip."
+          [ -z "${CLW_E2E_QUOTA_TENANT:-}" ] && echo "::warning::CLW_CI_QUOTA_TENANT absent — REQUIRE_ALL=1 will fail after recording the QUOTA skip."
+          [ -z "${CLW_E2E_QUOTA_TOKEN:-}" ] && echo "::warning::CLW_CI_QUOTA_TOKEN absent — REQUIRE_ALL=1 will fail after recording the QUOTA skip."
           echo "Driving the real clw binary as a user against prod; publishing per-step evidence."
           # The evidence runner locates the binary next to itself; point it explicitly.
           CLW_E2E_BIN="$(pwd)/target/debug/clw" "./target/debug/clw-e2e"

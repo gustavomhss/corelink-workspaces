@@ -422,19 +422,7 @@ fn build_source_tree(root: &std::path::Path) {
 /// trio themselves, on top of this clean base).
 fn clw_bin() -> Command {
     let mut cmd = Command::cargo_bin("clw").unwrap();
-    for v in [
-        "CLW_ENDPOINT",
-        "CLW_TENANT",
-        "CLW_TOKEN",
-        "CLW_CACHE_DIR",
-        "CLW_REF_DOMAIN",
-        "CORELINK_ENDPOINT",
-        "CORELINK_TENANT",
-        "CORELINK_TOKEN",
-        "CLW_CRED_TICKET",
-        "CLW_LEASE_ID",
-        "CLW_FABRIC_ENDPOINT",
-    ] {
+    for &v in clw_e2e_evidence::E2E_ENV_HYGIENE_VARS {
         cmd.env_remove(v);
     }
     cmd

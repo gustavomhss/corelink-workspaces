@@ -179,11 +179,13 @@ door. The report reads as a story: each beat narrates what the persona is doing,
 | **JE efficiency** | a divergent re-snapshot fails-fast on the ref (0 uploads before the 409), not upload-then-reject. Needs no creds. |
 
 **Two-tier skip (honest AND operable).** A story that cannot run reports a **skip**, never a false
-pass. A skip of a **primary-cred** persona (Marina / Dana / Ravi) trips `CLW_E2E_REQUIRE_PROD=1` → hard
-failure, so CI can never silently stop exercising prod (the canary-blind failure mode). A skip of an
-**optional-infra** persona (team needs a 2nd identity, offboarding a throwaway erase tenant, quota a
-low-ceiling tenant) is reported but never require-fails — so the lane is green with just the primary PAT
-(mirrors the conformance suite's `soft_skip`).
+pass. `CLW_E2E_REQUIRE_PROD=1` rejects a skipped **primary-cred** persona (Marina / Dana / Ravi), so a
+caller selecting that mode cannot silently stop exercising prod (the canary-blind failure mode), while
+an **optional-infra** persona remains a reported soft skip. `CLW_E2E_REQUIRE_ALL=1` is stricter: it
+rejects every skip, including a missing second identity, throwaway erase tenant, or low-ceiling quota
+tenant. The repository's evidence workflow enables both modes, so it requires the complete persona
+matrix. Ad-hoc callers that do not select `REQUIRE_ALL` — including callers using only
+`REQUIRE_PROD` — may proceed with just the primary PAT.
 
 **Provisioning (indistinguishable from a real user).** Each persona gets a real `{tenant, PAT}` via the
 actual admin/mint path — the data plane (CAS/AC/auth) can't distinguish it from a genuine customer.
@@ -194,9 +196,10 @@ personas need dedicated tenants (a throwaway for erase; a low-ceiling one for th
 **Mechanized:** `.github/workflows/e2e-evidence.yml` builds the binary + the runner, drives the stories
 against prod **on demand** (manual `workflow_dispatch` — no schedule; the daily prod watch is already
 the conformance/metered/deadman canaries' job, and this lane exercises prod + burns CI minutes) with
-`REQUIRE_PROD=1`, and uploads the evidence report as an artifact **always** (a red run is when the
-evidence matters most). It reuses the `CLW_CI_*` secrets from `live-journeys.yml` (+ `CLW_CI_TOKEN_B` for
-the team, `CLW_CI_ERASE_*` for offboarding, `CLW_CI_QUOTA_*` for quota).
+both `REQUIRE_PROD=1` and `REQUIRE_ALL=1`, and uploads the evidence report as an artifact **always** (a
+red run is when the evidence matters most). It reuses the `CLW_CI_*` secrets from `live-journeys.yml`
+(+ `CLW_CI_TOKEN_B` for the team, `CLW_CI_ERASE_*` for offboarding, `CLW_CI_QUOTA_*` for quota); all of
+those persona inputs are required by this strict workflow.
 
 ### The two anti-vacuity laws (learned the hard way — every journey's cold review broke on one)
 

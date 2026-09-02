@@ -326,6 +326,7 @@ dependencies = [
  "clap_complete",
  "clw-cache",
  "clw-client",
+ "clw-e2e-evidence",
  "clw-hydrate",
  "clw-manifest",
  "clw-run",
