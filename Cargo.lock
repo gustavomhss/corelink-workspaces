@@ -439,6 +439,7 @@ dependencies = [
  "clw-client",
  "clw-manifest",
  "clw-types",
+ "criterion",
  "proptest",
  "serde",
  "serde_json",

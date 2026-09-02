@@ -21,9 +21,14 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+criterion = { workspace = true }
 # Property-based robustness tests (RunRecord parse never panics on arbitrary
 # bytes). Already a workspace dev-dep; no new external crate.
 proptest = { workspace = true }
+
+[[bench]]
+name = "run_key"
+harness = false
 
 [lints]
 workspace = true

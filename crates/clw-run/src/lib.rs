@@ -28,7 +28,10 @@ pub use clw_types as types;
 use clw_manifest::walk;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Result, CAS_BLOB_CAP_BYTES};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 use tokio::io::AsyncReadExt as _;
 
 // ---------------------------------------------------------------------------
@@ -187,6 +190,12 @@ const FILE_DIGEST_BUFFER_BYTES: usize = 64 * 1024;
 /// while tool resolution preserves its established metadata/literal fallback.
 async fn digest_file(path: &Path) -> std::io::Result<Digest> {
     let mut file = tokio::fs::File::open(path).await?;
+    digest_open_file(&mut file).await
+}
+
+/// Digest an already-open file. Tool resolution uses this form so the metadata
+/// used to admit a cache entry is from the exact file whose bytes were read.
+async fn digest_open_file(file: &mut tokio::fs::File) -> std::io::Result<Digest> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; FILE_DIGEST_BUFFER_BYTES];
 
@@ -199,6 +208,116 @@ async fn digest_file(path: &Path) -> std::io::Result<Digest> {
     }
 
     Ok(Digest(*hasher.finalize().as_bytes()))
+}
+
+/// The precise filesystem facts that make a previously-computed tool digest
+/// reusable.  The path is deliberately part of the fingerprint: a PATH lookup
+/// that begins resolving to a different executable must never borrow the old
+/// executable's digest, even if the two files happen to have matching metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolFingerprint {
+    path: PathBuf,
+    len: u64,
+    modified: std::time::SystemTime,
+    // `(path, len, mtime)` is not enough to distinguish an atomic replacement
+    // that deliberately preserves those fields. Unix gives us the identity and
+    // change facts needed to close that gap; platforms without them do not use
+    // this process-local cache at all.
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl ToolFingerprint {
+    async fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = tokio::fs::metadata(path).await?;
+        Self::from_metadata(path, &metadata)
+    }
+
+    fn from_metadata(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(unix)]
+            ctime: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: metadata.ctime_nsec(),
+        })
+    }
+
+    const fn cacheable() -> bool {
+        cfg!(unix)
+    }
+}
+
+/// A deliberately bounded, process-local cache for the last successfully
+/// digested executable.  This is only an optimization: an unavailable or
+/// poisoned cache merely causes the caller to hash the file again.
+struct ToolDigestCache {
+    entry: Mutex<Option<(ToolFingerprint, Digest)>>,
+    #[cfg(test)]
+    digest_attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl ToolDigestCache {
+    fn new() -> Self {
+        Self {
+            entry: Mutex::new(None),
+            #[cfg(test)]
+            digest_attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self, fingerprint: &ToolFingerprint) -> Option<Digest> {
+        // A prior panicking holder must not turn a performance cache into a
+        // process-wide failure. Recovering its guarded value is safe because the
+        // entry is independently validated by the caller's current fingerprint.
+        let entry = self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entry
+            .as_ref()
+            .and_then(|(cached, digest)| (cached == fingerprint).then_some(*digest))
+    }
+
+    fn put(&self, fingerprint: ToolFingerprint, digest: Digest) {
+        let mut entry = self
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *entry = Some((fingerprint, digest));
+    }
+
+    #[cfg(test)]
+    fn note_digest_attempt(&self) {
+        self.digest_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn digest_attempts(&self) -> usize {
+        self.digest_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn global_tool_digest_cache() -> &'static ToolDigestCache {
+    static CACHE: OnceLock<ToolDigestCache> = OnceLock::new();
+    CACHE.get_or_init(ToolDigestCache::new)
 }
 
 /// True if `cmd0` is a path (resolve directly) rather than a bare name to look up
@@ -242,14 +361,11 @@ fn search_path(cmd0: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve `command[0]` to a stable tool-identity string.
-///
-/// If `cmd0` is a path (see [`looks_like_path`]) it is resolved against the RUN
-/// cwd; otherwise `PATH` is searched (with `PATHEXT` on Windows). When the
-/// executable can be read, the identity is its content digest; if it cannot be
-/// located or read, we fall back to a literal marker so the key is still
-/// well-defined.
-async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
+/// Resolve `command[0]` to a stable tool-identity string, reusing a successful
+/// digest only when its exact executable fingerprint still matches. Tests can
+/// pass an isolated cache to prove a true no-rehash hit without relying on timing
+/// or global test execution order.
+async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCache) -> String {
     // A relative tool path must resolve where the command actually RUNS, not
     // against the orchestrator process cwd (else the digest is unstable / wrong).
     // `Path::join` returns cmd0 unchanged when it is already absolute.
@@ -263,30 +379,99 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
     let Some(path) = candidate else {
         return format!("literal:{cmd0}");
     };
-    // Stream via tokio::fs so a potentially large toolchain binary is neither
-    // read with a blocking std::fs call nor allocated in full on the async worker.
-    match digest_file(&path).await {
-        Ok(digest) => format!("digest:{}", digest.to_hex()),
-        Err(_) => {
-            // The file EXISTS but is unreadable (e.g. exec-only / no read bit —
-            // exec and read are independent perms on unix). A content-free
-            // `literal:` would make two different builds of the tool collide and
-            // replay stale output across an in-place upgrade. Fold in a non-content
-            // identity (len + mtime) that still changes when the binary does;
-            // fall back to literal only if even the metadata is unavailable.
-            match tokio::fs::metadata(&path).await {
-                Ok(m) => {
-                    let mtime_ns = m
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    format!("meta:{}:{}", m.len(), mtime_ns)
+
+    // A resolution/reread can race a package-manager replacement. Retry a
+    // bounded number of times; on persistent churn we deliberately fail closed
+    // to the established metadata/literal fallback instead of returning bytes
+    // that were proven to belong to an old descriptor.
+    const RESOLUTION_ATTEMPTS: usize = 3;
+    for _ in 0..RESOLUTION_ATTEMPTS {
+        if ToolFingerprint::cacheable() {
+            if let Ok(fingerprint) = ToolFingerprint::read(&path).await {
+                if let Some(digest) = cache.get(&fingerprint) {
+                    // Read the resolved path again immediately before returning:
+                    // a rename with preserved len/mtime is rejected by the Unix
+                    // device/inode/ctime fields in the complete fingerprint.
+                    if ToolFingerprint::read(&path).await.ok().as_ref() == Some(&fingerprint) {
+                        return format!("digest:{}", digest.to_hex());
+                    }
+                    continue;
                 }
-                Err(_) => format!("literal:{cmd0}"),
             }
         }
+
+        #[cfg(test)]
+        cache.note_digest_attempt();
+        // Open once, then inspect and hash that same descriptor. Metadata from a
+        // separate pathname lookup could belong to a replacement made while the
+        // digest was running.
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+        };
+        let before = match file.metadata().await {
+            Ok(metadata) => match ToolFingerprint::from_metadata(&path, &metadata) {
+                Ok(fingerprint) => fingerprint,
+                // No exact fingerprint means no proof and hence no cache. The
+                // digest is still valid for this one invocation, as before.
+                Err(_) => match digest_open_file(&mut file).await {
+                    Ok(digest) => return format!("digest:{}", digest.to_hex()),
+                    Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+                },
+            },
+            Err(_) => match digest_open_file(&mut file).await {
+                Ok(digest) => return format!("digest:{}", digest.to_hex()),
+                Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+            },
+        };
+
+        // Stream via tokio::fs so a potentially large toolchain binary is neither
+        // read with a blocking std::fs call nor allocated in full on the async worker.
+        let digest = match digest_open_file(&mut file).await {
+            Ok(digest) => digest,
+            Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+        };
+        let after = match file.metadata().await {
+            Ok(metadata) => ToolFingerprint::from_metadata(&path, &metadata).ok(),
+            Err(_) => None,
+        };
+        let path_now = ToolFingerprint::read(&path).await.ok();
+        if after.as_ref() != Some(&before) || path_now.as_ref() != Some(&before) {
+            continue;
+        }
+
+        // On non-Unix hosts `(path, len, mtime)` cannot prove identity across
+        // replacement, so caching is fail-closed there. The just-verified digest
+        // remains the same payload used before this optimization existed.
+        if ToolFingerprint::cacheable() {
+            cache.put(before, digest);
+        }
+        return format!("digest:{}", digest.to_hex());
+    }
+
+    tool_metadata_or_literal(&path, cmd0).await
+}
+
+/// Preserve the historical failed-digest fallbacks byte-for-byte. This helper is
+/// intentionally called only after a failed open/read; neither fallback is ever
+/// admitted to [`ToolDigestCache`].
+async fn tool_metadata_or_literal(path: &Path, cmd0: &str) -> String {
+    // The file EXISTS but is unreadable (e.g. exec-only / no read bit — exec and
+    // read are independent perms on unix). A content-free `literal:` would make
+    // two different builds of the tool collide and replay stale output across an
+    // in-place upgrade. Fold in a non-content identity (len + mtime) that still
+    // changes when the binary does; fall back to literal if metadata is absent.
+    match tokio::fs::metadata(path).await {
+        Ok(m) => {
+            let mtime_ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("meta:{}:{}", m.len(), mtime_ns)
+        }
+        Err(_) => format!("literal:{cmd0}"),
     }
 }
 
@@ -302,6 +487,17 @@ async fn resolve_tool_id(cwd: &Path, cmd0: &str) -> String {
 /// Returns `Err(ClwError::Io(...))` if any input path is missing, or
 /// `Err(ClwError::InvalidManifest(...))` for walk errors.
 async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
+    compute_key_with_tool_digest_cache(cwd, opts, global_tool_digest_cache()).await
+}
+
+/// Cache-injectable form of [`compute_key`]. This keeps the production payload
+/// and resulting digest exactly the same while making the tool-digest cache
+/// observable in deterministic tests.
+async fn compute_key_with_tool_digest_cache(
+    cwd: &Path,
+    opts: &RunOptions,
+    tool_digest_cache: &ToolDigestCache,
+) -> Result<Digest> {
     // --- inputs ---
     // NOTE (cache-key change): this key now folds in (a) empty input directories
     // by path, (b) each input file's unix mode (exec/perm bits), and (c) `/`-
@@ -417,7 +613,7 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     let tool = if opts.command.is_empty() {
         String::new()
     } else {
-        resolve_tool_id(cwd, &opts.command[0]).await
+        resolve_tool_id_with_cache(cwd, &opts.command[0], tool_digest_cache).await
     };
 
     // --- working directory ---
@@ -1120,6 +1316,252 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tool_digest_cache_hits_only_for_the_exact_executable_fingerprint() {
+        use std::time::{Duration, SystemTime};
+
+        fn set_modified(path: &Path, seconds: u64) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        std::fs::write(cwd.join("input"), b"input").unwrap();
+        let tool_a = cwd.join("tool-a");
+        let tool_b = cwd.join("tool-b");
+        let original = b"#!/bin/sh\necho stable\n";
+        std::fs::write(&tool_a, original).unwrap();
+        std::fs::write(&tool_b, original).unwrap();
+        // Explicit timestamps make the mtime-only invalidation deterministic;
+        // no wall-clock resolution or sleep is involved.
+        set_modified(&tool_a, 10_000);
+        set_modified(&tool_b, 10_000);
+
+        let cache = ToolDigestCache::new();
+        // Unix has dev+ino+ctime to prove the resolved file identity and may
+        // reuse a digest. Other platforms deliberately fail closed: no cache
+        // hit is allowed without that proof, so both resolutions rehash.
+        let attempts_after_repeat = if cfg!(unix) { 1 } else { 2 };
+        let options_for = |tool: &Path| RunOptions {
+            inputs: vec!["input".to_string()],
+            command: vec![tool.to_string_lossy().into_owned(), "argument".to_string()],
+            env_keys: vec![],
+        };
+
+        let opts_a = options_for(&tool_a);
+        let first = compute_key_with_tool_digest_cache(cwd, &opts_a, &cache)
+            .await
+            .unwrap();
+        let hit = compute_key_with_tool_digest_cache(cwd, &opts_a, &cache)
+            .await
+            .unwrap();
+        assert_eq!(first, hit, "a cache hit must preserve the run key exactly");
+        assert_eq!(
+            cache.digest_attempts(),
+            attempts_after_repeat,
+            "Unix must hit with a proven fingerprint; other platforms must rehash closed"
+        );
+
+        // A different resolved path is a cache miss even when file contents and
+        // metadata match exactly.
+        let opts_b = options_for(&tool_b);
+        let path_changed = compute_key_with_tool_digest_cache(cwd, &opts_b, &cache)
+            .await
+            .unwrap();
+        assert_ne!(
+            first, path_changed,
+            "the command payload still carries its path"
+        );
+        assert_eq!(
+            cache.digest_attempts(),
+            attempts_after_repeat + 1,
+            "a path change must not reuse another executable's cached digest"
+        );
+
+        // Change only tool-a's length/content, then establish a new cached
+        // fingerprint for the restored original bytes.
+        std::fs::write(&tool_a, b"#!/bin/sh\necho longer\n").unwrap();
+        set_modified(&tool_a, 10_001);
+        let length_changed = compute_key_with_tool_digest_cache(cwd, &opts_a, &cache)
+            .await
+            .unwrap();
+        assert_ne!(first, length_changed, "tool content is part of the run key");
+        assert_eq!(
+            cache.digest_attempts(),
+            attempts_after_repeat + 2,
+            "a length change must rehash"
+        );
+
+        std::fs::write(&tool_a, original).unwrap();
+        set_modified(&tool_a, 10_002);
+        let restored = compute_key_with_tool_digest_cache(cwd, &opts_a, &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            first, restored,
+            "identical payload bytes yield the same key"
+        );
+        assert_eq!(cache.digest_attempts(), attempts_after_repeat + 3);
+
+        // The bytes and length remain identical, so the run key remains byte-for-
+        // byte identical; nevertheless the changed mtime forces a fresh hash.
+        set_modified(&tool_a, 10_003);
+        let mtime_changed = compute_key_with_tool_digest_cache(cwd, &opts_a, &cache)
+            .await
+            .unwrap();
+        assert_eq!(restored, mtime_changed, "the payload format is unchanged");
+        assert_eq!(
+            cache.digest_attempts(),
+            attempts_after_repeat + 4,
+            "an mtime-only change must invalidate the digest cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_digest_cache_rejects_same_metadata_rename_replacement() {
+        use std::time::{Duration, SystemTime};
+
+        fn set_modified(path: &Path, seconds: u64) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let tool = dir.path().join("tool");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&tool, b"AAAA").unwrap();
+        std::fs::write(&replacement, b"BBBB").unwrap();
+        // Deliberately make the replacement indistinguishable by the original
+        // `(path, len, mtime)` contract. Device/inode/ctime must still reject it.
+        set_modified(&tool, 20_000);
+        set_modified(&replacement, 20_000);
+
+        let cache = ToolDigestCache::new();
+        let command = tool.to_string_lossy();
+        let original = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+        std::fs::rename(&replacement, &tool).unwrap();
+        let replaced = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+
+        assert_ne!(original, replaced, "replacement bytes must be rehashed");
+        assert_eq!(
+            cache.digest_attempts(),
+            2,
+            "same-length, same-mtime rename replacement must not hit the cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_digest_cache_rejects_same_len_mtime_in_place_mutation() {
+        use std::time::{Duration, SystemTime};
+
+        fn set_modified(path: &Path, seconds: u64) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"AAAA").unwrap();
+        set_modified(&tool, 30_000);
+        let first_fingerprint = ToolFingerprint::read(&tool).await.unwrap();
+
+        let cache = ToolDigestCache::new();
+        let command = tool.to_string_lossy();
+        let original = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+
+        // Same path, byte length, and mtime, but a write changes Unix ctime.
+        std::fs::write(&tool, b"BBBB").unwrap();
+        set_modified(&tool, 30_000);
+        let changed_fingerprint = ToolFingerprint::read(&tool).await.unwrap();
+        assert_ne!(
+            first_fingerprint, changed_fingerprint,
+            "the Unix change identity must observe an in-place mutation"
+        );
+        let changed = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+
+        assert_ne!(original, changed, "mutated bytes must be rehashed");
+        assert_eq!(
+            cache.digest_attempts(),
+            2,
+            "same-length, same-mtime mutation must not hit the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_digest_cache_never_remembers_a_failed_digest() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing-tool");
+        let cache = ToolDigestCache::new();
+        let command = missing.to_string_lossy();
+
+        let first = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+        let second = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+        assert_eq!(first, format!("literal:{command}"));
+        assert_eq!(first, second, "literal fallback bytes must stay unchanged");
+        assert_eq!(
+            cache.digest_attempts(),
+            2,
+            "a failed digest must not be retained as a cache entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_digest_cache_never_remembers_a_real_read_failure() {
+        let dir = TempDir::new().unwrap();
+        let not_a_file = dir.path().join("not-a-file");
+        std::fs::create_dir(&not_a_file).unwrap();
+        let cache = ToolDigestCache::new();
+        let command = not_a_file.to_string_lossy();
+
+        let first = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+        let second = resolve_tool_id_with_cache(dir.path(), &command, &cache).await;
+        assert!(
+            first.starts_with("meta:"),
+            "directory read failure keeps meta fallback"
+        );
+        assert_eq!(first, second, "fallback payload remains stable");
+        assert_eq!(
+            cache.digest_attempts(),
+            2,
+            "an actual read failure must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_tool_digest_cache_falls_back_to_rehashing() {
+        let dir = TempDir::new().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"tool").unwrap();
+        let cache = ToolDigestCache::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.entry.lock().unwrap();
+            panic!("poison only the optimization cache");
+        }));
+
+        let id = resolve_tool_id_with_cache(dir.path(), &tool.to_string_lossy(), &cache).await;
+        assert!(
+            id.starts_with("digest:"),
+            "poison must not affect resolution"
+        );
+        assert_eq!(cache.digest_attempts(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_only_tool_uses_metadata_not_content_free_literal() {
@@ -1132,7 +1574,12 @@ mod tests {
         std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o111)).unwrap();
 
-        let id = resolve_tool_id(dir.path(), tool.to_str().unwrap()).await;
+        let id = resolve_tool_id_with_cache(
+            dir.path(),
+            tool.to_str().unwrap(),
+            global_tool_digest_cache(),
+        )
+        .await;
         assert!(
             id.starts_with("meta:"),
             "exec-only tool must use a metadata identity, got {id:?}"
