@@ -68,6 +68,114 @@ def fail(workflow: str, reason: str) -> None:
     print(f"GATE FAILED: PR credential-null guard: {workflow}: {reason}", file=sys.stderr)
     raise SystemExit(1)
 
+def yaml_double_quoted_key(value):
+    """Decode the YAML 1.2 double-quoted escapes permitted in a mapping key.
+
+    This is deliberately not a YAML parser.  It is only the scalar grammar the
+    source-level guard needs to compare a key with a small, fixed vocabulary.
+    Unknown escapes (and line folding) are refused by the caller, rather than
+    being guessed at and possibly making a security-relevant key invisible.
+    """
+    escapes = {
+        "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n",
+        "v": "\v", "f": "\f", "r": "\r", "e": "\x1b", " ": " ",
+        '\"': '\"', "/": "/", "\\": "\\", "N": "\u0085", "_": "\u00a0",
+        "L": "\u2028", "P": "\u2029",
+    }
+    decoded = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        index += 1
+        if index == len(value):
+            raise ValueError("trailing backslash")
+        escape = value[index]
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            index += 1
+            continue
+        digits = {"x": 2, "u": 4, "U": 8}.get(escape)
+        if digits is None or index + digits >= len(value):
+            raise ValueError("unsupported escape")
+        codepoint = value[index + 1:index + 1 + digits]
+        if not re.fullmatch(r"[0-9A-Fa-f]+", codepoint):
+            raise ValueError("non-hex escape")
+        codepoint_number = int(codepoint, 16)
+        if 0xD800 <= codepoint_number <= 0xDFFF or codepoint_number > 0x10FFFF:
+            raise ValueError("invalid Unicode code point")
+        decoded.append(chr(codepoint_number))
+        index += 1 + digits
+    return "".join(decoded)
+
+def yaml_mapping_key(line, indent, empty_value=False):
+    """Return one conservative plain/single/double-quoted block-map key.
+
+    The PR policy accepts a deliberately narrow block-mapping vocabulary.  This
+    recognizer proves the spelling of the few keys we inventory; it does not try
+    to interpret flow YAML, aliases, tags, or arbitrary YAML values.
+    """
+    prefix = " " * indent
+    if not line.startswith(prefix) or len(line) == len(prefix) or line[len(prefix)].isspace():
+        return None
+    value = line[len(prefix):]
+    key = None
+    after_key = ""
+    if value[0] == "'":
+        index = 1
+        decoded = []
+        while index < len(value):
+            if value[index] == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    decoded.append("'")
+                    index += 2
+                    continue
+                key = "".join(decoded)
+                after_key = value[index + 1:]
+                break
+            decoded.append(value[index])
+            index += 1
+    elif value[0] == '\"':
+        index = 1
+        raw = []
+        while index < len(value):
+            if value[index] == '\"':
+                try:
+                    key = yaml_double_quoted_key("".join(raw))
+                except ValueError:
+                    return None
+                after_key = value[index + 1:]
+                break
+            if value[index] == "\\" and index + 1 < len(value):
+                raw.extend(value[index:index + 2])
+                index += 2
+                continue
+            raw.append(value[index])
+            index += 1
+    else:
+        plain = re.match(r"([A-Za-z0-9_-]+)(.*)$", value)
+        if plain is None:
+            return None
+        key, after_key = plain.groups()
+    if key is None:
+        return None
+    separator = re.match(r"^[ \t]*:(.*)$", after_key)
+    if separator is None:
+        return None
+    tail = separator.group(1)
+    if empty_value and tail.strip() and not tail.lstrip().startswith("#"):
+        return None
+    return key
+
+def yaml_mapping_key_at_any_indent(line):
+    if "\t" in line[:len(line) - len(line.lstrip(" \t"))]:
+        return None
+    indent = len(line) - len(line.lstrip(" "))
+    return yaml_mapping_key(line, indent)
+
 if not workflow_root.is_dir():
     fail("workflow corpus", f"missing directory {workflow_root}")
 
@@ -120,13 +228,6 @@ for path in workflow_paths:
     if not on_events or len(on_events) != len(set(on_events)):
         fail(workflow, "top-level on must contain non-empty unique canonical event keys")
 
-    # Escapes make YAML keys semantically equal while defeating a source-level
-    # policy (for example `CLW_CRED_\u0054ICKET`). Reject them across the corpus:
-    # this guard intentionally accepts a small, auditable YAML vocabulary rather
-    # than pretending its regex is a complete YAML parser.
-    if re.search(r"\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})", text):
-        fail(workflow, "contains forbidden YAML escape syntax (\\x/\\u/\\U are ambiguous to this guard)")
-
     active_lines = [line.split("#", 1)[0] for line in text.splitlines()]
     if not any(event == "pull_request" or event.startswith("pull_request_") for event in on_events):
         continue
@@ -143,12 +244,16 @@ for path in workflow_paths:
     env_block = top_env.group(1)
     if env_block.count("  # CI_CREDENTIAL_NULL_GUARD: workflow-env") != 1:
         fail(workflow, "guard marker is not in the top-level env block")
+    if any(re.search(r"\benv:\s*\{[^}]*\\", line) for line in raw_lines):
+        fail(workflow, "an inline env mapping with YAML escapes is refused because its credential keys cannot be safely inventoried")
     for credential in credentials:
         declaration = f"  {credential}: \"\""
         if env_block.count(declaration) != 1:
             fail(workflow, f"top-level {credential} must be declared exactly once as empty")
-        key_form = re.compile(rf"^\s*(?:{credential}|['\"]{credential}['\"])\s*:")
-        declarations = [line for line in active_lines if key_form.match(line)]
+        declarations = [
+            line for line in raw_lines
+            if yaml_mapping_key_at_any_indent(line) == credential
+        ]
         if declarations != [declaration]:
             fail(workflow, f"{credential} must use one unquoted canonical declaration; quoted, inline, and duplicate forms are refused")
         if any(re.search(rf"\benv:\s*\{{[^}}]*{credential}", line) for line in active_lines):
@@ -162,28 +267,27 @@ for path in workflow_paths:
     # workflow env does not cross that boundary.  Therefore it is forbidden
     # unless this policy grows an explicit, independently-audited treatment.
     #
-    # Do not let YAML quoting make a job invisible to that rule.  Both quote
-    # styles and horizontal whitespace before `:` are valid YAML, so recognize
-    # canonical IDs in each form.  Any other mapping-looking job key is refused
+    # Do not let YAML quoting or a valid double-quoted escape make a job
+    # invisible to that rule.  Any other mapping-looking job key is refused
     # rather than silently omitted by this deliberately small parser.
-    job_key = re.compile(
-        r"^  (?:([A-Za-z0-9_-]+)|\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)')[ \t]*:[ \t]*(?:#.*)?$"
-    )
     job_starts = []
-    for index in range(jobs_start + 1, len(active_lines)):
-        line = active_lines[index]
+    for index in range(jobs_start + 1, len(raw_lines)):
+        line = raw_lines[index]
+        if line.startswith("  #"):
+            continue
         if not re.match(r"^  \S", line):
             continue
-        job = job_key.fullmatch(line)
-        if job is None:
+        job_name = yaml_mapping_key(line, 2, empty_value=True)
+        if job_name is None or not re.fullmatch(r"[A-Za-z0-9_-]+", job_name):
             fail(workflow, "jobs mapping contains a non-canonical job key; only plain or single/double-quoted [A-Za-z0-9_-] IDs are accepted")
-        job_starts.append((index, next(name for name in job.groups() if name is not None)))
+        job_starts.append((index, job_name))
     if not job_starts:
         fail(workflow, "PR workflow has no executable jobs")
     for position, (job_start, job_name) in enumerate(job_starts):
         job_end = job_starts[position + 1][0] if position + 1 < len(job_starts) else len(active_lines)
         job_lines = active_lines[job_start:job_end]
-        if any(re.match(r"^    (?:uses|['\"]uses['\"])[ \t]*:", line) for line in job_lines):
+        raw_job_lines = raw_lines[job_start:job_end]
+        if any(yaml_mapping_key(line, 4) == "uses" for line in raw_job_lines):
             fail(workflow, f"job {job_name} uses a reusable workflow; reusable jobs are refused until explicitly guarded")
         step_markers = [index for index, line in enumerate(job_lines) if line == "    steps:"]
         if len(step_markers) != 1:
@@ -306,7 +410,7 @@ text = open(path, encoding="utf-8").read()
 text = text.replace('    runs-on: corelink\n', '    runs-on: corelink\n    env:\n      "CLW_CRED_\\u0054ICKET": "leaked"\n', 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-  expect_pr_credential_null_failure "an escaped credential key cannot bypass the static guard" "forbidden YAML escape syntax"
+  expect_pr_credential_null_failure "an escaped credential key cannot bypass the static guard" "unquoted canonical declaration"
 
   cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml"
   python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/windows.yml" <<'PY'
@@ -368,6 +472,18 @@ PY
     "    'uses' : owner/example/.github/workflows/reusable.yml@main"
   expect_pr_credential_null_failure \
     "a single-quoted reusable job/key is named despite YAML whitespace" \
+    "job unguarded-reusable uses a reusable workflow"
+  write_quoted_reusable_job_fixture \
+    '  "unguarded\u002dreusable" :' \
+    '    "uses" : owner/example/.github/workflows/reusable.yml@main'
+  expect_pr_credential_null_failure \
+    "an escaped double-quoted reusable job ID is inventoried" \
+    "job unguarded-reusable uses a reusable workflow"
+  write_quoted_reusable_job_fixture \
+    '  "unguarded-reusable" :' \
+    '    "us\u0065s" : owner/example/.github/workflows/reusable.yml@main'
+  expect_pr_credential_null_failure \
+    "an escaped double-quoted uses key is inventoried" \
     "job unguarded-reusable uses a reusable workflow"
   rm -f "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/quoted-reusable.yml"
 
