@@ -16,6 +16,21 @@ Coverage is not one number. There are two very different questions:
 
 This doc maps lens 1 (per feature, below) and defines the suite that closes lens 2 (the prod-E2E plan).
 
+## WP-38a acceptance record — Windows exit-code contract
+
+**Status: DECLARED — compiled, not executed.** The frozen `clw run` contract is unchanged on the
+Windows target: `125` means a clw-internal failure before the child ran, `137` means clw killed a
+running child for the output cap, and a child result is passed through **verbatim**. The Windows
+cross-platform gate in [`scripts/gates.sh`](../scripts/gates.sh) invokes the `x86_64-pc-windows-gnu`
+build with `--all-targets`; this is compile/type-check evidence only and does not execute the exit-code
+journeys.
+
+The CLI E2E harness is `#![cfg(unix)]`, and the Wine lane is intentionally limited to smoke and
+pure-lexical checks because subprocess and filesystem semantics are not trustworthy there. The
+125/137/verbatim journeys therefore do **not** run under Wine, and no test has been moved into the
+portable/Wine lane. Runtime evidence requires a native Windows runner; until one exists, this explicit
+declaration is the WP-38a acceptance evidence rather than an implied green test.
+
 ## Journey inventory by feature (lens-1 status)
 
 Legend: **C** covered · **P** partial (unit/parse-level, not end-to-end) · **G** gap. Full cell-level matrices +

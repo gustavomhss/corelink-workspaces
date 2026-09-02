@@ -1399,6 +1399,7 @@ impl AcTransport for HttpClient {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1786,6 +1787,25 @@ mod tests {
         (digest, bytes)
     }
 
+    async fn read_http_headers(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut headers = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .expect("fixture client must send request headers");
+            assert!(
+                n > 0,
+                "fixture client closed before finishing request headers"
+            );
+            headers.extend_from_slice(&chunk[..n]);
+            if headers.windows(4).any(|window| window == b"\r\n\r\n") {
+                return headers;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // CAS exists — HEAD mappings
     // -------------------------------------------------------------------------
@@ -1865,6 +1885,85 @@ mod tests {
 
         let client = make_client(server.uri());
         assert!(CasTransport::exists(&client, &digest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cas_exists_head_405_get_200_ignores_oversized_body() {
+        // RED-on-revert: `exists` needs only the GET status after a HEAD 405; it
+        // must not buffer or parse that GET body. A finite 5 MiB body is not
+        // sufficient evidence because an uncapped `bytes()` call would eventually
+        // finish. This fixture sends only headers with a large declared
+        // Content-Length, then holds the socket open: the first body read blocks
+        // past the timeout.
+        let (digest, _) = digest_and_bytes();
+        let path_str = format!("/v1/cas/test-tenant/{}", digest);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener must bind");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let fixture_path = path_str.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let mut fixture = tokio::spawn(async move {
+            let (mut head_stream, _) = listener.accept().await.expect("HEAD must connect");
+            let head_request = read_http_headers(&mut head_stream).await;
+            assert!(
+                head_request.starts_with(format!("HEAD {fixture_path} HTTP/1.1").as_bytes()),
+                "first request must be the HEAD probe"
+            );
+            head_stream
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("fixture must reply to HEAD");
+            drop(head_stream);
+
+            let (mut get_stream, _) = listener.accept().await.expect("fallback GET must connect");
+            let get_request = read_http_headers(&mut get_stream).await;
+            assert!(
+                get_request.starts_with(format!("GET {fixture_path} HTTP/1.1").as_bytes()),
+                "second request must be the GET fallback"
+            );
+            let get_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                CAS_BLOB_CAP_BYTES + 1
+            );
+            get_stream
+                .write_all(get_response.as_bytes())
+                .await
+                .expect("fixture must send GET headers");
+
+            // Explicit test-owned release: the correct client has returned after
+            // status processing, while a body-consuming client remains blocked.
+            let _ = release_rx.await;
+            drop(get_stream);
+        });
+
+        let client = make_client(endpoint);
+        let exists = tokio::time::timeout(
+            Duration::from_secs(1),
+            CasTransport::exists(&client, &digest),
+        )
+        .await;
+
+        // Always release and await the fixture before asserting, including the
+        // regression path where `exists` timed out while reading the body.
+        let _ = release_tx.send(());
+        let fixture_result = tokio::time::timeout(Duration::from_secs(1), &mut fixture).await;
+        if fixture_result.is_err() {
+            fixture.abort();
+            let _ = fixture.await;
+            panic!("CAS fallback fixture did not shut down after explicit release");
+        }
+        fixture_result
+            .unwrap()
+            .expect("CAS fallback fixture must complete without panic");
+
+        assert!(
+            exists
+                .expect("GET fallback must return from headers without reading its body")
+                .expect("GET fallback status must not be an error"),
+            "GET fallback must report the 200 status as exists"
+        );
     }
 
     #[tokio::test]
@@ -2272,6 +2371,33 @@ mod tests {
 
         let client = make_client(server.uri());
         assert_eq!(AcTransport::get(&client, &key).await.unwrap(), Some(value));
+    }
+
+    #[tokio::test]
+    async fn ac_get_oversized_body_is_rejected_by_read_body_capped() {
+        // RED-on-revert: AC GET responses pass through `read_body_capped` too.
+        // The declared body is one byte over the transport ceiling, so a removed
+        // cap would return `Some` rather than the fail-closed TooLarge error.
+        let server = MockServer::start().await;
+        let (key, _) = digest_and_bytes();
+        let path_str = format!("/v1/ac/test-tenant/{}", key);
+        let oversized = vec![0u8; CAS_BLOB_CAP_BYTES + 1];
+
+        Mock::given(method("GET"))
+            .and(path(&path_str))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let err = AcTransport::get(&client, &key).await.unwrap_err();
+        assert!(
+            matches!(err, ClwError::TooLarge { size, cap }
+                if size == (CAS_BLOB_CAP_BYTES + 1) as u64
+                    && cap == CAS_BLOB_CAP_BYTES as u64),
+            "oversized AC GET body must be rejected by the capped reader, got {err:?}"
+        );
     }
 
     #[tokio::test]

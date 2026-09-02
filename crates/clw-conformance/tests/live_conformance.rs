@@ -226,6 +226,65 @@ async fn ac_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// ac_create_only_conflict
+// ---------------------------------------------------------------------------
+
+/// A create-only AC ref rejects a divergent value with the exact HTTP 409
+/// contract, while retaining the original value. The key is unique per run;
+/// cleanup is attempted after both the expected and every unexpected outcome.
+#[tokio::test]
+async fn ac_create_only_rejects_divergent_put_and_retains_original() {
+    let Some((client, _tenant)) = try_client() else {
+        return;
+    };
+
+    let suffix = run_suffix();
+    let key = Digest::of_bytes(format!("clw/ref/v1/conformance-create-only-{suffix}").as_bytes());
+    let original = format!("ac-create-only-original-{suffix}").into_bytes();
+    let differing = format!("ac-create-only-differing-{suffix}").into_bytes();
+
+    // Collect the assertion result before cleanup so an unexpected PUT/GET
+    // outcome cannot bypass deletion of the one key this test owns.
+    let result: Result<Vec<u8>, String> = async {
+        AcTransport::put(&client, &key, original.clone())
+            .await
+            .map_err(|e| format!("initial AC PUT failed: {e}"))?;
+
+        match AcTransport::put(&client, &key, differing).await {
+            Err(ClwError::Http { status: 409, .. }) => {}
+            Ok(()) => return Err("differing AC PUT unexpectedly succeeded".to_string()),
+            Err(e) => {
+                return Err(format!(
+                    "differing AC PUT must return exact ClwError::Http status 409, got {e}"
+                ));
+            }
+        }
+
+        match AcTransport::get(&client, &key).await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err("AC GET returned None after the original PUT".to_string()),
+            Err(e) => Err(format!("AC GET after the 409 failed: {e}")),
+        }
+    }
+    .await;
+
+    let cleanup = AcTransport::delete(&client, &key).await;
+    match (result, cleanup) {
+        (Err(test_error), Err(cleanup_error)) => {
+            panic!("{test_error}; cleanup of exact AC key {key} also failed: {cleanup_error}")
+        }
+        (Err(test_error), Ok(())) => panic!("{test_error}"),
+        (Ok(_), Err(cleanup_error)) => {
+            panic!("cleanup of exact AC key {key} failed: {cleanup_error}")
+        }
+        (Ok(retained), Ok(())) => assert_eq!(
+            retained, original,
+            "a divergent create-only PUT must leave the original value intact"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ac_missing
 // ---------------------------------------------------------------------------
 

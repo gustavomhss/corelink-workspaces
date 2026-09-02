@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Child as StdChild, Command as StdCommand, ExitStatus as StdExitStatus};
 use std::sync::{Arc, Mutex};
 
 use assert_cmd::Command;
@@ -445,6 +447,124 @@ fn clw_cmd(endpoint: &str, cache_dir: &std::path::Path) -> Command {
         .env("CLW_TOKEN", TEST_PAT)
         .env("CLW_CACHE_DIR", cache_dir.to_str().unwrap());
     cmd
+}
+
+/// Owns a process-group test's direct child so every panic path terminates the
+/// exact group and reaps clw. It stays armed until cleanup has confirmed that
+/// the group no longer exists; `Drop` is deliberately best-effort and never
+/// panics while unwinding a test failure.
+struct ProcessGroupCleanup {
+    pgid: u32,
+    child: StdChild,
+    child_reaped: bool,
+    armed: bool,
+}
+
+impl ProcessGroupCleanup {
+    fn new(child: StdChild) -> Self {
+        Self {
+            pgid: child.id(),
+            child,
+            child_reaped: false,
+            armed: true,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<StdExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.child_reaped = true;
+        }
+        Ok(status)
+    }
+
+    fn signal_group(&self, signal: &str) -> std::io::Result<StdExitStatus> {
+        StdCommand::new("/bin/kill")
+            .args([
+                format!("-{signal}"),
+                "--".to_string(),
+                format!("-{}", self.pgid),
+            ])
+            .status()
+    }
+
+    fn group_is_gone(&self) -> bool {
+        self.signal_group("0")
+            .map(|status| !status.success())
+            .unwrap_or(false)
+    }
+
+    /// Send SIGKILL, wait for the group to disappear, and reap direct clw.
+    /// A non-zero `kill -KILL` is acceptable when the group already exited;
+    /// `kill -0` distinguishes that cleaned state from a live group.
+    fn cleanup(&mut self) -> Result<(), String> {
+        let kill_status = self
+            .signal_group("KILL")
+            .map_err(|error| format!("spawn /bin/kill -KILL: {error}"))?;
+
+        if !self.child_reaped {
+            match self.child.try_wait() {
+                Ok(Some(_)) => self.child_reaped = true,
+                Ok(None) => {
+                    let kill_error = self.child.kill().err();
+                    let wait_result = self.child.wait();
+                    if wait_result.is_ok() {
+                        self.child_reaped = true;
+                    } else if let Err(wait_error) = wait_result {
+                        return Err(format!("child kill={kill_error:?}, wait={wait_error}"));
+                    }
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let wait_result = self.child.wait();
+                    if wait_result.is_ok() {
+                        self.child_reaped = true;
+                    } else {
+                        return Err(format!("child try_wait={error}, wait={wait_result:?}"));
+                    }
+                }
+            }
+        }
+
+        // Reap clw before probing the group: a zombie direct child still makes
+        // `kill -0 -PGID` report a live group even though SIGKILL was delivered.
+        let mut group_gone = !kill_status.success() && self.group_is_gone();
+        if kill_status.success() {
+            for _ in 0..100 {
+                if self.group_is_gone() {
+                    group_gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        if !group_gone {
+            return Err(format!(
+                "process group {} still exists after SIGKILL (kill status {kill_status:?})",
+                self.pgid
+            ));
+        }
+        if !self.child_reaped {
+            return Err(format!("direct clw child {} was not reaped", self.pgid));
+        }
+
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.signal_group("KILL");
+        if !self.child_reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 /// The 64-hex AC store key for a workspace `name` — the exact `ref_key` the binary
@@ -1484,6 +1604,41 @@ fn ls_unconfigured_fails_cleanly() {
     );
 }
 
+/// A bare `clw ls` must fail with the usage guidance that names both supported
+/// modes. Keep the identity configured so this reaches the subcommand's own
+/// argument validation instead of stopping at config resolution.
+#[test]
+fn ls_without_selector_exits_2_and_directs_to_name_or_all() {
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let out = clw_bin()
+        .env("HOME", home.path())
+        .env("CLW_ENDPOINT", "https://example.com")
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["ls"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bare ls must exit 2, got {:?}; stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--name") && stderr.contains("--all"),
+        "bare ls must direct the user to both --name and --all, got:\n{stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "bare ls guidance belongs on stderr, not stdout"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 11: uninstall — consent, dry-run, redaction, real removal
 //
@@ -1556,6 +1711,62 @@ fn uninstall_dry_run_lists_paths_removes_nothing_and_no_token() {
     }
     // The running binary is reported but NEVER auto-deleted.
     assert_eq!(parsed["binary"]["removed"], false);
+}
+
+#[test]
+fn uninstall_human_dry_run_labels_paths_preserves_footprint_and_redacts_token() {
+    let (home, cache) = seed_clw_footprint();
+    let clw_dir = home.path().join(".clw");
+    let config_path = clw_dir.join("config.toml");
+
+    let out = clw_bin()
+        .env("HOME", home.path())
+        .env_remove("CLW_TENANT")
+        .env_remove("CLW_TOKEN")
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["uninstall", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "human uninstall --dry-run must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "human uninstall --dry-run should report its plan on stderr, got stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("would remove"),
+        "dry-run stderr must identify planned removal, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("config dir") && stderr.contains("cache dir"),
+        "dry-run stderr must label both config and cache targets, got:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
+        "human uninstall --dry-run must NEVER print the token"
+    );
+
+    // A dry-run is observational: retain both sensitive targets and their
+    // contents, including the credential itself.
+    assert!(clw_dir.exists(), "dry-run must NOT remove ~/.clw");
+    assert!(
+        cache.path().exists(),
+        "dry-run must NOT remove the cache dir"
+    );
+    assert!(
+        std::fs::read_to_string(config_path)
+            .unwrap()
+            .contains(SECRET_TOKEN),
+        "dry-run must leave the credential footprint unchanged"
+    );
 }
 
 #[test]
@@ -2717,6 +2928,129 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
     );
 }
 
+/// Sending SIGTERM to the real `clw` process group must reach both the wrapper
+/// and its running command. The direct wrapper is terminated by the signal
+/// itself (so its status reports SIGTERM, rather than the 128+signal mapper used
+/// for a child result), while the shell's trap proves the group signal reached
+/// the descendant too.
+#[tokio::test]
+async fn run_process_group_sigterm_reaches_clw_and_child() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = work.path().join("in.txt");
+    std::fs::write(&input, b"declared input").unwrap();
+    let ready = work.path().join("child-ready.marker");
+    let term_seen = work.path().join("child-term-seen.marker");
+
+    // `assert_cmd::Command` deliberately hides spawning, so retain its resolved
+    // cargo binary path and configure a std command for process-group control.
+    let binary = clw_bin().get_program().to_owned();
+    let mut clw = StdCommand::new(binary);
+    for variable in [
+        "CLW_ENDPOINT",
+        "CLW_TENANT",
+        "CLW_TOKEN",
+        "CLW_CACHE_DIR",
+        "CLW_REF_DOMAIN",
+        "CORELINK_ENDPOINT",
+        "CORELINK_TENANT",
+        "CORELINK_TOKEN",
+        "CLW_CRED_TICKET",
+        "CLW_LEASE_ID",
+        "CLW_FABRIC_ENDPOINT",
+    ] {
+        clw.env_remove(variable);
+    }
+    clw.env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_TOKEN", TEST_PAT)
+        .env("CLW_CACHE_DIR", cache.path())
+        .current_dir(work.path())
+        .args([
+            "run",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "trap 'touch {}' TERM; touch {}; while :; do sleep 1; done",
+                term_seen.display(),
+                ready.display()
+            ),
+        ]);
+
+    // Safe std API: make clw the leader of a fresh process group before exec.
+    clw.process_group(0);
+    let child = clw.spawn().expect("real clw must spawn");
+    let mut process_group = ProcessGroupCleanup::new(child);
+
+    let ready_wait = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if ready_wait.is_err() {
+        let cleanup = process_group.cleanup();
+        panic!("child shell did not write its ready marker within 10 seconds; cleanup={cleanup:?}");
+    }
+
+    // The negative PID targets the fresh group, not just clw itself.
+    let signal = process_group
+        .signal_group("TERM")
+        .expect("/bin/kill must be available on Unix");
+    assert!(
+        signal.success(),
+        "SIGTERM to clw's process group must succeed: {signal:?}"
+    );
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = process_group.try_wait().expect("wait on clw process") {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => {
+            let cleanup = process_group.cleanup();
+            panic!("clw did not terminate within 10 seconds after SIGTERM; cleanup={cleanup:?}");
+        }
+    };
+
+    // The direct clw process was itself in the signalled group: assert its raw
+    // signal status, not the child-result 143 convention tested above.
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "direct clw must be terminated by SIGTERM: {status:?}"
+    );
+
+    let term_wait = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !term_seen.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if term_wait.is_err() {
+        let cleanup = process_group.cleanup();
+        panic!("child shell did not observe SIGTERM within 10 seconds; cleanup={cleanup:?}");
+    }
+
+    // The trap normally exits the child shell; this also confirms cleanup if a
+    // platform shell delayed trap delivery and left a shell/sleep descendant.
+    process_group
+        .cleanup()
+        .unwrap_or_else(|error| panic!("process-group cleanup failed: {error}"));
+}
+
 // ---------------------------------------------------------------------------
 // Resource-abuse caps + non-retryable error tiers, surfaced through the BINARY.
 //
@@ -3067,6 +3401,92 @@ fn auth_logout_removes_token_keeps_other_keys() {
     assert!(
         !stdout.contains(SECRET_TOKEN) && !stderr.contains(SECRET_TOKEN),
         "logout must NEVER echo the token value"
+    );
+}
+
+/// `auth logout --all` is a destructive local operation: without `--yes` it
+/// must refuse without changing the saved identity, while `--yes` clears every
+/// config key (including the PAT) from the real config file.
+#[test]
+fn auth_logout_all_requires_yes_and_clears_config_when_confirmed() {
+    let (home, cache) = seed_clw_footprint();
+    let config_path = home.path().join(".clw/config.toml");
+    let cache_file = cache.path().join("blob.bin");
+    let before = std::fs::read(&config_path).unwrap();
+    let cache_before = std::fs::read(&cache_file).unwrap();
+
+    let refused = clw_bin()
+        .env("HOME", home.path())
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["auth", "logout", "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "logout --all without --yes must refuse in a non-interactive test"
+    );
+    let refused_stdout = String::from_utf8_lossy(&refused.stdout);
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused_stderr.contains("--yes"),
+        "refusal must tell the user to pass --yes, got:\n{refused_stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        before,
+        "refused logout --all must not mutate the config/credential footprint"
+    );
+    assert_eq!(
+        std::fs::read(&cache_file).unwrap(),
+        cache_before,
+        "refused logout --all must not mutate the cache footprint"
+    );
+    assert!(
+        !refused_stdout.contains(SECRET_TOKEN) && !refused_stderr.contains(SECRET_TOKEN),
+        "refused logout --all must NEVER print the token"
+    );
+
+    let confirmed = clw_bin()
+        .env("HOME", home.path())
+        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
+        .args(["auth", "logout", "--all", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        confirmed.status.code(),
+        Some(0),
+        "logout --all --yes must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+    assert!(
+        config_path.exists(),
+        "logout --all should retain the config file with its secure mode"
+    );
+    let after = std::fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after, "# clw configuration\n",
+        "logout --all must clear every stored config key"
+    );
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "cleared config.toml must remain mode 0600");
+    assert!(
+        !String::from_utf8_lossy(&confirmed.stdout).contains(SECRET_TOKEN)
+            && !String::from_utf8_lossy(&confirmed.stderr).contains(SECRET_TOKEN),
+        "confirmed logout --all must NEVER print the token"
+    );
+    assert!(
+        cache.path().exists(),
+        "auth logout --all must not remove the separate cache footprint"
+    );
+    assert_eq!(
+        std::fs::read(cache_file).unwrap(),
+        cache_before,
+        "auth logout --all must not alter the separate cache footprint"
     );
 }
 

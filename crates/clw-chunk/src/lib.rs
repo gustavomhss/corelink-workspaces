@@ -251,6 +251,76 @@ mod tests {
         }
     }
 
+    // REGRESSION GUARD — all-zero input is pathological FastCDC data: its
+    // boundary scan reaches the maximum size (see fastcdc's `cut_gear`), so
+    // the first two chunks must be the frozen 4 MiB ceiling exactly. A change
+    // that stops passing CHUNK_MAX_BYTES to StreamCDC, or drops/truncates
+    // streamed bytes, must fail here.
+    #[test]
+    fn stream_crossing_chunk_max_stays_bounded_and_tiles_input() {
+        use std::io::Cursor;
+
+        assert_eq!(CHUNK_MAX_BYTES, 4 * 1024 * 1024, "frozen chunk ceiling");
+        let data = vec![0; CHUNK_MAX_BYTES * 2 + 17];
+
+        let streamed: Vec<StreamedChunk> = chunk_stream(Cursor::new(&data))
+            .collect::<std::io::Result<_>>()
+            .expect("chunk_stream over an in-memory Cursor is infallible");
+
+        assert!(
+            streamed.len() >= 3,
+            "input contains two full maximum chunks"
+        );
+        assert_eq!(
+            streamed
+                .first()
+                .expect("input contains a first maximum-size chunk")
+                .len,
+            CHUNK_MAX_BYTES as u64
+        );
+        assert_eq!(
+            streamed
+                .get(1)
+                .expect("input contains a second maximum-size chunk")
+                .len,
+            CHUNK_MAX_BYTES as u64
+        );
+
+        let mut expected_offset = 0_u64;
+        for chunk in &streamed {
+            assert!(
+                chunk.len <= CHUNK_MAX_BYTES as u64,
+                "streamed chunk len {} exceeds the 4 MiB ceiling {}",
+                chunk.len,
+                CHUNK_MAX_BYTES
+            );
+            assert_eq!(chunk.data.len() as u64, chunk.len);
+            assert_eq!(
+                chunk.offset, expected_offset,
+                "streamed chunks must be contiguous"
+            );
+            assert_eq!(
+                chunk.digest,
+                Digest::of_bytes(
+                    data.get(chunk.offset as usize..(chunk.offset + chunk.len) as usize)
+                        .expect("streamed chunk range must stay within its input")
+                ),
+                "streamed chunk digest must cover exactly its input bytes"
+            );
+            expected_offset += chunk.len;
+        }
+        assert_eq!(expected_offset, data.len() as u64);
+
+        let reassembled: Vec<u8> = streamed
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(
+            reassembled, data,
+            "streamed chunks must tile the input exactly"
+        );
+    }
+
     #[test]
     fn to_chunk_refs_maps_correctly() {
         let data = det_buf(3 * 1024 * 1024, 0xfeedfacecafe1234);

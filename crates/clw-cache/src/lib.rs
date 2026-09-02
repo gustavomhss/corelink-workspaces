@@ -205,7 +205,7 @@ impl LocalCache {
     ///   logged to stderr so the wipe is never silent.
     fn check_format_version(&self) -> Result<()> {
         let version_path = self.root.join(VERSION_FILE);
-        let on_disk: Option<u32> = match fs::read_to_string(&version_path) {
+        let on_disk: Option<u32> = match read_version_sentinel(&version_path) {
             Ok(s) => s.trim().parse::<u32>().ok().or(Some(u32::MAX)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(ClwError::Io(e)),
@@ -525,6 +525,20 @@ impl LocalCache {
     }
 }
 
+/// Read the format-version sentinel. Production delegates directly to the
+/// filesystem; the test-only hook makes a permission-denied read deterministic
+/// even under an elevated test runner that bypasses Unix mode bits.
+fn read_version_sentinel(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    if fault_injection_matches(&VERSION_READ_FAILURE_ROOT, path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test-injected unreadable cache version sentinel",
+        ));
+    }
+    fs::read_to_string(path)
+}
+
 /// Record a best-effort GC failure without allowing one bad cache entry to abort
 /// maintenance for all later entries. The returned `Result` still carries the first
 /// error after the sweep, so callers that explicitly request GC retain observability.
@@ -581,6 +595,9 @@ static TEMP_SYNC_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[cfg(test)]
 static GC_REMOVE_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+static VERSION_READ_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[cfg(test)]
 fn fault_injection_matches(slot: &Mutex<Option<PathBuf>>, path: &Path) -> bool {
@@ -761,6 +778,7 @@ fn io_ctx(op: &str, path: &Path, e: io::Error) -> ClwError {
 mod tests {
     use super::*;
     use filetime::{set_file_mtime, FileTime};
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     fn make_cache() -> (TempDir, LocalCache) {
@@ -1400,6 +1418,108 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Same-process concurrency: one shared LocalCache must tolerate put/get/gc
+    // racing from multiple threads. This deliberately avoids asserting an
+    // eviction *order* (mtime ties are filesystem-dependent); it asserts only
+    // the stable contract: every surviving digest remains readable and the final
+    // single-threaded sweep honors its byte capacity.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn shared_cache_put_get_gc_race_preserves_surviving_blob_integrity() {
+        const THREADS: usize = 6;
+        const BLOBS_PER_THREAD: usize = 12;
+        const BLOB_BYTES: usize = 128;
+        const CAPACITY: u64 = 4 * BLOB_BYTES as u64;
+
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(LocalCache::with_budget(dir.path(), CAPACITY).unwrap());
+        let start = Arc::new(Barrier::new(THREADS));
+
+        let mut all_blobs = Vec::with_capacity(THREADS * BLOBS_PER_THREAD);
+        let mut workers = Vec::with_capacity(THREADS);
+        for worker in 0..THREADS {
+            let mut blobs = Vec::with_capacity(BLOBS_PER_THREAD);
+            for sequence in 0..BLOBS_PER_THREAD {
+                // Fixed-size, distinct payloads make the final capacity assertion
+                // exact without depending on which equally-aged entries survived.
+                let mut bytes = vec![worker as u8; BLOB_BYTES];
+                bytes[..8].copy_from_slice(&(worker as u64).to_le_bytes());
+                bytes[8..16].copy_from_slice(&(sequence as u64).to_le_bytes());
+                let digest = Digest::of_bytes(&bytes);
+                all_blobs.push((digest, bytes.clone()));
+                blobs.push((digest, bytes));
+            }
+
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for (digest, bytes) in blobs {
+                    cache.put(&digest, &bytes).unwrap();
+
+                    // A concurrent gc may evict this entry before this read. Both
+                    // outcomes are valid; a hit, however, must always be intact.
+                    if let Some(got) = cache.get(&digest).unwrap() {
+                        assert_eq!(
+                            got, bytes,
+                            "a surviving blob must pass integrity verification"
+                        );
+                    }
+
+                    cache.gc(CAPACITY).unwrap();
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("cache worker must not panic");
+        }
+
+        // A final non-racing sweep establishes the capacity contract independently
+        // of any individual racing sweep's point-in-time directory snapshot. Reserve
+        // one fixed-size slot for a final put/get so this test is non-vacuous even
+        // if the racing evictors happened to remove every earlier blob.
+        cache.gc(CAPACITY - BLOB_BYTES as u64).unwrap();
+        let final_bytes = vec![0xa5; BLOB_BYTES];
+        let final_digest = Digest::of_bytes(&final_bytes);
+        cache.put(&final_digest, &final_bytes).unwrap();
+        assert_eq!(
+            cache.get(&final_digest).unwrap(),
+            Some(final_bytes.clone()),
+            "the shared cache must remain usable after the racing operations"
+        );
+        all_blobs.push((final_digest, final_bytes));
+
+        let mut survivors = 0usize;
+        for (digest, bytes) in all_blobs {
+            if let Some(got) = cache.get(&digest).unwrap() {
+                survivors += 1;
+                assert_eq!(
+                    got, bytes,
+                    "every surviving blob must be readable and uncorrupted"
+                );
+            }
+        }
+        assert!(survivors > 0, "the final post-race put must survive");
+
+        let blobs_root = dir.path().join("blobs");
+        let mut committed_bytes = 0u64;
+        for i in 0u16..=255 {
+            let shard = format!("{i:02x}");
+            for entry in fs::read_dir(blobs_root.join(shard)).unwrap() {
+                let entry = entry.unwrap();
+                if !entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+                    committed_bytes += entry.metadata().unwrap().len();
+                }
+            }
+        }
+        assert!(
+            committed_bytes <= CAPACITY,
+            "the final non-racing sweep must leave at most {CAPACITY} committed bytes, got {committed_bytes}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // format version: fresh cache stamps the sentinel
     // -----------------------------------------------------------------------
     #[test]
@@ -1412,6 +1532,39 @@ mod tests {
         );
         let contents = fs::read_to_string(&sentinel).unwrap();
         assert_eq!(contents.trim(), CACHE_FORMAT_VERSION.to_string());
+    }
+
+    // `check_format_version` treats only NotFound as an absent/legacy sentinel;
+    // every other read error is returned as ClwError::Io. The test-only reader
+    // hook models Unix's PermissionDenied deterministically, including when a
+    // privileged runner would bypass mode-000 and make a chmod-based test vacuous.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_version_sentinel_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let _cache = LocalCache::new(dir.path()).unwrap();
+        let sentinel = dir.path().join(VERSION_FILE);
+        let _failure = inject_failure_under(&VERSION_READ_FAILURE_ROOT, &sentinel);
+
+        let err = match LocalCache::new(dir.path()) {
+            Ok(_) => panic!("an unreadable version sentinel must not be treated as absent"),
+            Err(err) => err,
+        };
+        match err {
+            ClwError::Io(e) => {
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "the sentinel read error must propagate instead of falling back to legacy mode: {e}"
+                );
+                assert!(
+                    e.to_string()
+                        .contains("test-injected unreadable cache version sentinel"),
+                    "the propagated permission error must retain its diagnostic: {e}"
+                );
+            }
+            other => panic!("expected ClwError::Io(PermissionDenied), got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

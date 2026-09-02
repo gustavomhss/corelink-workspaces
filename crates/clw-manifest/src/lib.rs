@@ -512,6 +512,52 @@ mod tests {
         }
     }
 
+    // REGRESSION GUARD — special Unix filesystem objects have no manifest
+    // representation. They must be ignored rather than treated as regular
+    // files (which could block or capture process-local socket state).
+    #[cfg(unix)]
+    #[test]
+    fn walk_ignores_fifo_and_unix_socket() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("regular.txt"), b"content").unwrap();
+
+        let fifo = root.join("pipe");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on Unix test hosts");
+        assert!(status.success(), "mkfifo failed with {status}");
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "fixture must be a FIFO"
+        );
+
+        let socket = root.join("socket");
+        let listener = UnixListener::bind(&socket).expect("create Unix socket fixture");
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "fixture must be a Unix socket"
+        );
+
+        let entries = walk(root).expect("special files must not fail the walk");
+        let rels: Vec<&str> = entries.iter().map(WalkedEntry::rel).collect();
+        assert_eq!(
+            rels,
+            vec!["regular.txt"],
+            "FIFO and Unix socket must not produce manifest entries: {entries:?}"
+        );
+
+        drop(listener);
+    }
+
     // Option C — a symlink whose TARGET is ABSOLUTE (escapes the workspace) must
     // NOT hard-fail the walk: it is recorded as `SkippedExternalSymlink` while the
     // rest of the tree (a normal file) walks fine. The manifest never carries it.
