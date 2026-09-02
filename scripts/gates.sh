@@ -149,6 +149,8 @@ bash scripts/mutation-verdict-selftest.sh
 
 # shellcheck source=scripts/classify-lane.sh
 . scripts/classify-lane.sh
+# shellcheck source=scripts/scoped-package-set.sh
+. scripts/scoped-package-set.sh
 
 SCOPE="full"
 if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
@@ -179,6 +181,12 @@ if [ "${CI:-}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
       exit 1 ;;
   esac
 fi
+
+# The reverse-dependency expansion only affects Rust lanes. Exercise its real
+# metadata parser and graph walk after the docs-only exit so a Markdown-only PR
+# keeps its no-toolchain/no-index contract, but every full/scoped Rust run still
+# proves the expander before consuming its result.
+bash scripts/scoped-package-set-selftest.sh
 
 cargo fmt --all -- --check
 
@@ -254,22 +262,23 @@ if [ "$SCOPE" = "full" ]; then
   fi
 else
   echo "SCOPED lane: crates [${SCOPE}]"
-  # A `test -p <changed>` compiles the changed crate's DEPENDENCIES (downward) but not
-  # its DEPENDENTS (upward) — so a change to a low-level crate (e.g. clw-snapshot) would
-  # never exercise clw-cli / clw-integration-tests, letting a cross-crate regression pass
-  # the required PR gate green (caught only by main's post-merge full lane). Close that:
-  # always fold in the SINK crates where the whole graph converges, so any crate change
-  # is tested through its top-level consumers too. (main is always full-lane regardless.)
-  # Union the changed crates with the sink crates, de-duped by NAME (a change to
-  # clw-cli / clw-integration-tests must not pass `-p` for it twice).
-  # shellcheck disable=SC2086 # SCOPE deliberately contains a space-separated package set.
-  crate_set="$(printf '%s\n' $SCOPE clw-cli clw-integration-tests | sort -u | tr '\n' ' ')"
-  pkgs=""
-  for c in $crate_set; do pkgs="$pkgs -p $c"; done
-  # shellcheck disable=SC2086
-  cargo clippy $pkgs --all-targets --all-features -- -D warnings
-  # shellcheck disable=SC2086
-  cargo test $pkgs
+  # Cargo's normal `-p changed` walk only follows dependencies DOWNWARD.  Expand the
+  # reverse workspace closure as well, then add the named historical integration
+  # sinks.  The helper validates every metadata and directory->package mapping and
+  # returns a sorted, de-duped list; ambiguity is a hard failure, never a narrower run.
+  if ! package_lines="$(scoped_package_set "$SCOPE")"; then
+    exit 1
+  fi
+  [ -n "$package_lines" ] || { echo "GATE FAILED: scoped package set is empty" >&2; exit 1; }
+  crate_set=()
+  while IFS= read -r c; do
+    [ -n "$c" ] && crate_set+=("$c")
+  done <<<"$package_lines"
+  [ "${#crate_set[@]}" -gt 0 ] || { echo "GATE FAILED: scoped package set is empty" >&2; exit 1; }
+  pkgs=()
+  for c in "${crate_set[@]}"; do pkgs+=(-p "$c"); done
+  cargo clippy "${pkgs[@]}" --all-targets --all-features -- -D warnings
+  cargo test "${pkgs[@]}"
 fi
 
 # Cross-platform COMPILE gate — UNIVERSAL tripwire (runs in BOTH lanes). CI runs on a
