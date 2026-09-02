@@ -489,7 +489,9 @@ Examples: `clw uninstall --dry-run` · `clw uninstall --yes`
 
 ### `clw completions <shell>`
 Generate a shell-completion script to **stdout** (an install hint goes to stderr). Pure/offline — works
-before any config/login. Shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+before any config/login. Shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. Completion output is raw
+shell source, so `clw --json completions <shell>` is incompatible: it exits 2 with no generated script,
+before resolving configuration or redeeming a C2c credential ticket.
 
 Examples: `clw completions bash > ~/.local/share/bash-completion/completions/clw` · `clw completions zsh > "${fpath[1]}/_clw"`
 
@@ -798,7 +800,8 @@ mechanism behind a row above (or the fine-grained guarantees the table doesn't s
   child's own code (cached iff 0).
 
 ### H · Observability & UX
-- **`--json` on every command** (except `run`, which proxies the child) — a documented machine contract.
+- **`--json` on every data command** — `run` proxies the child and `completions` emits raw shell source,
+  so completions rejects `--json` rather than silently ignoring it.
 - **`doctor`** — a support-ready, redacted diagnostics bundle with a `problems:` advisory list.
 - **stdout/stderr discipline** — results to stdout, notices/progress/warnings to stderr (pipe-safe).
 - **Human-readable timestamps** (`ls`), **progress reporting** (TTY-gated, never in pipes/CI).
@@ -1113,7 +1116,8 @@ CLW_TENANT=my-tenant CLW_TOKEN=pat_xxxx cargo test -p clw-conformance --features
 <a id="18-outputs-schemas"></a>
 ## 18. Command outputs & `--json` schemas
 
-`--json` is a **global flag before the subcommand** (`clw --json <cmd>`). Every command supports it **except `run`** (which proxies the child's streams).
+`--json` is a **global flag before the subcommand** (`clw --json <cmd>`). Data commands support it; `run`
+proxies the child's streams, while `completions` emits raw shell source and rejects `--json` with exit 2.
 
 ### snapshot
 ```
@@ -1126,7 +1130,7 @@ snapshot complete
   chunks_uploaded: 3                          (< chunks_total ⇒ dedup working)
 ```
 An identical re-snapshot instead prints `already up to date — 'myapp-main' already points at this content` (`chunks_uploaded: 0`).
-`--json`: `{ name, root, files, bytes_total, chunks_total, chunks_uploaded, unchanged(bool), skipped_external_symlinks:[string] }`
+`--json`: `{ name, root, files, bytes_total, chunks_total, chunks_uploaded, unchanged(bool), secret_warnings:[string], skipped_external_symlinks:[string] }`. `secret_warnings` is the same advisory list printed to stderr for interactive users and is `[]` for a clean tree.
 
 ### hydrate
 ```
@@ -1168,7 +1172,7 @@ af1349b9f5f9a1a6  2025-06-04 00:00:00 UTC  myapp-dev
 c3d7e2a1b4f80011  2025-06-03 11:20:00 UTC  myapp-main
 (2 refs in tenant 'my-tenant')
 ```
-`--json --name`: `{ name, root, created_at_unix, parent:(hex|null), files, bytes }`  ·  `--json --all`: `{ tenant, count, refs:[{name,root,created_at_unix,parent}], run_cache_entries, skipped, errors:[{ref_key,error}] }`
+`--json --name`: `{ name, root, created_at_unix, parent:(hex|null), files, bytes, bytes_total }`. `bytes_total` is the preferred spelling; legacy `bytes` remains for this deprecation cycle.  ·  `--json --all`: `{ tenant, count, refs:[{name,root,created_at_unix,parent}], run_cache_entries, skipped, errors:[{ref_key,error}] }`
 
 ### run (no `--json`)
 ```

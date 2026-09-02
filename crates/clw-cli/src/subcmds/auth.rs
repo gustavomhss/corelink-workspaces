@@ -360,20 +360,21 @@ fn rotate(json: bool) {
 mod tests {
     use super::*;
     use clw_types::Config;
-    use std::path::PathBuf;
 
-    fn cfg_with(token: &str) -> ResolvedConfig {
-        ResolvedConfig {
+    fn cfg_with(token: &str) -> (tempfile::TempDir, ResolvedConfig) {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 tenant: "acme-tenant".to_string(),
                 token: token.to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
             ref_domain_invalid: None,
-        }
+        };
+        (cache, cfg)
     }
 
     #[test]
@@ -394,12 +395,13 @@ mod tests {
     // whoami must succeed on a config missing tenant, not error).
     #[test]
     fn whoami_json_on_missing_tenant_does_not_error() {
+        let cache = tempfile::TempDir::new().unwrap();
         let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 tenant: String::new(),
                 token: String::new(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
@@ -415,7 +417,7 @@ mod tests {
     #[test]
     fn whoami_json_never_leaks_token() {
         let secret = "super-secret-pat-abc123XYZ";
-        let cfg = cfg_with(secret);
+        let (_cache, cfg) = cfg_with(secret);
         let out = build_whoami_json(&cfg);
         let s = out.to_string();
         assert!(
@@ -426,29 +428,32 @@ mod tests {
         assert_eq!(out["token"], "<set>", "set token must redact to <set>");
 
         // And an unset token must redact to <unset>.
-        let empty = cfg_with("");
+        let (_cache, empty) = cfg_with("");
         assert_eq!(build_whoami_json(&empty)["token"], "<unset>");
     }
 
     /// A config whose endpoint smuggles a `user:pass@` credential.
-    fn cfg_with_userinfo_endpoint() -> ResolvedConfig {
-        ResolvedConfig {
+    fn cfg_with_userinfo_endpoint() -> (tempfile::TempDir, ResolvedConfig) {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://user:s3cret@host.example.com/v1".to_string(),
                 tenant: "acme-tenant".to_string(),
                 token: "tok".to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
             ref_domain_invalid: None,
-        }
+        };
+        (cache, cfg)
     }
 
     // M8 — `auth whoami --json` must NOT leak an embedded endpoint userinfo secret.
     #[test]
     fn whoami_json_redacts_endpoint_userinfo() {
-        let out = build_whoami_json(&cfg_with_userinfo_endpoint());
+        let (_cache, cfg) = cfg_with_userinfo_endpoint();
+        let out = build_whoami_json(&cfg);
         let s = out.to_string();
         assert!(
             !s.contains("s3cret") && !s.contains("user:"),
@@ -461,10 +466,8 @@ mod tests {
     // (the stored config keeps the real endpoint; only the echo is redacted).
     #[test]
     fn login_json_summary_redacts_endpoint_userinfo() {
-        let out = build_login_summary_json(
-            &cfg_with_userinfo_endpoint(),
-            std::path::Path::new("/tmp/config.toml"),
-        );
+        let (_cache, cfg) = cfg_with_userinfo_endpoint();
+        let out = build_login_summary_json(&cfg, std::path::Path::new("/tmp/config.toml"));
         let s = out.to_string();
         assert!(
             !s.contains("s3cret") && !s.contains("user:"),
@@ -478,7 +481,7 @@ mod tests {
     #[test]
     fn login_json_summary_redacts_token() {
         let secret = "pat-do-not-leak-987";
-        let cfg = cfg_with(secret);
+        let (_cache, cfg) = cfg_with(secret);
         let out = build_login_summary_json(&cfg, std::path::Path::new("/tmp/config.toml"));
         let s = out.to_string();
         assert!(
@@ -488,7 +491,7 @@ mod tests {
         assert_eq!(out["token"], "<set>", "set token must redact to <set>");
         assert_eq!(out["logged_in"], true);
 
-        let empty = cfg_with("");
+        let (_cache, empty) = cfg_with("");
         assert_eq!(
             build_login_summary_json(&empty, std::path::Path::new("/tmp/config.toml"))["token"],
             "<unset>"
@@ -509,7 +512,7 @@ mod tests {
         .unwrap();
 
         // Simulate the login rewrite (overwrite identity keys, merge the rest).
-        let cfg = cfg_with("new-tok");
+        let (_cache, cfg) = cfg_with("new-tok");
         let c = &cfg.clw_config;
         let updates = vec![
             ("endpoint".to_string(), c.endpoint.clone()),
@@ -539,7 +542,7 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         // Simulate login by writing via the shared helper directly.
-        let cfg = cfg_with("secret-tok");
+        let (_cache, cfg) = cfg_with("secret-tok");
         let c = &cfg.clw_config;
         let pairs = vec![
             ("endpoint".to_string(), c.endpoint.clone()),

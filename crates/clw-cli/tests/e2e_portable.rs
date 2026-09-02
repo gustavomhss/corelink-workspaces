@@ -82,6 +82,31 @@ fn completions_unknown_shell_is_rejected() {
     );
 }
 
+/// Completion scripts are raw shell source, so `--json` is an incompatible
+/// output mode. The rejection must happen before config resolution, which is
+/// why this deliberately supplies no identity at all.
+#[test]
+fn json_completions_is_rejected_early_without_stdout() {
+    let out = clw_bin()
+        .args(["--json", "completions", "bash"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--json completions must use the standard CLI error exit"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "--json completions must not generate a partial completion script"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--json") && stderr.contains("incompatible"),
+        "the early error must name the --json incompatibility, got: {stderr}"
+    );
+}
+
 #[test]
 fn doctor_json_redacts_the_token_on_this_platform() {
     let cache = TempDir::new().unwrap();

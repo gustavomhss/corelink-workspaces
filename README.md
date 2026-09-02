@@ -186,8 +186,9 @@ through to the next layer instead of using the empty value.
 | `--concurrency` | —                    | —               | `8`                                  |
 
 Global flags are accepted before any subcommand. `--json` emits machine-readable
-JSON on stdout for every command **except `clw run`**, which has no `--json` form
-by design (the wrapped command owns stdout). `--no-color` disables ANSI color;
+JSON on stdout for every data command. `clw run` has no `--json` form because the
+wrapped command owns stdout; `clw completions` rejects `--json` because it emits raw
+shell source rather than JSON. `--no-color` disables ANSI color;
 color is also auto-disabled when `NO_COLOR` is set or stdout is not a TTY.
 `--concurrency` sets the per-invocation CoreLink request ceiling for `snapshot`,
 `hydrate`, `prune`, and `erase` (lower it if you hit rate limits). It is a CLI

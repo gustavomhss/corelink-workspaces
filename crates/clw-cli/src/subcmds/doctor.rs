@@ -218,26 +218,26 @@ fn file_mode(_path: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use clw_types::Config;
-    use std::path::PathBuf;
-
-    fn cfg_with_token(token: &str) -> ResolvedConfig {
-        ResolvedConfig {
+    fn cfg_with_token(token: &str) -> (tempfile::TempDir, ResolvedConfig) {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 tenant: "acme-tenant".to_string(),
                 token: token.to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
             ref_domain_invalid: None,
-        }
+        };
+        (cache, cfg)
     }
 
     #[test]
     fn report_never_leaks_token() {
         let secret = "super-secret-pat-abc123XYZ";
-        let cfg = cfg_with_token(secret);
+        let (_cache, cfg) = cfg_with_token(secret);
         let report = build_report(&cfg);
         assert!(
             !report.contains(secret),
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn report_shows_unset_for_empty_token() {
-        let cfg = cfg_with_token("");
+        let (_cache, cfg) = cfg_with_token("");
         let report = build_report(&cfg);
         assert!(
             report.contains("token:          <unset>"),
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn report_includes_version_and_platform() {
-        let cfg = cfg_with_token("tok");
+        let (_cache, cfg) = cfg_with_token("tok");
         let report = build_report(&cfg);
         assert!(
             report.contains(env!("CARGO_PKG_VERSION")),
@@ -280,16 +280,16 @@ mod tests {
 
     #[test]
     fn report_shows_endpoint_tenant_and_cache() {
-        let cfg = cfg_with_token("tok");
+        let (_cache, cfg) = cfg_with_token("tok");
         let report = build_report(&cfg);
         assert!(report.contains("https://example.com"), "must show endpoint");
         assert!(report.contains("acme-tenant"), "must show tenant value");
-        assert!(report.contains("/tmp/clw-cache"), "must show cache dir");
+        assert!(report.contains("cache dir:"), "must show cache dir");
     }
 
     #[test]
     fn report_points_to_security_md() {
-        let cfg = cfg_with_token("tok");
+        let (_cache, cfg) = cfg_with_token("tok");
         let report = build_report(&cfg);
         assert!(
             report.contains("SECURITY.md"),
@@ -302,7 +302,7 @@ mod tests {
     // credential), so the "redacted" framing no longer over-promises.
     #[test]
     fn report_note_clarifies_only_token_is_redacted() {
-        let cfg = cfg_with_token("tok");
+        let (_cache, cfg) = cfg_with_token("tok");
         let report = build_report(&cfg);
         assert!(
             report.contains("only the token is redacted"),
@@ -326,25 +326,28 @@ mod tests {
     }
 
     /// A config whose endpoint smuggles a `user:pass@` credential.
-    fn cfg_with_userinfo_endpoint() -> ResolvedConfig {
-        ResolvedConfig {
+    fn cfg_with_userinfo_endpoint() -> (tempfile::TempDir, ResolvedConfig) {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://user:s3cret@host.example.com/v1".to_string(),
                 tenant: "acme-tenant".to_string(),
                 token: "tok".to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
             ref_domain_invalid: None,
-        }
+        };
+        (cache, cfg)
     }
 
     // M8 — a `CLW_ENDPOINT=https://user:s3cret@host` must NOT leak its embedded
     // userinfo secret into the doctor text report (which is pasted into tickets).
     #[test]
     fn report_redacts_endpoint_userinfo() {
-        let report = build_report(&cfg_with_userinfo_endpoint());
+        let (_cache, cfg) = cfg_with_userinfo_endpoint();
+        let report = build_report(&cfg);
         assert!(
             !report.contains("s3cret") && !report.contains("user:"),
             "doctor report must NOT leak endpoint userinfo, got:\n{report}"
@@ -358,7 +361,8 @@ mod tests {
     // M8 — same invariant for `doctor --json`.
     #[test]
     fn json_report_redacts_endpoint_userinfo() {
-        let report = build_report_json(&cfg_with_userinfo_endpoint());
+        let (_cache, cfg) = cfg_with_userinfo_endpoint();
+        let report = build_report_json(&cfg);
         assert!(
             !report.contains("s3cret") && !report.contains("user:"),
             "doctor --json must NOT leak endpoint userinfo, got:\n{report}"
@@ -370,7 +374,7 @@ mod tests {
     #[test]
     fn json_report_never_leaks_token() {
         let secret = "super-secret-pat-abc123XYZ";
-        let cfg = cfg_with_token(secret);
+        let (_cache, cfg) = cfg_with_token(secret);
         let report = build_report_json(&cfg);
         assert!(
             !report.contains(secret),
@@ -384,7 +388,7 @@ mod tests {
 
     #[test]
     fn json_report_shows_unset_for_empty_token() {
-        let cfg = cfg_with_token("");
+        let (_cache, cfg) = cfg_with_token("");
         let report = build_report_json(&cfg);
         let v: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(v["token"], "<unset>");
@@ -396,23 +400,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A leniently-resolved, half-configured config: empty tenant + empty token.
-    fn cfg_broken() -> ResolvedConfig {
-        ResolvedConfig {
+    fn cfg_broken() -> (tempfile::TempDir, ResolvedConfig) {
+        let cache = tempfile::TempDir::new().unwrap();
+        let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 tenant: String::new(),
                 token: String::new(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
             ref_domain_invalid: None,
-        }
+        };
+        (cache, cfg)
     }
 
     #[test]
     fn config_problems_reports_missing_tenant_and_token() {
-        let problems = config_problems(&cfg_broken());
+        let (_cache, cfg) = cfg_broken();
+        let problems = config_problems(&cfg);
         assert_eq!(problems.len(), 2, "missing tenant + token = 2 problems");
         assert!(
             problems
@@ -430,13 +437,14 @@ mod tests {
 
     #[test]
     fn config_problems_flags_invalid_tenant() {
+        let cache = tempfile::TempDir::new().unwrap();
         let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 // A path-injection tenant: present but invalid.
                 tenant: "../other".to_string(),
                 token: "tok".to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
@@ -453,12 +461,13 @@ mod tests {
     fn config_problems_flags_invalid_ref_domain() {
         // The lenient path coerces a bad ref-domain to 'user' but records the raw
         // input; `doctor` must SURFACE it as a diagnostic rather than swallow it.
+        let cache = tempfile::TempDir::new().unwrap();
         let cfg = ResolvedConfig {
             clw_config: Config {
                 endpoint: "https://example.com".to_string(),
                 tenant: "acme-tenant".to_string(),
                 token: "tok".to_string(),
-                cache_dir: PathBuf::from("/tmp/clw-cache"),
+                cache_dir: cache.path().to_path_buf(),
             },
             ref_domain: clw_types::RefDomain::User,
             broker: None,
@@ -475,8 +484,9 @@ mod tests {
 
     #[test]
     fn config_problems_empty_for_valid_config() {
+        let (_cache, cfg) = cfg_with_token("tok");
         assert!(
-            config_problems(&cfg_with_token("tok")).is_empty(),
+            config_problems(&cfg).is_empty(),
             "a fully-configured valid config has no problems"
         );
     }
@@ -485,7 +495,8 @@ mod tests {
     fn report_on_broken_config_lists_problems_and_does_not_error() {
         // build_report is the exact value `run` prints; on a broken config it must
         // render the problems section (so doctor can still exit 0 and diagnose).
-        let report = build_report(&cfg_broken());
+        let (_cache, cfg) = cfg_broken();
+        let report = build_report(&cfg);
         assert!(report.contains("problems:"), "must have a problems section");
         assert!(report.contains("tenant"), "must mention the missing tenant");
         assert!(report.contains("token"), "must mention the missing token");
@@ -493,7 +504,8 @@ mod tests {
 
     #[test]
     fn json_report_on_broken_config_carries_problems_array() {
-        let report = build_report_json(&cfg_broken());
+        let (_cache, cfg) = cfg_broken();
+        let report = build_report_json(&cfg);
         let v: serde_json::Value = serde_json::from_str(&report).unwrap();
         let problems = v["problems"].as_array().expect("problems must be an array");
         assert_eq!(problems.len(), 2, "missing tenant + token");

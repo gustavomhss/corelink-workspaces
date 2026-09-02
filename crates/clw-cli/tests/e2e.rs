@@ -4564,6 +4564,38 @@ async fn cred_ticket_early_exit_commands_do_not_redeem() {
     }
 }
 
+/// An incompatible `--json completions` invocation must reject before both
+/// script rendering and C2c ticket redemption. This is intentionally distinct
+/// from the successful-completions case above: a future reordering must not
+/// burn a single-use ticket merely to report an output-mode error.
+#[tokio::test]
+async fn cred_ticket_json_completions_rejects_without_redeeming() {
+    let server = MockServer::start().await;
+    mount_cred_ticket_success(&server).await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+
+    let out = clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args(["--json", "completions", "bash"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--json completions must reject with the standard CLI error exit"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "--json completions must not emit a generated script"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--json") && stderr.contains("incompatible"),
+        "the error must name the --json incompatibility, got: {stderr}"
+    );
+    assert_cred_ticket_redeems(&server, 0, "--json completions").await;
+}
+
 /// Happy path: a network command with CLW_CRED_TICKET (no CLW_TOKEN) redeems the ticket
 /// at the fabric endpoint, receives a cas_pat, and uses it for the operation.
 #[tokio::test]

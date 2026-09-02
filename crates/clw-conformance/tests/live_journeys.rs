@@ -24,6 +24,10 @@
 //! real-fabric cred-ticket (`CLW_CRED_TICKET`+`CLW_LEASE_ID`+`CLW_FABRIC_ENDPOINT`),
 //! and the DESTRUCTIVE erase/prune journeys (`CLW_LIVE_ERASE_TENANT/_TOKEN` — a
 //! THROWAWAY tenant the suite fully owns and wipes). Replica-lag needs a server hook.
+//! Once all three cred-ticket variables are supplied, redemption is fail-closed:
+//! only the redeemer's exact HTTP 410 "already consumed or expired" result is a
+//! soft skip. Authentication, other HTTP, parse, and transport failures are test
+//! failures, never evidence that the optional fabric is merely unwired.
 //!
 //! # Destructive safety
 //! The primary/team journeys only ever touch the unique `ws-<suffix>` names they
@@ -527,6 +531,35 @@ fn soft_skip(reason: &str) {
     eprintln!("SKIPPED (soft — needs dedicated infra): {reason}");
 }
 
+/// The redeemer currently preserves a non-success status inside this deliberately
+/// terse `Transport` message so it never echoes a broker response body. Keep the
+/// live-suite exception exact: accepting a substring such as `"410"` would make a
+/// future diagnostic or unrelated transport failure look like an expired ticket.
+const REDEEM_HTTP_410_EXPIRED: &str = "cred-ticket redemption failed: HTTP 410 (fail-closed; no CLW_TOKEN fallback in the runner ref-domain)";
+
+/// What the live journey may do after a cred-ticket redemption error.
+///
+/// A supplied ticket means the fabric was deliberately selected, so errors are
+/// fail-closed. The sole documented exception is its single-use HTTP 410 response.
+/// Support `ClwError::Http { status: 410, .. }` as well as the current redacted
+/// transport representation, so changing the client to preserve status structure
+/// cannot accidentally turn an expired ticket into a hard-to-diagnose failure.
+#[derive(Debug, Eq, PartialEq)]
+enum RedeemFailureDisposition {
+    AlreadyConsumedOrExpired,
+    FailClosed,
+}
+
+fn classify_redeem_failure(error: &ClwError) -> RedeemFailureDisposition {
+    match error {
+        ClwError::Http { status: 410, .. } => RedeemFailureDisposition::AlreadyConsumedOrExpired,
+        ClwError::Transport(message) if message == REDEEM_HTTP_410_EXPIRED => {
+            RedeemFailureDisposition::AlreadyConsumedOrExpired
+        }
+        _ => RedeemFailureDisposition::FailClosed,
+    }
+}
+
 /// A `(tenant, token)` pair from two env vars, or `None` if either is unset/empty.
 #[cfg(unix)]
 fn env_pair(tenant_var: &str, token_var: &str) -> Option<(String, String)> {
@@ -732,8 +765,10 @@ async fn concurrent_distinct_snapshots_share_cas_without_corruption() {
 // ===========================================================================
 
 /// JOURNEY — redeem a single-use cred-ticket against the REAL fabric at boot, then
-/// prove the redeemed CAS PAT authenticates against live prod. Soft-skips unless the
-/// real trio (`CLW_CRED_TICKET`+`CLW_LEASE_ID`+`CLW_FABRIC_ENDPOINT`) is provided.
+/// prove the redeemed CAS PAT authenticates against live prod. Soft-skips only when
+/// the real trio (`CLW_CRED_TICKET`+`CLW_LEASE_ID`+`CLW_FABRIC_ENDPOINT`) is absent;
+/// after an attempted redemption, only exact HTTP 410 (already consumed/expired)
+/// soft-skips. Every other redemption failure is fail-closed.
 #[tokio::test]
 async fn cred_ticket_redeems_against_the_real_fabric() {
     let (Some(ticket), Some(lease), Some(fabric)) = (
@@ -755,11 +790,14 @@ async fn cred_ticket_redeems_against_the_real_fabric() {
 
     let pat = match redeem_cred_ticket(&fabric, &lease, &ticket).await {
         Ok(p) => p,
-        Err(e) => {
-            return soft_skip(&format!(
-                "redeem failed (the ticket may be burned/expired): {e}"
-            ))
-        }
+        Err(error) => match classify_redeem_failure(&error) {
+            RedeemFailureDisposition::AlreadyConsumedOrExpired => {
+                return soft_skip("cred-ticket redemption returned exact HTTP 410 (already consumed or expired)");
+            }
+            RedeemFailureDisposition::FailClosed => panic!(
+                "cred-ticket redemption failed fail-closed; only an exact HTTP 410 already-consumed/expired response may soft-skip"
+            ),
+        },
     };
     // The redeemed CAS PAT must authenticate against live prod (not 401).
     let client = client_for(&tenant, &pat);
@@ -770,6 +808,72 @@ async fn cred_ticket_redeems_against_the_real_fabric() {
             return soft_skip(&format!("list_refs backend-unavailable ({e})"))
         }
         Err(e) => panic!("the redeemed CAS PAT failed to authenticate against prod: {e}"),
+    }
+}
+
+#[test]
+fn redeem_failure_classifier_is_fail_closed_except_exact_410() {
+    let cases = [
+        (
+            "structured HTTP 410",
+            ClwError::Http {
+                status: 410,
+                context: "cred-ticket redemption".to_string(),
+            },
+            RedeemFailureDisposition::AlreadyConsumedOrExpired,
+        ),
+        (
+            "current redacted HTTP 410 representation",
+            ClwError::Transport(REDEEM_HTTP_410_EXPIRED.to_string()),
+            RedeemFailureDisposition::AlreadyConsumedOrExpired,
+        ),
+        (
+            "HTTP 410 text with extra diagnostic is not exact",
+            ClwError::Transport(format!("{REDEEM_HTTP_410_EXPIRED}; retry later")),
+            RedeemFailureDisposition::FailClosed,
+        ),
+        (
+            "HTTP 401",
+            ClwError::Http {
+                status: 401,
+                context: "cred-ticket redemption".to_string(),
+            },
+            RedeemFailureDisposition::FailClosed,
+        ),
+        (
+            "HTTP 404",
+            ClwError::Http {
+                status: 404,
+                context: "cred-ticket redemption".to_string(),
+            },
+            RedeemFailureDisposition::FailClosed,
+        ),
+        (
+            "HTTP 500",
+            ClwError::Http {
+                status: 500,
+                context: "cred-ticket redemption".to_string(),
+            },
+            RedeemFailureDisposition::FailClosed,
+        ),
+        (
+            "transport error",
+            ClwError::Transport("cred-ticket redemption transport error".to_string()),
+            RedeemFailureDisposition::FailClosed,
+        ),
+        (
+            "parse/configuration error",
+            ClwError::Config("invalid cred-ticket response".to_string()),
+            RedeemFailureDisposition::FailClosed,
+        ),
+    ];
+
+    for (name, error, expected) in cases {
+        assert_eq!(
+            classify_redeem_failure(&error),
+            expected,
+            "{name} must retain the frozen redeem disposition"
+        );
     }
 }
 

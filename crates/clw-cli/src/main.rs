@@ -186,7 +186,7 @@ pub enum Commands {
     Auth(subcmds::auth::AuthArgs),
     /// Remove clw's on-disk footprint (config + PAT, cache).
     Uninstall(subcmds::uninstall::UninstallArgs),
-    /// Generate a shell-completion script (bash|zsh|fish|powershell|elvish).
+    /// Generate a shell-completion script (bash|zsh|fish|powershell|elvish; incompatible with --json).
     Completions(subcmds::completions::CompletionsArgs),
 }
 
@@ -470,6 +470,16 @@ async fn run_main() {
     // config resolution so a fresh user (no config, no token) can still generate
     // completions. (It is a pure offline reflection of the clap surface.)
     if let Commands::Completions(args) = cli.command {
+        // A completion script is deliberately raw shell source, not a clw data
+        // report. Reject `--json` before rendering anything (and, crucially,
+        // before config or C2c credential-ticket resolution) rather than
+        // silently ignoring a global output-mode request.
+        if cli.json {
+            eprintln!(
+                "error: --json is incompatible with `completions`; completion scripts are not JSON"
+            );
+            std::process::exit(2);
+        }
         if let Err(e) = subcmds::completions::run(args).await {
             exit_err(&e);
         }
@@ -1084,6 +1094,13 @@ mod tests {
                 "completions {shell} must parse"
             );
         }
+    }
+
+    #[test]
+    fn parse_json_completions_preserves_the_global_flag_for_early_rejection() {
+        let cli = Cli::try_parse_from(["clw", "--json", "completions", "bash"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Commands::Completions(_)));
     }
 
     #[test]

@@ -81,6 +81,7 @@ cred-ticket-64KiB C.
 config precedence C (CORELINK-vs-file **G**) · missing/unreadable/over-permissive/corrupt C · parser+proptests C ·
 lenient-vs-strict C · tenant-validation C (control-char P) · tilde C. **auth**: login/logout/whoami C ·
 **logout-`--json` no-op shapes G** · rotate C. **cred-ticket**: happy C · no-static-fallback C · 410 C ·
+live redeem soft-skip is **exact-410-only** C (all other redeem errors fail closed) ·
 **401/404-distinct P** · **transport-error-fail-closed G** · **both-ticket+token→no-fallback P** · missing-lease/
 fabric C · lease-injection C · 64KiB C. **runner keyspace**: disjoint C · other-value→exit2 **P (no e2e)**.
 **init**: 0600/0700/preserve C · **already-exists/`--force` behavior G**. **doctor**: problems/redaction C.

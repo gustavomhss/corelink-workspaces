@@ -79,14 +79,7 @@ async fn run_one(name: &str, cfg: ResolvedConfig, json: bool) -> Result<(), ClwE
         .map_or_else(|| "none".to_string(), |d| d.to_hex());
 
     if json {
-        let out = json!({
-            "name": record.name,
-            "root": record.root.to_hex(),
-            "created_at_unix": record.created_at_unix,
-            "parent": record.parent.map(|d| d.to_hex()),
-            "files": file_count,
-            "bytes": manifest.total_size,
-        });
+        let out = build_one_json(&record, file_count, manifest.total_size);
         println!("{out}");
     } else {
         println!("name:         {}", record.name);
@@ -232,32 +225,9 @@ async fn run_all(cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
     }
 
     if json {
-        let arr: Vec<_> = rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "name": r.name,
-                    "root": r.root.to_hex(),
-                    "created_at_unix": r.created_at_unix,
-                    "parent": r.parent.map(|d| d.to_hex()),
-                })
-            })
-            .collect();
-        let errors: Vec<_> = skipped
-            .iter()
-            .map(|(key, err)| json!({ "ref_key": key, "error": err }))
-            .collect();
         println!(
             "{}",
-            json!({
-                "tenant": tenant,
-                "count": rows.len(),
-                "refs": arr,
-                "run_cache_entries": run_cache,
-                "foreign_ac_entries": foreign,
-                "skipped": errors.len(),
-                "errors": errors,
-            })
+            build_all_json(&tenant, &rows, &skipped, run_cache, foreign)
         );
     } else if rows.is_empty() && skipped.is_empty() && run_cache == 0 && foreign == 0 {
         println!("no refs for tenant '{tenant}'");
@@ -347,12 +317,70 @@ fn capability_unavailable(json: bool, capability: &str, dep: &str) -> Result<(),
         "{capability} failed: corelink-server capability {dep} is LIVE but returned 405/501 — likely a server-side regression; retry or escalate (see docs/RELAY-server-D1-D7-D8.md)"
     );
     if json {
-        println!(
-            "{}",
-            json!({ "error": "capability-unavailable", "note": msg })
-        );
+        println!("{}", build_capability_unavailable_json(&msg));
     }
     Err(ClwError::Transport(msg))
+}
+
+/// Build the single-reference JSON response.
+///
+/// `bytes` is retained as the legacy field for the current deprecation cycle;
+/// new callers should read `bytes_total`. Keeping this in one production builder
+/// lets the versioned JSON-contract golden exercise the exact emitted value.
+pub(crate) fn build_one_json(
+    record: &RefRecord,
+    file_count: usize,
+    bytes_total: u64,
+) -> serde_json::Value {
+    json!({
+        "name": record.name,
+        "root": record.root.to_hex(),
+        "created_at_unix": record.created_at_unix,
+        "parent": record.parent.map(|d| d.to_hex()),
+        "files": file_count,
+        "bytes": bytes_total,
+        "bytes_total": bytes_total,
+    })
+}
+
+/// Build the aggregate `ls --all` JSON response from its real listing outcomes.
+pub(crate) fn build_all_json(
+    tenant: &str,
+    rows: &[RefRecord],
+    skipped: &[(String, String)],
+    run_cache: usize,
+    foreign: usize,
+) -> serde_json::Value {
+    let refs: Vec<_> = rows
+        .iter()
+        .map(|record| {
+            json!({
+                "name": record.name,
+                "root": record.root.to_hex(),
+                "created_at_unix": record.created_at_unix,
+                "parent": record.parent.map(|digest| digest.to_hex()),
+            })
+        })
+        .collect();
+    let errors: Vec<_> = skipped
+        .iter()
+        .map(|(key, error)| json!({ "ref_key": key, "error": error }))
+        .collect();
+
+    json!({
+        "tenant": tenant,
+        "count": rows.len(),
+        "refs": refs,
+        "run_cache_entries": run_cache,
+        "foreign_ac_entries": foreign,
+        "skipped": errors.len(),
+        "errors": errors,
+    })
+}
+
+/// Build the structured failure note emitted before `ls --all` returns an error.
+pub(crate) fn build_capability_unavailable_json(message: &str) -> serde_json::Value {
+    json!({ "error": "capability-unavailable", "note": message })
 }
 
 // ---------------------------------------------------------------------------
@@ -366,16 +394,20 @@ mod tests {
 
     #[test]
     fn ls_json_shape_matches_spec() {
-        // Verify the JSON shape has the correct keys per spec:
-        // {name, root, created_at_unix, parent, files, bytes}
-        let out = json!({
-            "name": "my-ws",
-            "root": "a".repeat(64),
-            "created_at_unix": 1_700_000_000_u64,
-            "parent": serde_json::Value::Null,
-            "files": 3_u64,
-            "bytes": 1024_u64,
-        });
+        // Exercise the production builder: both spellings are deliberately
+        // present through the `bytes` deprecation cycle.
+        let out = build_one_json(
+            &RefRecord {
+                name: "my-ws".to_string(),
+                root: Digest::of_bytes(b"root"),
+                manifest_size: 0,
+                created_at_unix: 1_700_000_000,
+                parent: None,
+                tool_version: "test".to_string(),
+            },
+            3,
+            1024,
+        );
         assert!(out.get("name").is_some(), "must have 'name'");
         assert!(out.get("root").is_some(), "must have 'root'");
         assert!(
@@ -385,6 +417,11 @@ mod tests {
         assert!(out.get("parent").is_some(), "must have 'parent'");
         assert!(out.get("files").is_some(), "must have 'files'");
         assert!(out.get("bytes").is_some(), "must have 'bytes'");
+        assert!(
+            out.get("bytes_total").is_some(),
+            "must have preferred 'bytes_total'"
+        );
+        assert_eq!(out["bytes"], out["bytes_total"]);
     }
 
     #[test]

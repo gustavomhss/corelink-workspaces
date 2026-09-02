@@ -122,16 +122,7 @@ pub async fn run(
     }
 
     if json {
-        let out = json!({
-            "name": args.name,
-            "root": report.root.to_hex(),
-            "files": report.files,
-            "bytes_total": report.bytes_total,
-            "chunks_total": report.chunks_total,
-            "chunks_uploaded": report.chunks_uploaded,
-            "unchanged": report.unchanged,
-            "skipped_external_symlinks": report.skipped_external_symlinks,
-        });
+        let out = build_success_json(&args.name, &report);
         println!("{out}");
     } else if report.unchanged {
         println!(
@@ -156,6 +147,28 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Build the successful snapshot JSON response from the completed report.
+///
+/// `secret_warnings` is the advisory list already computed by `clw-snapshot`
+/// and printed to stderr for people. Exposing the same list in JSON avoids a
+/// machine caller silently missing that signal; a clean tree emits `[]`.
+pub(crate) fn build_success_json(
+    name: &str,
+    report: &clw_snapshot::SnapshotReport,
+) -> serde_json::Value {
+    json!({
+        "name": name,
+        "root": report.root.to_hex(),
+        "files": report.files,
+        "bytes_total": report.bytes_total,
+        "chunks_total": report.chunks_total,
+        "chunks_uploaded": report.chunks_uploaded,
+        "unchanged": report.unchanged,
+        "secret_warnings": report.secret_warnings,
+        "skipped_external_symlinks": report.skipped_external_symlinks,
+    })
 }
 
 /// FIX 7: cheap presence check for a root-level ignore file (`.gitignore` /

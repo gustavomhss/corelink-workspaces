@@ -92,6 +92,17 @@ The family-relevant verbs support `--json` for machine parsing (content-address 
 hit/miss, byte counts). Pin against the documented fields in `docs/usage.md`; fields are additive
 within the `v0.1.0` line.
 
+### G2 additive compatibility policy
+
+Top-level keys in an existing JSON object are additive for the current deprecation
+cycle: a release may add a key, but must not remove or rename an existing one. The versioned
+`json_contract_v1_top_level_keys` golden verifies the real `snapshot`, `ls --name`, and
+`ls --all` builders changed in the current compatibility slice (including `ls --all`'s structured
+capability failure). It deliberately does not impose an artificial shared schema on unrelated
+commands; expanding the inventory is tracked as a separate, low-risk refactor. `run` is excluded
+because it intentionally proxies the child's streams and has no JSON document; `completions` is
+excluded because its result is a shell script, not JSON.
+
 ## Ref namespacing — **FROZEN (2026-06-16)**
 
 The frozen runners seam selects one of two domain separators in

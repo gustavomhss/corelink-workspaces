@@ -13,3 +13,6 @@ pub mod run;
 pub mod snapshot;
 pub mod status;
 pub mod uninstall;
+
+#[cfg(test)]
+mod json_contract;

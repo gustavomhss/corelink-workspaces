@@ -454,7 +454,8 @@ rm ./target/release/clw
 
 `clw completions <shell>` prints a completion script to stdout for one of `bash`,
 `zsh`, `fish`, `powershell`, or `elvish`. Redirect or source it per your shell's
-convention.
+convention. It is raw shell source, not a JSON data command: `clw --json completions
+<shell>` is rejected with exit 2 before configuration or credential resolution.
 
 ```sh
 # bash — source into the current shell (add to ~/.bashrc to persist):
@@ -480,10 +481,11 @@ clw completions elvish > ~/.config/elvish/lib/clw-completions.elv
 - **`--no-color`** disables ANSI color in human-readable output. Color is also
   auto-disabled when the `NO_COLOR` env var is set (https://no-color.org) or when
   stdout is not a TTY (a pipe, a file, or a `--json` consumer).
-- **`--json`** emits machine-readable JSON on stdout for every command **except
-  `clw run`**. `run` has no `--json` form by design: the wrapped command owns
-  stdout, so clw must not interleave its own JSON there. Errors always go to
-  stderr regardless of `--json`.
+- **`--json`** emits machine-readable JSON on stdout for every data command.
+  `clw run` has no JSON payload by design because its child owns stdout; it emits
+  an stderr hint when `--json` is passed. `clw completions` emits raw shell source,
+  so `--json` is incompatible and exits 2 without generating a script. Errors
+  always go to stderr regardless of `--json`.
 
 ```sh
 clw --no-color status --name myapp-dev
