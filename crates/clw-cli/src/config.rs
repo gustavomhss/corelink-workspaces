@@ -131,14 +131,14 @@ impl ResolvedConfig {
             .endpoint
             .clone()
             .or_else(|| corelink_env("CORELINK_ENDPOINT"))
-            .or_else(|| file_cfg.get("endpoint").cloned())
+            .or_else(|| config_file_value(&file_cfg, "endpoint").map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
         let tenant = cli_opts
             .tenant
             .clone()
             .or_else(|| corelink_env("CORELINK_TENANT"))
-            .or_else(|| file_cfg.get("tenant").cloned())
+            .or_else(|| config_file_value(&file_cfg, "tenant").map(str::to_owned))
             .ok_or_else(|| {
                 ClwError::Config(
                     "missing tenant: set --tenant, CLW_TENANT/CORELINK_TENANT, or add tenant to ~/.clw/config.toml"
@@ -155,7 +155,7 @@ impl ResolvedConfig {
         let cache_dir_str = cli_opts
             .cache_dir
             .clone()
-            .or_else(|| file_cfg.get("cache_dir").cloned())
+            .or_else(|| config_file_value(&file_cfg, "cache_dir").map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
 
         let cache_dir = expand_tilde(&cache_dir_str);
@@ -164,7 +164,7 @@ impl ResolvedConfig {
             cli_opts
                 .ref_domain
                 .as_deref()
-                .or_else(|| file_cfg.get("ref_domain").map(String::as_str)),
+                .or_else(|| config_file_value(&file_cfg, "ref_domain")),
         )?;
 
         // Credential resolution. Default path (user/check/hermetic, OR a runner
@@ -186,7 +186,7 @@ impl ResolvedConfig {
                     .token
                     .clone()
                     .or_else(|| corelink_env("CORELINK_TOKEN"))
-                    .or_else(|| file_cfg.get("token").cloned())
+                    .or_else(|| config_file_value(&file_cfg, "token").map(str::to_owned))
                     .ok_or_else(|| {
                         ClwError::Config(
                             "missing token: set --token, CLW_TOKEN/CORELINK_TOKEN, or add token to ~/.clw/config.toml"
@@ -252,7 +252,7 @@ impl ResolvedConfig {
             .endpoint
             .clone()
             .or_else(|| corelink_env("CORELINK_ENDPOINT"))
-            .or_else(|| file_cfg.get("endpoint").cloned())
+            .or_else(|| config_file_value(&file_cfg, "endpoint").map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
         // Missing tenant/token => empty string (reported as <unset> by the
@@ -261,20 +261,20 @@ impl ResolvedConfig {
             .tenant
             .clone()
             .or_else(|| corelink_env("CORELINK_TENANT"))
-            .or_else(|| file_cfg.get("tenant").cloned())
+            .or_else(|| config_file_value(&file_cfg, "tenant").map(str::to_owned))
             .unwrap_or_default();
 
         let token = cli_opts
             .token
             .clone()
             .or_else(|| corelink_env("CORELINK_TOKEN"))
-            .or_else(|| file_cfg.get("token").cloned())
+            .or_else(|| config_file_value(&file_cfg, "token").map(str::to_owned))
             .unwrap_or_default();
 
         let cache_dir_str = cli_opts
             .cache_dir
             .clone()
-            .or_else(|| file_cfg.get("cache_dir").cloned())
+            .or_else(|| config_file_value(&file_cfg, "cache_dir").map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
 
         // Local-only commands don't touch refs; a bad value here must not error
@@ -283,7 +283,7 @@ impl ResolvedConfig {
         let raw_ref_domain = cli_opts
             .ref_domain
             .clone()
-            .or_else(|| file_cfg.get("ref_domain").cloned());
+            .or_else(|| config_file_value(&file_cfg, "ref_domain").map(str::to_owned));
         let (ref_domain, ref_domain_invalid) = match parse_ref_domain(raw_ref_domain.as_deref()) {
             Ok(d) => (d, None),
             Err(_) => (RefDomain::User, raw_ref_domain),
@@ -317,7 +317,7 @@ impl ResolvedConfig {
         let cache_dir_str = cli_opts
             .cache_dir
             .clone()
-            .or_else(|| file_cfg.get("cache_dir").cloned())
+            .or_else(|| config_file_value(&file_cfg, "cache_dir").map(str::to_owned))
             .unwrap_or_else(|| DEFAULT_CACHE_DIR.to_string());
         expand_tilde(&cache_dir_str)
     }
@@ -334,6 +334,19 @@ impl ResolvedConfig {
 /// namespace (server D-9 dispatch-time env injection).
 fn corelink_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Return a config-file value only when it contains a non-whitespace character.
+///
+/// `parse_config_lines` deliberately retains every parsed key and its exact value
+/// (including an empty or whitespace-only value), so that config rewrites can
+/// preserve unknown and currently unusable settings. Resolution is the sole
+/// boundary that treats a blank value for one of the five global settings as
+/// absent, allowing the next precedence layer or its default/missing behavior to
+/// apply.
+fn config_file_value<'a>(map: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    map.get(key)
+        .and_then(|value| (!value.trim().is_empty()).then_some(value.as_str()))
 }
 
 /// Decide the credential path from the resolved ref-domain and the (optionally
@@ -1756,6 +1769,169 @@ cache_dir = "~/.clw/cache"
     fn m12_cli() -> crate::Cli {
         use clap::Parser as _;
         crate::Cli::try_parse_from(["clw", "ls", "--name", "ws"]).unwrap()
+    }
+
+    const FILE_GLOBALS: [(&str, &str); 5] = [
+        ("endpoint", "https://file.example.test"),
+        ("tenant", "file-tenant"),
+        ("token", "file-token"),
+        ("cache_dir", "/file/cache"),
+        ("ref_domain", "runner"),
+    ];
+
+    fn config_with_global(key_to_replace: &str, replacement: &str) -> String {
+        FILE_GLOBALS
+            .iter()
+            .map(|(key, value)| {
+                let value = if *key == key_to_replace {
+                    replacement
+                } else {
+                    value
+                };
+                format!("{key} = \"{value}\"\n")
+            })
+            .collect()
+    }
+
+    fn assert_file_globals(resolved: ResolvedConfig) {
+        assert_eq!(resolved.clw_config.endpoint, "https://file.example.test");
+        assert_eq!(resolved.clw_config.tenant, "file-tenant");
+        assert_eq!(resolved.clw_config.token, "file-token");
+        assert_eq!(resolved.clw_config.cache_dir, PathBuf::from("/file/cache"));
+        assert_eq!(resolved.ref_domain, RefDomain::Runner);
+    }
+
+    #[test]
+    fn config_parser_retains_blank_global_values_for_later_rewrite() {
+        // Resolution, not parsing, gives blank values their absent semantics. In
+        // particular, the parser must retain their keys for a future writer.
+        for blank in ["", " \t "] {
+            for (key, _) in FILE_GLOBALS {
+                let mut parsed = HashMap::new();
+                parse_config_lines(&config_with_global(key, blank), &mut parsed);
+                assert_eq!(parsed.get(key).map(String::as_str), Some(blank), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn nonblank_file_globals_resolve_in_strict_lenient_and_cache_only_paths() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        write_config_file(tmp.path(), &config_with_global("unused", "unused"));
+
+        assert_file_globals(ResolvedConfig::resolve(&m12_cli()).unwrap());
+        assert_file_globals(ResolvedConfig::resolve_lenient(&m12_cli()));
+        assert_eq!(
+            ResolvedConfig::resolve_cache_dir_lenient(&m12_cli()),
+            PathBuf::from("/file/cache")
+        );
+    }
+
+    #[test]
+    fn blank_file_globals_are_absent_in_strict_resolution() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+
+        for blank in ["", " \t "] {
+            for (key, _) in FILE_GLOBALS {
+                write_config_file(tmp.path(), &config_with_global(key, blank));
+                match key {
+                    "endpoint" => assert_eq!(
+                        ResolvedConfig::resolve(&m12_cli())
+                            .unwrap()
+                            .clw_config
+                            .endpoint,
+                        DEFAULT_ENDPOINT
+                    ),
+                    "tenant" => assert!(matches!(
+                        ResolvedConfig::resolve(&m12_cli()),
+                        Err(ClwError::Config(message)) if message.starts_with("missing tenant:")
+                    )),
+                    "token" => assert!(matches!(
+                        ResolvedConfig::resolve(&m12_cli()),
+                        Err(ClwError::Config(message)) if message.starts_with("missing token:")
+                    )),
+                    "cache_dir" => assert_eq!(
+                        ResolvedConfig::resolve(&m12_cli())
+                            .unwrap()
+                            .clw_config
+                            .cache_dir,
+                        tmp.path().join(".clw").join("cache")
+                    ),
+                    "ref_domain" => assert_eq!(
+                        ResolvedConfig::resolve(&m12_cli()).unwrap().ref_domain,
+                        RefDomain::User
+                    ),
+                    _ => unreachable!("FILE_GLOBALS contains only supported globals"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blank_file_globals_are_absent_in_lenient_and_cache_only_resolution() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+
+        for blank in ["", " \t "] {
+            for (key, _) in FILE_GLOBALS {
+                write_config_file(tmp.path(), &config_with_global(key, blank));
+                let resolved = ResolvedConfig::resolve_lenient(&m12_cli());
+                match key {
+                    "endpoint" => assert_eq!(resolved.clw_config.endpoint, DEFAULT_ENDPOINT),
+                    "tenant" => assert!(resolved.clw_config.tenant.is_empty()),
+                    "token" => assert!(resolved.clw_config.token.is_empty()),
+                    "cache_dir" => {
+                        assert_eq!(
+                            resolved.clw_config.cache_dir,
+                            tmp.path().join(".clw").join("cache")
+                        );
+                        assert_eq!(
+                            ResolvedConfig::resolve_cache_dir_lenient(&m12_cli()),
+                            tmp.path().join(".clw").join("cache")
+                        );
+                    }
+                    "ref_domain" => {
+                        assert_eq!(resolved.ref_domain, RefDomain::User);
+                        assert_eq!(resolved.ref_domain_invalid, None);
+                    }
+                    _ => unreachable!("FILE_GLOBALS contains only supported globals"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nonblank_cli_globals_still_beat_file_globals() {
+        use clap::Parser as _;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, _cred, tmp) = m12_env();
+        write_config_file(tmp.path(), &config_with_global("unused", "unused"));
+
+        let cli = crate::Cli::try_parse_from([
+            "clw",
+            "--endpoint",
+            "https://cli.example.test",
+            "--tenant",
+            "cli-tenant",
+            "--token",
+            "cli-token",
+            "--cache-dir",
+            "/cli/cache",
+            "--ref-domain",
+            "user",
+            "ls",
+            "--name",
+            "ws",
+        ])
+        .unwrap();
+        let resolved = ResolvedConfig::resolve(&cli).unwrap();
+        assert_eq!(resolved.clw_config.endpoint, "https://cli.example.test");
+        assert_eq!(resolved.clw_config.tenant, "cli-tenant");
+        assert_eq!(resolved.clw_config.token, "cli-token");
+        assert_eq!(resolved.clw_config.cache_dir, PathBuf::from("/cli/cache"));
+        assert_eq!(resolved.ref_domain, RefDomain::User);
     }
 
     #[test]
