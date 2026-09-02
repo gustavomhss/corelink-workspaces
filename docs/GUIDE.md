@@ -511,7 +511,7 @@ Examples: `clw completions bash > ~/.local/share/bash-completion/completions/clw
 | `CLW_CACHE_BUDGET_BYTES` | Local cache eviction budget (bytes) | `8589934592` (8 GiB) | A raw byte count. Unset/`0`/invalid → default. Raise it for a working set > 8 GiB; lower it on a disk-tight machine. |
 | `CLW_REF_DOMAIN` | Ref keyspace | `user` | `user` \| `runner`; other values → exit 2. |
 | `CLW_OP_DEADLINE_SECS` | Overall per-op deadline (across all retries) | `300` (5 min) | Clamped to 24h; `0`/invalid → default. |
-| `CLW_CRED_TICKET` + `CLW_LEASE_ID` + `CLW_FABRIC_ENDPOINT` | C2c single-use runner credential trio | — | Only in `runner` ref-domain; ticket is redeemed once at boot. |
+| `CLW_CRED_TICKET` + `CLW_LEASE_ID` + `CLW_FABRIC_ENDPOINT` | C2c single-use runner credential trio | — | Only in `runner` ref-domain; a CAS/AC command redeems the ticket once before dispatch. |
 | `NO_COLOR` | Disable color | unset | Presence only. |
 | `RUST_LOG` | Log level/filter (stderr) | unset | **Overrides** `-v`/`-q`. |
 | `HOME` / `USERPROFILE` | Home dir (config path, `~` expansion) | — | |
@@ -602,11 +602,13 @@ on the `run` path). It is a **billing** limit on your CoreLink account, not a cl
 - **Where the PAT lives:** in `CLW_TOKEN`/config; the config file is 0600; the token is redacted in every
   log, `doctor`, `whoami`, and `Debug`.
 - **C2c cred-ticket (runner mode):** instead of a PAT, the runner fabric injects a **single-use**
-  `CLW_CRED_TICKET` (+ `CLW_LEASE_ID` + `CLW_FABRIC_ENDPOINT`). At trusted boot — before any untrusted
-  `clw run` child execs — clw redeems it **once** (`POST {fabric}/v1/leases/{lease}/cas-cred` → `{cas_pat}`)
+  `CLW_CRED_TICKET` (+ `CLW_LEASE_ID` + `CLW_FABRIC_ENDPOINT`). Before dispatching a CAS/AC command —
+  and before any untrusted `clw run` child execs — clw redeems it **once**
+  (`POST {fabric}/v1/leases/{lease}/cas-cred` → `{cas_pat}`)
   and keeps the PAT in memory only. **Fail-closed:** any non-2xx (410 reused / 401 bad / 404 unknown) or
-  transport error fails; there is **no fallback to `CLW_TOKEN`**. A no-network command (doctor, whoami,
-  logout, uninstall) never redeems, so it can't burn the ticket.
+  transport error fails; there is **no fallback to `CLW_TOKEN`**. Local/auth commands (`init`, `doctor`,
+  `auth login`, `auth logout`, `auth whoami`, `auth rotate`, `uninstall`) and early-exit commands
+  (`completions`, `--help`, `--version`) never redeem, so they cannot burn the ticket.
 - **Runner keyspace:** `CLW_REF_DOMAIN=runner` selects `clw/ref/runner/v1/`, **disjoint by construction**
   from the user keyspace `clw/ref/v1/` — a user client can never reach a runner ref, for any name.
 

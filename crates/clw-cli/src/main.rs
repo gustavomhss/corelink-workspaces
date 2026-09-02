@@ -371,16 +371,36 @@ fn command_runs_on_broken_config(cmd: &Commands) -> bool {
 
 /// Whether `cmd` should redeem the C2c credential (`CLW_CRED_TICKET`) at boot.
 ///
-/// The ticket is **single-use** — redeeming it burns it — so ONLY commands that
-/// actually make a CAS/AC network call may redeem. A no-network diagnostic
-/// (`doctor`/`auth whoami`/`auth logout`) or the cleanup path (`uninstall`) must
-/// NOT redeem, or it would consume the ticket the real `snapshot`/`hydrate`/`run`
-/// workload needs (leaving that workload to fail-closed on the fabric's `410`).
-/// (`completions` never reaches credential resolution — it returns earlier.)
+/// The ticket is **single-use** — redeeming it burns it — so this is an explicit
+/// allowlist of ONLY the commands that make CAS/AC network calls. Every local,
+/// auth, and completion command must remain false: notably, `init`, `auth login`,
+/// and `auth rotate` must not persist a redeemed short-lived PAT. (`completions`
+/// never reaches credential resolution — it returns earlier.)
 /// This is a no-op off the broker path (`resolve_credential` does nothing when no
 /// ticket was injected), so it only matters in the runner ref-domain.
 fn command_redeems_credential(cmd: &Commands) -> bool {
-    !command_runs_on_broken_config(cmd) && !matches!(cmd, Commands::Uninstall(_))
+    use subcmds::auth::AuthCommand;
+
+    match cmd {
+        Commands::Snapshot(_)
+        | Commands::Hydrate(_)
+        | Commands::Status(_)
+        | Commands::Run(_)
+        | Commands::Ls(_)
+        | Commands::Rm(_)
+        | Commands::Prune(_)
+        | Commands::Erase(_) => true,
+        Commands::Auth(auth) => match &auth.command {
+            AuthCommand::Login
+            | AuthCommand::Logout(_)
+            | AuthCommand::Whoami
+            | AuthCommand::Rotate => false,
+        },
+        Commands::Init(_)
+        | Commands::Doctor(_)
+        | Commands::Uninstall(_)
+        | Commands::Completions(_) => false,
+    }
 }
 
 /// What to do when STRICT config resolution fails, decided purely from the command.
@@ -668,19 +688,29 @@ mod tests {
         assert_eq!(classify_resolve_failure(&ls.command), ResolveFailure::Fatal);
     }
 
-    // C2c (cold-review B1): the single-use cred ticket must be redeemed ONLY by a
-    // command that makes a CAS/AC call — a no-network diagnostic (or uninstall)
-    // must NOT redeem and burn the ticket the real workload needs.
+    // C2c: the single-use credential ticket is intentionally an exhaustive
+    // positive allowlist. Keep one parseable representative for every Commands
+    // variant (and every auth subcommand) so adding a local command cannot inherit
+    // redemption from a negative predicate.
     #[test]
-    fn credential_redeem_gated_to_network_commands() {
+    fn credential_redeem_allowlist_covers_every_command_variant() {
         for (argv, redeems) in [
+            (vec!["clw", "init"], false),
             (vec!["clw", "snapshot", "--name", "w", "."], true),
+            (vec!["clw", "hydrate", "/tmp/dest", "--name", "w"], true),
+            (vec!["clw", "status", "--name", "w"], true),
             (vec!["clw", "run", "--input", "f", "--", "true"], true),
             (vec!["clw", "ls"], true),
+            (vec!["clw", "rm", "--name", "w"], true),
+            (vec!["clw", "prune"], true),
+            (vec!["clw", "erase"], true),
             (vec!["clw", "doctor"], false),
+            (vec!["clw", "auth", "login"], false),
             (vec!["clw", "auth", "whoami"], false),
             (vec!["clw", "auth", "logout"], false),
+            (vec!["clw", "auth", "rotate"], false),
             (vec!["clw", "uninstall"], false),
+            (vec!["clw", "completions", "bash"], false),
         ] {
             let cli = Cli::try_parse_from(&argv).unwrap();
             assert_eq!(

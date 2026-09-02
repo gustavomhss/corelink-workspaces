@@ -48,11 +48,10 @@ runner-domain invocation: its ordinary purpose is a command that will make a CAS
 lease-bound `CLW_CRED_TICKET`, the gate redeems once at trusted boot for a scoped per-job CAS PAT; a missing
 lease id/fabric endpoint or failed redemption is fail-closed and never falls back to `CLW_TOKEN`. The ticket
 itself is not sent as the CAS/AC bearer token. The current
-[`command_redeems_credential`](../crates/clw-cli/src/main.rs) classifier explicitly does **not** redeem for
-`doctor`, `auth whoami`, `auth logout`, or `uninstall`; `completions`, `--help`, and `--version` exit before
-credential resolution. As shipped, that classifier still selects `init`, `auth login`, and `auth rotate`,
-although they do not currently make CAS/AC calls; that is an implementation fact, not an integration
-requirement (tracked by WP43b). `clw` never sets `x-corelink-tenant-id` — the resolved bearer token plus
+[`command_redeems_credential`](../crates/clw-cli/src/main.rs) classifier allows only the current CAS/AC
+commands: `snapshot`, `hydrate`, `status`, `run`, `ls`, `rm`, `prune`, and `erase`. Local and auth commands,
+including `init`, `auth login`, and `auth rotate`, do **not** redeem; `completions`, `--help`, and `--version`
+exit before credential resolution. `clw` never sets `x-corelink-tenant-id` — the resolved bearer token plus
 tenant-in-path is the sole client tenant authority. See [`config.rs`](../crates/clw-cli/src/config.rs).
 
 ## Auth + exit semantics

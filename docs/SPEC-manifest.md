@@ -307,10 +307,10 @@ included in error messages, and MAY be written only to the designated static-tok
 When selected by the current command gate, the runner C2c path instead redeems its single-use credential
 ticket for a scoped per-job PAT before CAS/AC use; it does not send the ticket as that bearer token.
 A C2c ticket MUST NEVER be logged,
-included in error messages, or written to `~/.clw/config.toml` or any other file. A redeemed PAT is
-initially held in process memory; commands that persist a resolved identity can write that PAT to the
-designated static-token config location. The current redemption gate is documented in
-[`CLI-CONTRACT.md`](CLI-CONTRACT.md).
+included in error messages, or written to `~/.clw/config.toml` or any other file. Under the current
+command gate, the redeemed PAT remains in process memory only: `init`, `auth login`, and `auth rotate`
+do not redeem the ticket and therefore cannot persist the scoped PAT. The current redemption gate is
+documented in [`CLI-CONTRACT.md`](CLI-CONTRACT.md).
 
 ### 7.3 CAS integrity — clients MUST verify
 

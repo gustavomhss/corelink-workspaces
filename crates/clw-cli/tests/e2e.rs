@@ -4021,6 +4021,141 @@ async fn corrupt_config_file_does_not_block_env_configured_op() {
 // the real binary against a mock fabric endpoint + CAS/AC.
 // ===========================================================================
 
+/// Build one C2c runner invocation with no static PAT and an isolated HOME.
+///
+/// This deliberately configures every value on the child process only; the test
+/// process's environment is never mutated, so these tests remain parallel-safe.
+fn clw_cred_ticket_cmd(
+    server: &MockServer,
+    home: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Command {
+    let mut cmd = clw_bin();
+    cmd.env("HOME", home)
+        .env("CLW_ENDPOINT", server.uri())
+        .env("CLW_TENANT", TEST_TENANT)
+        .env("CLW_CACHE_DIR", cache_dir)
+        .env("CLW_REF_DOMAIN", "runner")
+        .env("CLW_FABRIC_ENDPOINT", server.uri())
+        .env("CLW_LEASE_ID", "lease-1")
+        .env("CLW_CRED_TICKET", "the-ticket")
+        .env_remove("CLW_TOKEN");
+    cmd
+}
+
+async fn mount_cred_ticket_success(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path_regex(r"/v1/leases/.*/cas-cred$"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!(r#"{{"cas_pat":"{TEST_PAT}"}}"#)),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn assert_cred_ticket_redeems(server: &MockServer, expected: usize, command: &str) {
+    let requests = server.received_requests().await.unwrap();
+    let actual = requests
+        .iter()
+        .filter(|request| {
+            let path = request.url.path();
+            path.starts_with("/v1/leases/") && path.ends_with("/cas-cred")
+        })
+        .count();
+    assert_eq!(
+        actual, expected,
+        "{command} must make exactly {expected} C2c redeem request(s), got {actual}"
+    );
+}
+
+fn assert_broker_pat_never_persisted(home: &std::path::Path, command: &str) {
+    let config = home.join(".clw/config.toml");
+    if config.exists() {
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !content.contains(TEST_PAT),
+            "{command} must not persist a redeemed broker PAT to {}",
+            config.display()
+        );
+    }
+}
+
+/// `init` is local-only. A regression to the old negative predicate burns the
+/// ticket before writing config, so this binary test is red-on-revert.
+#[tokio::test]
+async fn cred_ticket_init_does_not_redeem_or_persist_broker_pat() {
+    let server = MockServer::start().await;
+    mount_cred_ticket_success(&server).await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+
+    clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    assert_cred_ticket_redeems(&server, 0, "init").await;
+    assert_broker_pat_never_persisted(home.path(), "init");
+}
+
+/// `auth login` is local-only. It must never exchange the ticket or write the
+/// short-lived broker PAT into the persistent config file.
+#[tokio::test]
+async fn cred_ticket_auth_login_does_not_redeem_or_persist_broker_pat() {
+    let server = MockServer::start().await;
+    mount_cred_ticket_success(&server).await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+
+    clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args(["auth", "login"])
+        .assert()
+        .success();
+
+    assert_cred_ticket_redeems(&server, 0, "auth login").await;
+    assert_broker_pat_never_persisted(home.path(), "auth login");
+}
+
+/// `auth rotate` is local-only. A C2c ticket must remain unused for the later
+/// workload even though this command requires normal strict config resolution.
+#[tokio::test]
+async fn cred_ticket_auth_rotate_does_not_redeem_or_persist_broker_pat() {
+    let server = MockServer::start().await;
+    mount_cred_ticket_success(&server).await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+
+    clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args(["auth", "rotate"])
+        .assert()
+        .success();
+
+    assert_cred_ticket_redeems(&server, 0, "auth rotate").await;
+    assert_broker_pat_never_persisted(home.path(), "auth rotate");
+}
+
+/// These paths return before credential resolution. Keep them black-boxed so a
+/// future startup reordering cannot turn help/completion rendering into a redeem.
+#[tokio::test]
+async fn cred_ticket_early_exit_commands_do_not_redeem() {
+    for (command, args) in [
+        ("completions", vec!["completions", "bash"]),
+        ("--help", vec!["--help"]),
+        ("--version", vec!["--version"]),
+    ] {
+        let server = MockServer::start().await;
+        mount_cred_ticket_success(&server).await;
+        let home = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let out = clw_cred_ticket_cmd(&server, home.path(), cache.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{command} must succeed");
+        assert_cred_ticket_redeems(&server, 0, command).await;
+    }
+}
+
 /// Happy path: a network command with CLW_CRED_TICKET (no CLW_TOKEN) redeems the ticket
 /// at the fabric endpoint, receives a cas_pat, and uses it for the operation.
 #[tokio::test]
@@ -4028,26 +4163,13 @@ async fn cred_ticket_redeem_happy_path_snapshots() {
     let server = MockServer::start().await;
     let (_cas, _ac) = mount_corelink(&server, true).await; // CAS/AC accept `Bearer test-pat`
                                                            // Fabric redeem route returns cas_pat = TEST_PAT so the CAS mock then accepts it.
-    Mock::given(method("POST"))
-        .and(path_regex(r"/v1/leases/.*/cas-cred$"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(format!(r#"{{"cas_pat":"{TEST_PAT}"}}"#)),
-        )
-        .mount(&server)
-        .await;
+    mount_cred_ticket_success(&server).await;
 
     let src = TempDir::new().unwrap();
     std::fs::write(src.path().join("f.txt"), b"cred-ticket payload").unwrap();
     let cache = TempDir::new().unwrap();
-    let out = clw_bin()
-        .env("CLW_ENDPOINT", server.uri())
-        .env("CLW_TENANT", TEST_TENANT)
-        .env("CLW_CACHE_DIR", cache.path().to_str().unwrap())
-        .env("CLW_REF_DOMAIN", "runner")
-        .env("CLW_FABRIC_ENDPOINT", server.uri())
-        .env("CLW_LEASE_ID", "lease-1")
-        .env("CLW_CRED_TICKET", "the-ticket")
-        .env_remove("CLW_TOKEN")
+    let home = TempDir::new().unwrap();
+    let out = clw_cred_ticket_cmd(&server, home.path(), cache.path())
         .args(["snapshot", src.path().to_str().unwrap(), "--name", "ct-ws"])
         .output()
         .unwrap();
@@ -4056,6 +4178,97 @@ async fn cred_ticket_redeem_happy_path_snapshots() {
         "redeem + snapshot with a cred ticket (no PAT) must succeed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_cred_ticket_redeems(&server, 1, "snapshot").await;
+}
+
+/// Hydration is a CAS/AC command, so it gets exactly one redeem. Seed the
+/// runner ref using the static-PAT path, then run hydrate in a separate C2c child.
+#[tokio::test]
+async fn cred_ticket_redeem_happy_path_hydrates_once() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    mount_cred_ticket_success(&server).await;
+    let seed_home = TempDir::new().unwrap();
+    let seed_cache = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    std::fs::write(src.path().join("f.txt"), b"hydrate credential ticket").unwrap();
+    clw_runner_cmd(
+        &server.uri(),
+        seed_home.path(),
+        seed_cache.path(),
+        Some("runner"),
+    )
+    .args([
+        "snapshot",
+        src.path().to_str().unwrap(),
+        "--name",
+        "ct-hydrate",
+    ])
+    .assert()
+    .success();
+    assert_cred_ticket_redeems(&server, 0, "static seed snapshot").await;
+
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let destination_root = TempDir::new().unwrap();
+    let destination = destination_root.path().join("hydrate-output");
+    clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args([
+            "hydrate",
+            destination.to_str().unwrap(),
+            "--name",
+            "ct-hydrate",
+        ])
+        .assert()
+        .success();
+    assert_cred_ticket_redeems(&server, 1, "hydrate").await;
+}
+
+/// `run` must redeem once before it executes the wrapped child.
+#[tokio::test]
+async fn cred_ticket_redeem_happy_path_runs_once() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    mount_cred_ticket_success(&server).await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    let input_file = input.path().join("input.txt");
+    std::fs::write(&input_file, b"run credential ticket").unwrap();
+
+    clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args(["run", "--input", input_file.to_str().unwrap(), "--", "true"])
+        .assert()
+        .success();
+    assert_cred_ticket_redeems(&server, 1, "run").await;
+}
+
+/// A failed `run` redemption is still the frozen reserved-125 "child never ran"
+/// outcome, and it must make only its one attempted broker request.
+#[tokio::test]
+async fn cred_ticket_run_redeem_failure_exits_125() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/v1/leases/.*/cas-cred$"))
+        .respond_with(ResponseTemplate::new(410))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    let input_file = input.path().join("input.txt");
+    std::fs::write(&input_file, b"run failed credential ticket").unwrap();
+
+    let out = clw_cred_ticket_cmd(&server, home.path(), cache.path())
+        .args(["run", "--input", input_file.to_str().unwrap(), "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a failed C2c redemption must prevent the child from running"
+    );
+    assert_cred_ticket_redeems(&server, 1, "run redemption failure").await;
 }
 
 /// Fail-closed: CLW_CRED_TICKET set but CLW_LEASE_ID missing → clean Config error, no redeem.
