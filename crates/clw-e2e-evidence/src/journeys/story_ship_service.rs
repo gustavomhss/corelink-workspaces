@@ -22,6 +22,13 @@ use crate::{ExpectExit, Journey, Observation, Persona, Runner, Secret, StepEvide
 const WS: &str = "orders-api";
 
 pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
+    run_impl(bin, creds, false)
+}
+
+/// Build Marina's journey. `stop_before_first_beat` exists solely so the hermetic
+/// regression can exercise the production pre-flight path without faking every live
+/// backend operation in the story.
+fn run_impl(bin: &Path, creds: &ProdCreds, stop_before_first_beat: bool) -> Journey {
     let persona = Persona::new(
         "marina",
         "backend engineer shipping an orders API",
@@ -44,6 +51,18 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
     // Marina's two machines are two clw caches. "work" is where she starts; "laptop" is a
     // COLD cache so the hydrate genuinely pulls from the backend (not a warm local replay).
     let work = runner(bin, creds, ws.dir("cache-work"));
+
+    // A prior run can die after the intentional `--force` replace but before its final
+    // cleanup. Keep Marina's fixed, realistic name (rather than adding a test-shaped
+    // suffix) and clear that residue before the story begins. This is harness setup,
+    // deliberately not a narrative beat and deliberately not attached to `j`.
+    assert!(
+        preflight_cleanup(&work),
+        "Marina pre-flight cleanup failed before the story could begin"
+    );
+    if stop_before_first_beat {
+        return j;
+    }
 
     // ---- Beat 1: Marina just installed clw and checks it's healthy -----------------
     {
@@ -398,22 +417,28 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
             );
             let after = marker_lines(&marker);
             if ev.stderr.contains("cache hit") {
-                hit_result = Some((ev, after == before, after));
+                let side_effect_free = matches!(
+                    (before, after),
+                    (Some(before), Some(after)) if before == after
+                );
+                hit_result = Some((ev, side_effect_free, before, after));
                 break;
             }
             replica_lag_misses += 1;
         }
-        let (mut hit, side_effect_free, marker_now) = hit_result.unwrap_or_else(|| {
-            // Never hit within the budget → a REAL failure (captured, not a panic).
-            let ev = work.step(
-                "run test suite (again — cache hit)",
-                &args,
-                &[],
-                ExpectExit::Eq(0),
-            );
-            let m = marker_lines(&marker);
-            (ev, false, m)
-        });
+        let (mut hit, side_effect_free, marker_before, marker_after) =
+            hit_result.unwrap_or_else(|| {
+                // Never hit within the budget → a REAL failure (captured, not a panic).
+                let before = marker_lines(&marker);
+                let ev = work.step(
+                    "run test suite (again — cache hit)",
+                    &args,
+                    &[],
+                    ExpectExit::Eq(0),
+                );
+                let after = marker_lines(&marker);
+                (ev, false, before, after)
+            });
         hit.narrate(
             "She runs the exact same thing again. clw should replay from cache WITHOUT \
              re-executing. (The memo is eventually-consistent on the shared backend, so the hit \
@@ -428,7 +453,7 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
             .check(
                 hit.stderr.contains("cache hit") && side_effect_free,
                 format!(
-                    "cache hit after {replica_lag_misses} replica-lag miss(es); the hit re-executed nothing (side-effect count stable at {marker_now})"
+                    "cache hit after {replica_lag_misses} replica-lag miss(es); the hit re-executed nothing (marker {marker_before:?}→{marker_after:?})"
                 ),
             ),
         );
@@ -458,10 +483,12 @@ pub fn run(bin: &Path, creds: &ProdCreds) -> Journey {
                 "keying the cache on the actual inputs is what makes memoization SAFE, not just fast",
             )
             .check(
-                // checked_add: if a marker read failed (usize::MAX sentinel), this is None →
-                // the check fails (correct) instead of overflow-panicking in debug.
-                miss2.stderr.contains("cache miss") && before_change.checked_add(1) == Some(after_change),
-                format!("cache-miss on stderr; the changed-input run re-executed exactly once (marker {before_change}→{after_change})"),
+                miss2.stderr.contains("cache miss")
+                    && matches!(
+                        (before_change, after_change),
+                        (Some(before), Some(after)) if Some(after) == before.checked_add(1)
+                    ),
+                format!("cache-miss on stderr; the changed-input run re-executed exactly once (marker {before_change:?}→{after_change:?})"),
             ),
         );
         j.push(miss2);
@@ -648,6 +675,29 @@ fn runner(bin: &Path, creds: &ProdCreds, cache: std::path::PathBuf) -> Runner {
     )
 }
 
+/// Remove Marina's fixed ref before a new run without turning setup into story evidence.
+///
+/// Current `clw rm --yes` is idempotent: a missing ref exits zero and reports
+/// `deleted:false`. Require that exact structured contract, rather than guessing from
+/// text: auth, transport, permission, spawn, malformed JSON, and every non-zero exit
+/// all abort the journey.
+fn preflight_cleanup(work: &Runner) -> bool {
+    let cleanup = work.step(
+        "pre-flight cleanup (not a story beat)",
+        &["--json", "rm", "--name", WS, "--yes"],
+        &[],
+        ExpectExit::Any,
+    );
+    cleanup.exit_code == Some(0)
+        && cleanup.json.as_ref().is_some_and(|json| {
+            json.get("name").and_then(serde_json::Value::as_str) == Some(WS)
+                && json
+                    .get("deleted")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some()
+        })
+}
+
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -692,10 +742,10 @@ fn empty_arr(ev: &StepEvidence, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn marker_lines(path: &Path) -> usize {
+fn marker_lines(path: &Path) -> Option<usize> {
     std::fs::read_to_string(path)
+        .ok()
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(usize::MAX)
 }
 
 fn count_files(root: &Path) -> usize {
@@ -748,4 +798,164 @@ fn collect_files(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn marker_lines_distinguishes_a_missing_file_from_marker_count() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let marker = temp.path().join("test-runs.log");
+
+        assert_eq!(
+            marker_lines(&marker),
+            None,
+            "missing marker must be observable"
+        );
+
+        std::fs::write(&marker, b"ran\n\n  \nran again\n").expect("write markers");
+        assert_eq!(
+            marker_lines(&marker),
+            Some(2),
+            "non-empty marker lines must be counted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marina_run_reclaims_a_fixed_name_after_a_simulated_post_force_crash() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let fake_clw = temp.path().join("fake-clw");
+        std::fs::write(
+            &fake_clw,
+            r#"#!/bin/sh
+state_dir="$(dirname "$0")/state"
+mkdir -p "$state_dir"
+if [ "$1" = "--json" ] && [ "$2" = "snapshot" ] && [ "$4" = "--name" ] && [ "$5" = "orders-api" ] && [ "$6" = "--force" ]; then
+  touch "$state_dir/residual-after-force"
+  printf '{"name":"orders-api","root":"force-root"}\n'
+  exit 0
+fi
+if [ "$1" != "--json" ] || [ "$2" != "rm" ] || [ "$3" != "--name" ] || [ "$4" != "orders-api" ] || [ "$5" != "--yes" ]; then
+  echo "unexpected pre-flight argv" >&2
+  exit 70
+fi
+printf '%s\n' "$@" >> "$state_dir/preflight-commands"
+if [ -f "$state_dir/malformed-json" ]; then
+  printf '{"name":"wrong-workspace","deleted":true}\n'
+  exit 0
+fi
+if [ -f "$state_dir/exit2-not-found" ]; then
+  echo "workspace 'orders-api' not found" >&2
+  exit 2
+fi
+if [ -f "$state_dir/preflight-fails" ]; then
+  echo "permission denied" >&2
+  exit 77
+fi
+if [ -f "$state_dir/residual-after-force" ]; then
+  rm "$state_dir/residual-after-force"
+  printf '{"name":"orders-api","deleted":true}\n'
+else
+  printf '{"name":"orders-api","deleted":false}\n'
+fi
+"#,
+        )
+        .expect("write fake clw");
+        let mut permissions = std::fs::metadata(&fake_clw)
+            .expect("fake clw metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_clw, permissions).expect("make fake clw executable");
+
+        let state = temp.path().join("state");
+        // The fake binary records the fixed `orders-api` ref when the prior story
+        // reaches `--force`. Stop there to simulate the crash. `run_impl` is the
+        // production implementation called by public `run`; its test seam stops after
+        // setup so this regression executes that real pre-flight without faking every
+        // live backend beat.
+        let residual = state.join("residual-after-force");
+        let work = Runner::new(
+            &fake_clw,
+            "https://example.invalid",
+            "test",
+            "tenant",
+            Secret::new("token"),
+            &cache,
+        );
+        let forced = work.step(
+            "force snapshot before simulated crash",
+            &["--json", "snapshot", "/fixture", "--name", WS, "--force"],
+            &[],
+            ExpectExit::Eq(0),
+        );
+        assert!(forced.passed(), "the simulated prior run reaches --force");
+        assert!(residual.exists(), "--force must leave the fixed ref behind");
+
+        let creds = ProdCreds {
+            endpoint: "https://example.invalid".to_string(),
+            tenant: "tenant".to_string(),
+            token: Secret::new("token"),
+        };
+        let recovery = run_impl(&fake_clw, &creds, true);
+        assert_eq!(
+            recovery.counts(),
+            (0, 0),
+            "the seam must stop before user-visible Beats"
+        );
+        assert!(
+            !residual.exists(),
+            "the real run setup must reclaim the fixed name left by the crashed run"
+        );
+        let consecutive = run_impl(&fake_clw, &creds, true);
+        assert_eq!(
+            consecutive.counts(),
+            (0, 0),
+            "a consecutive run still reaches the first Beat cleanly"
+        );
+
+        // A zero status alone is not enough: the structured response must name Marina's
+        // exact workspace and carry the idempotent deletion boolean.
+        std::fs::write(state.join("malformed-json"), b"wrong response")
+            .expect("seed malformed response");
+        assert!(
+            !preflight_cleanup(&work),
+            "a zero exit with the wrong JSON contract must not be accepted"
+        );
+        std::fs::remove_file(state.join("malformed-json")).expect("clear malformed response");
+
+        // A textual not-found on any non-zero exit is not the current idempotent rm
+        // contract and must not be guessed at or swallowed.
+        std::fs::write(state.join("exit2-not-found"), b"legacy response")
+            .expect("seed nonzero not-found response");
+        assert!(
+            !preflight_cleanup(&work),
+            "a non-zero not-found response must abort pre-flight"
+        );
+        std::fs::remove_file(state.join("exit2-not-found")).expect("clear nonzero response");
+
+        // Do not turn best-effort into "swallow every failure": a genuine cleanup
+        // failure must abort the journey before it can misreport a green story.
+        std::fs::write(state.join("preflight-fails"), b"permission denied")
+            .expect("seed cleanup failure");
+        assert!(
+            !preflight_cleanup(&work),
+            "a genuine cleanup failure must not be ignored"
+        );
+
+        let calls = std::fs::read_to_string(state.join("preflight-commands"))
+            .expect("read pre-flight command log");
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            ["--json", "rm", "--name", WS, "--yes"].repeat(5),
+            "every recovery attempt must use the exact non-interactive fixed-name rm command"
+        );
+    }
 }
