@@ -50,6 +50,9 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use clw_types::{ClwError, Digest, Result};
 
 /// On-disk cache format version.  Bump this whenever the blob layout, sharding, or
@@ -376,6 +379,11 @@ impl LocalCache {
         tmp.file
             .flush()
             .map_err(|e| io_ctx("put: flush", &tmp.path, e))?;
+        // `rename` only makes the name update atomic; it does not make dirty file
+        // contents durable. Sync the temp inode *before* publishing its digest name,
+        // so a power loss cannot leave a truncated blob at the final path (where
+        // `has` would otherwise report a false hit until `get` self-heals it).
+        sync_temp_file(&tmp.file, &tmp.path).map_err(|e| io_ctx("put: sync", &tmp.path, e))?;
         // Persist and rename.
         let tmp_path = tmp.path.clone();
         drop(tmp.file); // close before rename on Windows
@@ -399,7 +407,17 @@ impl LocalCache {
         // blob is already durably written); eviction is best-effort.
         if self.puts_since_gc.fetch_add(1, Ordering::Relaxed) + 1 >= GC_CHECK_EVERY_PUTS {
             self.puts_since_gc.store(0, Ordering::Relaxed);
-            let _ = self.gc(self.budget_bytes);
+            if let Err(e) = self.gc(self.budget_bytes) {
+                // Eviction is best-effort, but swallowing this error hid a cache
+                // that could grow without bound. The write remains successful: the
+                // newly committed blob is valid and cache maintenance is never a
+                // reason to fail snapshot/hydrate work.
+                tracing::warn!(
+                    budget_bytes = self.budget_bytes,
+                    error = %e,
+                    "cache gc failed after put; continuing with the committed blob"
+                );
+            }
         }
         Ok(())
     }
@@ -415,13 +433,17 @@ impl LocalCache {
 
     /// Evict blobs until the total cached size is ≤ `max_total_bytes`.
     ///
-    /// Blobs are deleted oldest-`mtime`-first.  Returns the number of bytes freed.
-    /// If the store is already within budget, returns 0.
+    /// Blobs are deleted oldest-`mtime`-first. Returns the number of bytes freed.
+    /// If the store is already within budget, returns 0. A failure for one blob is
+    /// reported and does not stop the sweep: later blobs are still considered. Once
+    /// the sweep finishes, the first such error is returned so explicit callers can
+    /// observe that the cache may remain above its target.
     pub fn gc(&self, max_total_bytes: u64) -> Result<u64> {
         // Collect all blob paths with their sizes and mtimes.
         let blobs_root = self.root.join("blobs");
         let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
         let mut total: u64 = 0;
+        let mut first_error = None;
 
         for i in 0u16..=255 {
             let shard = format!("{:02x}", i);
@@ -429,14 +451,20 @@ impl LocalCache {
             let rd = match fs::read_dir(&shard_path) {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(ClwError::Io(e)),
+                Err(e) => {
+                    record_gc_error(&mut first_error, "gc: read shard", &shard_path, e);
+                    continue;
+                }
             };
             for entry in rd {
                 let entry = match entry {
                     Ok(e) => e,
                     // A concurrent process removing an entry mid-iteration is benign.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(ClwError::Io(e)),
+                    Err(e) => {
+                        record_gc_error(&mut first_error, "gc: read entry", &shard_path, e);
+                        continue;
+                    }
                 };
                 // Skip in-flight temp files (`.tmp-*`): they are not committed blobs,
                 // so counting them toward the budget would skew eviction, and evicting
@@ -449,7 +477,10 @@ impl LocalCache {
                     Ok(m) => m,
                     // Removed by another process between read_dir and metadata — benign.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(ClwError::Io(e)),
+                    Err(e) => {
+                        record_gc_error(&mut first_error, "gc: metadata", &entry.path(), e);
+                        continue;
+                    }
                 };
                 if !meta.is_file() {
                     continue;
@@ -462,7 +493,7 @@ impl LocalCache {
         }
 
         if total <= max_total_bytes {
-            return Ok(0);
+            return first_error.map_or(Ok(0), Err);
         }
 
         // Sort oldest-first.
@@ -473,18 +504,39 @@ impl LocalCache {
             if total <= max_total_bytes {
                 break;
             }
-            match fs::remove_file(&path) {
+            match remove_file_for_gc(&path) {
                 Ok(()) => {}
                 // Another process (its own gc) already evicted this blob — benign;
                 // the space is freed either way, so still count it toward the target.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ClwError::Io(e)),
+                Err(e) => {
+                    // A locked/foreign-owned/corrupt entry must not prevent us from
+                    // evicting every later candidate. Keep its bytes in `total`, log
+                    // the precise path, and return the error only after this sweep.
+                    record_gc_error(&mut first_error, "gc: remove", &path, e);
+                    continue;
+                }
             }
             total -= size;
             freed += size;
         }
 
-        Ok(freed)
+        first_error.map_or(Ok(freed), Err)
+    }
+}
+
+/// Record a best-effort GC failure without allowing one bad cache entry to abort
+/// maintenance for all later entries. The returned `Result` still carries the first
+/// error after the sweep, so callers that explicitly request GC retain observability.
+fn record_gc_error(first_error: &mut Option<ClwError>, op: &str, path: &Path, error: io::Error) {
+    let error = io_ctx(op, path, error);
+    tracing::warn!(
+        path = %path.display(),
+        error = %error,
+        "cache gc could not process blob; continuing sweep"
+    );
+    if first_error.is_none() {
+        *first_error = Some(error);
     }
 }
 
@@ -495,6 +547,65 @@ impl LocalCache {
 struct NamedTmpFile {
     file: fs::File,
     path: PathBuf,
+}
+
+/// Flush the temporary blob's data and metadata before its digest name is published
+/// by `rename`. Keeping this as a helper lets the regression test prove that a sync
+/// failure prevents publication; production always delegates to `File::sync_all`.
+fn sync_temp_file(file: &fs::File, _path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&TEMP_SYNC_FAILURE_ROOT, _path) {
+        return Err(io::Error::other(
+            "test-injected temporary blob sync failure",
+        ));
+    }
+    file.sync_all()
+}
+
+/// Remove a committed blob during GC. The test-only hook makes an otherwise
+/// platform- and privilege-dependent unlink failure deterministic; production uses
+/// `fs::remove_file` directly.
+fn remove_file_for_gc(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&GC_REMOVE_FAILURE_ROOT, path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test-injected cache gc removal failure",
+        ));
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+static TEMP_SYNC_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+static GC_REMOVE_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn fault_injection_matches(slot: &Mutex<Option<PathBuf>>, path: &Path) -> bool {
+    slot.lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+}
+
+#[cfg(test)]
+struct FaultInjectionGuard {
+    slot: &'static Mutex<Option<PathBuf>>,
+}
+
+#[cfg(test)]
+impl Drop for FaultInjectionGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+fn inject_failure_under(slot: &'static Mutex<Option<PathBuf>>, root: &Path) -> FaultInjectionGuard {
+    *slot.lock().unwrap() = Some(root.to_path_buf());
+    FaultInjectionGuard { slot }
 }
 
 /// Create a uniquely named temporary file inside `dir`.  The file is NOT
@@ -859,26 +970,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // corruption: get returns Ok(None) and removes the file
+    // Simulated crash corruption: a final-name blob truncated after publication
+    // self-heals on get. `has` intentionally remains the inexpensive existence
+    // probe, so only `get` verifies contents and repairs the false hit.
     // -----------------------------------------------------------------------
     #[test]
-    fn corruption_self_heals() {
+    fn truncated_final_blob_self_heals_after_simulated_crash() {
         let (_dir, cache) = make_cache();
-        let data = b"good data";
+        let data = b"good data that must not be partially published";
         let d = Digest::of_bytes(data);
 
         cache.put(&d, data).unwrap();
 
-        // Overwrite with garbage.
+        // Simulate sudden power loss on an implementation that had published the
+        // final name before its contents reached disk: the final path exists but
+        // contains only a prefix. `put` now syncs the temp inode before rename to
+        // prevent this state; the existing read-side self-heal remains the defense
+        // for old/corrupt stores.
         let path = cache.blob_path(&d);
-        fs::write(&path, b"garbage!garbage!garbage!").unwrap();
+        fs::write(&path, &data[..7]).unwrap();
+        assert!(
+            cache.has(&d),
+            "has is only an existence check and sees the path"
+        );
 
         // get must return None (not an error) and remove the file.
         let result = cache.get(&d).unwrap();
-        assert!(result.is_none(), "corrupted blob should yield None");
+        assert!(result.is_none(), "truncated blob should yield None");
         assert!(
             !path.exists(),
-            "corrupted blob file should have been removed"
+            "truncated blob file should have been removed"
+        );
+    }
+
+    #[test]
+    fn put_does_not_publish_a_blob_when_temp_sync_fails() {
+        // A deterministic substitute for a failed fsync: the final digest name
+        // must remain absent. This is red-on-revert for the pre-rename sync -- if
+        // the sync is removed or moved after rename, `put` succeeds and publishes
+        // the blob despite this injected failure.
+        let (dir, cache) = make_cache();
+        let data = b"must be durable before rename";
+        let d = Digest::of_bytes(data);
+        let _failure = inject_failure_under(&TEMP_SYNC_FAILURE_ROOT, dir.path());
+
+        let err = cache.put(&d, data).unwrap_err();
+        assert!(
+            err.to_string().contains("put: sync"),
+            "sync failure must identify the durability step: {err}"
+        );
+        assert!(
+            !cache.has(&d),
+            "a failed pre-rename sync must never publish the final blob name"
         );
     }
 
@@ -919,6 +1062,48 @@ mod tests {
 
         // Suppress unused variable warning.
         let _ = base;
+    }
+
+    #[test]
+    fn gc_continues_after_a_blob_failure_and_returns_the_error() {
+        // Simulate an undeletable oldest blob, then require GC to keep sweeping the
+        // later candidates. The test hook avoids filesystem-permission tricks that
+        // are unreliable when CI runs as an elevated user. This is red-on-revert:
+        // the old early `return Err` leaves beta and gamma behind.
+        let (_dir, cache) = make_cache();
+        let blobs: &[&[u8]] = &[b"alpha-blob", b"beta--blob", b"gamma-blob"];
+        let mut digests = Vec::new();
+        for &data in blobs {
+            let d = Digest::of_bytes(data);
+            cache.put(&d, data).unwrap();
+            digests.push(d);
+        }
+        for (i, d) in digests.iter().enumerate() {
+            set_file_mtime(
+                cache.blob_path(d),
+                FileTime::from_unix_time(1_000_000 + i as i64, 0),
+            )
+            .unwrap();
+        }
+
+        // Fail only the oldest path. The other two must still be evicted even
+        // though `gc` ultimately reports the first correctness error to its caller.
+        let failed_path = cache.blob_path(&digests[0]);
+        let _failure = inject_failure_under(&GC_REMOVE_FAILURE_ROOT, &failed_path);
+        let err = cache.gc(0).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("gc: remove") && message.contains(&failed_path.display().to_string()),
+            "GC must report the failed blob path and operation: {message}"
+        );
+        assert!(
+            cache.has(&digests[0]),
+            "the injected undeletable blob remains in place"
+        );
+        assert!(
+            !cache.has(&digests[1]) && !cache.has(&digests[2]),
+            "one bad blob must not abort eviction of later candidates"
+        );
     }
 
     // -----------------------------------------------------------------------

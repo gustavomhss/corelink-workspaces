@@ -733,12 +733,13 @@ mechanism behind a row above (or the fine-grained guarantees the table doesn't s
 ### D · Integrity & durability
 - **BLAKE3 verify on every CAS GET** — mismatched bytes are discarded (`Integrity` error), never trusted.
 - **Manifest re-verified before parse**; **each chunk's length verified** against its declared size.
-- **fsync-before-rename** on every hydrated file (+ a parent-dir fsync) — durable against a torn file on
-  power loss (hydrate never re-hashes on read).
-- **Atomic writes** (temp-in-same-dir → rename) on every write path. The **hydrate** path additionally
-  `fsync`s before the rename (durability, above); the **local cache** put deliberately does *not* fsync —
-  it's a disposable, self-healing store (a torn cache blob is re-hashed and discarded on the next `get`), so
-  paying the fsync cost per chunk would be wasted. So: *atomic rename everywhere; fsync on hydrate, not on the cache.*
+- **fsync-before-rename** on every hydrated file and cached blob — durable against a torn final-name file on
+  power loss. Hydrate additionally performs a best-effort parent-directory fsync, because restored workspace
+  content is authoritative and hydrate never re-hashes it on read.
+- **Atomic writes** (temp-in-same-dir → rename) on every write path. Both the **hydrate** path and the
+  **local cache** sync the temp file before rename. The cache deliberately omits the parent-directory fsync:
+  it remains reconstructible and self-healing (a corrupt blob is re-hashed and discarded on the next `get`),
+  while hydrate pays that extra best-effort durability cost for the authoritative restored workspace.
 - **Size-truth guard** — a File's `size` and the manifest `total_size` derive from the bytes actually
   chunked, so an unrestorable snapshot can't be published.
 

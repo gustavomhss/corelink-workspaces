@@ -501,7 +501,13 @@ where
     // would grow without bound. Force one eviction sweep down to the cache budget
     // at the end of the run. Best-effort: a gc failure must not fail an otherwise
     // successful hydrate (the materialised destination is already complete).
-    let _ = cache.gc_to_budget();
+    if let Err(e) = cache.gc_to_budget() {
+        tracing::warn!(
+            destination = %dest.display(),
+            error = %e,
+            "cache gc failed after hydrate; retaining successful materialization"
+        );
+    }
 
     Ok(HydrateReport {
         root,
