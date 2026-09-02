@@ -27,6 +27,13 @@ env:
   # Expressions are data, never shell source. Keep the ref out of `run:` so a
   # future event-field change cannot turn the DCO fetch into shell injection.
   BASE_REF: ${{ github.base_ref || 'main' }}
+  # CI_CREDENTIAL_NULL_GUARD: workflow-env
+  # Every pull_request job checks out author-controlled input. Blank the runner
+  # fabric's one-shot broker credential trio before any such job can build, test,
+  # or execute repository scripts; gates.sh proves this scope and each checkout.
+  CLW_CRED_TICKET: ""
+  CLW_LEASE_ID: ""
+  CLW_FABRIC_ENDPOINT: ""
 
 jobs:
   gates:
@@ -41,9 +48,23 @@ jobs:
     runs-on: corelink
     timeout-minutes: 30
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: prove PR broker credential guard has teeth
+        if: github.event_name == 'pull_request'
+        run: bash scripts/gates.sh --selftest-pr-credential-null
       # The `corelink` image ships rustup + the pinned toolchain baked; `rustup show`
       # reads rust-toolchain.toml (1.91.1 + rustfmt/clippy) and resolves it with zero
       # per-spawn download. A download failure (if the pin ever drifts) surfaces here
@@ -68,6 +89,17 @@ jobs:
     runs-on: corelink
     timeout-minutes: 5
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -85,6 +117,17 @@ jobs:
     runs-on: corelink
     timeout-minutes: 5
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
       - name: pre-merge-gate-check self-test
         run: bash scripts/pre-merge-gate-check-selftest.sh
@@ -95,6 +138,17 @@ jobs:
     runs-on: corelink
     timeout-minutes: 5
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
       - name: release guards self-test
         run: bash scripts/release-guards-selftest.sh

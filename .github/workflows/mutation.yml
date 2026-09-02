@@ -100,6 +100,14 @@ on:
         options: [workspace, diff]
         default: workspace
 
+# cargo-mutants builds and tests checkout-controlled Rust. Empty the runner
+# fabric's broker credential trio before it can execute any PR-derived process.
+env:
+  # CI_CREDENTIAL_NULL_GUARD: workflow-env
+  CLW_CRED_TICKET: ""
+  CLW_LEASE_ID: ""
+  CLW_FABRIC_ENDPOINT: ""
+
 permissions:
   contents: read
 
@@ -134,6 +142,17 @@ jobs:
       # unactionable red this WP exists to remove.
       MUT_TIMEOUTS: "--timeout 300 --build-timeout 1200"
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
         with:
           # --in-diff needs the merge-base, so the graft point is not enough.

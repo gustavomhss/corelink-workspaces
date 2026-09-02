@@ -21,6 +21,458 @@ set -euo pipefail
 # silently ran against a DIFFERENT worktree when invoked with a `cd` that did not
 # stick — a green that meant nothing.
 cd "$(dirname "$0")/.."
+
+# PR checkout is untrusted input. The CoreLink runner fabric can inject the
+# single-use broker credential trio at env-0, but no PR workflow that checks out
+# repository input may inherit it. Inventory every direct workflow YAML file
+# below: a new direct-PR workflow is a failure until it supplies this boundary.
+# Direct means `pull_request` or an event named `pull_request_*` (target, review,
+# review-comment, and future siblings). Indirect events such as `issue_comment`
+# and `workflow_dispatch` do not carry that name and are not classified by name;
+# any current workflow that materializes a PR head is nevertheless audited because
+# this policy guards every executable job of every direct-PR workflow, not checkout
+# steps alone.
+credential_null_repo_root() {
+  CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd
+}
+
+assert_pr_credential_null_workflows() {
+  local workflow_root="$1"
+  command -v python3 >/dev/null 2>&1 || {
+    echo "GATE FAILED: python3 is required to validate the PR credential-null workflow guard" >&2
+    return 1
+  }
+
+  python3 - "$workflow_root" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow_root = Path(sys.argv[1])
+credentials = ("CLW_CRED_TICKET", "CLW_LEASE_ID", "CLW_FABRIC_ENDPOINT")
+first_step_guard = (
+    "      - name: assert PR broker credentials are absent\n"
+    "        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')\n"
+    "        shell: bash\n"
+    "        run: |\n"
+    "          set -euo pipefail\n"
+    "          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do\n"
+    "            [ -z \"${!credential:-}\" ] || {\n"
+    "              echo \"::error::PR broker credential must be empty: ${credential}\"\n"
+    "              exit 1\n"
+    "            }\n"
+    "          done"
+)
+
+def fail(workflow: str, reason: str) -> None:
+    print(f"GATE FAILED: PR credential-null guard: {workflow}: {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not workflow_root.is_dir():
+    fail("workflow corpus", f"missing directory {workflow_root}")
+
+workflow_paths = sorted(
+    path for path in workflow_root.iterdir()
+    if path.is_file() and path.suffix.lower() in (".yml", ".yaml")
+)
+if not workflow_paths:
+    fail("workflow corpus", "contains no workflow YAML files")
+
+guarded_workflows = []
+guarded_jobs = 0
+for path in workflow_paths:
+    workflow = path.name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(workflow, f"cannot read workflow ({exc})")
+
+    # Validate the top-level `on:` form BEFORE classifying events. YAML admits
+    # sequences, flow maps, aliases, anchors, tags and quoted keys; accepting a
+    # subset opportunistically would let a valid PR trigger fall through as
+    # "not a PR". The repository policy intentionally permits only a plain
+    # top-level mapping block with unquoted, unique event keys.
+    raw_lines = text.splitlines()
+    top_on_forms = [
+        index for index, line in enumerate(raw_lines)
+        if re.match(r"^(?:on|['\"]on['\"])\s*:", line)
+    ]
+    if len(top_on_forms) != 1 or raw_lines[top_on_forms[0]] != "on:":
+        fail(workflow, "top-level on must be exactly one plain `on:` mapping block (quoted, flow, alias, anchor, tag, and duplicate forms are refused)")
+    on_start = top_on_forms[0]
+    on_end = len(raw_lines)
+    for index in range(on_start + 1, len(raw_lines)):
+        line = raw_lines[index]
+        if line and not line[0].isspace() and not line.startswith("#"):
+            on_end = index
+            break
+    on_events = []
+    for line in raw_lines[on_start + 1:on_end]:
+        active = line.split("#", 1)[0]
+        if not active.strip():
+            continue
+        if active.startswith("    "):
+            continue
+        event = re.fullmatch(r"  ([A-Za-z_][A-Za-z0-9_-]*):\s*", active)
+        if event is None:
+            fail(workflow, "top-level on must be a plain event mapping (sequence, flow, alias, anchor, tag, and ambiguous forms are refused)")
+        on_events.append(event.group(1))
+    if not on_events or len(on_events) != len(set(on_events)):
+        fail(workflow, "top-level on must contain non-empty unique canonical event keys")
+
+    # Escapes make YAML keys semantically equal while defeating a source-level
+    # policy (for example `CLW_CRED_\u0054ICKET`). Reject them across the corpus:
+    # this guard intentionally accepts a small, auditable YAML vocabulary rather
+    # than pretending its regex is a complete YAML parser.
+    if re.search(r"\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})", text):
+        fail(workflow, "contains forbidden YAML escape syntax (\\x/\\u/\\U are ambiguous to this guard)")
+
+    active_lines = [line.split("#", 1)[0] for line in text.splitlines()]
+    if not any(event == "pull_request" or event.startswith("pull_request_") for event in on_events):
+        continue
+    guarded_workflows.append(workflow)
+
+    # The marker lives inside the top-level env block. It makes the scope
+    # auditable and lets this intentionally small parser reject a job-level
+    # lookalike rather than guessing at arbitrary YAML constructs.
+    if text.count("  # CI_CREDENTIAL_NULL_GUARD: workflow-env") != 1:
+        fail(workflow, "must contain exactly one top-level-env guard marker")
+    top_env = re.search(r"(?ms)^env:\n(.*?)(?=^[^ \t#]|\Z)", text)
+    if top_env is None:
+        fail(workflow, "has no top-level env block")
+    env_block = top_env.group(1)
+    if env_block.count("  # CI_CREDENTIAL_NULL_GUARD: workflow-env") != 1:
+        fail(workflow, "guard marker is not in the top-level env block")
+    for credential in credentials:
+        declaration = f"  {credential}: \"\""
+        if env_block.count(declaration) != 1:
+            fail(workflow, f"top-level {credential} must be declared exactly once as empty")
+        key_form = re.compile(rf"^\s*(?:{credential}|['\"]{credential}['\"])\s*:")
+        declarations = [line for line in active_lines if key_form.match(line)]
+        if declarations != [declaration]:
+            fail(workflow, f"{credential} must use one unquoted canonical declaration; quoted, inline, and duplicate forms are refused")
+        if any(re.search(rf"\benv:\s*\{{[^}}]*{credential}", line) for line in active_lines):
+            fail(workflow, f"{credential} may not appear in an inline env mapping")
+
+    try:
+        jobs_start = active_lines.index("jobs:")
+    except ValueError:
+        fail(workflow, "PR workflow has no jobs mapping")
+    # A reusable-workflow job receives a fresh called-workflow context: caller
+    # workflow env does not cross that boundary.  Therefore it is forbidden
+    # unless this policy grows an explicit, independently-audited treatment.
+    #
+    # Do not let YAML quoting make a job invisible to that rule.  Both quote
+    # styles and horizontal whitespace before `:` are valid YAML, so recognize
+    # canonical IDs in each form.  Any other mapping-looking job key is refused
+    # rather than silently omitted by this deliberately small parser.
+    job_key = re.compile(
+        r"^  (?:([A-Za-z0-9_-]+)|\"([A-Za-z0-9_-]+)\"|'([A-Za-z0-9_-]+)')[ \t]*:[ \t]*(?:#.*)?$"
+    )
+    job_starts = []
+    for index in range(jobs_start + 1, len(active_lines)):
+        line = active_lines[index]
+        if not re.match(r"^  \S", line):
+            continue
+        job = job_key.fullmatch(line)
+        if job is None:
+            fail(workflow, "jobs mapping contains a non-canonical job key; only plain or single/double-quoted [A-Za-z0-9_-] IDs are accepted")
+        job_starts.append((index, next(name for name in job.groups() if name is not None)))
+    if not job_starts:
+        fail(workflow, "PR workflow has no executable jobs")
+    for position, (job_start, job_name) in enumerate(job_starts):
+        job_end = job_starts[position + 1][0] if position + 1 < len(job_starts) else len(active_lines)
+        job_lines = active_lines[job_start:job_end]
+        if any(re.match(r"^    (?:uses|['\"]uses['\"])[ \t]*:", line) for line in job_lines):
+            fail(workflow, f"job {job_name} uses a reusable workflow; reusable jobs are refused until explicitly guarded")
+        step_markers = [index for index, line in enumerate(job_lines) if line == "    steps:"]
+        if len(step_markers) != 1:
+            fail(workflow, f"job {job_name} must declare exactly one steps list")
+        first_step = next(
+            (index for index in range(step_markers[0] + 1, len(job_lines)) if re.match(r"      - ", job_lines[index])),
+            None,
+        )
+        if first_step is None:
+            fail(workflow, f"job {job_name} has no executable step")
+        candidate = "\n".join(job_lines[first_step:first_step + len(first_step_guard.splitlines())])
+        if candidate != first_step_guard:
+            fail(workflow, f"job {job_name} must begin with the fail-closed PR credential runtime guard")
+        guarded_jobs += 1
+
+if not guarded_workflows:
+    fail("workflow corpus", "contains no pull_request or pull_request_target workflow to guard")
+print("PR credential-null workflow guard: clean (all PR workflows / jobs guarded: " + ", ".join(guarded_workflows) + f"; {guarded_jobs} jobs)")
+PY
+}
+
+assert_pr_credential_null_runtime() {
+  local credential
+  for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+    if [ -n "${!credential:-}" ]; then
+      echo "GATE FAILED: PR credential-null guard: ${credential} is non-empty" >&2
+      return 1
+    fi
+  done
+  echo "PR credential-null runtime guard: broker credential trio is absent or empty"
+}
+
+assert_pr_credential_null() {
+  local workflow_root="$1"
+  assert_pr_credential_null_workflows "$workflow_root"
+  assert_pr_credential_null_runtime
+}
+
+pr_credential_null_selftest() {
+  local repo_root script out rc
+  repo_root="$(credential_null_repo_root)"
+  script="$repo_root/scripts/gates.sh"
+  PR_CREDENTIAL_NULL_SELFTEST_FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/clw-pr-credential-null.XXXXXX")"
+  trap 'rm -rf "${PR_CREDENTIAL_NULL_SELFTEST_FIXTURE:-}"' EXIT
+  mkdir -p "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows"
+  cp "$repo_root/.github/workflows/ci.yml" "$repo_root/.github/workflows/coverage.yml" \
+    "$repo_root/.github/workflows/mutation.yml" "$repo_root/.github/workflows/shellcheck.yml" \
+    "$repo_root/.github/workflows/windows.yml" \
+    "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/"
+
+  if "$script" --assert-pr-credential-null --workflow-dir "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows" >/dev/null; then
+    echo "  ✓ clean PR workflow/job inventory passes"
+  else
+    echo "  ✗ clean PR workflow/job inventory failed" >&2
+    return 1
+  fi
+
+  expect_pr_credential_null_failure() {
+    local description="$1" expected="$2"
+    out=""
+    rc=0
+    out="$("$script" --assert-pr-credential-null --workflow-dir "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$expected"; then
+      echo "  ✓ $description"
+    else
+      echo "  ✗ $description — static guard passed or did not name '$expected'" >&2
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+  }
+
+  out=""
+  rc=0
+  out="$(CLW_CRED_TICKET=leaked "$script" --assert-pr-credential-null --workflow-dir "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF 'CLW_CRED_TICKET is non-empty'; then
+    echo "  ✓ a non-empty runtime broker credential is named"
+  else
+    echo "  ✗ a non-empty runtime broker credential was accepted" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+
+  # Change copies of the REAL PR workflows, then invoke the production
+  # subcommand in a fresh process. If the guard is replaced by `return 0`, each
+  # sabotage turns green and this self-test turns red.
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('  CLW_CRED_TICKET: ""', '  CLW_CRED_TICKET: "leaked"', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "a non-empty broker credential declaration is named" "coverage.yml"
+
+  cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml"
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('  CLW_LEASE_ID: ""\n', '', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "a removed broker credential declaration is named" "coverage.yml"
+
+  cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml"
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('    runs-on: corelink\n', '    runs-on: corelink\n    env:\n      "CLW_CRED_TICKET": "leaked"\n', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "a quoted credential key cannot bypass the static guard" "unquoted canonical declaration"
+
+  cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml"
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('    runs-on: corelink\n', '    runs-on: corelink\n    env:\n      "CLW_CRED_\\u0054ICKET": "leaked"\n', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "an escaped credential key cannot bypass the static guard" "forbidden YAML escape syntax"
+
+  cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/coverage.yml"
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/windows.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('      - name: assert PR broker credentials are absent\n', '      - name: bypassed PR broker credential guard\n', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "a missing first-step runtime guard is named" "windows.yml"
+
+  cp "$repo_root/.github/workflows/windows.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/windows.yml"
+  # fixture must write GitHub's expression literally.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    'name: unguarded-pr-target' \
+    'on:' \
+    '  pull_request_target:' \
+    'env:' \
+    '  # CI_CREDENTIAL_NULL_GUARD: workflow-env' \
+    '  CLW_CRED_TICKET: ""' \
+    '  CLW_LEASE_ID: ""' \
+    '  CLW_FABRIC_ENDPOINT: ""' \
+    'jobs:' \
+    '  build:' \
+    '    runs-on: corelink' \
+    '    steps:' \
+    '      - run: git fetch origin "${{ github.event.pull_request.head.sha }}"' \
+    > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/target-pr.yml"
+  expect_pr_credential_null_failure "a pull_request_target workflow is inventoried" "target-pr.yml"
+  rm -f "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/target-pr.yml"
+
+  # A caller's workflow-level env does not protect a called reusable workflow.
+  # These are valid YAML (and accepted by actionlint): quoted job IDs and quoted
+  # `uses` keys must therefore be recognized, not skipped by the source guard.
+  write_quoted_reusable_job_fixture() {
+    printf '%s\n' \
+      'name: quoted-reusable-pr-job' \
+      'on:' \
+      '  pull_request:' \
+      'env:' \
+      '  # CI_CREDENTIAL_NULL_GUARD: workflow-env' \
+      '  CLW_CRED_TICKET: ""' \
+      '  CLW_LEASE_ID: ""' \
+      '  CLW_FABRIC_ENDPOINT: ""' \
+      'jobs:' \
+      "$1" \
+      "$2" \
+      > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/quoted-reusable.yml"
+  }
+  write_quoted_reusable_job_fixture \
+    '  "unguarded-reusable" :' \
+    '    "uses" : owner/example/.github/workflows/reusable.yml@main'
+  expect_pr_credential_null_failure \
+    "a double-quoted reusable job/key is named despite YAML whitespace" \
+    "job unguarded-reusable uses a reusable workflow"
+  write_quoted_reusable_job_fixture \
+    "  'unguarded-reusable' :" \
+    "    'uses' : owner/example/.github/workflows/reusable.yml@main"
+  expect_pr_credential_null_failure \
+    "a single-quoted reusable job/key is named despite YAML whitespace" \
+    "job unguarded-reusable uses a reusable workflow"
+  rm -f "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/quoted-reusable.yml"
+
+  cp "$repo_root/.github/workflows/coverage.yml" "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/review-pr.yml"
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/review-pr.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('  pull_request:\n', '  pull_request_review:\n', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  if "$script" --assert-pr-credential-null --workflow-dir "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows" >/dev/null; then
+    echo "  ✓ a guarded pull_request_review workflow is accepted"
+  else
+    echo "  ✗ a guarded pull_request_review workflow was rejected" >&2
+    return 1
+  fi
+  python3 - "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/review-pr.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace('  pull_request_review:\n', '  pull_request_review_comment:\n', 1)
+text = text.replace('      - name: assert PR broker credentials are absent\n', '      - name: bypassed PR broker credential guard\n', 1)
+open(path, "w", encoding="utf-8").write(text)
+PY
+  expect_pr_credential_null_failure "a pull_request_review_comment workflow requires the first-step guard" "review-pr.yml"
+  rm -f "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/review-pr.yml"
+
+  write_ambiguous_on_fixture() {
+    printf '%s\n' 'name: ambiguous-on' "$@" 'jobs: {}' \
+      > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/on-form.yml"
+  }
+  write_ambiguous_on_fixture 'on:' '  - pull_request'
+  expect_pr_credential_null_failure "a sequence-form top-level on is refused" "plain event mapping"
+  write_ambiguous_on_fixture 'on:' '  pull_request:' '  pull_request:'
+  expect_pr_credential_null_failure "a duplicate pull_request event is refused" "unique canonical event keys"
+  write_ambiguous_on_fixture 'on: &pr_events'
+  expect_pr_credential_null_failure "an anchored top-level on is refused" "top-level on"
+  write_ambiguous_on_fixture 'on: *pr_events'
+  expect_pr_credential_null_failure "an aliased top-level on is refused" "top-level on"
+  write_ambiguous_on_fixture 'on: !!map'
+  expect_pr_credential_null_failure "a tagged top-level on is refused" "top-level on"
+  write_ambiguous_on_fixture 'on: [pull_request]'
+  expect_pr_credential_null_failure "a flow-form top-level on is refused" "top-level on"
+  write_ambiguous_on_fixture 'on: {pull_request: null}'
+  expect_pr_credential_null_failure "an inline-map top-level on is refused" "top-level on"
+  write_ambiguous_on_fixture '"on":' '  pull_request:'
+  expect_pr_credential_null_failure "a quoted top-level on is refused" "top-level on"
+  rm -f "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/on-form.yml"
+
+  printf '%s\n' \
+    'name: unguarded-pr-checkout' \
+    'on:' \
+    '  "pull_request":' \
+    'jobs:' \
+    '  build:' \
+    '    runs-on: corelink' \
+    '    steps:' \
+    '      - uses: actions/checkout@v4' \
+    '      - run: cargo test' \
+    > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/new-pr.yml"
+  expect_pr_credential_null_failure "a quoted PR trigger cannot evade workflow discovery" "plain event mapping"
+
+  # fixture must write GitHub's expression literally.
+  # shellcheck disable=SC2016
+  printf '%s\n' \
+    'name: unguarded-pr-checkout' \
+    'on:' \
+    '  pull_request:' \
+    'env:' \
+    '  # CI_CREDENTIAL_NULL_GUARD: workflow-env' \
+    '  CLW_CRED_TICKET: ""' \
+    '  CLW_LEASE_ID: ""' \
+    '  CLW_FABRIC_ENDPOINT: ""' \
+    'jobs:' \
+    '  build:' \
+    '    runs-on: corelink' \
+    '    steps:' \
+    '      - run: git fetch origin "${{ github.event.pull_request.head.sha }}"' \
+    > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/new-pr.yml"
+  expect_pr_credential_null_failure "a new PR job without a first-step guard cannot be omitted" "new-pr.yml"
+
+  echo "PR credential-null selftest: all red-on-revert cases passed"
+}
+
+case "${1:-}" in
+  --assert-pr-credential-null)
+    shift
+    if [ "${1:-}" = "--workflow-dir" ] && [ -n "${2:-}" ] && [ "$#" -eq 2 ]; then
+      assert_pr_credential_null "$2"
+    elif [ "$#" -eq 0 ]; then
+      assert_pr_credential_null "$(credential_null_repo_root)/.github/workflows"
+    else
+      echo "usage: $0 --assert-pr-credential-null [--workflow-dir DIR]" >&2
+      exit 2
+    fi
+    exit 0
+    ;;
+  --selftest-pr-credential-null)
+    [ "$#" -eq 1 ] || { echo "usage: $0 --selftest-pr-credential-null" >&2; exit 2; }
+    pr_credential_null_selftest
+    exit 0
+    ;;
+esac
+
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 # Persistent target dir on CI (outside the runner's _work checkout, immune to clean):

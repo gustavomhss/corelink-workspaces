@@ -29,12 +29,31 @@ concurrency:
 permissions:
   contents: read
 
+# Coverage compiles and runs PR-controlled Rust. The runner fabric's broker
+# credential trio must be empty before the checkout can reach a build/test step.
+env:
+  # CI_CREDENTIAL_NULL_GUARD: workflow-env
+  CLW_CRED_TICKET: ""
+  CLW_LEASE_ID: ""
+  CLW_FABRIC_ENDPOINT: ""
+
 jobs:
   coverage:
     name: llvm-cov (floor 88%)
     runs-on: corelink
     timeout-minutes: 30
     steps:
+      - name: assert PR broker credentials are absent
+        if: github.event_name == 'pull_request' || startsWith(github.event_name, 'pull_request_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for credential in CLW_CRED_TICKET CLW_LEASE_ID CLW_FABRIC_ENDPOINT; do
+            [ -z "${!credential:-}" ] || {
+              echo "::error::PR broker credential must be empty: ${credential}"
+              exit 1
+            }
+          done
       - uses: actions/checkout@v4
 
       # Materialize the pinned toolchain (rust-toolchain.toml = 1.91.1) + the
