@@ -20,6 +20,15 @@ const MAX_ATTEMPTS: u32 = 6;
 /// Sleep durations between attempt 1→2 and 2→3.
 const RETRY_SLEEP_MS: [u64; 5] = [200, 800, 2_000, 5_000, 10_000];
 
+/// Map raw `Retry-After` delta-seconds to a sleep duration in milliseconds,
+/// honoring the server hint only up to the longest jittered ladder rung
+/// (10s). A literal `0` is floored to 1ms so the slot is still consumed;
+/// any value >= 10s (including `u64::MAX` from saturating overflow) is capped
+/// at the 10s rung.
+fn retry_after_delta_secs_to_sleep_ms(secs: u64) -> u64 {
+    secs.saturating_mul(1_000).clamp(1, RETRY_SLEEP_MS[4])
+}
+
 /// Default OVERALL per-operation deadline (seconds) across ALL retry attempts.
 ///
 /// Without an overall bound a black-hole backend (accepts the connection but
@@ -344,10 +353,7 @@ impl HttpClient {
                 // resets the slot to the NONE sentinel.
                 let raw = slot.swap(NONE, Ordering::Relaxed);
                 let sleep_ms = if raw != NONE {
-                    // Cap at the longest ladder rung so a hostile header can't park
-                    // us for an unbounded time; floor at 1ms so a literal 0 still
-                    // delays. (Matches the previous clamp semantics.)
-                    raw.saturating_mul(1_000).clamp(1, RETRY_SLEEP_MS[4])
+                    retry_after_delta_secs_to_sleep_ms(raw)
                 } else {
                     // Cheap jitter in [0, base/2] derived from the clock — avoids a
                     // synchronized thundering herd without pulling in a rand dep.
@@ -1139,6 +1145,7 @@ impl CasTransport for HttpClient {
         let url = self.config.cas_url(digest);
         let auth = self.auth_header();
         let client = &self.inner;
+        let body_size = bytes.len() as u64;
 
         self.with_retry(|retry_slot| {
             let url = url.clone();
@@ -1158,7 +1165,7 @@ impl CasTransport for HttpClient {
                     200 | 201 | 204 => Ok(()),
                     401 => Err(ClwError::Auth),
                     413 => Err(ClwError::TooLarge {
-                        size: 0, // server-side; client size unknown here
+                        size: body_size,
                         cap: CAS_BLOB_CAP_BYTES as u64,
                     }),
                     429 => {
@@ -2228,6 +2235,7 @@ mod tests {
     async fn cas_put_413_returns_too_large() {
         let server = MockServer::start().await;
         let (digest, bytes) = digest_and_bytes();
+        let expected_size = bytes.len() as u64;
         let path_str = format!("/v1/cas/test-tenant/{}", digest);
 
         Mock::given(method("PUT"))
@@ -2240,7 +2248,13 @@ mod tests {
         let err = CasTransport::put(&client, &digest, bytes)
             .await
             .unwrap_err();
-        assert!(matches!(err, ClwError::TooLarge { .. }));
+        // RED-on-revert: a remote 413 reports the exact payload length that was
+        // sent, without interpreting the response body.
+        assert!(
+            matches!(err, ClwError::TooLarge { size, cap }
+                if size == expected_size && cap == CAS_BLOB_CAP_BYTES as u64),
+            "a remote PUT 413 must report the sent body size, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3002,6 +3016,25 @@ mod tests {
     // -------------------------------------------------------------------------
     // Overall per-op deadline (CLW_OP_DEADLINE_SECS) — WP-DEADLINE
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn retry_after_delta_secs_to_sleep_ms_maps_and_caps() {
+        let cases = [
+            (0, 1),
+            (1, 1_000),
+            (10, 10_000),
+            (11, 10_000),
+            (u64::MAX, 10_000),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                retry_after_delta_secs_to_sleep_ms(input),
+                expected,
+                "raw delta-seconds {input} must clamp to {expected}ms"
+            );
+        }
+    }
 
     /// The env knob parses to the default when unset/empty/`0`/garbage, and an
     /// explicit positive value overrides. Pure over its input, so no env race.

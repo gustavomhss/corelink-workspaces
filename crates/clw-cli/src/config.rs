@@ -1090,6 +1090,13 @@ cache_dir = "~/.clw/cache"
         assert_eq!(result, PathBuf::from("relative/path"));
     }
 
+    #[test]
+    fn expand_tilde_non_prefix_tildes_unchanged() {
+        for path in ["~", "~user/x", "a/~/b"] {
+            assert_eq!(expand_tilde(path), PathBuf::from(path));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // home_dir: Windows fallback to %USERPROFILE% when $HOME is absent
     // -----------------------------------------------------------------------

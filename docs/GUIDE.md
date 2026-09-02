@@ -616,9 +616,10 @@ on the `run` path). It is a **billing** limit on your CoreLink account, not a cl
 - **Per-op deadline** `CLW_OP_DEADLINE_SECS` (default 300s, 24h clamp) bounds the *whole* operation across
   all retries — a black-hole backend can't hang clw.
 - **Retries:** up to 6 attempts, backoff ladder `[200ms, 800ms, 2s, 5s, 10s]`, on connect/transport/5xx/429,
-  capped by the remaining deadline; honors a server `Retry-After` **in its integer delta-seconds form**
-  (e.g. `Retry-After: 30`). The RFC-legal HTTP-date form is not parsed — clw silently falls back to the fixed
-  ladder for that request (it never errors on a date-form header).
+  capped by the remaining deadline; honors a server `Retry-After` **only when it is an integer delta-seconds
+  value and only up to the 10-second cap** — any value above the cap is clamped (e.g. `Retry-After: 30` is treated
+  as 10s). The RFC-legal HTTP-date form is not parsed — clw silently falls back to the fixed ladder for that
+  request (it never errors on a date-form header).
 - **Adaptive concurrency (AIMD):** a 429 halves the in-flight window (floor 1); 8 consecutive successes
   grow it back toward the `--concurrency` ceiling (default 8).
 - **Output cap:** `clw run` SIGKILLs a child that exceeds **5 MiB on either stdout or stderr** (each stream is
@@ -770,8 +771,9 @@ mechanism behind a row above (or the fine-grained guarantees the table doesn't s
 - **Overall per-op deadline** (`CLW_OP_DEADLINE_SECS`, default 300s, 24h clamp) — bounds a whole operation
   across all retries; a black-hole backend fails cleanly.
 - **Bounded retries + `Retry-After`** — up to 6 attempts on connect/transport/5xx/429, backoff ladder
-  `[200ms, 800ms, 2s, 5s, 10s]`, honoring the server's `Retry-After` **delta-seconds** hint (the HTTP-date
-  form is not parsed → fixed ladder), capped by the remaining deadline.
+  `[200ms, 800ms, 2s, 5s, 10s]`, honoring the server's `Retry-After` **delta-seconds** hint — but only up to
+  the 10s cap (a larger value is clamped, a `0` is floored to 1ms). The HTTP-date form is not parsed → fixed
+  ladder; capped by the remaining deadline.
 - **AIMD adaptive concurrency** — a 429 halves the in-flight window (floor 1); 8 straight successes grow it
   back toward the `--concurrency` ceiling. The governor tolerates a poisoned lock.
 - **Pagination caps** — 16 MiB per page, ≤ 10,000,000 total keys (then `TooLarge`), ≤ 1,000,000 pages

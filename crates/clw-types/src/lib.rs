@@ -689,6 +689,41 @@ mod tests {
     }
 
     #[test]
+    fn ref_record_from_bytes_ignores_unknown_fields() {
+        let record = RefRecord {
+            name: "test-ref".into(),
+            root: Digest::of_bytes(b"root"),
+            manifest_size: 42,
+            created_at_unix: 1_700_000_000,
+            parent: Some(Digest::of_bytes(b"parent")),
+            tool_version: "0.1.0".into(),
+        };
+        let bytes = record.to_bytes().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["future_field"] = serde_json::Value::String("future".into());
+        let modified_bytes = serde_json::to_vec(&value).unwrap();
+        let parsed = RefRecord::from_bytes(&modified_bytes).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn ref_record_from_bytes_rejects_missing_required_field() {
+        let record = RefRecord {
+            name: "test-ref".into(),
+            root: Digest::of_bytes(b"root"),
+            manifest_size: 42,
+            created_at_unix: 1_700_000_000,
+            parent: Some(Digest::of_bytes(b"parent")),
+            tool_version: "0.1.0".into(),
+        };
+        let bytes = record.to_bytes().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value.as_object_mut().unwrap().remove("name");
+        let modified_bytes = serde_json::to_vec(&value).unwrap();
+        assert!(RefRecord::from_bytes(&modified_bytes).is_err());
+    }
+
+    #[test]
     fn from_bytes_rejects_parent_traversal_path() {
         // Hand-written JSON: a file entry whose path escapes via "..".
         let bytes = br#"{"version":1,"total_size":0,"entries":[{"kind":"file","path":"../escape.txt","mode":420,"size":0,"chunks":[]}]}"#;

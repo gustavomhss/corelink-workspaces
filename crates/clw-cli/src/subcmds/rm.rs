@@ -51,7 +51,7 @@ fn resolve_rm_target(
         (None, Some(k)) => {
             let digest = Digest::from_hex(k).map_err(|_| {
                 ClwError::Message(format!(
-                    "--ref-key must be a 64-char lowercase hex ref key, got '{k}'"
+                    "--ref-key must be a 64-character hexadecimal ref key, got '{k}'"
                 ))
             })?;
             Ok((digest, format!("ref-key {k}")))
@@ -234,6 +234,24 @@ mod tests {
         // neither flag → error naming BOTH options.
         let none = resolve_rm_target(None, None, RefDomain::User).unwrap_err();
         assert!(none.to_string().contains("--name") && none.to_string().contains("--ref-key"));
+    }
+
+    #[test]
+    fn resolve_rm_target_accepts_uppercase_hex_ref_key() {
+        let hex = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF";
+        let (digest, label) = resolve_rm_target(None, Some(hex), RefDomain::User).unwrap();
+        assert_eq!(digest, Digest::from_hex(hex).unwrap());
+        assert!(label.contains(hex));
+    }
+
+    #[test]
+    fn resolve_rm_target_rejects_invalid_ref_key_with_corrected_message() {
+        let invalid = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFG";
+        let err = resolve_rm_target(None, Some(invalid), RefDomain::User).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("--ref-key must be a 64-character hexadecimal ref key, got '{invalid}'")
+        );
     }
 
     #[test]

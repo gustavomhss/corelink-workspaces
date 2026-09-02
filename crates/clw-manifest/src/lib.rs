@@ -331,6 +331,8 @@ mod tests {
     use super::*;
     use clw_types::{ChunkRef, Digest, Entry, Manifest, MANIFEST_VERSION};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use tempfile::TempDir;
 
     fn make_manifest(entries: Vec<Entry>) -> Manifest {
@@ -367,6 +369,66 @@ mod tests {
             }
             other => panic!("expected File, got {other:?}"),
         }
+    }
+
+    /// Unix contract: hardlinked paths are independent regular-file entries.
+    /// The manifest records each path and the same content digest/size; it does
+    /// not promise to preserve the underlying hardlink relationship.
+    #[cfg(unix)]
+    #[test]
+    fn walk_hardlinked_files_are_independent_manifest_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let first = root.join("first.bin");
+        let second = root.join("second.bin");
+        let content = b"hardlink content\n";
+        fs::write(&first, content).unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let first_meta = fs::metadata(&first).unwrap();
+        let second_meta = fs::metadata(&second).unwrap();
+        assert_eq!(
+            first_meta.ino(),
+            second_meta.ino(),
+            "fixtures must be hardlinks"
+        );
+
+        let entries = walk(root).unwrap();
+        let files: Vec<&WalkedFile> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                WalkedEntry::File(file) => Some(file),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "both hardlinked paths must be walked: {entries:?}"
+        );
+
+        let digest = Digest::of_bytes(content);
+        let mut manifest_entries = Vec::new();
+        for file in files {
+            assert_eq!(fs::read(&file.abs).unwrap(), content);
+            assert_eq!(file.size, content.len() as u64);
+            manifest_entries.push(Entry::File {
+                path: file.rel.clone(),
+                mode: file.mode,
+                size: file.size,
+                chunks: vec![ChunkRef {
+                    digest,
+                    size: file.size,
+                }],
+            });
+        }
+        manifest_entries.sort_by(|a, b| a.path().cmp(b.path()));
+        let manifest = make_manifest(manifest_entries);
+        assert_eq!(manifest.total_size, content.len() as u64 * 2);
+        assert_eq!(manifest.entries.len(), 2);
+        assert_eq!(manifest.entries[0].path(), "first.bin");
+        assert_eq!(manifest.entries[1].path(), "second.bin");
+        assert!(manifest.canonical_bytes().is_ok());
     }
 
     #[test]

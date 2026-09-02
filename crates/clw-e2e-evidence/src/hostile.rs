@@ -151,7 +151,7 @@ impl Hostile {
         // AC ref DELETE (only reached under --force) → accept.
         Mock::given(method("DELETE"))
             .and(path_regex(r"/v1/ac/"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(ResponseTemplate::new(204))
             .with_priority(1)
             .mount(&server)
             .await;
