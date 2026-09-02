@@ -12,7 +12,7 @@
 # LICENSE POSTURE (finalized in WP M4.2 — read before editing the allow-list):
 #
 #   The workspace declares `license = "LicenseRef-Proprietary"` in
-#   [workspace.package] of the root Cargo.toml, inherited by all 11 first-party
+#   [workspace.package] of the root Cargo.toml, inherited by all 13 first-party
 #   clw-* crates. `LicenseRef-Proprietary` is a VALID SPDX expression (the
 #   `LicenseRef-` form reserved for licenses not on the SPDX list), so cargo-deny
 #   CAN evaluate it — unlike the old "UNLICENSED" token, which cargo accepts but
@@ -62,7 +62,7 @@ confidence-threshold = 0.8
 # First-party posture: every clw-* crate is `publish = false` and carries the
 # SPDX-valid `LicenseRef-Proprietary` token (proprietary; binding terms in
 # EULA.md). Treat those private crates as exempt from the license check. This
-# replaces the 11 per-crate [[licenses.clarify]] blocks that were temporary in
+# replaces the 13 per-crate [[licenses.clarify]] blocks that were temporary in
 # M4 — the trip-wire is now structural: any new first-party crate is covered
 # automatically as long as it stays `publish = false`, and a first-party crate
 # that is accidentally made publishable will still pass via the explicit

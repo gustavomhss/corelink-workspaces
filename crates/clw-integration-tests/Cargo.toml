@@ -3,6 +3,7 @@ name = "clw-integration-tests"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -21,7 +22,7 @@ tempfile = { workspace = true }
 reqwest = { workspace = true }
 proptest = { workspace = true }
 async-trait = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 
 [lints]
 workspace = true

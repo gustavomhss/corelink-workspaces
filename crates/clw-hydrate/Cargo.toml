@@ -3,6 +3,7 @@ name = "clw-hydrate"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -11,7 +12,7 @@ clw-types = { workspace = true }
 clw-cache = { workspace = true }
 clw-client = { workspace = true }
 tokio = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 

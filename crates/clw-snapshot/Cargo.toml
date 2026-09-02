@@ -3,6 +3,7 @@ name = "clw-snapshot"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -12,7 +13,7 @@ clw-chunk = { workspace = true }
 clw-manifest = { workspace = true }
 clw-cache = { workspace = true }
 tokio = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

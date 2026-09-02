@@ -1,4 +1,6 @@
 /target
+__pycache__/
+.claude/settings.local.json
 .techlead/
 .DS_Store
 *.local

@@ -19,6 +19,8 @@ members = [
 [workspace.package]
 version = "0.1.11"
 edition = "2021"
+# Keep the machine-checkable MSRV aligned with rust-toolchain.toml.
+rust-version = "1.91.1"
 # proprietary — binding terms in EULA.md (M4.2). `LicenseRef-Proprietary` is a
 # VALID SPDX expression (the `LicenseRef-` form for non-listed licenses), so
 # cargo-deny can evaluate it — unlike the old "UNLICENSED" token, which cargo
@@ -83,7 +85,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 ignore = "0.4"
 hex = "0.4"
-anyhow = "1"
+futures = "0.3"
 tempfile = "3"
 proptest = "1"
 wiremock = "0.6"
