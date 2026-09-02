@@ -16,6 +16,10 @@
   invalid, and `d/up -> ..` still hydrates into a real symlink there.
 
 ### Changed
+- **`--concurrency` now also governs destructive sweeps.** `prune` and `erase`
+  use the per-invocation value for both their bounded delete schedulers and their
+  CoreLink request governor; `0` is clamped to `1`, matching `snapshot` and
+  `hydrate`. The knob remains a CLI flag only, with no environment/config setting.
 - **Windows only: the symlink copy-fallback now refuses to descend past 64 directory levels**
   (`MAX_COPY_DEPTH`), as a fail-safe bound behind the M17 guard above — without it, any miss in
   that guard is unbounded rather than merely wrong. A legitimate manifest whose symlinked directory

@@ -189,8 +189,9 @@ Global flags are accepted before any subcommand. `--json` emits machine-readable
 JSON on stdout for every command **except `clw run`**, which has no `--json` form
 by design (the wrapped command owns stdout). `--no-color` disables ANSI color;
 color is also auto-disabled when `NO_COLOR` is set or stdout is not a TTY.
-`--concurrency` caps concurrent CAS requests for `snapshot`/`hydrate` (lower it if
-you hit rate limits).
+`--concurrency` sets the per-invocation CoreLink request ceiling for `snapshot`,
+`hydrate`, `prune`, and `erase` (lower it if you hit rate limits). It is a CLI
+flag only, with no environment-variable or config-file counterpart.
 
 **No telemetry.** clw collects **no usage data** and has **no mechanism** to send
 any — it never phones home. The only data it transmits is the workspace content

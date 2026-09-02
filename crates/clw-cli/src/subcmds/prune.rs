@@ -11,10 +11,12 @@
 //! transport surfaces it as an actionable server-regression error.
 
 use std::collections::HashSet;
+use std::future::Future;
 
 use clap::Args;
 use clw_client::HttpClient;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Entry, Manifest, RefRecord};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
 
 use crate::config::ResolvedConfig;
@@ -36,8 +38,18 @@ pub struct PruneArgs {
     pub yes: bool,
 }
 
-pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(), ClwError> {
-    let client = HttpClient::new(cfg.clw_config)?;
+pub async fn run(
+    args: PruneArgs,
+    cfg: ResolvedConfig,
+    json: bool,
+    concurrency: usize,
+) -> Result<(), ClwError> {
+    // Keep the scheduler and `HttpClient` governor at the same nonzero global
+    // limit. `HttpClient::new` would silently start at eight, so it is unsuitable
+    // when the caller explicitly requested another N. The governor may still
+    // adapt downward on 429 responses.
+    let concurrency = destructive_sweep_concurrency(concurrency);
+    let client = HttpClient::with_concurrency(cfg.clw_config, concurrency)?;
 
     // ORDER MATTERS for GC correctness. Snapshot the blob CANDIDATE set FIRST
     // (at T0), THEN compute the live set (refs read at T1 > T0). With candidates
@@ -62,13 +74,13 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
     // corelink-server item). Until then `prune` is dry-run-by-default: run it in a
     // low-write window, review the dry-run first, and rely on last-write-wins (a
     // concurrent re-push restores any blob a prune raced) to bound the exposure.
-    let all_blobs = match CasTransport::list_blobs(&client).await {
+    let all_blobs = stable_dedupe_targets(match CasTransport::list_blobs(&client).await {
         Ok(b) => b,
         Err(e) if is_capability_unavailable(&e) => {
             return capability_unavailable(json, "prune (CAS GC)", "D-8")
         }
         Err(e) => return Err(map_auth_error(e)),
-    };
+    });
     let live = match compute_live_set(&client).await {
         Ok(live) => live,
         Err(e) if is_capability_unavailable(&e) => {
@@ -148,30 +160,25 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         return Ok(());
     }
 
-    // --- DELETE: remove each orphan, never discarding progress on failure ----
-    // Live counter on an interactive TTY (stderr only, so --json stdout stays
-    // clean) so a long serial sweep isn't mistaken for a hang.
-    let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    let total = orphans.len();
-    let mut deleted = 0usize;
-    let mut failure: Option<(Digest, ClwError)> = None;
-    for d in &orphans {
-        if let Err(e) = CasTransport::delete(&client, d).await {
-            failure = Some((*d, map_auth_error(e)));
-            break;
+    // --- DELETE: bounded, drain-on-error, and audit-truthful ---------------
+    // `try_buffer_unordered` would drop in-flight DELETE futures on the first
+    // error. Instead this helper stops new submissions, drains every operation
+    // already submitted, and reports only confirmed successes. `failed_at` is
+    // chosen by the stable orphan input index rather than racing completion order.
+    let client_ref = &client;
+    let sweep = delete_bounded_draining(&orphans, concurrency, |digest| {
+        let client = client_ref;
+        async move {
+            CasTransport::delete(client, &digest)
+                .await
+                .map_err(map_auth_error)
         }
-        deleted += 1;
-        if show_progress {
-            eprint!("\rpruning {deleted}/{total}…");
-            use std::io::Write as _;
-            std::io::stderr().flush().ok();
-        }
-    }
-    if show_progress && deleted > 0 {
-        eprintln!("\rpruned {deleted}/{total} orphan(s).   ");
-    }
+    })
+    .await;
+    let deleted = sweep.succeeded.len();
+    let failure = sweep.failure;
 
-    if let Some((digest, err)) = failure {
+    if let Some((_, digest, err)) = failure {
         // Partial GC: report what WAS deleted (resumable/auditable) then fail.
         if json {
             println!(
@@ -197,6 +204,91 @@ pub async fn run(args: PruneArgs, cfg: ResolvedConfig, json: bool) -> Result<(),
         println!("pruned {deleted} orphaned blob(s) ({} live)", live.len());
     }
     Ok(())
+}
+
+/// Result of a bounded orphan-delete phase after it has drained. A failure is
+/// deterministic by lowest target input index, even when a later target's error
+/// reaches the client first.
+#[derive(Debug)]
+struct DrainedDeleteOutcome {
+    succeeded: Vec<Digest>,
+    failure: Option<(usize, Digest, ClwError)>,
+}
+
+/// Clamp the global CLI knob so `--concurrency 0` cannot stall a destructive
+/// sweep. This exactly mirrors snapshot/hydrate's established contract.
+fn destructive_sweep_concurrency(requested: usize) -> usize {
+    requested.max(1)
+}
+
+/// Keep the list endpoint's first-seen order (the stable input order used to
+/// choose `failed_at`) while ensuring a repeated listing row cannot issue two
+/// DELETEs or inflate the reported confirmed-success count.
+fn stable_dedupe_targets(targets: Vec<Digest>) -> Vec<Digest> {
+    let mut seen = HashSet::with_capacity(targets.len());
+    targets
+        .into_iter()
+        .filter(|digest| seen.insert(*digest))
+        .collect()
+}
+
+async fn await_delete<Fut>(
+    index: usize,
+    digest: Digest,
+    delete: Fut,
+) -> (usize, Digest, Result<(), ClwError>)
+where
+    Fut: Future<Output = Result<(), ClwError>>,
+{
+    (index, digest, delete.await)
+}
+
+/// Run DELETEs with at most `concurrency` operations in flight. On the first
+/// observed error it schedules no additional targets but
+/// drains the operations already sent to the transport. That preserves truthful
+/// partial counts and makes every result known before we return.
+async fn delete_bounded_draining<F, Fut>(
+    targets: &[Digest],
+    concurrency: usize,
+    delete: F,
+) -> DrainedDeleteOutcome
+where
+    F: Fn(Digest) -> Fut,
+    Fut: Future<Output = Result<(), ClwError>>,
+{
+    let concurrency = destructive_sweep_concurrency(concurrency);
+    let mut next = 0usize;
+    let mut in_flight = FuturesUnordered::new();
+    while next < targets.len() && in_flight.len() < concurrency {
+        let index = next;
+        let digest = targets[index];
+        in_flight.push(await_delete(index, digest, delete(digest)));
+        next += 1;
+    }
+
+    let mut succeeded = Vec::with_capacity(targets.len());
+    let mut failure: Option<(usize, Digest, ClwError)> = None;
+    while let Some((index, digest, result)) = in_flight.next().await {
+        match result {
+            Ok(()) => succeeded.push(digest),
+            Err(error) => {
+                if failure
+                    .as_ref()
+                    .is_none_or(|(lowest_index, _, _)| index < *lowest_index)
+                {
+                    failure = Some((index, digest, error));
+                }
+            }
+        }
+        if failure.is_none() && next < targets.len() {
+            let index = next;
+            let digest = targets[index];
+            in_flight.push(await_delete(index, digest, delete(digest)));
+            next += 1;
+        }
+    }
+
+    DrainedDeleteOutcome { succeeded, failure }
 }
 
 /// MARK phase: every digest reachable from a ref — the manifest roots plus every
@@ -361,7 +453,11 @@ mod tests {
     use super::*;
     use clw_types::{ChunkRef, Manifest, Result as ClwResult, MANIFEST_VERSION};
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
 
     // -----------------------------------------------------------------------
     // In-memory fake transport for driving the REAL `compute_live_set`.
@@ -620,6 +716,116 @@ mod tests {
         assert!(
             CasTransport::exists(&store, &protected).await.unwrap(),
             "the protected blob must NOT be deleted under replica lag"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_drains_mixed_failures_deterministically_for_50_runs() {
+        // The later failure finishes first on purpose. Every run must still name
+        // the lower input index, count only confirmed successes, drain all 16
+        // initially submitted deletes, and never exceed the bound.
+        let targets: Vec<Digest> = (0..32u8).map(|i| Digest::of_bytes(&[i])).collect();
+        for attempt in 0..50 {
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let started = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let confirmed = Arc::new(Mutex::new(Vec::new()));
+            let low_failure = targets[0];
+            let high_failure = targets[1];
+
+            let outcome = delete_bounded_draining(&targets, 16, {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let started = Arc::clone(&started);
+                let completed = Arc::clone(&completed);
+                let confirmed = Arc::clone(&confirmed);
+                move |digest| {
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    let started = Arc::clone(&started);
+                    let completed = Arc::clone(&completed);
+                    let confirmed = Arc::clone(&confirmed);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        // Index 1 fails first; index 0 is deliberately delayed
+                        // and must nevertheless win deterministic error selection.
+                        let delay = if digest == low_failure {
+                            Duration::from_millis(6)
+                        } else if digest == high_failure {
+                            Duration::from_millis(1)
+                        } else {
+                            Duration::from_millis(3)
+                        };
+                        tokio::time::sleep(delay).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        if digest == low_failure {
+                            Err(ClwError::Transport("low-index failure".into()))
+                        } else if digest == high_failure {
+                            Err(ClwError::Transport("high-index failure".into()))
+                        } else {
+                            confirmed.lock().unwrap().push(digest);
+                            Ok(())
+                        }
+                    }
+                }
+            })
+            .await;
+
+            let (index, digest, error) = outcome.failure.expect("mixed failures must fail");
+            assert_eq!(index, 0, "attempt {attempt} selected the wrong failure");
+            assert_eq!(digest, low_failure);
+            assert!(error.to_string().contains("low-index failure"));
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                16,
+                "attempt {attempt} must drain all work already in flight"
+            );
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                16,
+                "attempt {attempt} must not submit a replacement after the fast failure"
+            );
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert!(
+                peak.load(Ordering::SeqCst) <= 16,
+                "attempt {attempt} exceeded the orphan-delete bound"
+            );
+
+            let mut reported: Vec<String> = outcome.succeeded.iter().map(Digest::to_hex).collect();
+            let mut transport_confirmed: Vec<String> = confirmed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Digest::to_hex)
+                .collect();
+            reported.sort_unstable();
+            transport_confirmed.sort_unstable();
+            assert_eq!(
+                reported, transport_confirmed,
+                "attempt {attempt} must report exactly the deletes that completed successfully"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_sweep_concurrency_clamps_zero_and_keeps_explicit_n() {
+        assert_eq!(destructive_sweep_concurrency(0), 1);
+        assert_eq!(destructive_sweep_concurrency(1), 1);
+        assert_eq!(destructive_sweep_concurrency(16), 16);
+    }
+
+    #[test]
+    fn stable_dedupe_targets_preserves_first_seen_input_order() {
+        let first = Digest::of_bytes(b"first");
+        let second = Digest::of_bytes(b"second");
+        let third = Digest::of_bytes(b"third");
+        assert_eq!(
+            stable_dedupe_targets(vec![second, first, second, third, first]),
+            vec![second, first, third]
         );
     }
 

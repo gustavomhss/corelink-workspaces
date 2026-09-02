@@ -96,12 +96,12 @@ pub struct Cli {
     )]
     pub no_color: bool,
 
-    /// Max concurrent CAS requests for snapshot/hydrate.
+    /// Max concurrent CoreLink requests for snapshot, hydrate, prune, and erase.
     #[arg(
         long,
         global = true,
         default_value_t = 8,
-        help = "Max concurrent CAS requests for snapshot/hydrate (lower it if you hit rate limits)"
+        help = "Max concurrent CoreLink requests for snapshot/hydrate/prune/erase (lower it if you hit rate limits)"
     )]
     pub concurrency: usize,
 
@@ -593,8 +593,8 @@ async fn dispatch(
         Commands::Run(args) => subcmds::run::run(args, cfg, json).await,
         Commands::Ls(args) => subcmds::ls::run(args, cfg, json).await,
         Commands::Rm(args) => subcmds::rm::run(args, cfg, json).await,
-        Commands::Prune(args) => subcmds::prune::run(args, cfg, json).await,
-        Commands::Erase(args) => subcmds::erase::run(args, cfg, json).await,
+        Commands::Prune(args) => subcmds::prune::run(args, cfg, json, concurrency).await,
+        Commands::Erase(args) => subcmds::erase::run(args, cfg, json, concurrency).await,
         Commands::Doctor(args) => subcmds::doctor::run(args, cfg, json).await,
         Commands::Auth(args) => subcmds::auth::run(args, cfg, json).await,
         Commands::Uninstall(args) => {
@@ -771,6 +771,19 @@ mod tests {
     fn parse_concurrency_defaults_to_8() {
         let cli = Cli::try_parse_from(["clw", "snapshot", "--name", "ws"]).unwrap();
         assert_eq!(cli.concurrency, 8);
+    }
+
+    #[test]
+    fn parse_concurrency_for_destructive_sweeps() {
+        let erase = Cli::try_parse_from(["clw", "--concurrency", "16", "erase"]).unwrap();
+        assert_eq!(erase.concurrency, 16);
+        assert!(matches!(erase.command, Commands::Erase(_)));
+
+        // Zero is accepted by clap and clamped to one inside the destructive
+        // command, matching the established snapshot/hydrate behavior.
+        let prune = Cli::try_parse_from(["clw", "--concurrency", "0", "prune"]).unwrap();
+        assert_eq!(prune.concurrency, 0);
+        assert!(matches!(prune.command, Commands::Prune(_)));
     }
 
     #[test]

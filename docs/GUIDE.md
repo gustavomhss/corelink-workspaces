@@ -290,7 +290,7 @@ Run `clw --help` or `clw <cmd> --help` for the live text. `--version` prints the
 | `--cache-dir <DIR>` | | `~/.clw/cache` | `CLW_CACHE_DIR` | Local blob cache. |
 | `--ref-domain <D>` | | `user` | `CLW_REF_DOMAIN` | `user` or `runner`; `runner` uses a disjoint keyspace (set by the runner fabric — users never need it). |
 | `--json` | | off | | Machine-readable JSON on stdout (errors still on stderr). |
-| `--concurrency <N>` | | `8` | | Max concurrent CAS requests for `snapshot`/`hydrate` (min 1; does **not** apply to `run`). |
+| `--concurrency <N>` | | `8` | | Per-invocation ceiling for concurrent CoreLink requests in `snapshot`/`hydrate`/`prune`/`erase` (`0` is clamped to 1; does **not** apply to `run`). CLI flag only: no environment or config-file setting. |
 | `--no-color` | | off | `NO_COLOR`, non-TTY | Disable ANSI color. |
 | `--verbose` | `-v` | warn | `RUST_LOG` overrides | `-v`=info, `-vv`=debug. Diagnostics to stderr. Conflicts with `-q`. |
 | `--quiet` | `-q` | off | `RUST_LOG` overrides | Only errors. Conflicts with `-v`. |
@@ -1095,7 +1095,7 @@ clw completions powershell >> $PROFILE
 
 **Throttle / accessibility**
 ```sh
-clw --concurrency 4 snapshot --name myapp-dev   # cap concurrent CAS requests (default 8)
+clw --concurrency 4 snapshot --name myapp-dev   # cap this operation's CoreLink requests (default 8)
 clw --no-color status --name myapp-dev          # no ANSI (also NO_COLOR / non-TTY)
 ```
 
