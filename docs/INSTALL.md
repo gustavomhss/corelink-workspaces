@@ -13,8 +13,9 @@ credential. (See `docs/DISTRIBUTION.md`.)
 
 > Verifying the signature is **not optional**. `clw` carries a tenant Personal Access
 > Token and snapshots your workspace — run only a binary whose signature and checksum
-> you have verified against the published trust root. Homebrew verifies the per-asset
-> SHA-256 for you; for the `curl` and Windows paths, verify per
+> you have verified against the pinned trust root. Homebrew verifies the per-asset
+> SHA-256 pinned in its formula, but does not run minisign locally; for the `curl` and
+> manual paths, verify the signed checksum manifest per
 > [§4](#4-verify-the-download-per-platform).
 
 ---
@@ -55,7 +56,7 @@ no `latest` alias):
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   "https://raw.githubusercontent.com/HuGR-Labs/clw-releases/main/install.sh" \
-  | CLW_VERSION=<version> sh
+  | CLW_VERSION="<version>" sh
 ```
 
 Homebrew is the preferred path; this `curl` fallback verifies the minisign signature
@@ -68,6 +69,10 @@ SHA-256 (**never skippable**),
 strips the macOS quarantine attribute, and installs to `$HOME/.local/bin/clw`. See the
 [macOS quarantine note](#3-macos-quarantine-curl-path-only).
 
+If `minisign` is not installed, the installer refuses to continue. The explicit
+`CLW_SKIP_SIGNATURE=1` escape hatch proceeds with the SHA-256 check only and prints a
+warning; install `minisign` and rerun instead for the normal signed-manifest check.
+
 ### Windows — direct `.exe` download
 
 There is no Homebrew on Windows; download the `.exe` directly from the mirror release
@@ -79,7 +84,6 @@ $base = "https://github.com/HuGR-Labs/clw-releases/releases/download/v$ver"
 Invoke-WebRequest "$base/clw-$ver-x86_64-pc-windows-gnu.exe" -OutFile "clw.exe"
 Invoke-WebRequest "$base/SHA256SUMS"          -OutFile "SHA256SUMS"
 Invoke-WebRequest "$base/SHA256SUMS.minisig"  -OutFile "SHA256SUMS.minisig"
-Invoke-WebRequest "$base/minisign.pub"        -OutFile "minisign.pub"
 ```
 
 Then install it on `PATH` per [§5 Windows](#windows-powershell).
@@ -90,9 +94,9 @@ Then install it on `PATH` per [§5 Windows](#windows-powershell).
 
 | OS | Arch | Target triple | Asset name | Signing / verify |
 |----|------|---------------|------------|------------------|
-| macOS (Apple Silicon) | arm64 | `aarch64-apple-darwin` | `clw-<version>-aarch64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
-| macOS (Intel) | x86_64 | `x86_64-apple-darwin` | `clw-<version>-x86_64-apple-darwin` | minisign over `SHA256SUMS` (Developer-ID near-term) |
-| Windows | x86_64 | `x86_64-pc-windows-gnu` | `clw-<version>-x86_64-pc-windows-gnu.exe` | minisign over `SHA256SUMS` (Authenticode near-term) |
+| macOS (Apple Silicon) | arm64 | `aarch64-apple-darwin` | `clw-<version>-aarch64-apple-darwin` | signed `SHA256SUMS` manifest (Developer-ID planned) |
+| macOS (Intel) | x86_64 | `x86_64-apple-darwin` | `clw-<version>-x86_64-apple-darwin` | signed `SHA256SUMS` manifest (Developer-ID planned) |
+| Windows | x86_64 | `x86_64-pc-windows-gnu` | `clw-<version>-x86_64-pc-windows-gnu.exe` | signed `SHA256SUMS` manifest (Authenticode planned) |
 | Linux | x86_64 | `x86_64-unknown-linux-gnu` | `clw-<version>-x86_64-unknown-linux-gnu` | minisign over `SHA256SUMS` + per-binary `.minisig` |
 | Linux | arm64 | `aarch64-unknown-linux-gnu` | `clw-<version>-aarch64-unknown-linux-gnu` | minisign over `SHA256SUMS` + per-binary `.minisig` |
 
@@ -152,22 +156,20 @@ too, is near-term — see `docs/DISTRIBUTION.md`.)
 
 ## 4. Verify the download (per platform)
 
-Homebrew already verifies the per-asset SHA-256 from the formula, and `install.sh`
-verifies automatically. For the **Windows** and any **manual** download, verify both
-the checksum manifest **and**, where applicable, the platform signature.
+Homebrew verifies the per-asset SHA-256 pinned in `Formula/clw.rb`; it does **not** run
+minisign locally. The release pipeline parses that formula pin from the published,
+signed `SHA256SUMS` manifest, which anchors the checksum chain. `install.sh` verifies
+the manifest automatically. For the **Windows** and any **manual** download, verify
+both the checksum manifest **and**, where applicable, the platform signature.
 
 ### 4a. The minisign public key (trust root)
 
-`SHA256SUMS` is signed with **minisign**. The public key **is committed** to the
-source tree as `docs/minisign.pub` **and** published alongside every release on the
-public mirror (`.../v<version>/minisign.pub`) as the trust root — v0.1.0 and later are
-signed against it. Pin its fingerprint out of band:
-
-```sh
-# Inspect the published key; compare its fingerprint to the one below / in docs/minisign.pub
-# out-of-band before trusting it.
-cat minisign.pub
-```
+`SHA256SUMS` is signed with **minisign**. The public key is committed to the source
+tree as `docs/minisign.pub` and published alongside every release on the public mirror
+(`.../v<version>/minisign.pub`) — v0.1.0 and later are signed against it. The
+installer does **not** trust a key downloaded from the mirror: it embeds this pinned
+key. Manual verification should use the same pinned value below (rather than trusting
+a downloaded key by itself).
 
 > **Trust-root fingerprint (the committed `docs/minisign.pub`):**
 >
@@ -184,14 +186,14 @@ Verify `SHA256SUMS` directly against this trust-root key:
 ```sh
 minisign -V -P RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0 \
   -m SHA256SUMS
-# (equivalently: minisign -V -p minisign.pub -m SHA256SUMS — see §4b)
 ```
 
 ### 4b. Verify the signed checksum manifest (all platforms)
 
 ```sh
-# 1. Verify the manifest signature against the published public key:
-minisign -V -p minisign.pub -m SHA256SUMS
+# 1. Verify the manifest signature against the pinned trust root:
+minisign -V -P RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0 \
+  -m SHA256SUMS
 
 # 2. Verify your asset's checksum is the one the signed manifest attests:
 #    (Linux: sha256sum; macOS: shasum -a 256)
@@ -202,18 +204,17 @@ shasum -a 256 --ignore-missing -c SHA256SUMS  # macOS
 A failure on either step means **do not run the binary** — treat it as a potential
 compromise and follow `docs/go-live/RUNBOOK-key-rotation-revocation.md`.
 
-> **Not available yet — do not run this.** A build-provenance attestation
-> (`gh attestation verify`) is the intended additional supply-chain check, but the
-> pipeline step that would mint it is gated to public repositories and this source
-> repo is private, so no attestation is published (owner waiver, 2026-06-18). The
-> command would fail with "no attestation found", which is expected and is **not**
-> evidence that your download is compromised. The signed `SHA256SUMS` manifest above
-> is the verification of record. This note will be replaced with the real command
-> when attestation ships.
+> **Build-provenance attestation is not available — do not run an attestation check.**
+> The pipeline step that would mint one is gated to public repositories and this source
+> repo is private, so no attestation is published (owner waiver, 2026-06-18). A failed
+> attestation lookup is therefore expected and is **not** evidence that your download
+> was compromised. The signed `SHA256SUMS` manifest above is the verification of record;
+> this note will be replaced when attestation ships.
 
 ### 4c. macOS — Gatekeeper / signature
 
-Once Developer-ID signing is live you can assess the binary with Gatekeeper:
+**Planned — do not run until Developer-ID signing is announced as live.** Once it is,
+you can assess the binary with Gatekeeper:
 
 ```sh
 spctl -a -t open --context context:primary-signature -vv ./clw   # 'accepted' when signed
@@ -225,22 +226,35 @@ brew path runs them unquarantined, and the `curl`/manual path strips quarantine 
 
 ### 4d. Windows — Authenticode
 
-**Not live yet.** Windows Authenticode signing (Azure Trusted Signing) is deferred, so
-every shipped `clw.exe` is unsigned and `Get-AuthenticodeSignature` reports `NotSigned`.
-That is **expected** and is not evidence that your download was tampered with — verify
-via the signed checksum manifest below instead.
+**Planned — not live today.** Windows Authenticode signing (Azure Trusted Signing) is
+deferred, so every shipped `clw.exe` is unsigned and `Get-AuthenticodeSignature` reports
+`NotSigned`. That is **expected** and is not evidence that your download was tampered
+with — verify via the signed checksum manifest below instead. Do not treat the planned
+platform-signature command as a current release requirement.
 
-Once Authenticode signing is live, a `Valid` status will be the additional check:
+When Authenticode signing is announced as live, it will be an additional platform check:
 
 ```powershell
-Get-AuthenticodeSignature .\clw.exe | Format-List   # 'Valid' once signing is live
+Get-AuthenticodeSignature .\clw.exe | Format-List
 ```
 
 Verify the checksum manifest (PowerShell) — this is the check that works today:
 
 ```powershell
-(Get-FileHash .\clw.exe -Algorithm SHA256).Hash.ToLower()
-# compare against the clw-<version>-x86_64-pc-windows-gnu.exe line in SHA256SUMS
+$ver = "<version>"  # exact version of the downloaded release, e.g. "0.1.11"
+if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "<version>") {
+  throw "Set `$ver to the exact downloaded release version before verifying."
+}
+$asset = "clw-$ver-x86_64-pc-windows-gnu.exe"
+minisign.exe -V -P "RWRtOQ5KtbhXSxt24bM/T+ndWfjUDUm8c7gr8194pxnyWEUS/CTDIkm0" -m .\SHA256SUMS
+$expected = (Get-Content .\SHA256SUMS | ForEach-Object {
+  $parts = $_ -split '\s+', 2
+  if ($parts.Count -eq 2 -and $parts[1] -eq $asset) { $parts[0] }
+} | Select-Object -First 1)
+if (-not $expected) { throw "SHA256SUMS has no entry for $asset" }
+$actual = (Get-FileHash .\clw.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected.ToLowerInvariant()) { throw "SHA-256 checksum mismatch for $asset" }
+"SHA-256 checksum OK: $asset"
 ```
 
 ---
