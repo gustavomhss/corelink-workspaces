@@ -76,6 +76,12 @@ the Azure credentials.
 `AZURE_SUBSCRIPTION_ID`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERT_PROFILE` (OIDC
 preferred over a client secret). This stays last in the signing rollout.
 
+**Verification runner gate.** The release proof is generated only on a Windows
+self-hosted runner with the exact labels `self-hosted`, `Windows`, and `X64`.
+The repository has no registered Windows runner in its current inventory; until
+the organization provides that label set, the release job remains pending and
+the publish gate cannot pass.
+
 ---
 
 ## (c) macOS signing — Developer-ID (near-term)

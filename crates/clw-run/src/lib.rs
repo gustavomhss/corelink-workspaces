@@ -540,7 +540,7 @@ async fn compute_key_with_tool_digest_cache(
             for entry in walked {
                 match entry {
                     clw_manifest::WalkedEntry::File(f) => {
-                        let digest = digest_file(&f.abs).await?;
+                        let digest = Box::pin(digest_file(&f.abs)).await?;
                         let entry_rel = format!("{}/{}", rel, norm_sep(&f.rel));
                         // FIX 2: fold the file's mode (perm bits) into the value so a
                         // `chmod +x` on a declared input changes the key even though
@@ -579,7 +579,7 @@ async fn compute_key_with_tool_digest_cache(
             }
         } else {
             // Regular file: digest bytes + fold in the unix mode (FIX 2).
-            let digest = digest_file(&abs).await?;
+            let digest = Box::pin(digest_file(&abs)).await?;
             input_pairs.push([
                 rel.clone(),
                 format!("{}:{:o}", digest.to_hex(), file_mode(&meta)),
@@ -613,7 +613,15 @@ async fn compute_key_with_tool_digest_cache(
     let tool = if opts.command.is_empty() {
         String::new()
     } else {
-        resolve_tool_id_with_cache(cwd, &opts.command[0], tool_digest_cache).await
+        // Tool resolution retains the streamed file-digest state machine. Box it
+        // at this boundary so callers of `compute_key` do not inherit that large
+        // future frame on Tokio's default worker stack.
+        Box::pin(resolve_tool_id_with_cache(
+            cwd,
+            &opts.command[0],
+            tool_digest_cache,
+        ))
+        .await
     };
 
     // --- working directory ---

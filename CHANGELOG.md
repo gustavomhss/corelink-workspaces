@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.12] — required-hit cache replay + post-v0.1.11 hardening (2026-09-06)
+
 ### Fixed
 - **Windows: a symlink whose target directory contains the link itself is now rejected (M17).**
   Windows has no unprivileged symlinks, so `hydrate` materialises a `Symlink` entry as a COPY of
