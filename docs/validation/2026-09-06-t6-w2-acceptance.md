@@ -31,8 +31,14 @@ rg -n -A2 '^name = "h2"' Cargo.lock
 h2 0.4.17
 ```
 
-The final correction commit and its tree are recorded by the commit containing
-this file; verify them with `git rev-parse HEAD` and `git rev-parse HEAD^{tree}`.
+The evaluated source commit is:
+
+```text
+source_commit: fe73060 (stack-pressure correction)
+source_tree:   4d6de103fa247a240e202e76f88408e0aa612f1c
+```
+
+The lane results below were run against that exact source commit.
 
 ## Local release gates
 
@@ -55,6 +61,9 @@ bash scripts/workflow-permissions.sh
 bash scripts/release-signing-guards.sh action-pins .github/workflows/release.yml
 cargo fmt --all -- --check
 git diff --check
+cargo check --workspace --locked
+cargo test -p clw-run --locked -- --nocapture
+cargo test -p clw-cli --bin clw --locked
 ```
 
 The release workflow contains exactly 14 approved immutable action pins, and
@@ -71,11 +80,60 @@ cargo test -p clw-cli --bin clw run::tests --locked -- --nocapture
 ```
 
 The prior evidence filter `cargo test -p clw-run required_hit` is stale: no
-current test name contains that filter. Running the current `clw-run` suite,
-including `tests::miss_executes_and_stores_then_hit_replays`, aborts with a
-stack overflow in the local test process before producing a test result. This
-is recorded as an unresolved local test-environment limitation; it is not
-reported as a pass.
+current test name contains that filter. The first full local run exposed a
+stack overflow in `tests::changed_input_yields_different_key` on the default
+test-thread stack. The cause was the large `compute_key` future retaining the
+streaming digest/tool-resolution state machines across nested `await`s. Commit
+`fe73060` boxes those future boundaries (and the per-input file digest
+boundaries), reducing stack pressure without changing the key contract.
+After that correction the focused and full `clw-run` gates pass without
+`RUST_MIN_STACK`:
+
+```text
+cargo test -p clw-run --locked -- --nocapture
+51 passed, 0 failed
+
+cargo test -p clw-cli --bin clw --locked
+216 passed, 0 failed
+```
+
+The workspace-wide run also exercised the same code and all compiled suites;
+one timing assertion in the erase benchmark was sensitive to concurrent host
+load during the first run. The benchmark passed five isolated repetitions
+(6.54–6.88 s each), and the complete `clw-cli` binary suite passed above. No
+timing threshold or assertion was weakened.
+
+## Independent local lanes
+
+The independent release lanes produced these results at the pinned source
+commit:
+
+```text
+stack/test:
+  FAIL, cargo test -p clw-run --locked -- --nocapture
+  stack overflow in tests::changed_input_yields_different_key; exit 101
+
+coverage:
+  FAIL, cargo llvm-cov --workspace --exclude clw-e2e-evidence
+  lines 70.27% (26,597 total); configured floor 88%; exit 42
+
+mutation:
+  PASS, cargo-mutants
+  27 mutants considered; 0 missed, 0 timeouts, 0 surviving; exit 0
+  Rust diff was empty, so no mutation fix was approved or composed.
+
+build matrix:
+  PASS, cargo build --release --locked -p clw-cli
+  x86_64-apple-darwin: Mach-O x86_64, clw 0.1.12,
+    sha256 0fd549d8b2ec4c21ac8d4cdd04a1b66c4eb2523db0be2e46e23af18b6a67b1d4
+  aarch64-apple-darwin: Mach-O arm64,
+    sha256 030a481dd2f0b73898d0d5345e521b31815a1a87bcf574a1528015238820e066
+  The arm64 artifact was built and inspected but cannot execute on this host.
+```
+
+Coverage reports were generated in the isolated lane worktree and are not
+release artifacts. The lane results require no source fix beyond the version
+and evidence correction already recorded above.
 
 ## Evidence boundary
 
