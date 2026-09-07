@@ -103,10 +103,11 @@ load during the first run. The benchmark passed five isolated repetitions
 (6.54–6.88 s each), and the complete `clw-cli` binary suite passed above. No
 timing threshold or assertion was weakened.
 
-## Independent local lanes
+## Earlier baseline lanes
 
-The independent release lanes produced these results at the pinned source
-commit:
+The following diagnostics were run against the pre-fix source commit
+`56eaf82060fbac7b25fe22242af153e70acb7c33`. They are retained as historical
+baseline evidence and are not claims about the corrected source commit above:
 
 ```text
 stack/test:
@@ -132,8 +133,9 @@ build matrix:
 ```
 
 Coverage reports were generated in the isolated lane worktree and are not
-release artifacts. The lane results require no source fix beyond the version
-and evidence correction already recorded above.
+release artifacts. The stack failure from this baseline was closed by
+`fe73060`; the corrected focused and full gates are recorded above. Coverage,
+mutation, and build-matrix lanes were not rerun after that small source fix.
 
 ## Evidence boundary
 
