@@ -113,10 +113,18 @@ expect_fail "missing macOS attestation blocks publish gate" "notarization" \
 printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
   "$mac_arm" "$mac_arm_zip_sha256" > "$DIST/$mac_arm.notarization.json"
 
+# A proof with the exact EXE digest and valid statuses still cannot authorize a
+# release when the signer identity does not match the configured trust policy.
+windows_original_sha256="$(sha256_file "$DIST/$windows")"
+printf '{"asset":"%s","status":"Valid","chain_status":"Valid","signer_subject":"CN=Unexpected Signer","signer_issuer":"CN=Unexpected Issuer","sha256":"%s"}\n' \
+  "$windows" "$windows_original_sha256" > "$DIST/$windows.authenticode.json"
+expect_fail "wrong Authenticode signer blocks publish gate" "signer subject mismatch" \
+  env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
+    bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+
 # A proof can contain the expected status and signer text yet still refer to
 # different bytes. Never run the gate with the unchanged fake EXE; replace it
 # first and require the recomputed hash check to reject the proof.
-windows_original_sha256="$(sha256_file "$DIST/$windows")"
 printf '{"asset":"%s","status":"Valid","chain_status":"Valid","signer_subject":"CN=Test Signer","signer_issuer":"CN=Test Issuer","sha256":"%s"}\n' \
   "$windows" "$windows_original_sha256" > "$DIST/$windows.authenticode.json"
 printf 'replaced executable\n' > "$DIST/$windows"
