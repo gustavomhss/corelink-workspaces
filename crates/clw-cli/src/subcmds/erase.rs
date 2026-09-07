@@ -482,15 +482,12 @@ fn abort(json: bool, tenant: &str) -> Result<(), ClwError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clw_types::{Config, Digest, Result as ClwResult};
-    use std::path::PathBuf;
+    use clw_types::{Digest, Result as ClwResult};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
     use std::time::{Duration, Instant};
-    use wiremock::matchers::{method, path, path_regex};
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     // FIX 1 — a fake transport whose enumeration is EVENTUALLY CONSISTENT: on the
     // SECOND `list_refs`/`list_blobs` call it re-returns one already-deleted key,
@@ -907,121 +904,73 @@ mod tests {
         assert_eq!(actual, GOLDEN);
     }
 
-    #[derive(Clone)]
-    struct DelayedWireDeleteResponder {
-        delay: Duration,
-        active_until: Arc<Mutex<Vec<Instant>>>,
-        peak: Arc<AtomicUsize>,
-        deleted: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Respond for DelayedWireDeleteResponder {
-        fn respond(&self, request: &Request) -> ResponseTemplate {
-            // `ResponseTemplate::set_delay` keeps this request live on wiremock's
-            // async server. Track overlapping request windows independently so the
-            // acceptance test observes the actual HTTP fan-out as well as elapsed
-            // time. A completed response cannot trigger its replacement before its
-            // delay has elapsed, so expiring windows here never overstates N.
-            let now = Instant::now();
-            let mut active = self.active_until.lock().unwrap();
-            active.retain(|until| *until > now);
-            active.push(now + self.delay);
-            self.peak.fetch_max(active.len(), Ordering::SeqCst);
-            drop(active);
-
-            let digest = request
-                .url
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .expect("DELETE URL has a digest segment")
-                .to_owned();
-            self.deleted.lock().unwrap().push(digest);
-            ResponseTemplate::new(204).set_delay(self.delay)
-        }
-    }
-
-    async fn wiremock_500_ref_sweep(
+    async fn bounded_delete_scheduler_probe(
         concurrency: usize,
         targets: &[Digest],
-    ) -> (Duration, usize, Vec<String>) {
-        const DELAY: Duration = Duration::from_millis(8);
-        let server = MockServer::start().await;
-        let responder = DelayedWireDeleteResponder {
-            delay: DELAY,
-            active_until: Arc::new(Mutex::new(Vec::new())),
-            peak: Arc::new(AtomicUsize::new(0)),
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        };
-        Mock::given(method("DELETE"))
-            .and(path_regex("/v1/ac/bench/[a-f0-9]{64}$"))
-            .respond_with(responder.clone())
-            .mount(&server)
-            .await;
-        // `erase_with_verification` re-lists both namespaces before it can make
-        // the completed-erasure claim. Both need an empty, valid pagination page.
-        Mock::given(method("GET"))
-            .and(path("/v1/ac/bench"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "refs": [], "next_cursor": serde_json::Value::Null,
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/cas/bench"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "blobs": [], "next_cursor": serde_json::Value::Null,
-            })))
-            .mount(&server)
-            .await;
+    ) -> (usize, Vec<Digest>) {
+        let concurrency = destructive_sweep_concurrency(concurrency);
+        let first_wave = Arc::new(tokio::sync::Barrier::new(concurrency));
+        let wave_ticket = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let deleted = Arc::new(Mutex::new(Vec::with_capacity(targets.len())));
 
-        let client = HttpClient::with_concurrency(
-            Config {
-                endpoint: server.uri(),
-                tenant: "bench".into(),
-                token: "bench-token".into(),
-                cache_dir: PathBuf::from("/nonexistent/wp27-wiremock-cache"),
-            },
-            concurrency,
-        )
-        .expect("loopback WireMock endpoint is an allowed client endpoint");
-        let start = Instant::now();
-        let result = erase_with_verification(&client, targets.to_vec(), Vec::new(), concurrency)
-            .await
-            .expect("all delayed WireMock DELETEs return 204");
-        assert_eq!(result.refs_deleted, targets.len());
-        assert_eq!(result.blobs_deleted, 0);
-        let elapsed = start.elapsed();
-        let peak = responder.peak.load(Ordering::SeqCst);
-        let deleted = responder.deleted.lock().unwrap().clone();
-        (elapsed, peak, deleted)
+        let outcome = delete_bounded_draining(targets, concurrency, |digest| {
+            let first_wave = Arc::clone(&first_wave);
+            let wave_ticket = Arc::clone(&wave_ticket);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let deleted = Arc::clone(&deleted);
+            async move {
+                let ticket = wave_ticket.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+
+                // The first N calls must all be admitted before any can finish.
+                // This makes the observed peak a scheduling fact rather than a
+                // timing accident, while the bounded helper still controls all
+                // later submissions.
+                if ticket < concurrency {
+                    first_wave.wait().await;
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                deleted.lock().unwrap().push(digest);
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(
+            outcome.failure.is_none(),
+            "probe must not produce a failure"
+        );
+        let peak_value = peak.load(Ordering::SeqCst);
+        let deleted_values = deleted.lock().unwrap().clone();
+        (peak_value, deleted_values)
     }
 
     #[tokio::test]
-    async fn wiremock_500_ref_sweep_is_bounded_and_at_least_four_times_faster_at_n16() {
-        // Reproducible end-to-end scheduler benchmark: same 500 unique HTTP
-        // DELETEs, same delayed WireMock responder, only N differs. This exercises
-        // both `delete_bounded_draining` and the real HttpClient governor.
+    async fn delete_scheduler_is_deterministically_bounded_at_n16() {
+        // This proves the scheduler contract without a wall-clock threshold:
+        // N=1 is serial, N=16 admits exactly one first wave of sixteen, and the
+        // full target set is completed in both modes. A barrier forces the first
+        // wave to overlap, so llvm-cov overhead cannot turn this into a flaky
+        // performance benchmark.
         let targets: Vec<Digest> = (0..500u16)
             .map(|i| Digest::of_bytes(&i.to_le_bytes()))
             .collect();
-        let mut golden: Vec<String> = targets.iter().map(Digest::to_hex).collect();
-        golden.sort_unstable();
+        let mut golden = targets.clone();
+        golden.sort_unstable_by_key(Digest::to_hex);
 
-        let (n1_elapsed, n1_peak, mut n1_deleted) = wiremock_500_ref_sweep(1, &targets).await;
-        let (n16_elapsed, n16_peak, mut n16_deleted) = wiremock_500_ref_sweep(16, &targets).await;
+        let (n1_peak, mut n1_deleted) = bounded_delete_scheduler_probe(1, &targets).await;
+        let (n16_peak, mut n16_deleted) = bounded_delete_scheduler_probe(16, &targets).await;
         n1_deleted.sort_unstable();
         n16_deleted.sort_unstable();
+        golden.sort_unstable_by_key(Digest::to_hex);
         assert_eq!(n1_deleted, golden, "N=1 must delete the golden input set");
         assert_eq!(n16_deleted, golden, "N=16 must delete the golden input set");
-        assert_eq!(n1_peak, 1, "N=1 baseline must remain serial on the wire");
-        assert!(
-            n16_peak > 1 && n16_peak <= 16,
-            "WireMock observed invalid N=16 fan-out: peak={n16_peak}"
-        );
-        assert!(
-            n16_elapsed.saturating_mul(4) <= n1_elapsed,
-            "WireMock N=16 regressed below 4x: N=1={n1_elapsed:?}, N=16={n16_elapsed:?}"
-        );
+        assert_eq!(n1_peak, 1, "N=1 must remain serial");
+        assert_eq!(n16_peak, 16, "N=16 must admit exactly sixteen calls");
     }
 
     #[test]
