@@ -39,12 +39,14 @@ check_secrets() {
 }
 
 check_json_proof() {
-  local proof="$1" expected_asset="$2" expected_status="$3"
-  python3 - "$proof" "$expected_asset" "$expected_status" <<'PY'
+  local proof="$1" expected_asset="$2" expected_status="$3" bound_file="$4" digest_field="$5"
+  local expected_digest
+  expected_digest="$(sha256sum "$bound_file" | awk '{print $1}')"
+  python3 - "$proof" "$expected_asset" "$expected_status" "$digest_field" "$expected_digest" "${WINDOWS_EXPECTED_SIGNER_SUBJECT:-}" "${WINDOWS_EXPECTED_SIGNER_ISSUER:-}" <<'PY'
 import json
 import sys
 
-path, expected_asset, expected_status = sys.argv[1:]
+path, expected_asset, expected_status, digest_field, expected_digest, expected_signer, expected_issuer = sys.argv[1:]
 try:
     with open(path, encoding="utf-8") as handle:
         value = json.load(handle)
@@ -54,8 +56,18 @@ if value.get("asset") != expected_asset:
     raise SystemExit(f"signature proof asset mismatch in {path}")
 if value.get("status") != expected_status:
     raise SystemExit(f"signature proof status mismatch in {path}")
-if value.get("verified") is not True and value.get("codesign_verified") is not True:
-    raise SystemExit(f"signature proof is not marked verified in {path}")
+if value.get(digest_field, "").lower() != expected_digest:
+    raise SystemExit(f"signature proof digest mismatch in {path}")
+if expected_status == "Accepted":
+    if value.get("codesign_verified") is not True:
+        raise SystemExit(f"macOS proof is not codesign-verified in {path}")
+else:
+    if value.get("chain_status") != "Valid" or value.get("signer_subject") == "" or value.get("signer_issuer") == "":
+        raise SystemExit(f"Windows proof is not chain-verified in {path}")
+    if expected_signer and value.get("signer_subject") != expected_signer:
+        raise SystemExit(f"Windows signer subject mismatch in {path}")
+    if expected_issuer and value.get("signer_issuer") != expected_issuer:
+        raise SystemExit(f"Windows signer issuer mismatch in {path}")
 PY
 }
 
@@ -85,9 +97,11 @@ check_assets() {
   done
   for asset in "$mac_x86" "$mac_arm"; do
     [[ -s "$release_dir/$asset.zip" ]] || { echo "::error::notarized macOS archive missing: $asset" >&2; return 1; }
-    check_json_proof "$release_dir/$asset.notarization.json" "$asset" Accepted
+    check_json_proof "$release_dir/$asset.notarization.json" "$asset" Accepted "$release_dir/$asset.zip" zip_sha256
   done
-  check_json_proof "$release_dir/$windows.authenticode.json" "$windows" Signed
+  [[ -n "${WINDOWS_EXPECTED_SIGNER_SUBJECT:-}" ]] || { echo "::error::expected Windows signer subject is not configured" >&2; return 1; }
+  [[ -n "${WINDOWS_EXPECTED_SIGNER_ISSUER:-}" ]] || { echo "::error::expected Windows signer issuer is not configured" >&2; return 1; }
+  check_json_proof "$release_dir/$windows.authenticode.json" "$windows" Valid "$release_dir/$windows" sha256
   echo "asset signature gate: five target assets have verified signature/attestation evidence"
 }
 
@@ -124,8 +138,8 @@ for number, line in enumerate(text, 1):
     match = re.match(r"^\s*(?:-\s+)?uses:\s*([^\s#]+)", line)
     if match:
         uses.append((number, match.group(1)))
-if len(uses) != 12:
-    raise SystemExit(f"release action inventory changed: expected 12 uses, found {len(uses)}")
+if len(uses) != 14:
+    raise SystemExit(f"release action inventory changed: expected 14 uses, found {len(uses)}")
 for number, ref in uses:
     action, sep, commit = ref.rpartition("@")
     if not sep or action not in approved or commit != approved[action]:

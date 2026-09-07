@@ -71,13 +71,46 @@ for asset in "$linux_x86" "$linux_arm"; do
 done
 printf 'zip\n' > "$DIST/$mac_x86.zip"
 printf 'zip\n' > "$DIST/$mac_arm.zip"
-printf '{"asset":"%s","status":"Accepted","codesign_verified":true}\n' "$mac_x86" > "$DIST/$mac_x86.notarization.json"
-printf '{"asset":"%s","status":"Accepted","codesign_verified":true}\n' "$mac_arm" > "$DIST/$mac_arm.notarization.json"
-printf '{"asset":"%s","status":"Signed","verified":true}\n' "$windows" > "$DIST/$windows.authenticode.json"
-expect_pass "complete five-asset proofs pass" bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+mac_x86_zip_sha256="$(sha256sum "$DIST/$mac_x86.zip" | awk '{print $1}')"
+mac_arm_zip_sha256="$(sha256sum "$DIST/$mac_arm.zip" | awk '{print $1}')"
+printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
+  "$mac_x86" "$mac_x86_zip_sha256" > "$DIST/$mac_x86.notarization.json"
+printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
+  "$mac_arm" "$mac_arm_zip_sha256" > "$DIST/$mac_arm.notarization.json"
+
+# An asserted JSON file is not an Authenticode proof. A non-Valid status must
+# fail before any fixture can be treated as a release-ready Windows asset.
+printf '{"asset":"%s","status":"Invalid","chain_status":"Invalid","signer_subject":"CN=Test Signer","signer_issuer":"CN=Test Issuer","sha256":"%s"}\n' \
+  "$windows" "$(sha256sum "$DIST/$windows" | awk '{print $1}')" > "$DIST/$windows.authenticode.json"
+expect_fail "invalid Authenticode status blocks publish gate" "status mismatch" \
+  env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
+    bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+
+# The macOS attestation is bound to the archive bytes. Mutating the archive
+# must fail on the recomputed digest even when its JSON fields look valid.
+printf 'replaced zip\n' > "$DIST/$mac_x86.zip"
+expect_fail "replaced macOS archive blocks publish gate" "digest mismatch" \
+  env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
+    bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+printf 'zip\n' > "$DIST/$mac_x86.zip"
+
 rm -f "$DIST/$mac_arm.notarization.json"
 expect_fail "missing macOS attestation blocks publish gate" "notarization" \
-  bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+  env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
+    bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
+printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
+  "$mac_arm" "$mac_arm_zip_sha256" > "$DIST/$mac_arm.notarization.json"
+
+# A proof can contain the expected status and signer text yet still refer to
+# different bytes. Never run the gate with the unchanged fake EXE; replace it
+# first and require the recomputed hash check to reject the proof.
+windows_original_sha256="$(sha256sum "$DIST/$windows" | awk '{print $1}')"
+printf '{"asset":"%s","status":"Valid","chain_status":"Valid","signer_subject":"CN=Test Signer","signer_issuer":"CN=Test Issuer","sha256":"%s"}\n' \
+  "$windows" "$windows_original_sha256" > "$DIST/$windows.authenticode.json"
+printf 'replaced executable\n' > "$DIST/$windows"
+expect_fail "replaced Windows executable blocks publish gate" "digest mismatch" \
+  env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
+    bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
 printf 'digest fixture\n' > "$DIST/SHA256SUMS"
 minisign -S -s "$WORK/minisign.key" -m "$DIST/SHA256SUMS" >/dev/null 2>&1
 expect_pass "signed checksum gate passes" \

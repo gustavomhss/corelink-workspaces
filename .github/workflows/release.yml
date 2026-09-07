@@ -585,13 +585,14 @@ jobs:
           # force-passed: a Gatekeeper rejection of our own notarized artifact must
           # FAIL the step.
           spctl -a -t open --context context:primary-signature -v "dist/${ASSET}.zip"
-          python3 - "${ASSET}" "$NOTARY_JSON" > "dist/${ASSET}.notarization.json" <<'PY'
+          ZIP_SHA256="$(sha256sum "dist/${ASSET}.zip" | awk '{print $1}')"
+          python3 - "${ASSET}" "$NOTARY_JSON" "$ZIP_SHA256" > "dist/${ASSET}.notarization.json" <<'PY'
           import json
           import sys
 
-          asset, raw = sys.argv[1:]
+          asset, raw, zip_sha256 = sys.argv[1:]
           proof = json.loads(raw)
-          proof.update({"asset": asset, "codesign_verified": True})
+          proof.update({"asset": asset, "codesign_verified": True, "zip_sha256": zip_sha256})
           print(json.dumps(proof, sort_keys=True))
           PY
           # 5. Leave NO key material on the runner.
@@ -647,21 +648,8 @@ jobs:
             --timestamp-url "http://timestamp.acs.microsoft.com" \
             --file-digest SHA256 \
             --verbosity information
-          python3 - "${ASSET}" > "dist/${ASSET}.authenticode.json" <<'PY'
-          import json
-          import sys
-
-          print(json.dumps({
-              "asset": sys.argv[1],
-              "provider": "Azure Trusted Signing",
-              "status": "Signed",
-              "verified": True,
-          }, sort_keys=True))
-          PY
-          # Authenticode VERIFICATION is intentionally NOT run here: signtool /
-          # Get-AuthenticodeSignature are Windows-only, and this gnu .exe is signed on
-          # the macOS build host. The signature is verified downstream on a Windows
-          # consumer (the OS validates the Authenticode chain at install/run time).
+          # The signed EXE is verified on a real Windows runner before publish;
+          # this step deliberately emits no self-asserted proof file.
 
       # =======================================================================
       # SIGN — Linux: minisign detached signature (default). sigstore/cosign is a
@@ -716,6 +704,86 @@ jobs:
           name: clw-${{ matrix.target }}
           # `*` so the per-OS signature/zip files ride along once signing is wired.
           path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3a — WINDOWS AUTHENTICODE VERIFICATION
+  # Signing happens on the macOS build host; verification must happen on Windows
+  # with the OS Authenticode verifier. The proof is generated only after
+  # Get-AuthenticodeSignature reports Valid and the signer subject/issuer and
+  # certificate chain match the approved repository variables.
+  # ---------------------------------------------------------------------------
+  windows-authenticode:
+    name: verify Windows Authenticode
+    needs: [preflight, build]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+      WINDOWS_EXPECTED_SIGNER_SUBJECT: ${{ vars.CLW_WINDOWS_SIGNER_SUBJECT }}
+      WINDOWS_EXPECTED_SIGNER_ISSUER: ${{ vars.CLW_WINDOWS_SIGNER_ISSUER }}
+    steps:
+      - name: download exact Windows build asset
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: clw-x86_64-pc-windows-gnu
+          path: artifacts
+
+      - name: verify Authenticode signature and emit digest-bound proof
+        if: env.PRERELEASE == 'false'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = "clw-$env:VERSION-x86_64-pc-windows-gnu.exe"
+          $expectedSubject = $env:WINDOWS_EXPECTED_SIGNER_SUBJECT
+          $expectedIssuer = $env:WINDOWS_EXPECTED_SIGNER_ISSUER
+          if ([string]::IsNullOrWhiteSpace($expectedSubject) -or [string]::IsNullOrWhiteSpace($expectedIssuer)) {
+            throw 'CLW_WINDOWS_SIGNER_SUBJECT and CLW_WINDOWS_SIGNER_ISSUER repository variables are required on a real tag'
+          }
+          $matches = @(Get-ChildItem -LiteralPath $PWD/artifacts -Recurse -File -Filter $asset)
+          if ($matches.Count -ne 1) {
+            throw "expected exactly one Windows asset '$asset', found $($matches.Count)"
+          }
+          $exe = $matches[0].FullName
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Authenticode status for $asset is '$($signature.Status)' (expected Valid)"
+          }
+          $certificate = $signature.SignerCertificate
+          if ($null -eq $certificate) {
+            throw "Authenticode signer certificate is missing for $asset"
+          }
+          if ($certificate.Subject -cne $expectedSubject) {
+            throw "unexpected Authenticode signer subject: '$($certificate.Subject)'"
+          }
+          if ($certificate.Issuer -cne $expectedIssuer) {
+            throw "unexpected Authenticode signer issuer: '$($certificate.Issuer)'"
+          }
+          if (-not $certificate.Verify()) {
+            throw "Authenticode certificate chain did not verify for $asset"
+          }
+          $digest = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $proof = [ordered]@{
+            schema = 'clw.release.authenticode-proof.v1'
+            asset = $asset
+            sha256 = $digest
+            status = 'Valid'
+            chain_status = 'Valid'
+            signer_subject = $certificate.Subject
+            signer_issuer = $certificate.Issuer
+          }
+          $proofPath = Join-Path $PWD "$asset.authenticode.json"
+          $proof | ConvertTo-Json -Compress | Set-Content -LiteralPath $proofPath -Encoding utf8NoBOM
+          Write-Host "verified Authenticode asset $asset sha256=$digest"
+
+      - name: upload verified Windows proof
+        if: env.PRERELEASE == 'false'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clw-windows-authenticode-proof
+          path: '*.authenticode.json'
           if-no-files-found: error
           retention-days: 7
 
@@ -812,7 +880,7 @@ jobs:
     name: checksum + publish
     # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
     # predecessor of publish/sign — a red conformance tag never ships.
-    needs: [preflight, conformance, build, sbom]
+    needs: [preflight, conformance, build, windows-authenticode, sbom]
     # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). minisign +
     # cargo-about install here; gh is baked for the cross-repo mirror Release.
     runs-on: corelink
@@ -829,6 +897,8 @@ jobs:
       VERSION: ${{ needs.preflight.outputs.version }}
       # Canonical release kind from preflight. Do not re-parse the tag here.
       KIND: ${{ needs.preflight.outputs.kind }}
+      WINDOWS_EXPECTED_SIGNER_SUBJECT: ${{ vars.CLW_WINDOWS_SIGNER_SUBJECT }}
+      WINDOWS_EXPECTED_SIGNER_ISSUER: ${{ vars.CLW_WINDOWS_SIGNER_ISSUER }}
       # rc-vs-real, classified ONCE in preflight (never re-parsed here). "true"
       # for an `-rc` tag (=> --prerelease + NO formula bump), "false" for a real
       # vX.Y.Z (=> latest release + formula bump).
