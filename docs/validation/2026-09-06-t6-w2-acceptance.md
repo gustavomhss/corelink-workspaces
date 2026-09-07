@@ -121,8 +121,10 @@ release is still `v0.1.11`; there is no published `v0.1.12`, signed
 `SHA256SUMS`, or release binary digest to pin. The release workflow requires
 owner-provisioned signing and cross-repository publication credentials
 (`MINISIGN_SECRET_KEY`, `MINISIGN_PASSWORD`, `CLW_RELEASES_TOKEN`, and the
-platform signing credentials). Those credentials were not available to this
-local acceptance work.
+platform signing credentials). Read-only `gh secret list --repo
+HuGR-Labs/corelink-workspaces` confirms the non-secret minisign and mirror-token
+identifiers exist in GitHub Actions custody; values and local private keys were
+not accessible to this acceptance work.
 
 Therefore the candidate is behaviorally accepted, but the release artifact is
 `BLOCKED-AUTHORITY` until the owner provisions the signing/publish authority
