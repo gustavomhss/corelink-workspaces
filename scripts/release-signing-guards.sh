@@ -21,6 +21,18 @@ else
   [[ "$mode" == real || "$mode" == prerelease ]] || usage
 fi
 
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo "::error::need sha256sum or shasum -a 256 to verify release proof" >&2
+    return 1
+  fi
+}
+
 check_secrets() {
   local missing=() name
   for name in "${@:3}"; do
@@ -41,7 +53,7 @@ check_secrets() {
 check_json_proof() {
   local proof="$1" expected_asset="$2" expected_status="$3" bound_file="$4" digest_field="$5"
   local expected_digest
-  expected_digest="$(sha256sum "$bound_file" | awk '{print $1}')"
+  expected_digest="$(sha256_file "$bound_file")"
   python3 - "$proof" "$expected_asset" "$expected_status" "$digest_field" "$expected_digest" "${WINDOWS_EXPECTED_SIGNER_SUBJECT:-}" "${WINDOWS_EXPECTED_SIGNER_ISSUER:-}" <<'PY'
 import json
 import sys

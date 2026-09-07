@@ -585,7 +585,14 @@ jobs:
           # force-passed: a Gatekeeper rejection of our own notarized artifact must
           # FAIL the step.
           spctl -a -t open --context context:primary-signature -v "dist/${ASSET}.zip"
-          ZIP_SHA256="$(sha256sum "dist/${ASSET}.zip" | awk '{print $1}')"
+          if command -v sha256sum >/dev/null 2>&1; then
+            ZIP_SHA256="$(sha256sum "dist/${ASSET}.zip" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            ZIP_SHA256="$(shasum -a 256 "dist/${ASSET}.zip" | awk '{print $1}')"
+          else
+            echo "::error::need sha256sum or shasum -a 256 to bind notarization proof" >&2
+            exit 1
+          fi
           python3 - "${ASSET}" "$NOTARY_JSON" "$ZIP_SHA256" > "dist/${ASSET}.notarization.json" <<'PY'
           import json
           import sys
@@ -717,7 +724,11 @@ jobs:
   windows-authenticode:
     name: verify Windows Authenticode
     needs: [preflight, build]
-    runs-on: windows-2022
+    # No Windows runner is registered in this repository's workflow/config
+    # inventory. Publication therefore requires the org to provide this exact
+    # self-hosted label set; an unavailable runner leaves the shared release
+    # gate pending instead of silently using a GitHub-hosted machine.
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.preflight.outputs.version }}

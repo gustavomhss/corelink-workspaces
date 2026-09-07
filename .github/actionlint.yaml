@@ -4,6 +4,7 @@ self-hosted-runner:
     - corelink
     - self-hosted
     - macOS
+    - Windows
     - X64
 
 # Configuration variables in array of strings defined in your repository or

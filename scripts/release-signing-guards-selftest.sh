@@ -37,6 +37,18 @@ expect_pass() {
   fi
 }
 
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo "need sha256sum or shasum -a 256 for release proof selftest" >&2
+    return 1
+  fi
+}
+
 echo "release signing guards: secret fail-closed cases"
 expect_fail "real tag rejects absent macOS credentials" MACOS_CERT_P12_BASE64 \
   env -u MACOS_CERT_P12_BASE64 -u MACOS_CERT_PASSWORD -u MACOS_SIGN_IDENTITY \
@@ -71,8 +83,8 @@ for asset in "$linux_x86" "$linux_arm"; do
 done
 printf 'zip\n' > "$DIST/$mac_x86.zip"
 printf 'zip\n' > "$DIST/$mac_arm.zip"
-mac_x86_zip_sha256="$(sha256sum "$DIST/$mac_x86.zip" | awk '{print $1}')"
-mac_arm_zip_sha256="$(sha256sum "$DIST/$mac_arm.zip" | awk '{print $1}')"
+mac_x86_zip_sha256="$(sha256_file "$DIST/$mac_x86.zip")"
+mac_arm_zip_sha256="$(sha256_file "$DIST/$mac_arm.zip")"
 printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
   "$mac_x86" "$mac_x86_zip_sha256" > "$DIST/$mac_x86.notarization.json"
 printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":"%s"}\n' \
@@ -81,7 +93,7 @@ printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":
 # An asserted JSON file is not an Authenticode proof. A non-Valid status must
 # fail before any fixture can be treated as a release-ready Windows asset.
 printf '{"asset":"%s","status":"Invalid","chain_status":"Invalid","signer_subject":"CN=Test Signer","signer_issuer":"CN=Test Issuer","sha256":"%s"}\n' \
-  "$windows" "$(sha256sum "$DIST/$windows" | awk '{print $1}')" > "$DIST/$windows.authenticode.json"
+  "$windows" "$(sha256_file "$DIST/$windows")" > "$DIST/$windows.authenticode.json"
 expect_fail "invalid Authenticode status blocks publish gate" "status mismatch" \
   env WINDOWS_EXPECTED_SIGNER_SUBJECT='CN=Test Signer' WINDOWS_EXPECTED_SIGNER_ISSUER='CN=Test Issuer' \
     bash "$GUARD" assets real "$DIST" "$WORK/minisign.pub" "$version"
@@ -104,7 +116,7 @@ printf '{"asset":"%s","status":"Accepted","codesign_verified":true,"zip_sha256":
 # A proof can contain the expected status and signer text yet still refer to
 # different bytes. Never run the gate with the unchanged fake EXE; replace it
 # first and require the recomputed hash check to reject the proof.
-windows_original_sha256="$(sha256sum "$DIST/$windows" | awk '{print $1}')"
+windows_original_sha256="$(sha256_file "$DIST/$windows")"
 printf '{"asset":"%s","status":"Valid","chain_status":"Valid","signer_subject":"CN=Test Signer","signer_issuer":"CN=Test Issuer","sha256":"%s"}\n' \
   "$windows" "$windows_original_sha256" > "$DIST/$windows.authenticode.json"
 printf 'replaced executable\n' > "$DIST/$windows"
