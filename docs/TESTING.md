@@ -11,6 +11,16 @@ A line reached is not necessarily an assertion about its behavior; a passing sui
 cannot prove that all relevant faults would be detected. Keep **presence**, **oracle
 adequacy**, **execution**, **result** and **environment** separate.
 
+## Current campaign execution mode
+
+The owner's 2026-09-18 decision selects **local execution of the same applicable
+checks, without Actions**, as recorded in [CLAUDE.md](../CLAUDE.md#local-execution-and-equivalence).
+The workflow inventory below retains the checked-in commands, selectors and
+configured platforms; it is not a requirement to schedule this campaign through
+Actions. Local failures, missing required evidence and stale SHAs still block.
+No workflow, test, threshold or actual repository protection is changed by this
+execution-provider decision.
+
 ## Workflow inventory at the reviewed source
 
 The versioned workflows now use standard **GitHub-hosted runners**, following the
@@ -55,9 +65,12 @@ policy checks under [REVIEWER-BRIEF](../REVIEWER-BRIEF.md) and the work package.
 Prove any comment-only source edit leaves executable text, attributes and selectors
 unchanged. This does not disable workflow-triggered checks or invent remote success.
 DCO, title validation and the documented integration path still apply. The
-[pre-merge checker](../scripts/pre-merge-gate-check.sh) must not interpret missing,
-stale or cancelled runs as green; any owner-authorized local substitution must
-retain its explicit scope and real results. #320 owns operational/enforcement gaps.
+[pre-merge checker](../scripts/pre-merge-gate-check.sh) retains its remote-only
+meaning: no missing, stale or cancelled run becomes green. Under the selected
+local mode, a refusal solely for absent Actions results is not a failed local
+check or a request to rerun Actions. Use the current local acceptance and
+head/base/review checks in CLAUDE.md. The historical #320 diagnosis is not proof
+that Actions billing was repaired and is not a dependency on hosted execution.
 
 Use an isolated checkout and application HOME/cache/temp for commands that touch
 configuration or fixture files. Limit build/test parallelism on shared hosts and
