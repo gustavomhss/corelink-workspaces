@@ -84,9 +84,7 @@
 # in particular a broken baseline (4) on a dispatched workspace sweep is still RED,
 # which is the behaviour the old lane had and which `workspace` mode preserves.
 #
-# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"), matching
-# coverage.yml, the repo's other per-PR analysis lane.
+# Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
 
 name: mutation
 
@@ -118,7 +116,7 @@ concurrency:
 jobs:
   mutation:
     name: cargo-mutants (new survivors in this diff)
-    runs-on: corelink
+    runs-on: ubuntu-24.04
     # A workspace sweep is hours; a diff run is minutes. An exceeded ceiling is a
     # bare `cancelled` with no exit code and nothing to act on, so the budget is
     # generous and the per-mutant timeouts below do the real bounding.

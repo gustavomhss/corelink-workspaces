@@ -8,11 +8,8 @@
 #     same %), so this is a real quality gate rather than a report-only metric.
 #   * Phase 1c: promote to a required check once stable; ratchet the floor upward.
 #
-# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Each box is a fresh
-# microVM, so the toolchain is clean per run. Default-features only: the clw-conformance
-# `live` suite is NEVER compiled/run here (no backend), matching the gate's `cargo test`,
-# so this lane needs NO live-cred wiring.
+# Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+# Default-features only: no live backend credentials are used in coverage.
 
 name: coverage
 
@@ -40,7 +37,7 @@ env:
 jobs:
   coverage:
     name: llvm-cov (floor 88%)
-    runs-on: corelink
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: assert PR broker credentials are absent

@@ -1,5 +1,13 @@
 # CLAUDE.md — project guide for Claude Code
 
+> **CI provider override — 2026-09-17, explicitly approved by the owner:** this
+> repository was made public temporarily and is private again. Every workflow
+> uses standard GitHub-hosted runners. This supersedes older self-hosted-only/private-source instructions
+> below; it does not change the proprietary license, release destinations,
+> signing requirements, live-test credentials or merge gates. Making the repository
+> private again does not revert runner labels and may reintroduce hosted-minute
+> quota/billing restrictions. Other CoreLink repositories are not changed.
+
 > Durable, in-repo context for any Claude session on `clw` / corelink-workspaces. Keep this current.
 > Point-in-time/resume state lives in `docs/HANDOFF-*-clw-TL-state.md` (read the latest first).
 

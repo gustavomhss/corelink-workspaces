@@ -10,29 +10,14 @@
 # Pipeline shape (four serial stages, dependent jobs):
 #   preflight  -> build (5-target matrix, sign folded in) -> publish (checksum + upload)
 #
-# Constraints (from docs/go-live/WP-BRIEFS.md M2.3 / M2.5):
-#   * Proprietary: the download surface is NOT a public GitHub Release.
-#   * Signed: macOS Developer ID + notarize; Windows cloud/HSM Authenticode;
-#     Linux minisign (sigstore as documented alternative).
-#   * Cross-platform, 5 locked targets, built with ZERO GitHub-hosted spend
-#     (org mandate "self-hosted tudo ou não roda"), mirroring the PROVEN
-#     corelink-server CLI release (release-cli.yml): ONE self-hosted Mac runner
-#     (`corelink-builder`) builds every target via `cargo-zigbuild` —
-#       aarch64-apple-darwin       -> native `cargo build` (system linker)
-#       x86_64-apple-darwin        -> native `cargo build` (cross on Apple Silicon)
-#       x86_64-unknown-linux-gnu   -> `cargo zigbuild` (zig libc+linker)
-#       aarch64-unknown-linux-gnu  -> `cargo zigbuild` (zig libc+linker)
-#       x86_64-pc-windows-gnu      -> `cargo zigbuild` (zig, gnu ABI)
-#   * Build host: the self-hosted Mac fleet (`corelink-builder`, $0 CF). zig
-#     supplies the libc headers + linker for the Linux + windows-gnu cross
-#     targets; the darwin targets build NATIVELY (zigcc has an upstream
-#     iconv/charset bug for darwin-on-darwin). A real macOS host is required for
-#     the Developer-ID codesign + notarization anyway, so folding every leg onto
-#     it costs nothing extra. Rust comes from the pre-installed HOST toolchain via
-#     `scripts/ci-use-host-toolchain.sh` (NEVER `rustup install`/`default` on the
-#     shared-$HOME Mac fleet — the os-error-2 crash + reproducibility-pin drift).
-#     The non-build jobs (preflight, conformance, sbom, publish) run on `corelink`
-#     (ephemeral CF-Firecracker Linux). Windows is gnu, NOT msvc.
+# Execution-provider decision (owner-authorized 2026-09-17):
+# All jobs use standard GitHub-hosted runners. The five-target release contract,
+# live conformance, signing, checksum and public-mirror guards remain unchanged.
+# Build/sign runs on fresh Intel macOS VMs: Darwin uses the system linker;
+# Linux and Windows GNU use cargo-zigbuild. Authenticode verification is native
+# Windows. Preflight, conformance, SBOM and publish use Ubuntu.
+# Toolchains must be installed per job; no developer-host PATH or pre-warmed
+# CoreLink image is assumed. License and distribution destinations are unchanged.
 
 name: release
 
@@ -63,10 +48,8 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: preflight (guard + gates)
-    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). rustup +
-    # the pinned toolchain are baked; `sudo apt-get` (mingw for the windows-gnu
-    # cross-check) works on the box.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -279,9 +262,8 @@ jobs:
   conformance:
     name: live conformance gate (pre-tag)
     needs: preflight
-    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend); a network
-    # test against live prod.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # CI service identity for the live conformance suite. The suite reads these
@@ -364,29 +346,21 @@ jobs:
     # `conformance` is a REQUIRED predecessor (WP M4.5): no binary is built or
     # signed until the live conformance gate is green.
     needs: [preflight, conformance]
-    # ALL five targets build on the repo's self-hosted Mac runner `clw-mac-1`
-    # (labels: self-hosted, macOS, X64 — an Intel host, $0 CF), mirroring the
-    # proven corelink-server release mechanism: darwin native, and the Linux +
-    # windows-gnu targets cross-compiled with cargo-zigbuild (zig supplies the libc
-    # + linker). A real macOS host is required for codesign/notarize anyway, so
-    # every leg folds onto it at no extra cost. (NB: this repo's Mac carries the
-    # `macOS` label, NOT the server's `corelink-builder` — verified against the live
-    # runner registration.)
-    runs-on: [self-hosted, macOS, X64]
+    # All five release targets build on fresh GitHub-hosted Intel macOS VMs.
+    # Darwin uses the system linker; Linux and Windows GNU retain zig cross-builds.
+    runs-on: macos-15-intel
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      # The fleet is one physical Mac; cap parallelism so 5 concurrent builds do
-      # not thrash CPU/RAM (mirrors release-cli.yml). 5/3 = two batches.
+      # Bound release fan-out even though each matrix leg has its own VM.
       max-parallel: 3
       matrix:
         include:
-          # --- macOS (Apple Silicon host, native `cargo build`) -------------
+          # --- macOS ARM64 (system-linker cross-build on Intel macOS) -------
           - target: aarch64-apple-darwin
             platform: macos
             ext: ""
-          # --- macOS (Intel: native cross on the Apple-Silicon host; the Apple
-          #     toolchain builds both arches with the system linker) ----------
+          # --- macOS Intel (native system-linker build) ---------------------
           - target: x86_64-apple-darwin
             platform: macos
             ext: ""
@@ -413,33 +387,29 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # Rust from the pre-installed HOST toolchain (rust-toolchain.toml channel) +
-      # this leg's target. NEVER `rustup install`/`default` on the shared-$HOME Mac
-      # fleet — the os-error-2 crash + reproducibility-pin drift the helper prevents.
-      - name: use the workspace-pinned host toolchain (provisions nothing)
+      # Every hosted VM has independent rustup state. Install the repository pin
+      # and this matrix target instead of relying on the developer Mac's setup.
+      - name: install the workspace-pinned toolchain and matrix target
         shell: bash
-        run: bash scripts/ci-use-host-toolchain.sh "${{ matrix.target }}"
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup target add "${{ matrix.target }}"
+          rustc --version
 
-      # zig cross-toolchain (Linux + windows-gnu only): libc headers + linker for
-      # the cross targets. The darwin targets build natively (zigcc has an upstream
-      # iconv/charset bug for darwin-on-darwin), so they skip zig. The Mac host has
-      # zig via `brew install zig`; hard-fail with that instruction if it is absent
-      # (do NOT fall back to a hosted setup action — zero-hosted mandate).
-      - name: ensure zig is present (Linux + Windows cross)
+      # Install the cross-linker on this fresh macOS runner, not on a user host.
+      - name: install zig (Linux + Windows cross)
         if: matrix.platform != 'macos'
         shell: bash
         run: |
           set -euo pipefail
-          if command -v zig >/dev/null 2>&1; then
-            echo "zig found at $(command -v zig)"
-          else
-            echo "::error::zig is required for the ${{ matrix.target }} cross build but is not installed on this runner host. Run once on the host: brew install zig" >&2
-            exit 1
+          if ! command -v zig >/dev/null 2>&1; then
+            brew install zig
           fi
+          zig version
 
       # cargo-zigbuild as a PREBUILT binary (Linux + Windows only). NOT
-      # `cargo install` — that compiles into the shared ~/.cargo all runners use at
-      # once (the os-error-2 race). install-action is a no-op when already present.
+      # `cargo install`: use the existing pinned prebuilt tool on each fresh VM.
       - name: install cargo-zigbuild (prebuilt, Linux + Windows cross)
         if: matrix.platform != 'macos'
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
@@ -684,8 +654,7 @@ jobs:
             exit 0
           fi
           # Real minisign detached signature -> dist/${ASSET}.minisig.
-          # This leg now builds+signs on the self-hosted Mac (corelink-builder),
-          # so install minisign via brew (NOT apt), skipping if already present.
+          # Build/sign runs on GitHub-hosted macOS, so use brew rather than apt.
           if ! command -v minisign >/dev/null 2>&1; then
             brew install minisign
           fi
@@ -724,11 +693,8 @@ jobs:
   windows-authenticode:
     name: verify Windows Authenticode
     needs: [preflight, build]
-    # No Windows runner is registered in this repository's workflow/config
-    # inventory. Publication therefore requires the org to provide this exact
-    # self-hosted label set; an unavailable runner leaves the shared release
-    # gate pending instead of silently using a GitHub-hosted machine.
-    runs-on: [self-hosted, Windows, X64]
+    # Native Authenticode verification on a standard GitHub-hosted Windows VM.
+    runs-on: windows-2025
     timeout-minutes: 15
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -812,9 +778,8 @@ jobs:
   sbom:
     name: sbom (CycloneDX)
     needs: [preflight, conformance]
-    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend); derived from
-    # Cargo.lock, no network/secret.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
@@ -880,10 +845,9 @@ jobs:
   # STAGE 4 — CHECKSUM + PUBLISH (REWORKED — public mirror + brew, WP-B/WP-C)
   # Collect every signed artifact, produce one signed SHA256SUMS, then publish a
   # PUBLIC GitHub Release on the dedicated mirror repo `HuGR-Labs/clw-releases`
-  # (the source repo `corelink-workspaces` is PRIVATE, so its own Release assets
-  # are not public — see DISTRIBUTION-REWORK-PLAN §8 B1). After a real upload,
-  # add SLSA build-provenance attestation (SKIPPED on this private repo — see the
-  # step's waiver), then bump the Homebrew formula in
+  # regardless of source-repository visibility. After a real upload, the existing
+  # visibility-conditioned SLSA step runs for a public source repository, then
+  # the pipeline bumps the Homebrew formula in
   # `HuGR-Labs/homebrew-clw` (real tags only). minisign stays the offline
   # signature-of-record; attestation WOULD BE the added provenance layer.
   # ---------------------------------------------------------------------------
@@ -892,9 +856,8 @@ jobs:
     # `conformance` named explicitly (WP M4.5) so the gate is an unambiguous
     # predecessor of publish/sign — a red conformance tag never ships.
     needs: [preflight, conformance, build, windows-authenticode, sbom]
-    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). minisign +
-    # cargo-about install here; gh is baked for the cross-repo mirror Release.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Provenance attestation needs to mint an OIDC token + write the attestation.
     # `contents: write` is harmless here (the public Release is created on the
@@ -1072,9 +1035,9 @@ jobs:
       # PUBLISH — create a PUBLIC GitHub Release on the MIRROR repo
       # `HuGR-Labs/clw-releases`, uploading ALL of release/* as assets.
       #
-      # WHY a cross-repo token: the source repo here is PRIVATE, so its own
-      # Release assets are not public. The default GITHUB_TOKEN is scoped to THIS
-      # repo and cannot write a Release on another repo — so we authenticate `gh`
+      # WHY a cross-repo token: the mirror is a DIFFERENT repository. The default
+      # GITHUB_TOKEN is scoped to THIS repo and cannot write a Release on another
+      # repo, regardless of source visibility — so we authenticate `gh`
       # with a dedicated, repo-bound CLW_RELEASES_TOKEN (deploy key / fine-grained
       # PAT scoped to clw-releases, contents:write).
       #

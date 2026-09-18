@@ -9,8 +9,7 @@
 #     (CLW_CI_TOKEN / CLW_CI_TENANT / CLW_CI_ENDPOINT) mapped onto the names the
 #     suite actually reads (CLW_TOKEN / CLW_TENANT / CLW_ENDPOINT), plus the
 #     `cargo test -p clw-conformance --features live` invocation.
-#   * ci.yml's self-hosted "put pinned Rust toolchain on PATH" step (the rustup
-#     proxy can be nuked on the shared self-hosted Mac).
+#   * ci.yml's repository-pinned rustup bootstrap on a fresh hosted VM.
 #
 # DIFFERENCE from release.yml's gate: there the missing-PAT SKIP is an intentional
 # dry-run no-op (green). HERE the canary always sets CLW_CONFORMANCE_REQUIRE=1, so a
@@ -48,15 +47,8 @@ env:
 jobs:
   canary:
     name: live conformance canary (prod)
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric
-    # (zero hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The
-    # earlier "must be hosted so it doesn't depend on the single Mac" rationale no
-    # longer holds: `corelink` boxes are ephemeral microVMs, NOT the single Mac, so
-    # there is no shared-box blind spot. The canary is a network test against live
-    # prod; if the corelink fabric is itself down the job fails-to-start = RED, which
-    # is the correct signal (and hosted already produced no useful red under the
-    # GitHub-Actions billing block — a 2s no-runner failure).
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       # CI service identity for the live conformance suite (same secrets as
@@ -68,13 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The `corelink` image ships rustup; `rustup show` reads rust-toolchain.toml
-      # and provisions the pinned channel (1.91.1 + rustfmt/clippy) on first use.
-      # Do NOT `rustup default`/`toolchain install` here: the pin in the file is
-      # authoritative and rustup honours it over any global default — matching the
-      # corelink-server self-hosted lanes. The box is an ephemeral microVM, so there
-      # is no shared-$HOME hazard, but keeping the pin as the single source of truth
-      # avoids a per-run global mutation for nothing.
+      # rustup on the fresh GitHub runner installs the authoritative repository pin.
       - name: provision the workspace-pinned toolchain (rust-toolchain.toml)
         run: rustup show
 

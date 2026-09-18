@@ -1,5 +1,13 @@
 # Contributing to `clw` (CoreLink Workspaces)
 
+> **CI provider override — 2026-09-17, explicitly approved by the owner:** this
+> repository was made public temporarily and is private again. Every workflow
+> uses standard GitHub-hosted runners. This supersedes older self-hosted-only/private-source instructions
+> below; it does not change the proprietary license, release destinations,
+> signing requirements, live-test credentials or merge gates. Making the repository
+> private again does not revert runner labels and may reintroduce hosted-minute
+> quota/billing restrictions. Other CoreLink repositories are not changed.
+
 `clw` is a **proprietary, commercial** client of the CoreLink API. There is no
 public repository; this guide is for authorized contributors. It is a **pure
 client** — it never edits `corelink-server` (server work is coordinated through

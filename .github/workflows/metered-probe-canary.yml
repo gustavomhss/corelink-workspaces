@@ -33,11 +33,8 @@ permissions:
 jobs:
   probe:
     name: metered probe — assert the $-ceiling 402 fires
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). curl + python3 are
-    # baked; blake3 is NOT, and Ubuntu 24.04 is PEP-668 "externally managed" so a global
-    # `pip install` is refused — the probe installs blake3 into a venv instead.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     env:
       EP: https://corelink-api.humangr.com

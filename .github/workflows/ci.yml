@@ -37,15 +37,8 @@ env:
 
 jobs:
   gates:
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Each box is an
-    # ephemeral microVM, NOT the single self-hosted Mac, so this required gate has no
-    # shared-box SPOF: the 2026-07-20 class of outage (an expired cert wedging every
-    # Mac-backed runner) does not apply to per-lease Firecracker boxes, and if the fabric
-    # itself is down the job fails-to-start = RED, the correct signal for a required check.
-    # The gate is platform-agnostic; the OS-divergent target (Windows) is covered by the
-    # windows-gnu cross-check below + the separate windows-runtime lane.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: assert PR broker credentials are absent
@@ -65,10 +58,7 @@ jobs:
       - name: prove PR broker credential guard has teeth
         if: github.event_name == 'pull_request'
         run: bash scripts/gates.sh --selftest-pr-credential-null
-      # The `corelink` image ships rustup + the pinned toolchain baked; `rustup show`
-      # reads rust-toolchain.toml (1.91.1 + rustfmt/clippy) and resolves it with zero
-      # per-spawn download. A download failure (if the pin ever drifts) surfaces here
-      # rather than mid-gate.
+      # rustup on the fresh GitHub runner installs the authoritative repository pin.
       - name: install pinned Rust toolchain (rust-toolchain.toml)
         run: rustup show
       # Provision the supply-chain tools as PREBUILT binaries (gates.sh runs
@@ -85,8 +75,8 @@ jobs:
         run: bash scripts/gates.sh
 
   dco:
-    # Same `corelink` ephemeral fabric — pure git + bash, no toolchain (zero hosted spend).
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu — pure git + bash, no Rust toolchain needed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: assert PR broker credentials are absent
@@ -109,12 +99,12 @@ jobs:
         run: bash scripts/dco-check.sh "origin/$BASE_REF"
 
   gate-check-selftest:
-    # Same `corelink` ephemeral fabric — pure bash + python3, no toolchain (zero hosted
-    # spend). Proves scripts/pre-merge-gate-check.sh (the mandatory pre-merge gate, see
+    # Standard GitHub-hosted Ubuntu — pure bash + python3.
+    # Proves scripts/pre-merge-gate-check.sh (the mandatory pre-merge gate, see
     # its header) still refuses CONFLICTING/UNKNOWN/zero-checks/missing-always-present-
     # gate and still allows a healthy PR, against a stubbed `gh` — so the safety script
     # keeps proving itself on every PR that touches it, instead of silently bit-rotting.
-    runs-on: corelink
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: assert PR broker credentials are absent
@@ -135,7 +125,7 @@ jobs:
   release-guards-selftest:
     # Pure bash + git + jq, fully offline. Exercises release security decisions on
     # every PR without spending a tag or touching release/publish credentials.
-    runs-on: corelink
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: assert PR broker credentials are absent

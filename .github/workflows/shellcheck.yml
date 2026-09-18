@@ -5,11 +5,7 @@
 # They were never shellcheck-gated. This runs shellcheck on all of scripts/*.sh;
 # actionlint checks the workflow syntax and expressions that orchestrate them.
 #
-# Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-# hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). The corelink image
-# does NOT bake shellcheck, so the job installs it via apt (passwordless sudo + apt are
-# present on the box). Additive — does not touch the required gates/dco checks. Runs on
-# every PR so a workflow-only change cannot evade actionlint, plus main + dispatch.
+# Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
 
 name: lint
 
@@ -32,7 +28,7 @@ env:
 jobs:
   lint:
     name: shellcheck + actionlint
-    runs-on: corelink
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: assert PR broker credentials are absent
@@ -47,9 +43,8 @@ jobs:
             }
           done
       - uses: actions/checkout@v4
-      # The corelink image does not bake shellcheck; install it from apt (the box has
-      # passwordless sudo + apt — see the runner Dockerfile).
-      - name: install shellcheck (not baked into the corelink image)
+      # Install the workflow linter explicitly on the fresh Ubuntu VM.
+      - name: install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
       - name: install actionlint 1.7.12 (checksum-pinned prebuilt)
         env:
@@ -72,7 +67,7 @@ jobs:
           shellcheck --version
           shellcheck -S warning scripts/*.sh
           echo "all scripts/*.sh pass shellcheck"
-      - name: actionlint (workflows + corelink runner label)
+      - name: actionlint (workflows + standard GitHub-hosted runner labels)
         run: |
           set -euo pipefail
           actionlint -version

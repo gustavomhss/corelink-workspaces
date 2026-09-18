@@ -397,7 +397,8 @@ PY
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
-text = text.replace('    runs-on: corelink\n', '    runs-on: corelink\n    env:\n      "CLW_CRED_TICKET": "leaked"\n', 1)
+assert '    runs-on: ubuntu-24.04\n' in text, 'coverage job runner anchor changed'
+text = text.replace('    runs-on: ubuntu-24.04\n', '    runs-on: ubuntu-24.04\n    env:\n      "CLW_CRED_TICKET": "leaked"\n', 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
   expect_pr_credential_null_failure "a quoted credential key cannot bypass the static guard" "unquoted canonical declaration"
@@ -407,7 +408,8 @@ PY
 import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
-text = text.replace('    runs-on: corelink\n', '    runs-on: corelink\n    env:\n      "CLW_CRED_\\u0054ICKET": "leaked"\n', 1)
+assert '    runs-on: ubuntu-24.04\n' in text, 'coverage job runner anchor changed'
+text = text.replace('    runs-on: ubuntu-24.04\n', '    runs-on: ubuntu-24.04\n    env:\n      "CLW_CRED_\\u0054ICKET": "leaked"\n', 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
   expect_pr_credential_null_failure "an escaped credential key cannot bypass the static guard" "unquoted canonical declaration"
@@ -436,7 +438,7 @@ PY
     '  CLW_FABRIC_ENDPOINT: ""' \
     'jobs:' \
     '  build:' \
-    '    runs-on: corelink' \
+    '    runs-on: ubuntu-24.04' \
     '    steps:' \
     '      - run: git fetch origin "${{ github.event.pull_request.head.sha }}"' \
     > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/target-pr.yml"
@@ -540,7 +542,7 @@ PY
     '  "pull_request":' \
     'jobs:' \
     '  build:' \
-    '    runs-on: corelink' \
+    '    runs-on: ubuntu-24.04' \
     '    steps:' \
     '      - uses: actions/checkout@v4' \
     '      - run: cargo test' \
@@ -560,7 +562,7 @@ PY
     '  CLW_FABRIC_ENDPOINT: ""' \
     'jobs:' \
     '  build:' \
-    '    runs-on: corelink' \
+    '    runs-on: ubuntu-24.04' \
     '    steps:' \
     '      - run: git fetch origin "${{ github.event.pull_request.head.sha }}"' \
     > "$PR_CREDENTIAL_NULL_SELFTEST_FIXTURE/.github/workflows/new-pr.yml"

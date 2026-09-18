@@ -1,8 +1,8 @@
-# Windows RUNTIME smoke — zero-hosted (org mandate "self-hosted tudo ou não roda").
+# Windows binary smoke on a standard GitHub-hosted Ubuntu VM.
 #
 # What this IS: a cheap regression smoke that the SHIPPED windows-gnu `clw.exe`
 # actually EXECUTES and dispatches commands. It builds the binary with mingw on
-# `corelink` (Linux) and runs it under Wine — catching a build/link that compiles
+# Ubuntu Linux and runs it under Wine — catching a build/link that compiles
 # but won't run, or a broken command dispatch, at $0 hosted cost. This replaces the
 # old `windows-latest` lane, which under the GitHub-Actions billing block never
 # started (steps=0, no runner) and therefore tested NOTHING.
@@ -15,8 +15,8 @@
 # and the pure-logic unit tests pass under Wine, but clw-run's command-execution +
 # FS-semantics tests and the assert_cmd-based e2e harness do NOT run trustworthily
 # under Wine (subprocess/path-translation limits). Full-fidelity Windows-runtime
-# coverage needs a REAL self-hosted Windows runner — the owner-chosen Phase-3 item;
-# until that box exists, this smoke is the honest, zero-hosted floor.
+# coverage needs a separate native Windows test lane. This migration preserves
+# the existing Wine smoke; it does not upgrade Wine results to native evidence.
 #
 # The shipped Windows BINARY is separately cross-built + released via zig on the Mac
 # (release.yml) — independent of this lane.
@@ -51,10 +51,8 @@ env:
 jobs:
   smoke:
     name: windows binary smoke (mingw build, wine run)
-    # `corelink` — ephemeral CF-Firecracker Linux (zero hosted spend). Neither wine
-    # nor mingw is baked into the image; both install via apt (passwordless sudo is
-    # present on the box).
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: assert PR broker credentials are absent
@@ -70,7 +68,7 @@ jobs:
           done
       - uses: actions/checkout@v4
 
-      - name: install wine + mingw (not baked into the corelink image)
+      - name: install wine + mingw on Ubuntu
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -130,7 +128,7 @@ jobs:
       #     wine, and two of them need SeCreateSymbolicLinkPrivilege. They are
       #     deliberately NOT filtered in, rather than run with
       #     `continue-on-error`, which would be a gate in name only. They run for
-      #     real when the Phase-3 self-hosted Windows runner exists.
+      #     real only in a separately validated native Windows test lane.
       #
       # The `lexical_` prefix is what keeps that separation honest: it selects
       # the pure-computation tests and nothing else. An earlier revision filtered

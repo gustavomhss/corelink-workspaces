@@ -63,15 +63,10 @@ env:
 jobs:
   evidence:
     name: e2e evidence (Linux binary, real binary as user)
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Manual-only, a
-    # network test against live prod. The Windows-binary evidence leg is DROPPED: it
-    # drives the real clw binary via the clw-e2e harness (a spawned child), which does not
-    # run trustworthily under Wine on the Linux fabric (subprocess/path-translation limits,
-    # measured 2026-08-12), and there is no self-hosted Windows runner yet. Windows-binary
-    # evidence returns when that box lands (Phase 3); the Linux evidence covers the six
-    # personas' cross-platform journeys against the same prod.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    # This manual live-evidence job remains Linux-only; no native Windows
+    # evidence is claimed by changing the execution provider.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:

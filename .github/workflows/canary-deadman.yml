@@ -1,8 +1,8 @@
 # Dead-man's-switch for EVERY scheduled lane in this repo.
 #
 # A scheduled lane goes RED when it finds a problem — but a lane that NEVER RUNS
-# (a broken cron, a disabled workflow, an Actions outage, a starved self-hosted
-# fabric) produces NO run and therefore NO red: a SILENT blind spot. This job runs
+# (a broken cron, a disabled workflow, an Actions outage, runner scheduling
+# unavailability) produces NO run and therefore NO red: a SILENT blind spot. This job runs
 # on its own schedule and FAILS loudly when a registered lane has no completed run,
 # has not reported inside its window, or reported a non-success — converting "the
 # surveillance silently stopped" into a visible red workflow (which GitHub emails
@@ -94,10 +94,8 @@ env:
 jobs:
   deadman:
     name: scheduled-lane dead-man's-switch
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). Pure gh/jq/git/date
-    # (all baked into the image); no toolchain needed.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}

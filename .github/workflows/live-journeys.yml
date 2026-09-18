@@ -44,20 +44,13 @@ env:
 jobs:
   journeys:
     name: live journeys (prod, real user)
-    # Runs on `corelink` — CoreLink's OWN ephemeral CF-Firecracker runner fabric (zero
-    # hosted-Actions spend; org mandate "self-hosted tudo ou não roda"). This is a network
-    # test against live prod; the box is an ephemeral microVM (NOT the single Mac), so
-    # there is no shared-box blind spot, and if the fabric is down the job fails-to-start =
-    # RED, the correct signal.
-    runs-on: corelink
+    # Standard GitHub-hosted Ubuntu; no CoreLink runner or local Mac is required.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      # The `corelink` image ships rustup; `rustup show` reads rust-toolchain.toml and
-      # provisions the pinned channel (1.91.1) on first use. Do NOT `rustup default` — the
-      # pin in the file is authoritative and the box is an ephemeral microVM (no shared-$HOME
-      # hazard), matching the corelink-server self-hosted lanes.
+      # rustup on the fresh GitHub runner installs the authoritative repository pin.
       - name: provision the workspace-pinned toolchain (rust-toolchain.toml)
         run: rustup show
 
