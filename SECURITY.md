@@ -17,8 +17,10 @@ Please include, where possible:
 - a description of the issue and its impact (e.g. credential exposure, write
   outside the hydrate destination, integrity bypass);
 - the minimal steps, manifest, or server response needed to reproduce;
-- any logs — **with your PAT and file contents redacted** (`clw` already
-  redacts tokens in its own diagnostics; please double-check before sending).
+- any logs — **with your PAT and file contents redacted**. Managed identity
+  reports mask their token fields, but generated help and arbitrary command
+  output are separate paths. Inspect every attachment before sending; see
+  the redaction scope and the open #333 limitation below.
 
 ### What to expect
 
@@ -42,34 +44,73 @@ stability charter and an EOL policy land with `1.0` (roadmap M3.6 / M5.5).
 
 ## Security posture
 
-The posture below reflects the findings closed in the 2026-06-09 full-crate
-audit (`docs/AUDIT-clw-2026-06-09.md`) and its M0.5 follow-up. See
-`docs/THREAT-MODEL.md` for the asset/boundary/threat breakdown and the explicit
-out-of-scope / residual-risk list.
+This section describes source `be96b8394c66d1dc36ce7ca2f186780f0ea48308`
+(workspace version 0.1.12), reviewed on 2026-09-18. The June audit and its
+follow-up remain historical records, not proof that later findings are closed.
+See [THREAT-MODEL.md](docs/THREAT-MODEL.md) for the boundary model and
+[the audit tracker](https://github.com/HuGR-Labs/corelink-workspaces/issues/325)
+for outstanding fixes. This documentation does not certify a deployed service
+or a released executable.
 
-- **Path traversal closed.** Manifest entry paths and symlink targets are
-  validated (`clw-types::validate_rel_path` / `validate_symlink_target`):
-  absolute paths and any `..`/`.` component are rejected at
-  `Manifest::from_bytes`, and `hydrate` re-validates as defense-in-depth. A
-  malicious or tampered manifest cannot write outside the hydrate destination
-  (zip-slip / symlink-slip). *(audit H1)*
-- **PAT protected at rest.** `~/.clw/config.toml` is written `0600`, `~/.clw`
-  and the local cache root `0700` — no longer umask-dependent (was often
-  `0644`). *(audit H2)*
-- **PAT never sent in cleartext.** The HTTP client requires an `https://`
-  endpoint. A loopback exception (dev/tests) uses an **exact-host** check
-  (`127.0.0.1` / `localhost` / `[::1]`, optional `:port`/path) — the earlier
-  prefix match that let `http://127.0.0.1.evil.com` through is closed, with a
-  regression test. *(audit M2; M0.5 CRIT)*
-- **No stale replay across toolchain changes.** The `clw run` memoization key
-  folds the content digest of the invoked tool (`command[0]`, resolved against
-  the run cwd), so a cached result is not replayed after the underlying
-  toolchain changes. *(audit M3; M0.5 HIGH)*
-- **Integrity verified.** Every chunk is BLAKE3 content-addressed and verified
-  on fetch; manifests are canonical-JSON, Merkle-style.
-- **Token redaction.** PATs are redacted in `clw`'s own output/diagnostics; the
-  `--token` flag's help warns it is visible in the process list (prefer the
-  config file or env).
+
+> **Integrated changes at this source:** [PR #329](https://github.com/HuGR-Labs/corelink-workspaces/pull/329)
+> supplies Unix hydrate temporary ownership and pre-publication permissions;
+> [PR #334](https://github.com/HuGR-Labs/corelink-workspaces/pull/334) supplies
+> checked per-file size validation. Both are already in the pinned main commit.
+> Earlier test records retain their original source identities; this documentation
+> update is not a new runtime-test or release result.
+
+- **Paths require semantic validation as well as integrity.**
+  `Manifest::from_bytes`, `validate_rel_path` and
+  `validate_symlink_target_contained` check literal entry paths and relative
+  targets. Entry paths reject dot components; contained symlink targets may
+  contain `..`. The combined-link confinement finding
+  [#296](https://github.com/HuGR-Labs/corelink-workspaces/issues/296) and
+  destination-alias finding [#303](https://github.com/HuGR-Labs/corelink-workspaces/issues/303)
+  remain open in this source. Files-before-links is not proof of full confinement.
+- **Local credential and content permissions are platform-specific.** Unix
+  config/cache writers use owner-only modes for their managed paths. The integrated
+  #297 fix creates hydrate temporaries owner-only, arms cleanup only after exclusive
+  creation and applies the intended final mode through the owned descriptor before
+  sync/rename. Intentionally public final modes may be applied before rename; this
+  is not a promise that such files remain private indefinitely.
+  Windows config hardening explicitly warns and continues if applying the ACL
+  fails. Config and default/custom cache require separate effective-access
+  verification ([#317](https://github.com/HuGR-Labs/corelink-workspaces/issues/317)).
+  A child running as the same user may read a reachable plaintext config; known
+  secret environment names being removed does not create a filesystem sandbox.
+- **Transport destination is parsed, not prefix-matched.** `clw-client` permits
+  HTTPS with a host and no embedded username/password, or HTTP for a parsed
+  loopback IP (IPv4 127.0.0.0/8 or IPv6 ::1) or the domain `localhost`.
+  Redirects are disabled. The HTTP exception is for development/tests, not
+  encrypted transport. HTTPS acceptance does not authorize an arbitrary host:
+  the operator must choose a trusted destination before supplying a bearer token.
+- **Memoization is a declared-input contract, not a hermetic toolchain.** The
+  `clw/run/v3/` key includes selected input digests/modes, declared environment,
+  command/tool identity and cwd. It does not capture every transitive tool,
+  network response, clock or concurrent edit. Actual executable selection and
+  non-UTF-8 environment identity have separate findings
+  [#301](https://github.com/HuGR-Labs/corelink-workspaces/issues/301)/[#302](https://github.com/HuGR-Labs/corelink-workspaces/issues/302).
+  Only the producer is success-only in this baseline; received-record eligibility
+  is [#307](https://github.com/HuGR-Labs/corelink-workspaces/issues/307).
+- **Digest verification is not a proof of metadata, retention or safety.** CAS
+  fetches and the local cache verify BLAKE3 against the expected content address.
+  The root is one flat JSON manifest. Deterministic producer encoding and
+  tolerant reader acceptance are different contracts. Integrated
+  [#306](https://github.com/HuGR-Labs/corelink-workspaces/issues/306) checks each
+  file's chunk sum for overflow and agreement with its declared size before
+  materialization. The aggregate and fetched-byte checks remain. Broader parser
+  acceptance is still [#308](https://github.com/HuGR-Labs/corelink-workspaces/issues/308).
+- **Redaction has a defined scope.** Managed identity reports mask the bearer
+  token and redact endpoint userinfo. Tenant IDs and paths can be shown in full;
+  command output and snapshotted file contents are not automatically sanitized.
+  Avoid credentials in command-line flags (process listings/history) and inspect
+  any support bundle before sharing it. **Parser-generated help is a separate
+  path:** this baseline displays configured token environment values in help
+  ([#333](https://github.com/HuGR-Labs/corelink-workspaces/issues/333)). Do not share help captured with credentials
+  present; identity-report redaction does not cover that output.
+  Token authority is enforced by the
+  server's scope, not inferred from a tenant name or a ref hash domain.
 - **`unsafe` forbidden (one audited exception).** Shipped `clw` crates contain zero
   `unsafe` **except one audited block in `clw-win-acl`** — the `cfg(windows)` DACL
   hardening in `crates/clw-win-acl/src/imp.rs`, which must go through Win32 FFI
@@ -180,11 +221,12 @@ out-of-scope / residual-risk list.
     **three of the five shipped targets — `aarch64-apple-darwin`, `x86_64-apple-darwin`
     and `aarch64-unknown-linux-gnu` — are linted by no lane at all.**
     **This is the widest remaining hole.**
-  * **`rust-toolchain.toml`.** In-repo, committable, and it selects WHICH rustc binary
-    runs — a `channel` naming a `rustup toolchain link`-ed path aims the whole build at
-    an arbitrary compiler. Same class as the cargo-config keys the guard refuses, and
-    NOT checked. Named here because the rationale for checking cargo config is "a config
-    decides what runs as the compiler", and it applies to this file verbatim.
+  * **Toolchain selection and provenance.** `rust-toolchain.toml` selects the
+    compiler channel. Release preflight in `.github/workflows/release.yml`
+    explicitly checks that its channel matches `RUST_TOOLCHAIN`; it is not
+    wholly unchecked. Agreement between two configuration values is not an
+    attestation of the compiler binary or its installation. The selected
+    toolchain and build environment still require trusted provisioning and review.
   * **Lint capping, and compiler replacement, from the environment.** The guard closes
     every in-repo cargo config, but the same effects arrive from outside the repo.
     `RUSTFLAGS="--cap-lints allow"` and `CARGO_ENCODED_RUSTFLAGS` carry the flag
@@ -206,8 +248,9 @@ out-of-scope / residual-risk list.
   * Third-party dependencies, `[patch]`-substituted paths, and proc-macro expansions,
     which have no first-party source to inspect.
   * `fuzz/`, a deliberately detached workspace.
-  The one avoidable raw-pointer borrow found in the audit was removed. Prod
-  paths avoid `unwrap/expect/panic`.
+  The audit removed one avoidable raw-pointer borrow. These guards do not
+  establish that every runtime path is panic-free; output-delivery behavior is
+  separately tracked in [#310](https://github.com/HuGR-Labs/corelink-workspaces/issues/310).
 
 ## Scope
 

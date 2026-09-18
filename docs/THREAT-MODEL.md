@@ -1,84 +1,151 @@
 # Threat model — `clw` (CoreLink Workspaces CLI)
 
-> Concise threat model for the `clw` client. Companion to `SECURITY.md`.
-> Findings reference the 2026-06-09 audit (`docs/AUDIT-clw-2026-06-09.md`) and
-> its M0.5 follow-up (`CHANGELOG.md`). Tracked / out-of-scope items reference
-> `docs/ROADMAP-go-live.md`.
+> Client-side model reconciled against commit
+> `be96b8394c66d1dc36ce7ca2f186780f0ea48308` (0.1.12), 2026-09-18.
+> Companion to [SECURITY.md](../SECURITY.md) and
+> [ARCHITECTURE.md](ARCHITECTURE.md). This is a documentation correction, not
+> runtime remediation, an operational certification or a new release claim.
 
-`clw` is a **pure client** of the CoreLink API. It does not run a server, open a
-listening socket, or process input from untrusted local users — its untrusted
-inputs are (a) the data it receives from the CoreLink API (manifests, chunks)
-and (b) the local environment in which it stores its credential and cache.
+The June audit and follow-up are historical evidence, not current runtime
+guarantees. This reconciliation supersedes the present-tense conclusions of the
+[prior model](https://github.com/HuGR-Labs/corelink-workspaces/blob/4ff0fcfcd31fa467562f782852ef2f3c5554be24/docs/THREAT-MODEL.md).
+Dated audit artifacts are not rewritten here.
+The current campaign's canonical obligations are in
+[tracker #325](https://github.com/HuGR-Labs/corelink-workspaces/issues/325).
+A mitigation below is not a declaration that every related finding has closed.
+
+`clw` is a client, not a server or a compute-isolation service. Untrusted inputs
+include remote records and chunks, selected local paths and metadata, and the
+output of commands the user explicitly launches. Tests may start local HTTP
+fixtures; that does not make a test server a shipped service.
+
+
+> **Integrated changes at this source:** [PR #329](https://github.com/HuGR-Labs/corelink-workspaces/pull/329)
+> supplies Unix hydrate temporary ownership and pre-publication permissions;
+> [PR #334](https://github.com/HuGR-Labs/corelink-workspaces/pull/334) supplies
+> checked per-file size validation. Both are already in the pinned main commit.
+> Earlier test records retain their original source identities; this documentation
+> update is not a new runtime-test or release result.
 
 ## Assets
 
-| Asset | Where it lives | Why it matters |
+| Asset | Location and boundary | Required protection |
 |---|---|---|
-| **The PAT** (tenant Personal Access Token) | `~/.clw/config.toml`, optionally env / `--token`; sent as `Authorization: Bearer` | The single credential. Leaking it gives full tenant access to CAS + AC. |
-| **Tenant data / file contents** | Uploaded to content-addressed storage (CAS); referenced by AC refs | The product's payload — source/working-tree contents. Confidentiality + integrity required; regional residency is a product promise. |
-| **The local cache** | `~/.clw/cache` (chunk store) | Holds plaintext file contents at rest on the user's machine; integrity-sensitive (a tampered cache could yield a corrupt hydrate). |
+| Static or redeemed bearer token | Resolved configuration/environment; CAS/AC Authorization header. A runner bootstrap ticket and its lease/fabric binding are distinct from the bearer token. | Prevent unintended disclosure. The authority of a stolen token depends on server-enforced scope; do not assume every token grants all tenant operations. |
+| Selected workspace content | Source tree, remote chunks/manifest, local cache and hydrate destination. | Content integrity, intended access and recoverability. These are separate properties. |
+| Refs and memo records | Tenant AC and any related server-side catalogs. | Correct association of names/results with content, explicit lifecycle and concurrency rules. |
+| Local config, cache and temporary files | Default or configured paths on the host. | Permission policy during creation, writing and publication, plus owned cleanup. A protected cache does not protect an unrelated hydrate destination. |
+
+The credential resolver and command-gated bootstrap are in
+[`config.rs`](../crates/clw-cli/src/config.rs) and
+[`main.rs`](../crates/clw-cli/src/main.rs). Content and transport contracts are in
+[`clw-types`](../crates/clw-types/src/lib.rs). Source inspection does not establish
+which credentials or production policies are currently provisioned.
 
 ## Trust boundaries
 
-- **Client ↔ CoreLink API**, over **TLS**. The PAT is the **only** credential
-  the client holds and sends. The client trusts the TLS endpoint to be CoreLink
-  (`https://` is required; see PAT-leakage mitigations).
-- **CoreLink API → client (untrusted payload).** Manifests and chunks returned
-  by the API are treated as **untrusted input**: a compromised/MITM'd server, a
-  tampered manifest, or a malicious tenant's data must not be able to escape the
-  hydrate destination or forge content past integrity checks.
-- **Client ↔ local filesystem.** Config + cache live under `~/.clw` with
-  restrictive permissions; the client trusts its own machine but minimizes
-  blast radius if other local users exist (perms) or if a tool changes
-  underneath it (run-key identity).
-- **`x-corelink-tenant-id` is server-internal** and is **never** set by `clw`
-  — tenant scoping is carried by the PAT + tenant-in-URL-path.
+**Transport destination and server authority.**
+[`HttpClient::with_concurrency`](../crates/clw-client/src/lib.rs) uses parsed
+`is_safe_https`/`is_loopback_http` checks, rejects endpoints outside that policy
+and disables redirects. The loopback exception is for local development/tests;
+it is not a prefix match against a raw hostname string. TLS validation does not
+prove a configured host belongs to CoreLink. The operator chooses the destination;
+server-side authentication, tenant authorization and storage isolation must be
+verified at the service boundary, not inferred from a tenant string in a URL.
 
-## Threats considered & mitigations
+**Remote bytes and local effects.** Content-address verification detects bytes
+that do not match the expected digest. It does not authenticate who selected that
+digest, prove metadata consistency, prove safe link composition or make a
+namespace representable on every filesystem. Path and semantic checks remain
+necessary after integrity verification. Ref key domain separation is not an ACL.
 
-| Threat | Vector | Mitigation | Ref |
-|---|---|---|---|
-| **Malicious / tampered manifest → path traversal** | A manifest entry path or symlink target that is absolute or contains `..`/`.` (POSIX) or a Windows backslash / drive-letter / UNC form causes `hydrate` to write **outside** the destination (zip-slip / symlink-slip) | `validate_rel_path` + `validate_symlink_target` reject such entries at `Manifest::from_bytes`; `hydrate` re-validates (defense-in-depth). **Windows-aware: backslash / drive-letter / UNC are rejected on every platform** (M2.2), so this is no longer unix-only | audit H1 / M2.2 |
-| **PAT leakage — at rest** | World-readable config on a multi-user machine | `config.toml` `0600`; `~/.clw` + cache root `0700` | audit H2 |
-| **PAT leakage — in transit** | PAT sent over cleartext `http://`, incl. a loopback allow-list bypass (`http://127.0.0.1.evil.com`) | `https://`-only client; loopback exception uses an **exact-host** check, not a prefix match (regression-tested) | audit M2 / M0.5 CRIT |
-| **PAT leakage — in output / argv** | Token printed in logs/diagnostics; `--token` visible in the process list | Token **redaction** in all `clw` output; `--token` help **warns** of process-list visibility (config/env preferred) | audit LOWs |
-| **Integrity forgery** | Server/MITM returns wrong bytes for a content address | Every chunk BLAKE3-verified on fetch; canonical-JSON Merkle-style manifests | (baseline) |
-| **Stale / incorrect replay** | `clw run` replays a cached result after the underlying toolchain changed, yielding wrong output | Run key folds the **tool-identity** (content digest of `command[0]`, resolved against the run cwd); key domain bumped `v1→v2` | audit M3 / M0.5 HIGH |
-| **Memory-unsafety** | `unsafe` raw-pointer borrow | Removed; **zero `unsafe`** in shipped crates **except one audited block in `clw-win-acl`** (`cfg(windows)` DACL FFI in `src/imp.rs` — no safe Rust equivalent), enforced by the workspace lint `[workspace.lints.rust] unsafe_code = "forbid"`. `clw-win-acl` is a ~180-line crate that exists only to hold that block, and is the only member restating the lint as `deny` so it can carry the single reviewed `#[allow(unsafe_code)]`; `clw-cli` inherits `forbid`. The guard models no Rust grammar: the compiler rejects every permission-attribute spelling in a `forbid` crate (E0453), the `deny` crate is hash-pinned, three of its four source scans are monotone (raw bytes, over-report only) while the fourth, `cfg_attr`, compares whole attribute FORMS against a one-entry ledger because a blanket refusal false-positives on legitimate `cfg_attr(not(windows), allow(dead_code))`. The widest thing NEITHER sees is platform-conditional code — rustc strips inactive `cfg` before linting, so `unsafe` under a `cfg(target_os)` that no lane compiles is invisible, and three of the five targets `release.yml` ships are linted by no lane. See SECURITY.md, which enumerates that and the rest | audit M1 / H4b |
+**Host files and command execution.** The application manages config/cache and
+writes selected destinations. `clw run` spawns locally and removes known secret
+environment names, but preserves other ambient state. A child running as the same
+user can still access files allowed to that user, including a reachable config.
+This is not a sandbox and environment scrubbing is not filesystem isolation.
+Do not infer tenant credential safety from a test that observes only the child's
+environment.
 
-## Out of scope / residual risks
+**Publication and lifecycle.** A file rename is not a tree transaction, a ref
+record is not indefinite retention, and a set of per-request transport deadlines
+is not a guaranteed deadline for the entire command or a blocked filesystem call.
+Server-side GC, other CAS consumers and writers are separate actors.
 
-These are **known and tracked**, not silently accepted. See
-`docs/ROADMAP-go-live.md` for owners and sequencing.
+## Threats, implemented measures and remaining obligations
 
-- **Resource exhaustion from a hostile manifest.** Path traversal is closed, but
-  a manifest with enormous entry counts / chunk counts / total download size
-  could still drive OOM or disk-fill, and symlink **cycles** are not yet bounded.
-  Resource-safety / abuse bounds are tracked as **roadmap M1.6** (complements H1
-  with anti-OOM / anti-disk-fill / symlink-cycle guards). Hydrate-side hardening
-  (re-verify fetched-chunk digests, mask setuid/setgid/sticky/world-writable
-  mode bits, materialize files before symlinks) is **M1.7**.
-- **Resource-safety / abuse bounds (hostile manifest).** Now mitigated by
-  **roadmap M1.6** — `hydrate` enforces manifest entry-count / byte / symlink
-  bounds (anti-OOM, anti disk-fill, symlink-cycle guard). See the entry-count
-  guard in `clw-hydrate`.
-- **Right-to-erasure (GDPR Art. 17) gap.** `clw` has **no erasure command today**
-  — there is no `clw rm`. A future `clw rm` (deleting the AC ref pointer) is
-  tracked as **roadmap M1.4**, gated on server **dependency D-1** (`DELETE /v1/ac`).
-  Even once `clw rm` lands it would delete only the AC ref pointer and **cannot
-  enumerate or garbage-collect the CAS blobs**, so fully deleting a tenant's
-  uploaded data additionally needs client `prune`/CAS-GC **plus** server
-  capabilities: ref-enumeration LIST (**dependency D-7**) and CAS DELETE/LIST
-  (**dependency D-8**), tracked under the erasure milestone **M6/M6.4**. Until
-  these land, the residency promise is non-compliant.
-- **Operational secret backup.** The server-side `SIGNUP_TOKEN_KEY` backup rule
-  is tracked as dependency **D-2** (server-owned, coordinated via the ledger).
+| Concern | Implemented measure at the reviewed source | Remaining boundary / canonical obligation |
+|---|---|---|
+| Unsafe materialization paths | `Manifest::from_bytes`, `validate_rel_path` and `validate_symlink_target_contained`; separate files and links passes. | Entry paths and link targets have different rules: contained relative targets may contain `..`. Lexical acceptance and files-before-links do not prove safe combined resolution. [#296](https://github.com/HuGR-Labs/corelink-workspaces/issues/296) remains the confinement obligation. |
+| Local publication confidentiality | Config/cache permission handling exists; integrated #297 creates Unix hydrate temporaries owner-only, applies final mode before sync/rename and cleans only acquired temporaries. | Intentionally broader final modes can apply before rename. Windows config/cache effective access and failure policy are [#317](https://github.com/HuGR-Labs/corelink-workspaces/issues/317), not a Unix-mode inference. |
+| Incorrect or forged content bytes | CAS transport contract requires BLAKE3 verification; hydrate checks root/chunk integrity and, with integrated #306, checked per-file size equality before materialization; local cache checks read content. | Expected digest, semantic metadata validity and availability are distinct. Broader parser acceptance remains #308; these size checks do not establish safe link composition or a representable namespace. |
+| Loss through destination aliases | Literal entry ordering and uniqueness are validated. | Literal uniqueness does not prove filesystem uniqueness. [#303](https://github.com/HuGR-Labs/corelink-workspaces/issues/303) covers loss on unrepresentable destination names. |
+| Resource use | Hydrate checks entry, aggregate chunk-byte, link and chunk counts; output capture and HTTP bodies also have caps. | See the precise scope below. Snapshot growth [#291](https://github.com/HuGR-Labs/corelink-workspaces/issues/291), Windows copy expansion/order [#298](https://github.com/HuGR-Labs/corelink-workspaces/issues/298)/[#299](https://github.com/HuGR-Labs/corelink-workspaces/issues/299), cache maintenance/temporaries [#304](https://github.com/HuGR-Labs/corelink-workspaces/issues/304)/[#314](https://github.com/HuGR-Labs/corelink-workspaces/issues/314) have separate boundaries. |
+| Late effects after failure | Each file writer has a finish/abort and cleanup protocol. | Sibling-writer quiescence after the outer error is [#300](https://github.com/HuGR-Labs/corelink-workspaces/issues/300); cleanup must not race effects whose completion has not been observed. |
+| Stale or incorrect memo reuse | Run-key domain `clw/run/v3/` includes declared inputs, environment, command/tool and cwd; producer writes on exit 0. | Tool selection [#301](https://github.com/HuGR-Labs/corelink-workspaces/issues/301), OS environment encoding [#302](https://github.com/HuGR-Labs/corelink-workspaces/issues/302), received-record eligibility [#307](https://github.com/HuGR-Labs/corelink-workspaces/issues/307). Undeclared and concurrently changing inputs are not made immutable by computing a key. |
+| Misleading execution/delivery result | CLI forwards captured output and maps internal failures. | Error-phase [#305](https://github.com/HuGR-Labs/corelink-workspaces/issues/305) and delivery [#310](https://github.com/HuGR-Labs/corelink-workspaces/issues/310) remain distinct. Exit integers alone cannot prove absence of side effects. |
+| Loss of named or shared content | New content is normally uploaded before publishing its ref; prune marks known refs and rejects unreadable recognized roots. | Ref replacement [#292](https://github.com/HuGR-Labs/corelink-workspaces/issues/292), missing-root repair [#294](https://github.com/HuGR-Labs/corelink-workspaces/issues/294), other root families [#293](https://github.com/HuGR-Labs/corelink-workspaces/issues/293) and concurrent GC [#295](https://github.com/HuGR-Labs/corelink-workspaces/issues/295). A partial root view must not authorize deletion. |
+| Unsafe implementation | Workspace `unsafe_code = "forbid"` and the separately reviewed Windows ACL exception; configuration/source guards accompany compiler checks. | Linting applies to the code compiled for the selected target. Guard configuration or cross-compilation is not native runtime evidence or proof that every dependency/platform is memory-safe. See [SECURITY.md](../SECURITY.md) and the current manifests/workflows. |
 
-## Non-goals
+This table is defensive scope documentation. It does not publish attack fixtures
+or claim new reproduction of any issue.
 
-- `clw` is not a server and exposes no network listener; remote-code-execution
-  surface is limited to the data it fetches (covered above) and the commands a
-  user explicitly runs via `clw run`.
-- Defending the user's own machine against a local root attacker is out of
-  scope; the `0600/0700` perms reduce blast radius among **non-root** local
-  users only.
+## Resource bounds: what is actually bounded
+
+At the reviewed source, `enforce_resource_bounds` in
+[`clw-hydrate`](../crates/clw-hydrate/src/lib.rs) checks at most 1,000,000 manifest
+entries, 1 TiB summed regular-file `ChunkRef.size` bytes, 100,000 symlink entries
+and 64,000,000 total chunk references. A per-file check limits chunk references to
+16,000,000. These policies run after the root bytes have been fetched, verified
+and parsed, and before destination materialization. They are not checks before
+all allocation. The symlink-count cap is not a general cycle-resolution proof.
+
+The summed regular-file budget is neither a physical disk quota nor accounting
+for every Windows fallback copy. The parent disk can still run out of space.
+The single CAS body cap is 5 MiB; it is not the maximum total workspace size.
+The root is a flat manifest blob, not recursive per-directory Merkle metadata.
+Resource and copy gaps above remain named rather than contradicted by a blanket
+claim that exhaustion or traversal is already solved.
+
+## Destructive operations and retention
+
+[`rm`](../crates/clw-cli/src/subcmds/rm.rs),
+[`prune`](../crates/clw-cli/src/subcmds/prune.rs) and
+[`erase`](../crates/clw-cli/src/subcmds/erase.rs) are implemented commands, not
+future milestones. Their consent rails do not by themselves prove completeness:
+
+- `rm` removes a selected AC reference, not the referenced CAS tree.
+- `prune` protects recognized current workspace roots/chunks and RunRecord streams.
+  It does not traverse `parent`; shared catalogs and concurrent publication still
+  require their tracked fixes. Preserve the incomplete-root and empty-live-set
+  safety rails rather than treating them as evidence of universal root coverage.
+- `erase` drains ref deletion before blob deletion and re-enumerates for at most
+  three passes, reporting partial results. This is not, by itself, a writer fence,
+  account-offboarding protocol or proof about every backup/log/catalog. Its actual
+  server scope is the verification obligation in
+  [#316](https://github.com/HuGR-Labs/corelink-workspaces/issues/316).
+
+Lineage or possession of a digest does not reserve its bytes against collection.
+The retention decision in [#315](https://github.com/HuGR-Labs/corelink-workspaces/issues/315)
+must identify a supported root and the applicable collection envelope.
+Do not label a legal-compliance or residency promise satisfied or violated solely
+from this client model or from the presence/absence of a CLI command.
+
+## Non-goals and evidence requirements
+
+A local root adversary and isolation of arbitrary child code from its own user
+require controls outside this client. This does **not** waive protection against
+untrusted remote manifests or intended access control among non-root local users.
+Capture of a mutable working tree, undeclared inputs and transitive toolchain
+identity are not automatically converted into hermetic execution by memoization.
+Server secret backup, physical residency, service deployment and release signing
+are outside the evidence provided by these client source reads.
+
+Each claimed fix needs its own relevant regression and healthy controls on an
+identified source/build. Windows access needs Windows evidence, and private Unix
+publication needs effective-access evidence rather than only final mode bits.
+Source inspection, previously recorded results, tests run for another PR and a
+proposed patch are different evidence classes. Preserve historical reports;
+update this model when their corresponding changes and acceptance really land.
+The pinned [source-to-claim index](ARCHITECTURE.md#source-to-claim-review-index)
+records the main implementation anchors for this reconciliation.

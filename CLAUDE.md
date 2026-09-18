@@ -8,83 +8,118 @@
 > private again does not revert runner labels and may reintroduce hosted-minute
 > quota/billing restrictions. Other CoreLink repositories are not changed.
 
-> Durable, in-repo context for any Claude session on `clw` / corelink-workspaces. Keep this current.
-> Point-in-time/resume state lives in `docs/HANDOFF-*-clw-TL-state.md` (read the latest first).
+## Source and operational state
+
+This guide describes commit `be96b8394c66d1dc36ce7ca2f186780f0ea48308`,
+workspace version 0.1.12, reconciled on 2026-09-18. A manifest version is not a
+claim about the latest published release. Consult current PRs and
+[tracker #325](https://github.com/HuGR-Labs/corelink-workspaces/issues/325)
+at every resume. Dated handoffs and the Git history preserve earlier observations;
+do not turn an old green run, release assertion or branch-policy statement into
+current evidence.
+
+The branch API observed during this reconciliation reported `protected=false`.
+That does not establish the absence of all inherited rules. The intended process
+below remains mandatory independently of that observation; #320 owns effective
+policy and Actions execution verification. Recorded billing/startup failures are
+not failed Rust assertions, and local validation is not a fabricated remote check.
+
+
+> **Integrated changes at this source:** [PR #329](https://github.com/HuGR-Labs/corelink-workspaces/pull/329)
+> supplies Unix hydrate temporary ownership and pre-publication permissions;
+> [PR #334](https://github.com/HuGR-Labs/corelink-workspaces/pull/334) supplies
+> checked per-file size validation. Both are already in the pinned main commit.
+> Earlier test records retain their original source identities; this documentation
+> update is not a new runtime-test or release result.
 
 ## What this is
-`clw` (CoreLink Workspaces) — a Rust workspace CLI: `snapshot` / `hydrate` / `run` over a
-content-addressed backend (CAS + AC). Auth = `Authorization: Bearer <PAT>` + tenant-in-URL-path
-(never `x-corelink-tenant-id`). Config is env-driven (`CLW_ENDPOINT/CLW_TENANT/CLW_TOKEN/CLW_REF_DOMAIN`),
-no config file required. Single human owner = Gustavo (stakeholder + approver).
 
-**Status: SHIPPED — v0.1.11 is live (open beta; v0.1.0 launched 2026-06-18).**
-`brew install hugr-labs/clw/clw`. v0.1.11 (2026-07-13) is a stabilization wave from a 5-angle
-hidden-debt sweep (core code was clean; the recurring debt lived in the GATE layer): signing is now
-FAIL-CLOSED on real releases (a real `vX.Y.Z` with the minisign secret absent hard-fails instead of
-publishing unsigned + bumping brew — #182); the PR scoped-lane no longer has coverage holes (tests
-now include the sink crates clw-cli/clw-integration-tests, the windows-gnu cross-check is a UNIVERSAL
-tripwire in both lanes, clippy runs `--all-features` — #183); the last two size-unbounded reads are
-capped (cred-ticket body + snapshot small-file fast-path — #184); `cargo-audit` pinned `@0.22.2`.
-v0.1.6 (2026-07-09) shipped the 5-angle adversarial-audit remediation (4 HIGH + 6 MED + LOW cluster).
-v0.1.7 (2026-07-10) closes the external-symlink LOW. v0.1.5 shipped `clw hydrate --manifest-digest`
-(#153). **`main` is branch-protected (`gates`+`dco` required, enforce_admins).**
+`clw` snapshots selected files, hydrates into a new/empty destination and memoizes
+local command stdout/stderr/exit over CAS and AC. It is not a VM checkpoint,
+remote scheduler or sandbox. Auth is Bearer PAT with tenant in the URL path;
+configuration can be entirely environment-driven. A config file is optional.
+The owner is Gustavo; confirm authority for spending, publishing or destructive
+operations instead of treating repository write access as blanket permission.
 
-## Build / test / gate
-- The repo gate is `bash scripts/gates.sh` (FULL) or `bash scripts/gates.sh --scoped [base]` (change-scoped
-  fast lane). It runs fmt/clippy/test/deny(+windows-cross) lanes. (There is no root `verify.sh`.)
-- **Test-rigor lanes (make coverage PROVABLE, additive — NOT part of the required gate): see `docs/TESTING.md`.**
-  `coverage.yml` (llvm-cov, per-PR, measure→ratchet→gate), `fuzz.yml` (nightly cargo-fuzz on the clw-types
-  untrusted-input targets, crash=red), `mutation.yml` (weekly cargo-mutants, report-only→follow-on blocks
-  new survivors). All on github-hosted ubuntu.
-- On the self-hosted CI Mac, the toolchain is ISOLATED (a shared rustup-nuke happens) — use
-  `CARGO_HOME=$HOME/.clw-ci-rust/cargo RUSTUP_HOME=$HOME/.clw-ci-rust/rustup $HOME/.clw-ci-rust/cargo/bin/cargo`.
-  Pinned `RUST_TOOLCHAIN` (currently 1.91.1). Cross-builds use cargo-zigbuild (ziglang in an isolated venv).
+Read [ARCHITECTURE.md](docs/ARCHITECTURE.md), [GUIDE.md](docs/GUIDE.md) and
+[THREAT-MODEL.md](docs/THREAT-MODEL.md) for mechanisms and their limits.
+Outstanding runtime fixes stay outstanding until accepted and integrated:
+#291 bounded small-file read; #292/#294 refs/root repair; #293/#295 GC;
+#296/#300/#303 hydrate boundaries; #298/#299 Windows copies;
+#301/#302/#305/#307/#310 run identity, replay and delivery. Do not silently
+implement a new product feature to correct a documentation claim.
 
-## Observability limitation (WP-36)
+## Build, tests and gates
 
-As of 2026-09-01, no observer outside GitHub Actions is configured or tested: there is no owner-Mac cron,
-third-party heartbeat service, webhook/pager, or independent alert channel. The in-platform deadman only
-checks whether registered scheduled lanes have recent completed runs and successful conclusions; it cannot
-prove GitHub Actions scheduler or CoreLink fabric ingestion/liveness. Because the deadman itself runs on
-that Actions/fabric path and reports through GitHub, an outage there can silence both the watcher and its
-alert. See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md). This is a documented limitation, not an
-external liveness mitigation or a claim that WP-36's observer exists; a future Mac or third-party cron is
-only a possible path until it is independently deployed and tested.
+The pin is Rust 1.91.1 in `rust-toolchain.toml`. Use isolated, campaign-owned
+application HOME/cache/temp paths and bounded jobs on a shared host. Preserve
+other worktrees, in-progress builds and their caches. Never change a global
+compiler installation to make one task pass.
 
-## Repo conventions (enforced — do not relearn the hard way)
-- **DCO: commit with `-s`** (sign-off gate blocks otherwise). Conventional Commits for titles.
-- **Flow (main is branch-protected — no direct-to-main):** as of 2026-07-09 `main` requires the `gates` +
-  `dco` status checks GREEN and enforces admins, force-push/deletion blocked, linear history. So EVERYTHING
-  goes: short-lived branch → PR → independent cold review → **squash-merge on green**. No approval-review is
-  required (the cold review is the gate, not the GitHub button), so the TechLead self-merges once checks pass.
-  Run the FULL gate LOCALLY first, then merge. ~1 PR in flight.
-- **Never force-push / history-rewrite on main.** The destructive-guard blocks the agent from force-push
-  (a human runs it out-of-band) → prefer fresh-branch / add-a-commit. Never `--no-verify`. Don't commit
-  telemetry/state (`.techlead/`, `__pycache__`, audit logs) — the git-hygiene-guard blocks it.
-- **The TechLead owns merge/approval end-to-end** (owner delegated: "prs, merge etc sao responsabilidade
-  sua, revisar, aprovar/reprovar, pedir review independente"). The local clone still goes stale → always
-  `git fetch` + diff `origin/main` before assuming. Trust the repo over any in-context/pre-compaction summary.
+```sh
+cargo build --locked
+cargo test --workspace --locked
+bash scripts/gates.sh
+```
 
-## Release (proven end-to-end)
-- Tag `v*` triggers `.github/workflows/release.yml`: preflight → conformance → 5-target build+sign
-  (mac×2 native, linux×2 + windows-gnu cross) → SBOM → checksum + publish.
-- **`vX.Y.Z-rc.N` = dry-run** (⇒ `--prerelease`, NO formula bump, reversible). Cut an rc to exercise the
-  tag-only legs before a real release — rc dry-runs have repeatedly caught latent, tag-only bugs.
-- **Real `vX.Y.Z`** publishes the GitHub Release on the PUBLIC mirror `HuGR-Labs/clw-releases` (latest)
-  and bumps the formula in the PUBLIC tap `HuGR-Labs/homebrew-clw`.
-- Binaries are minisign-signed (`SHA256SUMS.minisig`, trust-root `docs/minisign.pub`). SLSA provenance is
-  gated to public repos only (deferred per waiver — this repo is private). macOS Developer-ID + Azure
-  Windows signing are deferred.
-- **Transient failure:** the self-hosted runner can hit a network `ENOTFOUND` on artifact upload — NOT a
-  code bug. Just `gh run rerun <id> --failed` (same tag; the fail-safe skips publish if any build fails,
-  so there is never a partial release).
+`gates.sh` has no supported `--scoped [base]` interface. Local and main runs take
+the full lane. A trusted pull-request context selects the automatic diff lane:
+Markdown-only skips Rust; runtime and ambiguous changes retain the appropriate
+Rust checks. Read `scripts/classify-lane.sh` and the actual gate, not a historical
+command recipe. Cross-lint is not native Windows execution. The local cross-skip
+policy remains #319 until its patch lands; a local shortcut cannot certify CI.
 
-## Distribution model
-clw stays proprietary-LICENSED (EULA governs use) but the binary is PUBLICLY downloadable. Main repo
-stays PRIVATE; binaries live on the public mirror (a private repo's Release assets aren't public).
-`install.sh` is the curl fallback (public; strips macOS quarantine). Windows = direct `.exe`.
+[TESTING.md](docs/TESTING.md) and the workflows define supplementary coverage,
+fuzz, mutation and platform lanes. Their existence is not a passing run.
+Record exact selectors, nonempty expected counts, source/tree SHA and terminal
+results. Coverage, live conformance and signing have distinct acceptance records.
 
-## Cross-team seam (frozen — `docs/CLI-SURFACE-EXIT-FREEZE.md`)
-The runner DRIVES `clw snapshot→hydrate→run` (never reimplements). `clw run` exits the child's code
-verbatim; a clw-internal failure where the child NEVER ran exits the RESERVED `125`. Non-zero is never
-cached. Inject identity via `CLW_*` env; `CLW_REF_DOMAIN=runner` → keyspace `clw/ref/runner/v1/`.
+## Integration and hygiene
+
+- DCO: commit with `-s` using the real configured identity. Use Conventional
+  Commits titles and the existing DCO/title checks.
+- Short branch → reviewed PR → accepted evidence → squash merge → post-merge
+  verification. Independent cold review is not the author's second reading.
+  Keep one active integration item; coordinate queued drafts and shared files.
+- Run the applicable gate and `scripts/pre-merge-gate-check.sh`; an explicit
+  owner-authorized exception must be recorded with its scope. It never turns
+  missing tests into successes or substitutes for independent review.
+- Never force-push main, discard unrelated work, use `--no-verify`, fabricate
+  checks or auto-close an issue with operational acceptance still pending.
+  The executor owns review, integration, receipts and cleanup of its own work.
+- Fetch and compare actual base/head before integration. Preserve valid evidence
+  across docs-only receipts, but repeat affected verification for material changes.
+  Keep logs outside the source tree and retain only concise validation notes there.
+
+## Release and distribution
+
+`release.yml` is the source of the five-target build/sign and verification graph.
+At this commit, builds run on hosted Intel macOS; the ARM Darwin target and
+Linux/Windows GNU targets are cross-built, while Authenticode verification runs
+on native Windows. Real releases require their live conformance and signature
+proofs. Source configuration is not proof that secrets, runners or released
+assets have met these requirements.
+
+An RC/tag/draft can cause external work and uploads; it is not automatically
+private, harmless or reversible. Obtain the relevant authority before creating
+one. #321 owns RC scheduling, #322 artifact-set retry identity, #323 distribution
+verification. Retrying must not silently replace an accepted asset set.
+Homebrew publication can be optional under the existing policy; record the
+actual selected channels and waivers, never infer universal delivery.
+
+The source remains proprietary; EULA governs use. Binary download destinations
+are the public mirror `HuGR-Labs/clw-releases` and tap `HuGR-Labs/homebrew-clw`.
+Consult [INSTALL.md](docs/INSTALL.md) and [DISTRIBUTION.md](docs/DISTRIBUTION.md)
+for a specifically selected release. Do not assert current signing or residency
+from older release notes. #324 owns the independently delivered observer; the
+Actions deadman cannot alone demonstrate its own scheduler's liveness.
+
+## Cross-team seam
+
+Consumers drive `snapshot → hydrate → run`; see
+[CLI-SURFACE-EXIT-FREEZE.md](docs/CLI-SURFACE-EXIT-FREEZE.md).
+`run` forwards the child's exit and records successful producer results, but
+125/137 can also be legitimate child exits and do not alone prove lifecycle or
+authorize retries. HIT restores streams, not output files. The user/runner ref
+hash domains avoid naming collisions, not access-control checks. Server changes
+are coordinated explicitly rather than assumed from a client-side method.
