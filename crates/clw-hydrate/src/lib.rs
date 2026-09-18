@@ -15,7 +15,7 @@ mod path_containment;
 
 use std::io::ErrorKind;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -577,6 +577,17 @@ enum FileWrite {
     Finish,
     #[cfg(test)]
     FailWrite,
+    #[cfg(all(test, unix))]
+    FailMode,
+    #[cfg(test)]
+    FailSync,
+    #[cfg(all(test, unix))]
+    Checkpoint(tokio::sync::oneshot::Sender<()>),
+    #[cfg(all(test, unix))]
+    BeforePublish {
+        ready: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    },
     #[cfg(test)]
     BlockFor(std::time::Duration),
 }
@@ -602,33 +613,73 @@ fn spawn_file_writer(
         use std::io::Write as _;
 
         std::fs::create_dir_all(&parent)?;
-        let mut tmp_guard = TmpFileGuard {
-            path: Some(tmp_path.clone()),
-        };
-        let mut file = std::fs::File::create(&tmp_path)?;
+        // Declare cleanup before the file so errors close the handle before
+        // unlinking (also required on Windows). An unsuccessful exclusive open
+        // owns nothing: only arm cleanup after we actually created the temp.
+        let mut tmp_guard = TmpFileGuard { path: None };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp_path)?;
+        tmp_guard.path = Some(tmp_path.clone());
+        #[cfg(all(test, unix))]
+        let mut fail_mode = false;
+        #[cfg(test)]
+        let mut fail_sync = false;
+        #[cfg(all(test, unix))]
+        let mut before_publish: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )> = None;
 
         while let Some(message) = rx.blocking_recv() {
             match message {
                 FileWrite::Chunk(data) => file.write_all(&data)?,
                 FileWrite::Finish => {
                     // Publishing is deliberately a positive protocol message,
-                    // never an EOF side effect. Keep the established durability
-                    // and metadata order intact.
+                    // never an EOF side effect. Final Unix metadata is committed
+                    // to the owned temp before the pathname becomes visible.
                     file.flush()?;
+                    #[cfg(all(test, unix))]
+                    if fail_mode {
+                        return Err(ClwError::Io(std::io::Error::other(
+                            "injected pre-publication mode failure",
+                        )));
+                    }
+                    #[cfg(unix)]
+                    {
+                        // The temp starts owner-only and receives its intended
+                        // final metadata while we still own the open file. A
+                        // metadata failure therefore aborts before publication,
+                        // and the guard removes the uncommitted temp.
+                        let perms = std::fs::Permissions::from_mode(mode & 0o777);
+                        file.set_permissions(perms)?;
+                    }
+                    #[cfg(windows)]
+                    let _ = mode;
+                    // Sync both bytes and the pre-publication metadata before
+                    // exposing the final pathname.
+                    #[cfg(test)]
+                    if fail_sync {
+                        return Err(ClwError::Io(std::io::Error::other(
+                            "injected pre-publication sync failure",
+                        )));
+                    }
                     file.sync_all()?;
+                    #[cfg(all(test, unix))]
+                    if let Some((ready, resume)) = before_publish.take() {
+                        let _ = ready.send(());
+                        resume.blocking_recv().map_err(|_| {
+                            ClwError::Io(std::io::Error::other("publication test cancelled"))
+                        })?;
+                    }
                     drop(file);
                     std::fs::rename(&tmp_path, &abs)?;
                     tmp_guard.disarm();
                     if let Ok(dir) = std::fs::File::open(&parent) {
                         let _ = dir.sync_all();
                     }
-                    #[cfg(unix)]
-                    {
-                        let perms = std::fs::Permissions::from_mode(mode & 0o777);
-                        std::fs::set_permissions(&abs, perms)?;
-                    }
-                    #[cfg(windows)]
-                    let _ = mode;
                     return Ok(());
                 }
                 #[cfg(test)]
@@ -636,6 +687,18 @@ fn spawn_file_writer(
                     return Err(ClwError::Io(std::io::Error::other(
                         "injected blocking writer failure",
                     )));
+                }
+                #[cfg(all(test, unix))]
+                FileWrite::FailMode => fail_mode = true,
+                #[cfg(test)]
+                FileWrite::FailSync => fail_sync = true,
+                #[cfg(all(test, unix))]
+                FileWrite::Checkpoint(ready) => {
+                    let _ = ready.send(());
+                }
+                #[cfg(all(test, unix))]
+                FileWrite::BeforePublish { ready, resume } => {
+                    before_publish = Some((ready, resume));
                 }
                 #[cfg(test)]
                 FileWrite::BlockFor(duration) => std::thread::sleep(duration),
@@ -2689,6 +2752,142 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    async fn writer_checkpoint(tx: &tokio::sync::mpsc::Sender<FileWrite>) {
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        tx.send(FileWrite::Checkpoint(ready)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_temp_is_private_during_writes_and_mode_precedes_publication() {
+        for requested_mode in [0o600, 0o640, 0o644, 0o755] {
+            let dir = TempDir::new().unwrap();
+            let parent = dir.path().to_path_buf();
+            let final_path = parent.join("out.bin");
+            let tmp_path = parent.join(".clw-tmp-private");
+            let (tx, writer) =
+                spawn_file_writer(tmp_path.clone(), final_path.clone(), parent, requested_mode);
+            // The actual writer acknowledges each boundary, not a timer.
+            writer_checkpoint(&tx).await;
+            assert_eq!(
+                std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            tx.send(FileWrite::Chunk(b"private-".to_vec()))
+                .await
+                .unwrap();
+            writer_checkpoint(&tx).await;
+            assert_eq!(std::fs::read(&tmp_path).unwrap(), b"private-");
+            assert_eq!(
+                std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            tx.send(FileWrite::Chunk(b"bytes".to_vec())).await.unwrap();
+            writer_checkpoint(&tx).await;
+            assert_eq!(std::fs::read(&tmp_path).unwrap(), b"private-bytes");
+            assert_eq!(
+                std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!final_path.exists());
+
+            let (ready, observed) = tokio::sync::oneshot::channel();
+            let (resume, paused) = tokio::sync::oneshot::channel();
+            tx.send(FileWrite::BeforePublish {
+                ready,
+                resume: paused,
+            })
+            .await
+            .unwrap();
+            tx.send(FileWrite::Finish).await.unwrap();
+            drop(tx);
+            tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+                .await
+                .unwrap()
+                .unwrap();
+            // Only the intended final permissions may be applied. The final
+            // pathname is still absent while metadata and bytes are synced.
+            assert!(!final_path.exists());
+            assert_eq!(
+                std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777,
+                requested_mode
+            );
+            resume.send(()).unwrap();
+            writer.await.unwrap().unwrap();
+            assert!(!tmp_path.exists());
+            assert_eq!(
+                std::fs::metadata(&final_path).unwrap().permissions().mode() & 0o777,
+                requested_mode
+            );
+            assert_eq!(std::fs::read(&final_path).unwrap(), b"private-bytes");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writer_empty_file_is_private_until_final_metadata() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("empty.bin");
+        let tmp_path = parent.join(".clw-tmp-empty-private");
+        let (tx, writer) = spawn_file_writer(tmp_path.clone(), final_path.clone(), parent, 0o640);
+        writer_checkpoint(&tx).await;
+        assert_eq!(
+            std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!final_path.exists());
+        tx.send(FileWrite::Finish).await.unwrap();
+        drop(tx);
+        writer.await.unwrap().unwrap();
+        assert!(!tmp_path.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"");
+        assert_eq!(
+            std::fs::metadata(&final_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_exclusive_open_preserves_preexisting_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let tmp_path = parent.join(".clw-tmp-already-owned");
+        let final_path = parent.join("out.bin");
+        std::fs::write(&tmp_path, b"existing owned bytes").unwrap();
+        let (tx, writer) = spawn_file_writer(tmp_path.clone(), final_path.clone(), parent, 0o600);
+        drop(tx);
+        let error = writer.await.unwrap().unwrap_err();
+        assert!(matches!(error, ClwError::Io(ref e) if e.kind() == ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), b"existing owned bytes");
+        assert!(!final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn sync_failure_aborts_before_publication_and_cleans_owned_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let tmp_path = parent.join(".clw-tmp-sync-fail");
+        let final_path = parent.join("out.bin");
+        let (tx, writer) = spawn_file_writer(tmp_path, final_path.clone(), parent.clone(), 0o600);
+        tx.send(FileWrite::Chunk(b"synthetic".to_vec()))
+            .await
+            .unwrap();
+        tx.send(FileWrite::FailSync).await.unwrap();
+        tx.send(FileWrite::Finish).await.unwrap();
+        drop(tx);
+        assert!(matches!(
+            writer.await.unwrap().unwrap_err(),
+            ClwError::Io(_)
+        ));
+        assert_no_tmp_or_final(&parent, &final_path);
+    }
+
     #[tokio::test]
     async fn writer_eof_without_finish_aborts_and_cleans_temp() {
         let dir = TempDir::new().unwrap();
@@ -2722,6 +2921,54 @@ mod tests {
         let err = writer.await.unwrap().unwrap_err();
         assert!(matches!(err, ClwError::Io(_)));
         assert_no_tmp_or_final(&parent, &final_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mode_failure_aborts_before_publication_and_cleans_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("out.bin");
+        let tmp_path = parent.join(".clw-tmp-mode-fail");
+        let (tx, writer) = spawn_file_writer(tmp_path, final_path.clone(), parent.clone(), 0o600);
+
+        tx.send(FileWrite::Chunk(b"private".to_vec()))
+            .await
+            .unwrap();
+        tx.send(FileWrite::FailMode).await.unwrap();
+        tx.send(FileWrite::Finish).await.unwrap();
+        drop(tx);
+        let err = writer.await.unwrap().unwrap_err();
+        assert!(matches!(err, ClwError::Io(_)));
+        assert_no_tmp_or_final(&parent, &final_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_failure_does_not_publish_and_cleans_temp() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let final_path = parent.join("occupied");
+        std::fs::create_dir(&final_path).unwrap();
+        let tmp_path = parent.join(".clw-tmp-rename-fail");
+        let (tx, writer) =
+            spawn_file_writer(tmp_path.clone(), final_path.clone(), parent.clone(), 0o600);
+
+        tx.send(FileWrite::Chunk(b"private".to_vec()))
+            .await
+            .unwrap();
+        tx.send(FileWrite::Finish).await.unwrap();
+        drop(tx);
+        let err = writer.await.unwrap().unwrap_err();
+        assert!(matches!(err, ClwError::Io(_)));
+        assert!(
+            final_path.is_dir(),
+            "existing destination directory must remain"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "failed rename must clean the private temp"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- Unix hydration creates owner-only temporary files, applies the intended file
+  mode through the open handle, and syncs before publishing the final name (#297).
+  Cleanup is armed only after exclusive creation succeeds, so an occupied temp
+  path is never removed by a failed open. Metadata/sync failures abort before
+  publication. Windows ACL semantics and whole-tree confinement are separate.
+
 ## [0.1.12] — required-hit cache replay + post-v0.1.11 hardening (2026-09-06)
 
 ### Fixed
