@@ -373,11 +373,9 @@ impl LocalCache {
         let dir = self.shard_dir(d);
         // Write to a named temp file in the same directory so rename is atomic.
         let mut tmp = tempfile_in(&dir)?;
-        tmp.file
-            .write_all(bytes)
+        write_temp_file(&mut tmp.file, &tmp.path, bytes)
             .map_err(|e| io_ctx("put: write", &tmp.path, e))?;
-        tmp.file
-            .flush()
+        flush_temp_file(&mut tmp.file, &tmp.path)
             .map_err(|e| io_ctx("put: flush", &tmp.path, e))?;
         // `rename` only makes the name update atomic; it does not make dirty file
         // contents durable. Sync the temp inode *before* publishing its digest name,
@@ -387,7 +385,7 @@ impl LocalCache {
         // Persist and rename.
         let tmp_path = tmp.path.clone();
         drop(tmp.file); // close before rename on Windows
-        fs::rename(&tmp_path, &dest).map_err(|e| {
+        rename_temp_file(&tmp_path, &dest).map_err(|e| {
             // Name BOTH paths: under concurrent shared-cache load an ENOENT here is
             // exactly the failure we want to pinpoint (tmp vs. dest-parent).
             ClwError::Io(io::Error::new(
@@ -399,6 +397,9 @@ impl LocalCache {
                 ),
             ))
         })?;
+
+        // The name is now committed; cleanup must never act on this PUT again.
+        tmp.cleanup.armed = false;
 
         // Eviction is wired HERE so every write path (snapshot uploads + hydrate's
         // download-side caching) is bounded without each caller remembering to call
@@ -559,9 +560,82 @@ fn record_gc_error(first_error: &mut Option<ClwError>, op: &str, path: &Path, er
 // ---------------------------------------------------------------------------
 
 struct NamedTmpFile {
+    // Fields drop in declaration order: close the handle before unlinking on
+    // ordinary errors/unwinding. Keeping Drop on the path guard also permits
+    // put's explicit partial move of `file` before rename on Windows.
     file: fs::File,
     path: PathBuf,
+    cleanup: TempCleanup,
 }
+
+/// Owns only this operation's unpublished name, never a shard or final digest.
+/// SIGKILL/power loss cannot run Drop; crash residue remains excluded from GC.
+struct TempCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = remove_temp_file(&self.path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %error,
+                        "cache put: failed to remove owned unpublished temporary"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn write_temp_file(file: &mut fs::File, _path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&TEMP_WRITE_FAILURE_ROOT, _path) {
+        // Leave real partial bytes, then fail, without filling the disk.
+        file.write_all(&bytes[..bytes.len().min(1)])?;
+        return Err(io::Error::other("test-injected temporary write failure"));
+    }
+    file.write_all(bytes)
+}
+
+fn flush_temp_file(file: &mut fs::File, _path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&TEMP_FLUSH_FAILURE_ROOT, _path) {
+        return Err(io::Error::other("test-injected temporary flush failure"));
+    }
+    file.flush()
+}
+
+fn rename_temp_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&TEMP_RENAME_FAILURE_ROOT, from) {
+        return Err(io::Error::other("test-injected temporary rename failure"));
+    }
+    fs::rename(from, to)
+}
+
+fn remove_temp_file(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if fault_injection_matches(&TEMP_REMOVE_FAILURE_ROOT, path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test-injected temporary cleanup failure",
+        ));
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+static TEMP_WRITE_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEMP_FLUSH_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEMP_RENAME_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static TEMP_REMOVE_FAILURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Flush the temporary blob's data and metadata before its digest name is published
 /// by `rename`. Keeping this as a helper lets the regression test prove that a sync
@@ -625,8 +699,10 @@ fn inject_failure_under(slot: &'static Mutex<Option<PathBuf>>, root: &Path) -> F
     FaultInjectionGuard { slot }
 }
 
-/// Create a uniquely named temporary file inside `dir`.  The file is NOT
-/// deleted on drop — the caller is responsible for renaming or removing it.
+/// Create a uniquely named temporary file inside `dir`. Its guard unlinks only
+/// this unpublished name on ordinary error/unwinding, after closing the handle.
+/// The caller disarms the guard after successful rename. Crash residue is not
+/// automatically scavenged: Drop does not run after SIGKILL or power loss.
 ///
 /// # Cross-process uniqueness
 /// The temp name combines the PID, thread-id, subsec-nanos, AND a process-wide
@@ -674,7 +750,13 @@ fn tempfile_in(dir: &Path) -> Result<NamedTmpFile> {
             opts.mode(0o600);
         }
         match opts.open(&path) {
-            Ok(file) => return Ok(NamedTmpFile { file, path }),
+            Ok(file) => {
+                return Ok(NamedTmpFile {
+                    file,
+                    path: path.clone(),
+                    cleanup: TempCleanup { path, armed: true },
+                });
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 last_err = Some(e);
                 continue;
@@ -780,6 +862,9 @@ mod tests {
     use filetime::{set_file_mtime, FileTime};
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    // These tests share root-scoped fault slots, not the cache implementation.
+    static PUT_FAULT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_cache() -> (TempDir, LocalCache) {
         let dir = TempDir::new().unwrap();
@@ -1023,6 +1108,7 @@ mod tests {
 
     #[test]
     fn put_does_not_publish_a_blob_when_temp_sync_fails() {
+        let _serial = PUT_FAULT_TEST_LOCK.lock().unwrap();
         // A deterministic substitute for a failed fsync: the final digest name
         // must remain absent. This is red-on-revert for the pre-rename sync -- if
         // the sync is removed or moved after rename, `put` succeeds and publishes
@@ -1041,6 +1127,212 @@ mod tests {
             !cache.has(&d),
             "a failed pre-rename sync must never publish the final blob name"
         );
+        let leftovers: Vec<_> = fs::read_dir(cache.shard_dir(&d))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed PUT leaked temporaries: {leftovers:?}"
+        );
+    }
+
+    fn temporary_paths(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(TMP_PREFIX)
+            })
+            .collect()
+    }
+
+    #[derive(Clone, Default)]
+    struct CleanupWarnings(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for CleanupWarnings {
+        fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+            *m.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={v:?};", f.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn put_io_failure_removes_only_its_temporary_and_preserves_sibling() {
+        let _serial = PUT_FAULT_TEST_LOCK.lock().unwrap();
+        for (stage, slot) in [
+            ("write", &TEMP_WRITE_FAILURE_ROOT),
+            ("flush", &TEMP_FLUSH_FAILURE_ROOT),
+            ("rename", &TEMP_RENAME_FAILURE_ROOT),
+        ] {
+            let (dir, cache) = make_cache();
+            let data = b"cleanup fixture";
+            let digest = Digest::of_bytes(data);
+            let shard = cache.shard_dir(&digest);
+            let mut sibling = tempfile_in(&shard).unwrap();
+            sibling.file.write_all(b"sibling").unwrap();
+            let sibling_path = sibling.path.clone();
+            let fault = inject_failure_under(slot, dir.path());
+            let error = cache.put(&digest, data).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("put: {stage}")),
+                "{error}"
+            );
+            assert!(!cache.has(&digest));
+            assert_eq!(
+                temporary_paths(&shard),
+                vec![sibling_path.clone()],
+                "stage {stage}"
+            );
+            assert_eq!(fs::read(&sibling_path).unwrap(), b"sibling");
+            sibling.file.write_all(b" still owned").unwrap();
+            drop(fault);
+            cache.put(&digest, data).unwrap();
+            assert_eq!(
+                cache.get(&digest).unwrap().as_deref(),
+                Some(data.as_slice())
+            );
+            assert!(sibling_path.exists());
+            drop(sibling);
+            assert!(temporary_paths(&shard).is_empty());
+            assert!(cache.has(&digest));
+        }
+    }
+
+    #[test]
+    fn put_cleanup_failure_preserves_primary_error_and_emits_warning() {
+        let _serial = PUT_FAULT_TEST_LOCK.lock().unwrap();
+        let (dir, cache) = make_cache();
+        let data = b"cleanup fixture";
+        let digest = Digest::of_bytes(data);
+        let _write = inject_failure_under(&TEMP_WRITE_FAILURE_ROOT, dir.path());
+        let _cleanup = inject_failure_under(&TEMP_REMOVE_FAILURE_ROOT, dir.path());
+        let warnings = CleanupWarnings::default();
+        let error = tracing::subscriber::with_default(warnings.clone(), || {
+            cache.put(&digest, data).unwrap_err()
+        });
+        assert!(
+            error.to_string().contains("put: write"),
+            "primary error lost: {error}"
+        );
+        assert!(!error
+            .to_string()
+            .contains("test-injected temporary cleanup failure"));
+        assert!(!cache.has(&digest));
+        let residue = temporary_paths(&cache.shard_dir(&digest));
+        assert_eq!(residue.len(), 1, "unlink failure must remain observable");
+        assert_eq!(fs::read(&residue[0]).unwrap(), b"c");
+        let messages = warnings.0.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("failed to remove owned unpublished temporary"));
+        assert!(messages[0].contains("test-injected temporary cleanup failure"));
+        assert!(messages[0].contains(TMP_PREFIX));
+        // Inspect residue before TempDir teardown; do not hide it by cleanup.
+    }
+
+    #[test]
+    fn successful_put_disarms_cleanup_and_keeps_committed_bytes() {
+        let _serial = PUT_FAULT_TEST_LOCK.lock().unwrap();
+        let (dir, cache) = make_cache();
+        let data = b"published bytes";
+        let digest = Digest::of_bytes(data);
+        let _cleanup = inject_failure_under(&TEMP_REMOVE_FAILURE_ROOT, dir.path());
+        let warnings = CleanupWarnings::default();
+        tracing::subscriber::with_default(warnings.clone(), || cache.put(&digest, data)).unwrap();
+        // An armed guard would hit the injected unlink failure after rename.
+        assert!(warnings.0.lock().unwrap().is_empty());
+        assert!(temporary_paths(&cache.shard_dir(&digest)).is_empty());
+        assert_eq!(
+            cache.get(&digest).unwrap().as_deref(),
+            Some(data.as_slice())
+        );
+        cache.put(&digest, data).unwrap();
+        assert_eq!(
+            cache.get(&digest).unwrap().as_deref(),
+            Some(data.as_slice())
+        );
+    }
+
+    #[test]
+    fn temporary_cleanup_tolerates_an_already_absent_owned_name() {
+        let dir = TempDir::new().unwrap();
+        let tmp = tempfile_in(dir.path()).unwrap();
+        let path = tmp.path.clone();
+        drop(tmp.file);
+        fs::remove_file(&path).unwrap();
+        let warnings = CleanupWarnings::default();
+        tracing::subscriber::with_default(warnings.clone(), || drop(tmp.cleanup));
+        assert!(warnings.0.lock().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_creation_error_preserves_preexisting_parent_file() {
+        let dir = TempDir::new().unwrap();
+        let parent_file = dir.path().join("not-a-directory");
+        fs::write(&parent_file, b"preexisting occupant").unwrap();
+        let warnings = CleanupWarnings::default();
+        let result =
+            tracing::subscriber::with_default(warnings.clone(), || tempfile_in(&parent_file));
+        assert!(result.is_err(), "a file cannot be the temporary directory");
+        assert_eq!(fs::read(&parent_file).unwrap(), b"preexisting occupant");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(warnings.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_put_disarms_cleanup_and_preserves_published_empty_blob() {
+        let _serial = PUT_FAULT_TEST_LOCK.lock().unwrap();
+        let (dir, cache) = make_cache();
+        let digest = Digest::of_bytes(b"");
+        let _cleanup = inject_failure_under(&TEMP_REMOVE_FAILURE_ROOT, dir.path());
+        let warnings = CleanupWarnings::default();
+        tracing::subscriber::with_default(warnings.clone(), || cache.put(&digest, b"")).unwrap();
+        assert!(warnings.0.lock().unwrap().is_empty());
+        assert!(temporary_paths(&cache.shard_dir(&digest)).is_empty());
+        assert_eq!(fs::read(cache.blob_path(&digest)).unwrap(), b"");
+        assert_eq!(cache.get(&digest).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn temporary_unwind_cleanup_keeps_another_writer_alive() {
+        let dir = TempDir::new().unwrap();
+        let mut sibling = tempfile_in(dir.path()).unwrap();
+        sibling.file.write_all(b"other writer").unwrap();
+        let sibling_path = sibling.path.clone();
+        let mut abandoned_path = PathBuf::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut abandoned = tempfile_in(dir.path()).unwrap();
+            abandoned_path = abandoned.path.clone();
+            abandoned.file.write_all(b"partial").unwrap();
+            panic!("synthetic ordinary unwinding");
+        }));
+        assert!(result.is_err());
+        assert!(!abandoned_path.exists());
+        assert_eq!(temporary_paths(dir.path()), vec![sibling_path.clone()]);
+        sibling.file.write_all(b" continues").unwrap();
+        assert_eq!(fs::read(&sibling_path).unwrap(), b"other writer continues");
+        drop(sibling);
+        assert!(temporary_paths(dir.path()).is_empty());
     }
 
     // -----------------------------------------------------------------------

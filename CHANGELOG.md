@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- Local-cache PUT failures and unwinding now clean only the temporary file
+  owned by that operation, after closing its handle. Successful publication
+  disarms cleanup; removal errors preserve the primary error and emit a warning
+  (#314). Crash scavenging and cache-budget scheduling are unchanged.
 - `clw run` refuses replay of stored non-success records while retaining their
   stream references for garbage collection. The existing one-command fallback
   preserves create-only cache occupants and the real child result (#307).

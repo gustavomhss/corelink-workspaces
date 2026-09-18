@@ -529,6 +529,27 @@ The table distinguishes per-body, manifest, captured-stream and local-cache poli
 | `run` post-success cache store | **30s** phase deadline | The post-success store phase is best-effort and time-boxed to 30 seconds; it can add up to that phase budget before returning. |
 | Retry policy | **6** attempts, ladder `[200ms, 800ms, 2s, 5s, 10s]` | Applies to connect/transport/5xx/429, capped by the remaining op deadline. AIMD concurrency: a 429 halves the in-flight window (floor 1); 8 straight successes grow it back toward `--concurrency` (default 8). |
 
+### Owned local-cache temporary cleanup
+
+This is a scoped #314 / PR #338 update to the historical source baseline in this
+guide. Its [implementation](https://github.com/HuGR-Labs/corelink-workspaces/blob/3c71ff98c06918428527d982c78e886771ac5f1b/crates/clw-cache/src/lib.rs)
+supersedes that baseline's failed-PUT temporary behavior; it is not a claim about
+a published release.
+
+Ordinary PUT write, flush, sync and rename failures, and Rust unwinding, close
+this operation's temporary handle and attempt to remove only its unpublished
+`.tmp-*` name. Cleanup is armed after exclusive creation succeeds and disarmed
+after successful publication. A failed removal emits a warning without replacing
+the primary I/O error; other writers and committed digest names are not targets.
+
+SIGKILL, process abort and power loss do not run Drop. Crash leftovers remain
+excluded from normal GC and may consume space beyond the committed-blob budget.
+Any manual removal requires all writers of that exact cache root to be stopped
+and the names to be established as abandoned cache temporaries; age or PID alone
+is insufficient. Do not follow symlinks or apply that procedure to a workspace
+destination. This cleanup fix (#314) does not change #304's maintenance schedule.
+
+
 ---
 
 <a id="9-exit-codes"></a>
