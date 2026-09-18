@@ -1,12 +1,15 @@
-//! PORTABLE real-binary e2e — the platform-agnostic command journeys, run on
-//! EVERY OS (NOT `#[cfg(unix)]`, unlike `e2e.rs` which relies on unix symlinks +
-//! modes). This closes the "the shipped Windows binary's command dispatch is never
-//! observed on Windows" gap (docs/TEST-JOURNEY-MAP.md): the `windows.yml` lane runs
-//! `cargo test --workspace`, so these now exercise the real `clw` binary on Windows.
+//! Portable-source, real-binary CLI tests for offline command dispatch.
 //!
-//! Every test here spawns the real binary and uses only offline commands
-//! (completions / --version / doctor / config resolution) — no network, no
-//! symlinks, no chmod — so the behavior is identical across platforms.
+//! This target has no whole-file Unix cfg gate. Actual execution still depends
+//! on the selected host and test command: source portability is not native
+//! Windows acceptance. `windows.yml` builds on Ubuntu and runs explicit Wine
+//! smoke plus hydrate `lexical_` tests; it does not execute this test target.
+//!
+//! These cases cover version, completions, doctor and selected configuration
+//! behavior. They do not cover hydrate filesystem semantics or `run` subprocess
+//! contracts. Doctor's redaction assertion here examines stdout; broader output
+//! and native-platform evidence must name their own tests and observed results.
+//! See docs/TEST-JOURNEY-MAP.md and docs/TESTING.md for the selection boundaries.
 
 use assert_cmd::Command;
 use tempfile::TempDir;
