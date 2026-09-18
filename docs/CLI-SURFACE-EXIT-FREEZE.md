@@ -2,8 +2,9 @@
 
 > **Authoritative freeze** of the `clw` verbs/flags and exit-code convention the CoreLink **runner**
 > drives. Requested by the Runners TL (2026-06-17 `relay-to-clw-tl-cli-and-exit-code-freeze.md`).
-> Every line below is verified against the v0.1.0 code (cited). **Frozen for v0.1.0** — changes are a
-> semver/contract event, announced via this file.
+> The original freeze is v0.1.0; additive changes and corrections are recorded below.
+> The 2026-09-18 clarification preserves the numeric interface and withdraws the
+> unsupported claim that an exit value uniquely proves execution history.
 
 ## 1. The driven verbs (exact surface)
 
@@ -48,35 +49,67 @@
 | `0` | success |
 | non-zero (`2`) | **clw-internal failure** (no child involved) — substrate/config/IO error or bad args (`main.rs::exit_err` → 2; clap usage errors also 2) |
 
-### `clw run` (wraps a child) — docker/`env`/`timeout`-style reserved-code convention
-| Exit | Meaning | Cache | Runner classification |
-|---|---|---|---|
-| `N` (the child's code, **0–255**, **passed through verbatim**) | the child ran and returned `N` (`run.rs` → `process::exit(outcome.exit_code)`) | cached **iff `N == 0`** (`clw-run` only stores on exit 0) | `Child(N)` |
-| **`125`** (RESERVED) | **clw-INTERNAL failure: the child NEVER ran** — substrate unreachable, bad config, hydrate/cache error (`run.rs` → `process::exit(CLW_RUN_INTERNAL_NOT_RUN=125)`) | **never** | `ClwFailed{clw_exit_code: 125}` |
-| **`137`** (RESERVED) | **clw-INTERNAL failure: the child DID run but clw killed it** for exceeding the captured-output CAS blob cap (`ClwError::TooLarge`; `run.rs` → `process::exit(CLW_RUN_OUTPUT_TOO_LARGE=137)`). Distinct from `125` — the child started and ran up to the point clw SIGKILLed it — so it borrows the POSIX `128+signal` convention for SIGKILL (`128+9=137`), the same convention used for any signal-killed child. | **never** — `run_memoized` returns `Err` before the memoization/store step is ever reached (`crates/clw-run/src/lib.rs`) | `ClwFailed{clw_exit_code: 137}` |
-| `2` (clap usage error) | **malformed `clw run` invocation** — bad/missing flags; clap exits before the child runs (child NEVER ran). The runner builds the argv, so this is not expected in production. | **never** | treat as clw-failed (child never ran) |
+### `clw run` — exit values and their known origins
 
-- **125** is the industry "the wrapper itself failed" code (docker run, `env`, `timeout`, `nice`). A
-  child SHOULD avoid emitting 125–127; clw reserves them for "child did not run."
-- **137** is reserved for the one case where clw kills a child that DID run (oversized captured
-  output) — see the table row above. It is not exploitable via a normal child exit: a child that
-  itself returns 137 (e.g. it was independently SIGKILLed) is indistinguishable to the runner from
-  clw's own 137, but in both cases the run is a non-zero exit and is never cached, so the ambiguity
-  has no cache-correctness impact.
-- A clw-internal `clw run` failure also prints a stderr sentinel `[clw] internal error — child not run: …`
-  as a secondary signal (the exit code is the contract; the line is for humans/logs).
-- **This supersedes** the earlier "exit 2 = clw-internal" framing in the 2026-06-17 four-confirms reply:
-  exit `2` collided with a child that returns 2, so `clw run` now uses the unambiguous reserved **125**.
+The numeric interface remains unchanged. The following rows describe **known
+code paths**, not an inverse mapping from a process exit value to execution
+history. Different paths can return the same integer.
 
-### Runner rule (matches the relay's acceptance)
-```
-exit = run `clw run … -- <cmd>`
-if exit == 125  -> ClwFailed{clw_exit_code: 125}   # child never ran; never cache
-if exit == 137  -> ClwFailed{clw_exit_code: 137}   # child ran, clw killed it (output cap); never cache
-else            -> Child(exit)                      # transparent; clw already caches iff exit==0
-```
-(`snapshot`/`hydrate`: `0` = ok, non-zero = `ClwFailed`.)
+| Known outcome origin | Exit | What that path establishes |
+|---|---|---|
+| A child completed, or an existing record was replayed | `N`, passed through verbatim | Completion/replay returns its outcome; a HIT does not start a new child. New memos are produced only for exit-zero execution. Replay eligibility is the separate #307 correction. |
+| Configuration/identity failure before dispatch, a failed spawn, or the oversized initial AC lookup covered by #305 | `125` | These particular paths do not execute a child. Their phase is established by their control flow, not by the number alone. |
+| The wrapper's captured-output cap terminates a started child | `137` | This cap path returns an error and does not publish a memo. A child may independently return the same number. |
+| Invalid CLI arguments rejected by clap | `2` | This parser path does not start a child. A legitimate child may also return 2. |
+| Other wrapper errors handled by `run_err_exit_code` | `125` | The existing fallback mapping remains; #305 does not establish the execution phase of every other error, including errors after dispatch. |
+
+Child exits 125 and 137 remain legitimate passthrough values. Asking commands to
+avoid them is not an enforced discriminator. The wrapper's diagnostic strings
+are for people: the existing `child not run` wording does not provide a reliable
+machine protocol for every error path, and a child's stderr can contain the same
+text. Do not infer execution history by searching stderr for that phrase.
+
+### Consumer rule — preserve the result, do not infer retry safety
+
+Preserve the observed process result. **Do not automatically execute the command
+again solely because the result equals 125, 137, or 2.** A retry that depends on
+"the child did not run" needs positive, trustworthy phase evidence for that
+invocation; the numeric exit interface alone does not provide it. This
+clarification adds no new CLI flag, side channel, return code or public type.
+
+The earlier rule that classified every 125 as `ClwFailed`/never-executed and every
+137 as wrapper-terminated is withdrawn as a general consumer rule. It conflicted
+with the same document's verbatim child-exit contract. Preserve the historical
+record in Git rather than retaining contradictory current instructions.
+
+The separate consumer correction is tracked in
+[corelink-runners #567](https://github.com/HuGR-Labs/corelink-runners/issues/567).
+This document does not claim that consumer has been repaired. The #305 change
+only corrects the oversized **initial** lookup classification. Other error-phase
+limitations and final stream delivery remain separately scoped work.
+
+For `snapshot` and `hydrate`, no child command is wrapped: zero remains success
+and a nonzero result is failure of that CLI operation.
+
+### Clarification — initial lookup response size (#305)
+
+An oversized initial AC response is refused **before child spawn**. At the
+`run_memoized` boundary this size error is normalized to a lookup-specific
+`ClwError::Transport`, retaining the observed size and cap in the diagnostic;
+the lower-level HTTP client still enforces and returns its typed body-cap error.
+The CLI reports its existing internal-error exit **125**, not a claim that a child
+was killed. Actual captured-output overflow retains **137** and no memo is stored.
+No shared error-enum variant, public function signature or key domain changes.
+
+A child may itself return 125 or 137; those outcomes remain verbatim passthrough.
+These integers alone are therefore not a unique lifecycle discriminator and do
+not authorize an automatic retry of possible side effects. This scoped repair
+does not claim to resolve every error after spawn or introduce a new outcome
+protocol. Stream-delivery handling remains the separate #310 obligation.
 
 ## 3. Stability
-Frozen for v0.1.0. The verbs, flag names, arg order, the `125` and `137` reserved codes, and the
-child-passthrough + cache-iff-0 semantics will not change without a new contract version announced here.
+The v0.1.0 verb/flag convention and its documented additive extensions remain.
+The numeric values 125/137, child-exit passthrough and success-only memo
+production are unchanged by #305. These values are not exclusive to wrapper
+failures. Changes to the public interface require an explicit contract update;
+correcting an unsupported inverse classification does not introduce a new interface.

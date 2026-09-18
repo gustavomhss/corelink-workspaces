@@ -2987,6 +2987,134 @@ async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
     );
 }
 
+/// #305: an oversized INITIAL AC response is not output produced by a child.
+/// The real HTTP client must refuse it before spawn, without cache writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_oversized_initial_ac_response_is_not_child_output() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!("/v1/ac/{TEST_TENANT}/[a-f0-9]{{64}}$")))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            format!("Bearer {TEST_PAT}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+            b'x';
+            clw_types::CAS_BLOB_CAP_BYTES
+                + 1
+        ]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .timeout(Duration::from_secs(20))
+        .args([
+            "run",
+            "--input",
+            "input.txt",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf started > child-started; printf child-output",
+        ])
+        .output()
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "only the initial AC lookup may occur");
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert!(requests[0]
+        .url
+        .path()
+        .starts_with(&format!("/v1/ac/{TEST_TENANT}/")));
+    assert!(
+        !work.path().join("child-started").exists(),
+        "child must not start"
+    );
+    assert!(out.stdout.is_empty(), "no child output may be fabricated");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "initial AC failure: {stderr}");
+    assert!(stderr.contains("child not run"), "{stderr}");
+    assert!(
+        stderr.contains("lookup"),
+        "lookup phase must be retained: {stderr}"
+    );
+    assert!(
+        stderr.contains("5242881") && stderr.contains("5242880"),
+        "size/cap: {stderr}"
+    );
+    assert!(
+        !stderr.contains("child killed"),
+        "must not invent child death: {stderr}"
+    );
+}
+
+/// 125/137 are also legitimate child results; integer equality does not prove
+/// a wrapper failure. The actual child and the cache effects are the oracle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_child_exit_125_and_137_remain_passthrough() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    for code in [0, 7, 125, 137] {
+        let work = TempDir::new().unwrap();
+        std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+        let script = format!(
+            "printf x >> executions; printf child-output; printf child-stderr >&2; exit {code}"
+        );
+        for attempt in 0..2 {
+            let out = clw_cmd(&server.uri(), cache.path())
+                .current_dir(work.path())
+                .timeout(Duration::from_secs(20))
+                .args([
+                    "run",
+                    "--input",
+                    "input.txt",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &script,
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(code));
+            assert_eq!(out.stdout, b"child-output");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("child-stderr"), "{stderr}");
+            assert!(
+                stderr.contains(if code == 0 && attempt == 1 {
+                    "cache hit"
+                } else {
+                    "cache miss"
+                }),
+                "{stderr}"
+            );
+            assert!(
+                !stderr.contains("child not run") && !stderr.contains("child killed"),
+                "{stderr}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(work.path().join("executions")).unwrap(),
+            if code == 0 {
+                b"x".as_slice()
+            } else {
+                b"xx".as_slice()
+            }
+        );
+    }
+    assert_eq!(
+        ac.lock().unwrap().len(),
+        1,
+        "only exit zero may be memoized"
+    );
+}
+
 /// A command that cannot be spawned (ENOENT) is also "child never ran" → reserved 125,
 /// even though the substrate (mock) is healthy. Distinguishes spawn-failure from a child
 /// that ran and exited non-zero.
@@ -4528,28 +4656,44 @@ async fn run_env_var_value_busts_the_cache_key() {
 #[tokio::test]
 async fn run_oversized_child_output_exits_137() {
     let server = MockServer::start().await;
-    let (_cas, _ac) = mount_corelink(&server, true).await;
-    let cache = TempDir::new().unwrap();
-    let src = TempDir::new().unwrap();
-    std::fs::write(src.path().join("f.txt"), b"x").unwrap();
-    let out = clw_cmd(&server.uri(), cache.path())
-        .args([
-            "run",
-            "--input",
-            src.path().to_str().unwrap(),
-            "--",
-            "sh",
-            "-c",
-            "head -c 6291456 /dev/zero", // 6 MiB > 5 MiB cap
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(137),
-        "oversized child output must exit the reserved 137, got {:?} (stderr: {})",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    for redirect in ["", " >&2"] {
+        let cache = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+        let script = format!("printf x >> executions; head -c 6291456 /dev/zero{redirect}");
+        for attempt in 1..=2 {
+            let out = clw_cmd(&server.uri(), cache.path())
+                .current_dir(work.path())
+                .timeout(Duration::from_secs(20))
+                .args([
+                    "run",
+                    "--input",
+                    "input.txt",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &script,
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(137), "{stderr}");
+            assert!(stderr.contains("child output exceeded the cap"), "{stderr}");
+            assert!(!stderr.contains("child not run"), "{stderr}");
+            assert_eq!(
+                std::fs::read(work.path().join("executions")).unwrap(),
+                vec![b'x'; attempt]
+            );
+        }
+    }
+    assert!(
+        ac.lock().unwrap().is_empty(),
+        "output overflow must not create a memo"
+    );
+    assert!(
+        cas.lock().unwrap().is_empty(),
+        "output overflow must not store partial streams"
     );
 }
 

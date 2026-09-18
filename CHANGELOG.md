@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- `clw run`: an oversized initial AC lookup response now reports the existing
+  pre-spawn error (125), rather than incorrectly claiming the child was killed
+  for output overflow (137). The response cap, actual output-cap termination,
+  and legitimate child exit-code passthrough are unchanged (#305).
 - Hydration rejects per-file size/chunk-sum mismatches and sum overflow before
   creating destination entries or fetching materialization chunks (#306). Named
   and direct-digest restores share this validation; valid manifest bytes are unchanged.

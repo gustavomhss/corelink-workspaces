@@ -734,6 +734,20 @@ where
     Ok(buf)
 }
 
+/// Normalize only the initial AC response-size failure at the run boundary.
+/// A network response cap is a lookup/transport failure, not evidence that a
+/// child exceeded its output cap. Keep the existing public error enum and
+/// signature; retain the phase and numeric limit in the diagnostic. HTTP-level
+/// callers still receive the original typed `TooLarge` from `clw-client`.
+fn initial_lookup_error(error: ClwError) -> ClwError {
+    match error {
+        ClwError::TooLarge { size, cap } => ClwError::Transport(format!(
+            "initial run-cache lookup response exceeded cap ({size} bytes > {cap})"
+        )),
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -761,7 +775,10 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     let key = compute_key(cwd, opts).await?;
 
     // --- AC lookup ---
-    if let Some(record_bytes) = AcTransport::get(client, &key).await? {
+    if let Some(record_bytes) = AcTransport::get(client, &key)
+        .await
+        .map_err(initial_lookup_error)?
+    {
         // Try to parse the record and fetch blobs; treat any failure as a miss.
         if let Ok(record) = serde_json::from_slice::<RunRecord>(&record_bytes) {
             match (
@@ -3205,5 +3222,31 @@ mod tests {
         let key = compute_key(cwd, &opts).await.unwrap();
         let stored = AcTransport::get(&store, &key).await.unwrap();
         assert!(stored.is_none(), "an over-cap run must NOT be memoized");
+    }
+
+    #[test]
+    fn initial_lookup_size_failure_is_not_child_output_overflow() {
+        let error = initial_lookup_error(ClwError::TooLarge { size: 11, cap: 10 });
+        assert!(matches!(error, ClwError::Transport(ref message)
+            if message == "initial run-cache lookup response exceeded cap (11 bytes > 10)"));
+    }
+
+    #[test]
+    fn initial_lookup_preserves_other_error_variants_and_details() {
+        for error in [
+            ClwError::Config("synthetic config error".into()),
+            ClwError::Transport("synthetic connection error".into()),
+            ClwError::Http {
+                status: 401,
+                context: "synthetic auth".into(),
+            },
+            ClwError::Http {
+                status: 402,
+                context: "synthetic quota".into(),
+            },
+        ] {
+            let before = format!("{error:?}");
+            assert_eq!(format!("{:?}", initial_lookup_error(error)), before);
+        }
     }
 }

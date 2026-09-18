@@ -100,6 +100,8 @@ pub const CLW_RUN_OUTPUT_TOO_LARGE: i32 = 137;
 /// for exceeding the output cap ([`ClwError::TooLarge`]) → the distinct
 /// [`CLW_RUN_OUTPUT_TOO_LARGE`] (137). Pure so the frozen mapping is unit-tested
 /// without driving a real child through `std::process::exit`.
+/// The run layer reports an oversized initial AC response as a lookup Transport
+/// failure before this mapper; it is not captured child output (#305).
 fn run_err_exit_code(e: &ClwError) -> i32 {
     match e {
         ClwError::TooLarge { .. } => CLW_RUN_OUTPUT_TOO_LARGE,
