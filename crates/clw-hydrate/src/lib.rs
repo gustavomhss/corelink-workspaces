@@ -345,17 +345,33 @@ where
     // allocations is the total chunk count. A malicious manifest can declare
     // `total_size = 0` while its chunks sum to gigabytes, so we MUST budget against
     // the summed figure. We also bound the per-file chunk count so a single entry
-    // cannot smuggle an enormous `chunks` Vec past the entry cap. Saturating adds
-    // keep a hostile manifest from wrapping the running total to a small value.
+    // cannot smuggle an enormous `chunks` Vec past the entry cap. Check each
+    // file's sum before comparing its declared size; the global saturating sum
+    // still ensures an excessive total reaches the existing resource guard.
     let mut real_total_bytes: u64 = 0;
     let mut total_chunks: u64 = 0;
     for entry in &manifest.entries {
-        if let Entry::File { path, chunks, .. } = entry {
+        if let Entry::File {
+            path, size, chunks, ..
+        } = entry
+        {
             enforce_per_file_chunk_cap(path, chunks.len())?;
             total_chunks = total_chunks.saturating_add(chunks.len() as u64);
-            for c in chunks {
-                real_total_bytes = real_total_bytes.saturating_add(c.size);
+            let mut file_bytes = 0u64;
+            for chunk in chunks {
+                file_bytes = file_bytes.checked_add(chunk.size).ok_or_else(|| {
+                    ClwError::InvalidManifest(format!(
+                        "file '{path}' chunk sizes overflow u64; refusing to hydrate"
+                    ))
+                })?;
             }
+            if *size != file_bytes {
+                return Err(ClwError::InvalidManifest(format!(
+                    "file '{path}' size ({size}) disagrees with the sum of its chunk sizes \
+                     ({file_bytes}); refusing to hydrate an internally inconsistent manifest"
+                )));
+            }
+            real_total_bytes = real_total_bytes.saturating_add(file_bytes);
         }
     }
 
@@ -993,6 +1009,8 @@ mod tests {
     struct FakeStore {
         cas: Mutex<HashMap<Digest, Vec<u8>>>,
         ac: Mutex<HashMap<Digest, Vec<u8>>>,
+        cas_gets: Mutex<Vec<Digest>>,
+        ac_gets: Mutex<Vec<Digest>>,
     }
 
     impl FakeStore {
@@ -1000,6 +1018,8 @@ mod tests {
             Self {
                 cas: Mutex::new(HashMap::new()),
                 ac: Mutex::new(HashMap::new()),
+                cas_gets: Mutex::new(Vec::new()),
+                ac_gets: Mutex::new(Vec::new()),
             }
         }
 
@@ -1019,6 +1039,7 @@ mod tests {
         }
 
         async fn get(&self, digest: &Digest) -> Result<Vec<u8>> {
+            self.cas_gets.lock().unwrap().push(*digest);
             self.cas
                 .lock()
                 .unwrap()
@@ -1045,6 +1066,7 @@ mod tests {
     #[async_trait::async_trait]
     impl AcTransport for FakeStore {
         async fn get(&self, key: &Digest) -> Result<Option<Vec<u8>>> {
+            self.ac_gets.lock().unwrap().push(*key);
             Ok(self.ac.lock().unwrap().get(key).cloned())
         }
 
@@ -3295,4 +3317,188 @@ mod tests {
     // keeping rename metadata). The `full_hydrate_*`, `hydrate_rerun_heals_*`, and
     // `multichunk_*` tests assert the file materialises byte-exactly; we honestly
     // do NOT fake a power-loss assertion for the fsync itself.
+
+    // #306: exercise the real public hydrate preflight, not an arithmetic-only
+    // helper. The canonical serializer's structural checks are unchanged by
+    // this hydrate-local fix; inconsistent size metadata reaches hydrate itself.
+    async fn assert_per_file_metadata_refused(
+        manifest: Manifest,
+        chunks: &[(Digest, Vec<u8>)],
+        expected_message: &str,
+    ) {
+        for direct_digest in [false, true] {
+            for existing_empty_dest in [false, true] {
+                let (store, _cache_dir, cache) = setup_store(&manifest, chunks);
+                let root = manifest.digest().unwrap();
+                let parent = TempDir::new().unwrap();
+                let dest = parent.path().join("out");
+                if existing_empty_dest {
+                    std::fs::create_dir(&dest).unwrap();
+                }
+                let options = if direct_digest {
+                    HydrateOptions::from_manifest_digest(root)
+                } else {
+                    HydrateOptions::new("test-ws")
+                };
+                let err = hydrate(&dest, &store, &cache, &options)
+                    .await
+                    .expect_err("per-file metadata disagreement must be rejected");
+                assert!(
+                    matches!(&err, ClwError::InvalidManifest(message)
+                        if message.contains("a.bin") && message.contains(expected_message)),
+                    "wrong rejection for direct={direct_digest}, existing={existing_empty_dest}: {err}"
+                );
+                assert_eq!(dest.exists(), existing_empty_dest);
+                if existing_empty_dest {
+                    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+                }
+                assert_eq!(
+                    *store.cas_gets.lock().unwrap(),
+                    vec![root],
+                    "invalid metadata must not authorize any chunk fetch"
+                );
+                let expected_refs = if direct_digest {
+                    vec![]
+                } else {
+                    vec![clw_types::ref_key("test-ws")]
+                };
+                assert_eq!(*store.ac_gets.lock().unwrap(), expected_refs);
+            }
+        }
+    }
+
+    fn size_test_file(path: &str, size: u64, chunks: Vec<ChunkRef>) -> Entry {
+        Entry::File {
+            path: path.into(),
+            mode: 0o600,
+            size,
+            chunks,
+        }
+    }
+
+    #[tokio::test]
+    async fn per_file_size_disagreements_are_rejected_before_effects() {
+        let (digest, bytes) = make_chunk(b"abc");
+        for declared in [0, 2, 4] {
+            let manifest = Manifest {
+                version: MANIFEST_VERSION,
+                total_size: 3,
+                entries: vec![
+                    Entry::Dir {
+                        path: "0-empty".into(),
+                    },
+                    size_test_file("a.bin", declared, vec![ChunkRef { digest, size: 3 }]),
+                ],
+            };
+            assert_per_file_metadata_refused(manifest, &[(digest, bytes.clone())], "disagrees")
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn per_file_compensating_disagreements_are_rejected() {
+        let (digest, bytes) = make_chunk(b"abc");
+        // Both global sums equal six; only the individual contract is wrong.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 6,
+            entries: vec![
+                size_test_file("a.bin", 2, vec![ChunkRef { digest, size: 3 }]),
+                size_test_file("b.bin", 4, vec![ChunkRef { digest, size: 3 }]),
+            ],
+        };
+        assert_per_file_metadata_refused(manifest, &[(digest, bytes)], "disagrees").await;
+    }
+
+    #[tokio::test]
+    async fn per_file_nonzero_size_without_chunks_is_rejected() {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 0,
+            entries: vec![size_test_file("a.bin", 1, vec![])],
+        };
+        assert_per_file_metadata_refused(manifest, &[], "disagrees").await;
+    }
+
+    #[tokio::test]
+    async fn per_file_chunk_sum_overflow_is_rejected_without_fetch() {
+        let (digest, bytes) = make_chunk(b"x");
+        // Tiny metadata only: no large allocation or actual large chunk body.
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: u64::MAX,
+            entries: vec![size_test_file(
+                "a.bin",
+                u64::MAX,
+                vec![
+                    ChunkRef {
+                        digest,
+                        size: u64::MAX,
+                    },
+                    ChunkRef { digest, size: 1 },
+                ],
+            )],
+        };
+        assert_per_file_metadata_refused(manifest, &[(digest, bytes)], "overflow").await;
+    }
+
+    #[tokio::test]
+    async fn per_file_valid_empty_single_and_multichunk_files_restore() {
+        let (first, first_bytes) = make_chunk(b"ab");
+        let (second, second_bytes) = make_chunk(b"c");
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            total_size: 5,
+            entries: vec![
+                size_test_file("empty", 0, vec![]),
+                size_test_file(
+                    "multi",
+                    3,
+                    vec![
+                        ChunkRef {
+                            digest: first,
+                            size: 2,
+                        },
+                        ChunkRef {
+                            digest: second,
+                            size: 1,
+                        },
+                    ],
+                ),
+                size_test_file(
+                    "single",
+                    2,
+                    vec![ChunkRef {
+                        digest: first,
+                        size: 2,
+                    }],
+                ),
+            ],
+        };
+        let original_bytes = manifest.canonical_bytes().unwrap();
+        let root = Digest::of_bytes(&original_bytes);
+        for direct_digest in [false, true] {
+            let (store, _cache_dir, cache) = setup_store(
+                &manifest,
+                &[(first, first_bytes.clone()), (second, second_bytes.clone())],
+            );
+            let parent = TempDir::new().unwrap();
+            let dest = parent.path().join("out");
+            let options = if direct_digest {
+                HydrateOptions::from_manifest_digest(root)
+            } else {
+                HydrateOptions::new("test-ws")
+            };
+            let report = hydrate(&dest, &store, &cache, &options).await.unwrap();
+            assert_eq!(report.files, 3);
+            assert_eq!(report.bytes_total, 5);
+            assert_eq!(std::fs::read(dest.join("empty")).unwrap(), b"");
+            assert_eq!(std::fs::read(dest.join("single")).unwrap(), b"ab");
+            assert_eq!(std::fs::read(dest.join("multi")).unwrap(), b"abc");
+            assert_eq!(
+                store.cas.lock().unwrap().get(&root).unwrap(),
+                &original_bytes
+            );
+        }
+    }
 }

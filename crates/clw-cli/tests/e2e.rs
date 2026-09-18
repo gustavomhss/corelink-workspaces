@@ -5462,3 +5462,172 @@ async fn snapshot_external_symlink_skipped_through_cli() {
         "the external symlink must be absent from the hydrated tree (no manifest entry)"
     );
 }
+
+// #306: raw fixture bytes reach the public parser and hydrate preflight. The
+// fixture must not call a newly introduced validation helper before the CLI.
+#[tokio::test]
+async fn hydrate_cli_per_file_size_rejects_before_chunks_and_fs() {
+    for direct_digest in [false, true] {
+        let server = MockServer::start().await;
+        let (cas, ac) = mount_corelink(&server, true).await;
+        let scratch = TempDir::new().unwrap();
+        let payload = b"abc";
+        let chunk = clw_types::Digest::of_bytes(payload);
+        let manifest = clw_types::Manifest {
+            version: clw_types::MANIFEST_VERSION,
+            total_size: 3,
+            entries: vec![
+                clw_types::Entry::Dir {
+                    path: "0-empty".into(),
+                },
+                clw_types::Entry::File {
+                    path: "a.bin".into(),
+                    mode: 0o600,
+                    size: 999,
+                    chunks: vec![clw_types::ChunkRef {
+                        digest: chunk,
+                        size: 3,
+                    }],
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let root = clw_types::Digest::of_bytes(&bytes);
+        cas.lock().unwrap().insert(chunk.to_hex(), payload.to_vec());
+        cas.lock().unwrap().insert(root.to_hex(), bytes.clone());
+        let name = "per-file-mismatch";
+        let record = clw_types::RefRecord {
+            name: name.into(),
+            root,
+            manifest_size: bytes.len() as u64,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "test".into(),
+        };
+        ac.lock()
+            .unwrap()
+            .insert(ref_key_hex(name), record.to_bytes().unwrap());
+        let dest = scratch.path().join("out");
+        let cache = scratch.path().join("cache");
+        let mut command = clw_cmd(&server.uri(), &cache);
+        command
+            .env("HOME", scratch.path())
+            .args(["hydrate", dest.to_str().unwrap()]);
+        if direct_digest {
+            command.args(["--manifest-digest", &root.to_hex()]);
+        } else {
+            command.args(["--name", name]);
+        }
+        let output = command.output().unwrap();
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{diagnostic}");
+        assert!(
+            diagnostic.contains("a.bin") && diagnostic.contains("disagrees"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("panicked"), "{diagnostic}");
+        assert!(
+            !dest.exists(),
+            "invalid metadata must not create even an empty directory"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let observed: Vec<_> = requests
+            .iter()
+            .map(|r| (r.method.as_str(), r.url.path().to_owned()))
+            .collect();
+        let mut expected = vec![];
+        if !direct_digest {
+            expected.push(("GET", format!("/v1/ac/{TEST_TENANT}/{}", ref_key_hex(name))));
+        }
+        expected.push(("GET", format!("/v1/cas/{TEST_TENANT}/{}", root.to_hex())));
+        assert_eq!(
+            observed, expected,
+            "no chunk fetches or writes may follow invalid metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hydrate_cli_per_file_size_valid_controls_restore_exact_bytes() {
+    for direct_digest in [false, true] {
+        let server = MockServer::start().await;
+        let (cas, ac) = mount_corelink(&server, true).await;
+        let scratch = TempDir::new().unwrap();
+        let first = clw_types::Digest::of_bytes(b"ab");
+        let second = clw_types::Digest::of_bytes(b"c");
+        let chunk = |digest, size| clw_types::ChunkRef { digest, size };
+        let file = |path: &str, size, chunks| clw_types::Entry::File {
+            path: path.into(),
+            mode: 0o600,
+            size,
+            chunks,
+        };
+        let manifest = clw_types::Manifest {
+            version: clw_types::MANIFEST_VERSION,
+            total_size: 5,
+            entries: vec![
+                file("empty", 0, vec![]),
+                file("multi", 3, vec![chunk(first, 2), chunk(second, 1)]),
+                file("single", 2, vec![chunk(first, 2)]),
+            ],
+        };
+        let bytes = manifest.canonical_bytes().unwrap();
+        let root = clw_types::Digest::of_bytes(&bytes);
+        for (digest, data) in [
+            (first, b"ab".to_vec()),
+            (second, b"c".to_vec()),
+            (root, bytes.clone()),
+        ] {
+            cas.lock().unwrap().insert(digest.to_hex(), data);
+        }
+        let name = "per-file-valid";
+        let record = clw_types::RefRecord {
+            name: name.into(),
+            root,
+            manifest_size: bytes.len() as u64,
+            created_at_unix: 0,
+            parent: None,
+            tool_version: "test".into(),
+        };
+        ac.lock()
+            .unwrap()
+            .insert(ref_key_hex(name), record.to_bytes().unwrap());
+        let dest = scratch.path().join("out");
+        let cache = scratch.path().join("cache");
+        let mut command = clw_cmd(&server.uri(), &cache);
+        command
+            .env("HOME", scratch.path())
+            .args(["hydrate", dest.to_str().unwrap()]);
+        if direct_digest {
+            command.args(["--manifest-digest", &root.to_hex()]);
+        } else {
+            command.args(["--name", name]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(dest.join("empty")).unwrap(), b"");
+        assert_eq!(std::fs::read(dest.join("single")).unwrap(), b"ab");
+        assert_eq!(std::fs::read(dest.join("multi")).unwrap(), b"abc");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 3);
+        assert_eq!(cas.lock().unwrap().get(&root.to_hex()).unwrap(), &bytes);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
+        let expected_ac = if direct_digest { 0 } else { 1 };
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path().starts_with("/v1/ac/"))
+                .count(),
+            expected_ac
+        );
+        for digest in [root, first, second] {
+            assert!(requests
+                .iter()
+                .any(|r| r.url.path() == format!("/v1/cas/{TEST_TENANT}/{}", digest.to_hex())));
+        }
+    }
+}

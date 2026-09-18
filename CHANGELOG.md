@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Fixed
+- Hydration rejects per-file size/chunk-sum mismatches and sum overflow before
+  creating destination entries or fetching materialization chunks (#306). Named
+  and direct-digest restores share this validation; valid manifest bytes are unchanged.
 - Unix hydration creates owner-only temporary files, applies the intended file
   mode through the open handle, and syncs before publishing the final name (#297).
   Cleanup is armed only after exclusive creation succeeds, so an occupied temp
