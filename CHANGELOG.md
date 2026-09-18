@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Fixed
+- `clw run` refuses replay of stored non-success records while retaining their
+  stream references for garbage collection. The existing one-command fallback
+  preserves create-only cache occupants and the real child result (#307).
 - `clw run`: an oversized initial AC lookup response now reports the existing
   pre-spawn error (125), rather than incorrectly claiming the child was killed
   for output overflow (137). The response cap, actual output-cap termination,

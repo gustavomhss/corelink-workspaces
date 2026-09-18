@@ -779,8 +779,13 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
         .await
         .map_err(initial_lookup_error)?
     {
-        // Try to parse the record and fetch blobs; treat any failure as a miss.
-        if let Ok(record) = serde_json::from_slice::<RunRecord>(&record_bytes) {
+        // Non-success records retain their blob references for GC, but do not
+        // authorize replay. Leave an occupied create-only AC key untouched;
+        // a failed cache write never changes the completed fallback outcome.
+        if let Some(record) = serde_json::from_slice::<RunRecord>(&record_bytes)
+            .ok()
+            .filter(|record| record.exit_code == 0)
+        {
             match (
                 CasTransport::get(client, &record.stdout).await,
                 CasTransport::get(client, &record.stderr).await,
