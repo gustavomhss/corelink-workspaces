@@ -125,10 +125,14 @@ or a released executable.
      replayed by the self-test below. The clippy run in `scripts/gates.sh` carries
      `-D warnings` on the host (`--workspace` in the full lane; in the scoped lane the
      changed crates plus the sink crates, a set that always contains any crate whose
-     own source changed) and on the windows-gnu cross target. `CLW_SKIP_CROSS=1` skips
-     the cross lane; it exists for local iteration, and "CI/main must NOT skip it" is
-     currently a COMMENT in `scripts/gates.sh`, not an assertion — nothing fails if the
-     variable is set in CI.
+     own source changed) and on the windows-gnu cross target. `CLW_SKIP_CROSS=1` is
+     an explicit local-only shortcut. The early `ci-cross-policy.sh` guard now
+     refuses it when either `CI` or `GITHUB_ACTIONS` has an active or unknown
+     nonempty value. Unset, empty, `false` and `0` are the accepted local markers;
+     other skip values leave the cross command enabled. This #319 / PR #330
+     enforcement supplements the source baseline above. Legitimate docs-only
+     classification is unchanged. The guard checks trusted configuration, not
+     the identity of a caller able to rewrite the workflow.
   2. **A content hash**, for the one `deny` crate. Its whole source tree is pinned
      byte-for-byte in `.github/win-acl-sources.expected`. Changing anything there is a
      fixture diff a person reads.

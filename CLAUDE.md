@@ -67,7 +67,11 @@ the full lane. A trusted pull-request context selects the automatic diff lane:
 Markdown-only skips Rust; runtime and ambiguous changes retain the appropriate
 Rust checks. Read `scripts/classify-lane.sh` and the actual gate, not a historical
 command recipe. Cross-lint is not native Windows execution. The local cross-skip
-policy remains #319 until its patch lands; a local shortcut cannot certify CI.
+policy is enforced by `scripts/ci-cross-policy.sh` before setup or lane selection
+(#319 / PR #330). Only `CLW_SKIP_CROSS=1` requests the shortcut. Both `CI` and
+`GITHUB_ACTIONS` must be unset, empty, `false` or `0`; any other nonempty marker
+refuses it. A legitimate docs-only lane is separate, and a local shortcut cannot
+certify a required cross check.
 
 [TESTING.md](docs/TESTING.md) and the workflows define supplementary coverage,
 fuzz, mutation and platform lanes. Their existence is not a passing run.

@@ -22,6 +22,11 @@ set -euo pipefail
 # stick — a green that meant nothing.
 cd "$(dirname "$0")/.."
 
+# Validate local-only overrides before setup and lane selection.
+# shellcheck source=scripts/ci-cross-policy.sh
+. scripts/ci-cross-policy.sh
+assert_ci_cross_policy
+
 # PR checkout is untrusted input. The CoreLink runner fabric can inject the
 # single-use broker credential trio at env-0, but no PR workflow that checks out
 # repository input may inherit it. Inventory every direct workflow YAML file
@@ -739,6 +744,7 @@ bash scripts/workflow-permissions-selftest.sh
 bash scripts/fuzz-selftest.sh
 bash scripts/pr-title-workflow-selftest.sh
 bash scripts/ci-build-target-selftest.sh
+python3 scripts/ci-cross-policy-selftest.py
 
 # The lane classifier decides whether the Rust gates run at all, so it is itself
 # gated — in EVERY lane, before any classification happens, because a broken
@@ -891,7 +897,8 @@ fi
 # so Windows breakage is caught at PR time, not only on main's post-merge full lane
 # (a `#[cfg(windows)]` break inside a scoped-lane crate change used to slip the required
 # gate). Per-OS NATIVE release binaries are built by release.yml's matrix.
-# Set CLW_SKIP_CROSS=1 for fast local iteration; CI/main must NOT skip it.
+# CLW_SKIP_CROSS=1 is local-only, validated at entry before any setup.
+# Deliberate docs-only lane selection remains a separate, valid early exit.
 if [ "${CLW_SKIP_CROSS:-}" != "1" ]; then
   echo "cross-compile gate: windows-gnu (the cfg-divergent target)"
   rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 || true

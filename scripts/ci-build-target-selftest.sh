@@ -8,7 +8,8 @@ trap 'rm -rf -- "$fixture"' EXIT
 gates="$PWD/scripts/gates.sh"
 
 target_for() {
-  CI=true RUNNER_TEMP="$fixture" GITHUB_RUN_ID="$1" GITHUB_RUN_ATTEMPT="$2" \
+  # The fixture simulates CI, independently of the caller's local shortcut.
+  CI=true CLW_SKIP_CROSS=0 RUNNER_TEMP="$fixture" GITHUB_RUN_ID="$1" GITHUB_RUN_ATTEMPT="$2" \
     CARGO_TARGET_DIR="$fixture/forged-persistent-target" "$gates" --print-ci-cargo-target-dir \
     | tail -n 1
 }
