@@ -10,7 +10,8 @@
 //! `clw run` memoizes on, and ONLY on:
 //! - the digests (and unix mode bits) of the declared `--input` paths,
 //! - the declared `--env` variable NAMES (their current values + set/unset
-//!   presence are folded in; their *names* define the scope),
+//!   presence are folded in; their *names* define the scope). A declared value
+//!   not representable as UTF-8 is refused before cache lookup or child dispatch,
 //! - the command vector + the resolved identity of `command[0]` (the tool), and
 //! - the canonicalized absolute working directory the child runs in.
 //!
@@ -38,7 +39,9 @@ use tokio::io::AsyncReadExt as _;
 // Public constants + types (frozen anchor)
 // ---------------------------------------------------------------------------
 
-pub const RUN_KEY_DOMAIN: &str = "clw/run/v3/";
+// v4 separates results from v3 entries whose invalid OS environment value
+// was encoded as absent. Keep old record decoding intact for GC reachability.
+pub const RUN_KEY_DOMAIN: &str = "clw/run/v4/";
 
 /// H3 (credential leak): the credential-bearing environment variables that `clw`
 /// itself reads (see `clw-cli/src/config.rs`) and that MUST be stripped from the
@@ -600,7 +603,14 @@ async fn compute_key_with_tool_digest_cache(
     for key in &env_keys {
         let value = match std::env::var(key) {
             Ok(v) => format!("set:{v}"),
-            Err(_) => "unset".to_string(),
+            Err(std::env::VarError::NotPresent) => "unset".to_string(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                // Do not format the rejected OsString: it can contain secrets.
+                return Err(ClwError::Config(format!(
+                    "declared environment variable {key:?} is not representable as UTF-8; \
+                     provide a UTF-8 value or unset it (value omitted)"
+                )));
+            }
         };
         env_pairs.push([key.clone(), value]);
     }

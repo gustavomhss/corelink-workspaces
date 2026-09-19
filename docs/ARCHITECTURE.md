@@ -1,5 +1,9 @@
 # CoreLink Workspaces — Architecture
 
+> **#302 source update:** memoization paragraphs below additionally describe the
+> `clw/run/v4/` transition and rejection of declared values not representable as
+> UTF-8. Earlier source dates remain historical; this is not release evidence.
+
 ## Thesis and reviewed scope
 
 The durable object is a snapshot of the **selected files**, not the machine or a
@@ -161,7 +165,7 @@ accounting and dependency order are tracked in
 
 ### Run (memoized command)
 
-The reviewed key domain is `clw/run/v3/`. The key includes declared input paths
+The reviewed key domain is `clw/run/v4/`. The key includes declared input paths
 and digests (plus supported modes), declared environment presence/values, the
 command vector, tool identity and cwd. See
 [`clw-run`](../crates/clw-run/src/lib.rs) for its encoding and fallback behavior.
@@ -195,6 +199,17 @@ stream delivery have separate obligations
 [#310](https://github.com/HuGR-Labs/corelink-workspaces/issues/310).
 The integer exits 125/137 can also be legitimate child results; they alone do not
 establish execution history or authorize automatic retry.
+
+
+### Declared environment identity update (#302)
+
+The v4 run-key domain separates the new reader from v3 records that conflated
+non-Unicode OS values with absent values. Unsupported declared values now fail
+before AC lookup or spawn without including their bytes in diagnostics. Supported
+UTF-8, absent and empty inputs remain distinct. RunRecord serialization and its
+GC reachability decoder are unchanged; no old entry is deleted by this migration.
+Executable selection (#301) and concurrently changing inputs remain separate.
+
 
 ## Lifecycle operations and limits
 

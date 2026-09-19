@@ -1,5 +1,9 @@
 # Security Policy
 
+> **#302 source update:** memoization paragraphs below additionally describe the
+> `clw/run/v4/` transition and rejection of declared values not representable as
+> UTF-8. Earlier source dates remain historical; this is not release evidence.
+
 `clw` (CoreLink Workspaces CLI) is a proprietary, commercial client of the
 CoreLink API. It handles a tenant credential (a Personal Access Token) and
 uploads/downloads tenant file contents to/from content-addressed storage. We
@@ -86,11 +90,12 @@ or a released executable.
   encrypted transport. HTTPS acceptance does not authorize an arbitrary host:
   the operator must choose a trusted destination before supplying a bearer token.
 - **Memoization is a declared-input contract, not a hermetic toolchain.** The
-  `clw/run/v3/` key includes selected input digests/modes, declared environment,
+  `clw/run/v4/` key includes selected input digests/modes, declared environment,
   command/tool identity and cwd. It does not capture every transitive tool,
-  network response, clock or concurrent edit. Actual executable selection and
-  non-UTF-8 environment identity have separate findings
-  [#301](https://github.com/HuGR-Labs/corelink-workspaces/issues/301)/[#302](https://github.com/HuGR-Labs/corelink-workspaces/issues/302).
+  network response, clock or concurrent edit. Actual executable selection remains
+  [#301](https://github.com/HuGR-Labs/corelink-workspaces/issues/301). Declared values
+  not representable as UTF-8 are rejected before memo lookup/dispatch (#302);
+  the v4 domain prevents reuse of v3 entries polluted by the old absent encoding.
   Only the producer is success-only in this baseline; received-record eligibility
   is [#307](https://github.com/HuGR-Labs/corelink-workspaces/issues/307).
 - **Digest verification is not a proof of metadata, retention or safety.** CAS

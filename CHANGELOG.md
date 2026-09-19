@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- Declared non-UTF-8 environment values are refused before run-cache lookup or
+  child dispatch, without printing their contents (#302). The `clw/run/v4/` domain
+  deliberately invalidates v3 memo keys, including invalid-value records that
+  aliased an absent variable. Old records remain recognizable for GC; supported
+  environment values and child-exit behavior are unchanged.
 - Snapshot conflict guidance no longer claims a server rejection for local
   preflight refusal (#309). Exit codes, dry refusal and replacement behavior
   are unchanged; real remote conflicts retain actionable guidance.

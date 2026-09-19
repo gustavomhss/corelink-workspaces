@@ -6245,3 +6245,70 @@ async fn snapshot_conflict_unchanged_control_stays_successful_and_dry() {
     assert_eq!(*ac.lock().unwrap(), original_ac);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("already exists"));
 }
+
+// #302: real CLI refusal must precede all HTTP and any child, including a warm
+// cache populated with an absent-variable command. Environment bytes are set only
+// on the subprocess builder, never in the parallel test runner.
+#[tokio::test]
+async fn run_declared_non_utf8_env_rejected_before_lookup_or_spawn() {
+    use std::os::unix::ffi::OsStringExt;
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    std::fs::write(root.path().join("input.txt"), b"stable synthetic input").unwrap();
+    let name = "CLW_302_SYNTHETIC_VALUE";
+    let script = "printf x >> executions; printf '<%s>' \"${CLW_302_SYNTHETIC_VALUE-unset}\"";
+    let run = |value: Option<&[u8]>| {
+        let mut cmd = clw_cmd(&server.uri(), cache.path());
+        cmd.current_dir(root.path())
+            .env("HOME", home.path())
+            .env_remove(name)
+            .args([
+                "run",
+                "--input",
+                "input.txt",
+                "--env",
+                name,
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+            ]);
+        if let Some(bytes) = value {
+            cmd.env(name, std::ffi::OsString::from_vec(bytes.to_vec()));
+        }
+        cmd.output().unwrap()
+    };
+    let healthy = run(None);
+    assert!(healthy.status.success(), "{healthy:?}");
+    assert_eq!(healthy.stdout, b"<unset>");
+    let original_cas = cas.lock().unwrap().clone();
+    let original_ac = ac.lock().unwrap().clone();
+    for bytes in [
+        b"synthetic-private-A\xff".as_slice(),
+        b"synthetic-private-B\xfe".as_slice(),
+    ] {
+        let before = server.received_requests().await.unwrap().len();
+        let out = run(Some(bytes));
+        assert_eq!(out.status.code(), Some(125), "{out:?}");
+        assert!(out.stdout.is_empty());
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains(name) && error.contains("UTF-8"), "{error}");
+        assert!(!error.contains("synthetic-private"));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before,
+            "unsupported value reached HTTP"
+        );
+        assert_eq!(std::fs::read(root.path().join("executions")).unwrap(), b"x");
+        assert_eq!(*cas.lock().unwrap(), original_cas);
+        assert_eq!(*ac.lock().unwrap(), original_ac);
+    }
+    let again = run(None);
+    assert!(again.status.success());
+    assert_eq!(again.stdout, b"<unset>");
+    assert!(String::from_utf8_lossy(&again.stderr).contains("cache hit"));
+    assert_eq!(std::fs::read(root.path().join("executions")).unwrap(), b"x");
+}

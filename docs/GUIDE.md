@@ -1,5 +1,9 @@
 # CoreLink Workspaces (`clw`) — The Complete Guide
 
+> **#302 source update:** memoization paragraphs below additionally describe the
+> `clw/run/v4/` transition and rejection of declared values not representable as
+> UTF-8. Earlier source dates remain historical; this is not release evidence.
+
 > Reference for the client commands, configuration and selected runtime guarantees.
 > Examples describe the pinned source below, not a complete JSON schema or live-service certification.
 > Source baseline: `be96b8394c66d1dc36ce7ca2f186780f0ea48308` (workspace 0.1.12), reconciled 2026-09-18.
@@ -155,7 +159,7 @@ Use a new destination for recovery; do not race cleanup against unfinished work.
 
 ### Run
 
-`clw/run/v3/` keys selected inputs/modes, declared environment presence/values,
+`clw/run/v4/` keys selected inputs/modes, declared environment presence/values,
 command/tool identity and absolute cwd. An initial AC transport failure propagates.
 A usable memo replays captured stdout/stderr/exit; an absent or unusable memo
 causes one local child execution. This baseline's producer stores only exit-zero
@@ -190,6 +194,37 @@ Windows downloads require verification of the selected `.exe` and its evidence.
 macOS quarantine handling is part of the installer; do not remove quarantine from
 an unverified download. See [DISTRIBUTION.md](DISTRIBUTION.md) for the selected
 platform signing policy, rather than assuming every current asset is unsigned.
+
+
+### Declared environment compatibility (#302)
+
+`--env NAME` accepts absent, empty and nonempty UTF-8 values as distinct inputs.
+An OS value that cannot be represented as UTF-8 is explicitly refused before
+cache lookup or child dispatch; the diagnostic names the variable, never its value.
+The existing internal-error exit 125 is retained for this pre-dispatch refusal.
+No variable is silently converted to absent or replacement characters.
+
+`clw/run/v4/` intentionally starts a cold memo domain. Older clients could store
+non-UTF-8 results under the same v3 key as an absent value, so rejection alone is
+not sufficient for a new client reading an old cache. Old AC records and their
+stream blobs are not deleted; their structural recognition for GC is unchanged.
+**Rollback is not a safe recovery to v3.** Downgrading to a v3 client can reactivate
+previously stored, incorrectly keyed memos; retaining old records does not make
+that reader safe. A follow-up repair must preserve the v4 separation and
+unsupported-value rejection. This migration does not delete old records or
+claim that older deployed binaries have been repaired.
+
+The no-lookup/no-dispatch guarantee belongs to **this `clw` invocation**. An
+enclosing CoreLink memoize Action in `optional` mode can handle exit 125 by
+running its own cold fallback. That consumer behavior is not changed here;
+see [Runners #567](https://github.com/HuGR-Labs/corelink-runners/issues/567) for
+retry-state ambiguity and [#568](https://github.com/HuGR-Labs/corelink-runners/issues/568)
+for the separate required-hit interface. This CLI fix is not a runner-wide
+fail-closed guarantee and adds no trusted execution-state signal.
+
+Tool selection (#301), undeclared inputs and environment changes concurrent
+with an invocation remain separate.
+
 
 ### Quickstart
 
@@ -350,7 +385,7 @@ Examples: `clw status --name my-ws` · `clw --json status ./proj --name my-ws`
 ### `clw run --input <PATH>... [--env <KEY>...] -- <CMD>...`
 Run a command and **memoize** its output; replay stdout/stderr/exit on a cache hit.
 
-- **Cache key** = selected input digests/modes, declared env presence/values, command/tool identity and absolute cwd, under `clw/run/v3/`. Tool-resolution and OS-environment gaps are #301/#302.
+- **Cache key** = selected input digests/modes, declared env presence/values, command/tool identity and absolute cwd, under `clw/run/v4/`. Tool resolution remains #301. #302 rejects declared values that cannot be represented as UTF-8 before lookup/dispatch.
 - **Hermeticity caveat**: undeclared inputs (network, clock, RNG, files not passed via `--input`) are
   invisible to the key — only memoize **deterministic** commands.
 - Input **directories** are walked respecting `.gitignore`/`.clwignore`; an ignored file inside a dir

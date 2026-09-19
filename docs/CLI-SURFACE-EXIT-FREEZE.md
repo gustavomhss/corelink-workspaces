@@ -33,6 +33,15 @@
 ### `clw run --input <PATH>… --env <KEY>… -- <CMD>…`
 - `--input <PATH>` — repeatable; the file/dir paths that form the memoization key (`…/subcmds/run.rs`).
 - `--env <KEY>` — repeatable; env var **names** folded into the key.
+  #302: declared values must be representable as UTF-8; unsupported OS values
+  fail before lookup/spawn **inside this clw invocation**, through the existing
+  internal-error path (125). An enclosing Action in `optional` mode may run its
+  own cold fallback; this patch does not change that consumer (#567/#568).
+  The internal run-key domain moves to v4 (one cold memo domain); no flag,
+  process code or RunRecord schema changes. A downgrade to a v3 client can
+  reactivate incorrectly keyed legacy memos and is not a safe recovery path;
+  subsequent repairs must preserve the v4 separation and rejection. See
+  [declared environment compatibility](GUIDE.md#declared-environment-compatibility-302).
 - `-- <CMD>…` — everything after `--` is the child command + args, run verbatim.
 - `clw run` proxies the child's stdout/stderr and has **no `--json` form** (the child owns stdout).
 
