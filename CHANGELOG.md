@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Fixed
+- Snapshot conflict guidance no longer claims a server rejection for local
+  preflight refusal (#309). Exit codes, dry refusal and replacement behavior
+  are unchanged; real remote conflicts retain actionable guidance.
 - Forced unchanged snapshots repair an absent root manifest before reporting
   success, without deleting or rewriting the same-root ref (#294). The default
   non-force no-op remains dry. This repairs missing content, not corrupt-but-present

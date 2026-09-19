@@ -181,16 +181,13 @@ fn has_ignore_file(path: &std::path::Path) -> bool {
     path.join(".gitignore").exists() || path.join(".clwignore").exists()
 }
 
-/// Map snapshot errors to actionable messages. A re-snapshot of an existing
-/// workspace name currently returns **HTTP 409** from the AC `PUT` (the server's
-/// ref store is create-only — in-place versioning/upsert isn't live yet). Translate
-/// that bare `HTTP 409` into a clear, actionable message (v0.1.1 power-user finding);
-/// other errors fall through to the shared auth mapping.
+/// Map local create-only refusals and remote conflicts to origin-neutral guidance.
+/// Both use the 409 error variant, but local preflight refusal makes no AC PUT and
+/// receives no HTTP conflict response. Other errors retain the shared auth mapping.
 fn map_snapshot_error(err: ClwError, name: &str) -> ClwError {
     match &err {
         ClwError::Http { status: 409, .. } => ClwError::Message(format!(
-            "workspace '{name}' already exists with different content and the server rejected the in-place \
-             update (HTTP 409) — the ref store is create-only (in-place versioning isn't live yet). To \
+            "workspace '{name}' already exists with different content — the ref store is create-only. To \
              replace it, re-run `clw snapshot --name {name} --force`, or `clw rm --name {name} --yes` first \
              then snapshot again. (Re-snapshotting identical content is a no-op and needs neither.)"
         )),
@@ -248,6 +245,15 @@ mod tests {
             "must not be a bare HTTP 409: {msg}"
         );
         assert!(msg.contains("my-ws"), "must name the workspace: {msg}");
+        assert!(msg.contains("clw snapshot --name my-ws --force"), "{msg}");
+        assert!(
+            !msg.contains("server rejected"),
+            "origin must stay neutral: {msg}"
+        );
+        assert!(
+            !msg.contains("HTTP 409"),
+            "local refusal has no response: {msg}"
+        );
         assert!(
             msg.contains("clw rm --name my-ws --yes"),
             "must give the rm-first workaround: {msg}"

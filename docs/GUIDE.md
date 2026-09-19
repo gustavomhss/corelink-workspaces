@@ -3,7 +3,7 @@
 > Reference for the client commands, configuration and selected runtime guarantees.
 > Examples describe the pinned source below, not a complete JSON schema or live-service certification.
 > Source baseline: `be96b8394c66d1dc36ce7ca2f186780f0ea48308` (workspace 0.1.12), reconciled 2026-09-18.
-> Snapshot absence-repair paragraphs additionally describe the #294 correction in this change.
+> Snapshot absence-repair paragraphs describe #294; conflict diagnostics additionally describe #309.
 > This is source documentation, not latest-release or production-availability evidence.
 
 ---
@@ -128,8 +128,9 @@ maintenance best-effort, and its budget is not a hard disk quota.
 The selected tree is walked, chunks processed, and the root serialized. For a new
 publication, content is handled before its ref. This is not a transaction with GC.
 An occupied, non-forced divergent snapshot is refused locally without uploading
-its candidate content; the diagnostic currently overattributes this to a server
-409 ([#309](https://github.com/HuGR-Labs/corelink-workspaces/issues/309)).
+its candidate content. The [#309 diagnostic](https://github.com/HuGR-Labs/corelink-workspaces/issues/309)
+names the occupied workspace and supported replacement options without claiming
+that this local refusal received an HTTP response.
 With the [#294 repair](https://github.com/HuGR-Labs/corelink-workspaces/issues/294),
 force checks/uploads an absent root before same-root success, alongside its existing
 chunk checks, without replacing that ref. Non-force keeps its dry no-op and does
@@ -295,7 +296,7 @@ Content-address a directory and upload it, recorded under `NAME`.
 
 - `PATH` is **positional** (default `.`), *not* `--path`.
 - Same-root content returns unchanged without a ref rewrite. Force repairs missing root/chunks before success (#294); non-force does not verify availability. Neither is an integrity scrub or protection from concurrent GC.
-- A differing occupied name without force is refused locally before candidate upload. The wording overattributes it to server 409 (#309). Force uses separate deletion/publication, not an atomic replacement (#292).
+- A differing occupied name without force is refused locally before candidate upload. Origin-neutral guidance names the conflict and replacement options (#309). Force uses separate deletion/publication, not an atomic replacement (#292).
 - After the storage result, **stderr advisories** report ignore-file presence,
   uploaded secret-looking names and skipped external links. They do not reject
   a publication because of those findings. Output writes themselves can fail;
@@ -582,7 +583,9 @@ Error variants include `Auth`, `Http`, `NotFound`, `TooLarge`, `Integrity`,
 `InvalidDigest`, `InvalidManifest`, `InvalidTenant`, `Config`, `Transport`, `Io`,
 `Json` and `Message`. They do not each have an exclusive CLI exit code. HTTP 402,
 409 and 429 are HTTP statuses, not process codes; local guards can also produce
-an error whose wording mentions a server status. #309 owns conflict attribution.
+the same internal status variant without an HTTP exchange. Snapshot conflict
+guidance is therefore origin-neutral (#309); inspect request evidence to distinguish
+local refusal from an actual remote response.
 
 Producer memo storage is restricted to successful results. The separate received
 record eligibility issue #307 remains at this source. No format/key/lifecycle
@@ -773,7 +776,7 @@ reports a new measured coverage floor nor waives the unresolved test-map #312.
   Its `problems:` list flags a missing/invalid tenant, a missing token, an empty endpoint, or an invalid
   ref-domain.
 - **"missing tenant / token"** (exit 2) — set `CLW_TENANT` + `CLW_TOKEN` (or `clw init` / `clw auth login`).
-- **Occupied-name conflict** — differing content without force is refused locally in this baseline; #309 owns its misleading 409 wording. Review the non-atomic force/replacement limitation before changing the ref.
+- **Occupied-name conflict** — differing content without force is refused locally, with origin-neutral replacement guidance (#309). Review the non-atomic force/replacement limitation before changing the ref.
 - **`hydrate` says "destination not empty"** — hydrate refuses to write into a non-empty directory. Choose a
   new path, or remove/empty the target first.
 - **"not found in CAS: <digest>"** — usually a wrong `--name`, a wrong `CLW_TENANT`, or a snapshot that was

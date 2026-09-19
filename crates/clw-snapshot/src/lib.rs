@@ -31,12 +31,11 @@ pub struct SnapshotOptions {
     pub concurrency: usize,
     /// Ref keyspace the snapshot's ref is written under (default [`RefDomain::User`]).
     pub ref_domain: RefDomain,
-    /// Replace an existing name whose content DIFFERS: because the AC ref PUT is
-    /// create-only server-side, an in-place overwrite 409s. With `force`, snapshot
-    /// deletes the existing ref then writes the new one (blobs are already uploaded,
-    /// so the only gap is a sub-second local round-trip — far safer than the manual
-    /// rm-then-snapshot, where a failure leaves NO ref). Re-snapshotting IDENTICAL
-    /// content is always a no-op success and needs no `force`.
+    /// Replace differing content using separate ref DELETE and PUT requests after
+    /// ensuring content is present. An interruption or competing writer may leave
+    /// the name absent; this is not an atomic replacement (#292). Same-root saves
+    /// never rewrite the ref. Force additionally repairs absent root/chunk content
+    /// before same-root success (#294); it is not an integrity scrub or GC fence.
     pub force: bool,
 }
 

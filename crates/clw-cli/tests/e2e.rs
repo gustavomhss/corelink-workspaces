@@ -2719,12 +2719,10 @@ async fn erase_fails_loud_and_exits_nonzero_when_data_still_remains() {
 // these, the very bugs we shipped fixes for had ZERO automated coverage.
 // ---------------------------------------------------------------------------
 
-// Finding #1 — re-snapshot of an EXISTING name hits the server's create-only AC
-// PUT (HTTP 409). The raw 409 used to surface verbatim with no guidance; v0.1.2
-// maps it to an actionable message pointing at `clw rm --name <X> --yes`. This
-// test uses the create-only AC mock so the real 409 path is exercised, asserts
-// the actionable wording, and proves the documented workaround (rm then re-snapshot)
-// actually works.
+// Existing-name divergence is refused locally before AC PUT. Keep the historical
+// test name, but do not mistake create-only mock configuration for a remote 409.
+// The test checks actionable guidance and the rm-then-snapshot workaround.
+// snapshot_conflict_remote_409_* below separately exercises an actual remote 409.
 #[tokio::test]
 async fn resnapshot_existing_name_409_is_actionable_and_rm_then_retry_works() {
     let server = MockServer::start().await;
@@ -2743,7 +2741,7 @@ async fn resnapshot_existing_name_409_is_actionable_and_rm_then_retry_works() {
         .success();
     assert!(ac.lock().unwrap().contains_key(&ref_key_hex(ws)));
 
-    // Re-snapshot the SAME name with DIFFERENT content → the AC overwrite is 409.
+    // Re-snapshot the SAME name with DIFFERENT content → local create-only refusal.
     // It must fail with the actionable message, NOT a raw "409"/"transport error".
     let src2 = TempDir::new().unwrap();
     std::fs::write(src2.path().join("f.txt"), b"version two - changed").unwrap();
@@ -6027,4 +6025,223 @@ async fn forced_same_root_repair_propagates_root_put_failure() {
 #[tokio::test]
 async fn forced_same_root_repair_propagates_root_head_failure() {
     assert_forced_same_root_repair_failure("HEAD").await;
+}
+
+// #309: diagnostics must not invent a remote response for local refusal.
+fn assert_snapshot_conflict_diagnostic(out: &std::process::Output, name: &str) {
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "a refusal is not a JSON success report"
+    );
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        message.contains(&format!(
+            "workspace '{name}' already exists with different content"
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("clw snapshot --name {name} --force")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("clw rm --name {name} --yes")),
+        "{message}"
+    );
+    assert!(
+        !message.contains("server rejected"),
+        "must not invent a server decision: {message}"
+    );
+    assert!(
+        !message.contains("HTTP 409"),
+        "a local refusal has no HTTP response: {message}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_conflict_local_refusal_is_origin_neutral_and_get_only() {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let name = "conflict-local";
+    std::fs::write(src.path().join("input.txt"), b"old content").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", name])
+        .assert()
+        .success();
+    let original_cas = cas.lock().unwrap().clone();
+    let original_ac = ac.lock().unwrap().clone();
+    std::fs::write(src.path().join("input.txt"), b"new content").unwrap();
+    let start = server.received_requests().await.unwrap().len();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            name,
+        ])
+        .output()
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let observed = &requests[start..];
+    assert_eq!(observed.len(), 1, "refusal must remain a single AC GET");
+    assert_eq!(observed[0].method.as_str(), "GET");
+    assert_eq!(
+        observed[0].url.path(),
+        format!("/v1/ac/{TEST_TENANT}/{}", ref_key_hex(name))
+    );
+    assert_eq!(*cas.lock().unwrap(), original_cas);
+    assert_eq!(*ac.lock().unwrap(), original_ac);
+    assert_snapshot_conflict_diagnostic(&out, name);
+}
+
+// Install the competing ref exactly at PUT, after the initial GET returned 404.
+// Delegation retains the same create-only responder and authentication checks.
+#[derive(Clone)]
+struct SnapshotConflictAtPut {
+    store: Store,
+    key: String,
+    competing_ref: Vec<u8>,
+}
+impl Respond for SnapshotConflictAtPut {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        assert_eq!(request.method.as_str(), "PUT");
+        assert_eq!(last_segment(&request.url), self.key);
+        assert_ne!(request.body, self.competing_ref);
+        assert!(self
+            .store
+            .lock()
+            .unwrap()
+            .insert(self.key.clone(), self.competing_ref.clone())
+            .is_none());
+        AcCreateOnlyResponder {
+            store: Arc::clone(&self.store),
+            auth_ok: true,
+        }
+        .respond(request)
+    }
+}
+
+#[tokio::test]
+async fn snapshot_conflict_remote_409_is_origin_neutral_and_preserves_competing_ref() {
+    let server = MockServer::start().await;
+    let (_cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let name = "conflict-remote";
+    std::fs::write(src.path().join("input.txt"), b"competing content").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", name])
+        .assert()
+        .success();
+    let key = ref_key_hex(name);
+    let competing_ref = ac.lock().unwrap().remove(&key).unwrap();
+    let ac_path = format!("/v1/ac/{TEST_TENANT}/{key}");
+    Mock::given(method("PUT"))
+        .and(path(&ac_path))
+        .respond_with(SnapshotConflictAtPut {
+            store: Arc::clone(&ac),
+            key: key.clone(),
+            competing_ref: competing_ref.clone(),
+        })
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    std::fs::write(src.path().join("input.txt"), b"candidate content").unwrap();
+    let start = server.received_requests().await.unwrap().len();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            name,
+        ])
+        .output()
+        .unwrap();
+    server.verify().await;
+    let requests = server.received_requests().await.unwrap();
+    let observed = &requests[start..];
+    assert_eq!(observed[0].method.as_str(), "GET");
+    assert_eq!(observed[0].url.path(), ac_path);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path() == ac_path)
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == ac_path)
+            .count(),
+        2
+    );
+    assert!(observed
+        .iter()
+        .any(|r| r.method.as_str() == "PUT" && r.url.path().contains("/cas/")));
+    assert!(observed.iter().all(|r| r.method.as_str() != "DELETE"));
+    assert_eq!(ac.lock().unwrap().get(&key), Some(&competing_ref));
+    assert_snapshot_conflict_diagnostic(&out, name);
+}
+
+#[tokio::test]
+async fn snapshot_conflict_unchanged_control_stays_successful_and_dry() {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let name = "conflict-unchanged";
+    std::fs::write(src.path().join("input.txt"), b"stable content").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", name])
+        .assert()
+        .success();
+    let original_cas = cas.lock().unwrap().clone();
+    let original_ac = ac.lock().unwrap().clone();
+    let start = server.received_requests().await.unwrap().len();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            name,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["unchanged"], true);
+    assert_eq!(report["chunks_uploaded"], 0);
+    assert_eq!(report["name"], name);
+    let requests = server.received_requests().await.unwrap();
+    let observed = &requests[start..];
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].method.as_str(), "GET");
+    assert_eq!(
+        observed[0].url.path(),
+        format!("/v1/ac/{TEST_TENANT}/{}", ref_key_hex(name))
+    );
+    assert_eq!(*cas.lock().unwrap(), original_cas);
+    assert_eq!(*ac.lock().unwrap(), original_ac);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("already exists"));
 }
