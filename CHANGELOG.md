@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- Forced unchanged snapshots repair an absent root manifest before reporting
+  success, without deleting or rewriting the same-root ref (#294). The default
+  non-force no-op remains dry. This repairs missing content, not corrupt-but-present
+  blobs or concurrent publication/GC races.
 - Local-cache PUT failures and unwinding now clean only the temporary file
   owned by that operation, after closing its handle. Successful publication
   disarms cleanup; removal errors preserve the primary error and emit a warning

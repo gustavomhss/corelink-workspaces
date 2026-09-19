@@ -5775,3 +5775,256 @@ async fn hydrate_cli_per_file_size_valid_controls_restore_exact_bytes() {
         }
     }
 }
+
+// #294: force can repair absent immutable content without replacing a same-root ref.
+// These tests use a create-only AC and fresh HOME/cache for the subsequent hydrate.
+async fn assert_forced_same_root_repair(remove_root: bool, remove_chunk: bool, empty: bool) {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let ws = "force-root-repair";
+    let payload = b"small deterministic root-repair payload\n";
+    if !empty {
+        std::fs::write(src.path().join("input.txt"), payload).unwrap();
+    }
+    let save = |force: bool| {
+        let mut cmd = clw_cmd(&server.uri(), cache.path());
+        cmd.env("HOME", home.path()).args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            ws,
+        ]);
+        if force {
+            cmd.arg("--force");
+        }
+        cmd.output().unwrap()
+    };
+    let first = save(false);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let ref_key = ref_key_hex(ws);
+    let ref_before = ac.lock().unwrap().get(&ref_key).unwrap().clone();
+    let record = clw_types::RefRecord::from_bytes(&ref_before).unwrap();
+    let root_hex = record.root.to_hex();
+    let root_before = cas.lock().unwrap().get(&root_hex).unwrap().clone();
+
+    // Healthy controls: neither default nor force rewrites an unchanged ref/blob.
+    for force in [false, true] {
+        let start = server.received_requests().await.unwrap().len();
+        let out = save(force);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["unchanged"], true);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[start..]
+            .iter()
+            .all(|r| r.method.as_str() != "PUT" && r.method.as_str() != "DELETE"));
+        if !force {
+            assert!(requests[start..]
+                .iter()
+                .all(|r| !r.url.path().contains("/cas/")));
+        }
+        assert_eq!(ac.lock().unwrap().get(&ref_key), Some(&ref_before));
+    }
+
+    if remove_root {
+        assert!(cas.lock().unwrap().remove(&root_hex).is_some());
+    }
+    let chunk_hex = clw_types::Digest::of_bytes(payload).to_hex();
+    if remove_chunk {
+        assert!(!empty);
+        assert!(cas.lock().unwrap().remove(&chunk_hex).is_some());
+    }
+    // The ordinary no-op deliberately stays dry, even when its root is absent.
+    // Only force selects absence repair; a ref alone is not an availability proof.
+    if remove_root {
+        let start = server.received_requests().await.unwrap().len();
+        let out = save(false);
+        assert!(out.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["unchanged"], true);
+        assert_eq!(report["chunks_uploaded"], 0);
+        assert!(!cas.lock().unwrap().contains_key(&root_hex));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[start..].iter().all(|r| {
+            !r.url.path().contains("/cas/") && !matches!(r.method.as_str(), "PUT" | "DELETE")
+        }));
+        assert_eq!(ac.lock().unwrap().get(&ref_key), Some(&ref_before));
+    }
+    let start = server.received_requests().await.unwrap().len();
+    let out = save(true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["unchanged"], true);
+    assert_eq!(report["root"], root_hex);
+    assert_eq!(report["chunks_uploaded"], usize::from(remove_chunk));
+    assert_eq!(
+        cas.lock().unwrap().get(&root_hex),
+        Some(&root_before),
+        "root must exist remotely before unchanged success"
+    );
+    assert_eq!(ac.lock().unwrap().get(&ref_key), Some(&ref_before));
+    let requests = server.received_requests().await.unwrap();
+    let repair_requests = &requests[start..];
+    assert!(
+        repair_requests
+            .iter()
+            .all(|r| !(r.url.path().contains("/ac/")
+                && matches!(r.method.as_str(), "PUT" | "DELETE"))),
+        "same-root repair must not mutate the ref"
+    );
+    let root_path = format!("/v1/cas/{TEST_TENANT}/{root_hex}");
+    assert_eq!(
+        repair_requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path() == root_path)
+            .count(),
+        usize::from(remove_root)
+    );
+    if remove_chunk {
+        assert_eq!(
+            cas.lock().unwrap().get(&chunk_hex).map(Vec::as_slice),
+            Some(payload.as_slice())
+        );
+    }
+
+    let cold_cache = TempDir::new().unwrap();
+    let cold_home = TempDir::new().unwrap();
+    let dest_parent = TempDir::new().unwrap();
+    let dest = dest_parent.path().join("restored");
+    let start = server.received_requests().await.unwrap().len();
+    clw_cmd(&server.uri(), cold_cache.path())
+        .env("HOME", cold_home.path())
+        .args(["hydrate", "--name", ws, dest.to_str().unwrap()])
+        .assert()
+        .success();
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests[start..]
+            .iter()
+            .any(|r| r.method.as_str() == "GET" && r.url.path() == root_path),
+        "cold hydrate must fetch the real remote root"
+    );
+    if empty {
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    } else {
+        assert_eq!(std::fs::read(dest.join("input.txt")).unwrap(), payload);
+        let chunk_path = format!("/v1/cas/{TEST_TENANT}/{chunk_hex}");
+        assert!(
+            requests[start..]
+                .iter()
+                .any(|r| r.method.as_str() == "GET" && r.url.path() == chunk_path),
+            "cold hydrate must fetch remote content, not a warm writer cache"
+        );
+    }
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_restores_missing_manifest_with_cold_hydrate() {
+    assert_forced_same_root_repair(true, false, false).await;
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_restores_missing_chunk_with_cold_hydrate() {
+    assert_forced_same_root_repair(false, true, false).await;
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_restores_missing_root_and_chunk() {
+    assert_forced_same_root_repair(true, true, false).await;
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_handles_empty_workspace() {
+    assert_forced_same_root_repair(true, false, true).await;
+}
+
+async fn assert_forced_same_root_repair_failure(verb: &'static str) {
+    let server = MockServer::start().await;
+    let (cas, ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let ws = "force-root-failure";
+    std::fs::write(src.path().join("input.txt"), b"preserve my ref").unwrap();
+    clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args(["snapshot", src.path().to_str().unwrap(), "--name", ws])
+        .assert()
+        .success();
+    let key = ref_key_hex(ws);
+    let original_ref = ac.lock().unwrap().get(&key).unwrap().clone();
+    let record = clw_types::RefRecord::from_bytes(&original_ref).unwrap();
+    let root = record.root.to_hex();
+    assert!(cas.lock().unwrap().remove(&root).is_some());
+    let root_path = format!("/v1/cas/{TEST_TENANT}/{root}");
+    // A nonretryable response keeps the failure deterministic and bounded.
+    Mock::given(method(verb))
+        .and(path(&root_path))
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let start = server.received_requests().await.unwrap().len();
+    let out = clw_cmd(&server.uri(), cache.path())
+        .env("HOME", home.path())
+        .args([
+            "--json",
+            "snapshot",
+            src.path().to_str().unwrap(),
+            "--name",
+            ws,
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{verb} root failure must use the snapshot error exit"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "failed repair must not print a success report"
+    );
+    assert_eq!(ac.lock().unwrap().get(&key), Some(&original_ref));
+    assert!(!cas.lock().unwrap().contains_key(&root));
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[start..]
+        .iter()
+        .any(|r| r.method.as_str() == verb && r.url.path() == root_path));
+    assert!(
+        requests[start..]
+            .iter()
+            .all(|r| !(r.url.path().contains("/ac/")
+                && matches!(r.method.as_str(), "PUT" | "DELETE")))
+    );
+    if verb == "HEAD" {
+        assert!(requests[start..].iter().all(|r| r.method.as_str() != "PUT"));
+    }
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_propagates_root_put_failure() {
+    assert_forced_same_root_repair_failure("PUT").await;
+}
+
+#[tokio::test]
+async fn forced_same_root_repair_propagates_root_head_failure() {
+    assert_forced_same_root_repair_failure("HEAD").await;
+}

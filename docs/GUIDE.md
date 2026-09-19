@@ -3,6 +3,7 @@
 > Reference for the client commands, configuration and selected runtime guarantees.
 > Examples describe the pinned source below, not a complete JSON schema or live-service certification.
 > Source baseline: `be96b8394c66d1dc36ce7ca2f186780f0ea48308` (workspace 0.1.12), reconciled 2026-09-18.
+> Snapshot absence-repair paragraphs additionally describe the #294 correction in this change.
 > This is source documentation, not latest-release or production-availability evidence.
 
 ---
@@ -129,8 +130,11 @@ publication, content is handled before its ref. This is not a transaction with G
 An occupied, non-forced divergent snapshot is refused locally without uploading
 its candidate content; the diagnostic currently overattributes this to a server
 409 ([#309](https://github.com/HuGR-Labs/corelink-workspaces/issues/309)).
-Same-root success can occur before repairing a missing root blob, including under
-force ([#294](https://github.com/HuGR-Labs/corelink-workspaces/issues/294)).
+With the [#294 repair](https://github.com/HuGR-Labs/corelink-workspaces/issues/294),
+force checks/uploads an absent root before same-root success, alongside its existing
+chunk checks, without replacing that ref. Non-force keeps its dry no-op and does
+not verify availability. This repairs absence in a quiescent store, not corrupt
+but present bytes or a subsequent concurrent deletion.
 The root-size check follows chunk work; it does not avoid every earlier upload.
 
 ### Hydrate
@@ -290,7 +294,7 @@ Examples with identity already configured through an approved environment: `clw 
 Content-address a directory and upload it, recorded under `NAME`.
 
 - `PATH` is **positional** (default `.`), *not* `--path`.
-- Same-root content returns unchanged, but is not an integrity scrub and may not repair a missing root (#294).
+- Same-root content returns unchanged without a ref rewrite. Force repairs missing root/chunks before success (#294); non-force does not verify availability. Neither is an integrity scrub or protection from concurrent GC.
 - A differing occupied name without force is refused locally before candidate upload. The wording overattributes it to server 409 (#309). Force uses separate deletion/publication, not an atomic replacement (#292).
 - After the storage result, **stderr advisories** report ignore-file presence,
   uploaded secret-looking names and skipped external links. They do not reject

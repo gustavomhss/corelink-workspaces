@@ -558,7 +558,7 @@ where
     // NEITHER writes the ref, so NEITHER needs an upload. Deciding this now lets the
     // chunk pipeline run DRY (digests only, no CAS round-trips), so a rejected divergent
     // re-snapshot no longer uploads — and orphans — the entire workspace before the 409.
-    // (Absent ref OR `--force` ⇒ we will write the ref ⇒ we must upload.)
+    // (Absent ref OR `--force` ⇒ ensure content exists; the ref may still be unchanged.)
     //
     // Capture RAW presence separately from a successful parse: a present-but-corrupt ref
     // still OCCUPIES the create-only AC key (so `--force` must delete it on RAW presence),
@@ -575,8 +575,8 @@ where
             None
         }
     };
-    // We will write the ref (and therefore must upload) only when the key is free or we
-    // are force-replacing it. Otherwise the pipeline runs DRY.
+    // Ensure content is available when the key is free or force was requested.
+    // A forced same-root repair does not need a ref write. Otherwise run DRY.
     let will_upload = !raw_present || opts.force;
 
     // Process files (and pass symlinks/dirs through) concurrently, tagging each
@@ -673,13 +673,21 @@ where
     let manifest_digest = Digest::of_bytes(&manifest_bytes);
     let manifest_size = manifest_bytes.len() as u64;
 
-    // Idempotent no-op: the pre-read ref already points at this EXACT root, so there is
-    // nothing to write. This makes "save again, nothing changed" (and a runner's
-    // idempotent re-snapshot per job) a clean SUCCESS instead of the create-only AC
-    // PUT's 409. On the DRY path (occupied ref, no `--force`) `chunks_uploaded` is 0: we
-    // did not re-upload, because the ref committing to this exact root is itself the
-    // proof the content was durably stored. (A paranoid re-verify/heal against external
-    // CAS deletion is out of the default fast path; `--force` re-uploads in full.)
+    // Publish missing immutable content before accepting a forced same-root no-op.
+    // The chunk pipeline already checks/uploads on `will_upload`; the manifest is a
+    // separate CAS object and needs the same treatment. Presence checks repair
+    // absence, not corruption of bytes already present. The default occupied-ref
+    // path remains dry (no CAS calls), including a divergent non-force refusal.
+    if will_upload {
+        let already_there = CasTransport::exists(client, &manifest_digest).await?;
+        if !already_there {
+            CasTransport::put(client, &manifest_digest, manifest_bytes).await?;
+        }
+    }
+
+    // Idempotent no-op: this exact root needs no new ref record or destructive
+    // replacement. Force has now established root availability; non-force retains
+    // its existing fast path and does not verify remote content availability.
     if let Some(ex) = &existing {
         if ex.root == manifest_digest {
             return Ok(SnapshotReport {
@@ -716,12 +724,6 @@ where
         });
     }
 
-    // --- 6. Upload the manifest (we WILL write the ref) ---------------------
-    let already_there = CasTransport::exists(client, &manifest_digest).await?;
-    if !already_there {
-        CasTransport::put(client, &manifest_digest, manifest_bytes).await?;
-    }
-
     // --- 7. Write new ref record --------------------------------------------
     let created_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -739,8 +741,9 @@ where
 
     // The AC ref PUT is create-only server-side, so REPLACING an existing name whose
     // content DIFFERS needs an explicit rm-first. `--force` does the rm+PUT here: the
-    // blobs are already uploaded, so the only gap is this sub-second local round-trip
-    // (vs the manual rm-then-snapshot, where a crash between the two leaves NO ref).
+    // blobs are already uploaded, but DELETE and PUT are separate requests. An
+    // interrupted or competing replacement may leave the name absent (#292);
+    // same-root absence repair above never enters this destructive transition.
     // Without `force`, the PUT 409s and the CLI surfaces the actionable guidance.
     // Gate on RAW presence, NOT a successful parse: a present-but-corrupt ref must
     // also be deleted so the create-only PUT does not 409. (A no-op identical re-
@@ -1083,6 +1086,38 @@ mod tests {
             !report1.unchanged,
             "the FIRST snapshot is a real write, not a no-op"
         );
+    }
+
+    // #294: a forced no-op must heal its separate immutable root object.
+    #[tokio::test]
+    async fn forced_same_root_repairs_missing_manifest() {
+        for empty in [false, true] {
+            let src = TempDir::new().unwrap();
+            if !empty {
+                std::fs::write(src.path().join("input.txt"), b"root repair control").unwrap();
+            }
+            let cache_dir = TempDir::new().unwrap();
+            let cache = LocalCache::new(cache_dir.path()).unwrap();
+            let client = FakeTransport::default();
+            let opts = SnapshotOptions::new("root-repair");
+            let first = snapshot(src.path(), &client, &cache, &opts).await.unwrap();
+            let key = ref_key("root-repair");
+            let original_ref = client.ac.lock().await.get(&key).unwrap().clone();
+            let original_manifest = client.cas.lock().await.remove(&first.root).unwrap();
+
+            let repaired = snapshot(src.path(), &client, &cache, &opts.with_force(true))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.cas.lock().await.get(&first.root),
+                Some(&original_manifest),
+                "forced unchanged snapshot must repair its missing root (empty={empty})"
+            );
+            assert_eq!(repaired.root, first.root);
+            assert!(repaired.unchanged);
+            assert_eq!(repaired.chunks_uploaded, 0);
+            assert_eq!(client.ac.lock().await.get(&key), Some(&original_ref));
+        }
     }
 
     // -----------------------------------------------------------------------
