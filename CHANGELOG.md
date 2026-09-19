@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Fixed
+- Cwd-only PATH lists preserve native script launch spelling and their exact
+  child PATH in the Unix selected-tool correction (#301). On Linux, a selected
+  empty component in a mixed PATH is explicitly refused before memo lookup;
+  an explicit `./tool` or `PATH=.` avoids changing script `$0` or the environment.
+- On Unix, memoization now identifies an executable with effective launch access
+  and retains that selected path through lookup and dispatch (#301, Unix slice).
+  Weak identity is refused, native argv0 is preserved, and detected tool drift
+  suppresses replay or memo publication. Versioned tool identities invalidate
+  older Unix keys without deleting records; non-Unix resolution is unchanged.
 - Declared non-UTF-8 environment values are refused before run-cache lookup or
   child dispatch, without printing their contents (#302). The `clw/run/v4/` domain
   deliberately invalidates v3 memo keys, including invalid-value records that

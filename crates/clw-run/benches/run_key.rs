@@ -5,24 +5,24 @@
 //! [`clw_run::run_memoized`], so this benchmark does not widen the production
 //! API just for measurement.
 //!
-//! The fixture contains a deterministic 32 MiB declared input and a 4 MiB tool
-//! fixture. Both are created before Criterion starts timing and reread from the
-//! same inodes, so the filesystem page cache is warm during measured calls. The
-//! AC-miss case uses an in-memory empty transport: key derivation (including
-//! input and tool streaming digests) runs, then spawning the deliberately
-//! non-executable local fixture fails without invoking a host-provided command.
-//! The AC-hit case uses an in-memory AC/CAS record and therefore exercises
-//! repeated key/input work followed by a real memo hit. It is *not* labelled as
-//! a no-I/O path because declared inputs are still read on every call; any
-//! tool-digest reuse is part of the implementation being measured.
+//! The fixture contains a deterministic 32 MiB input and 4 MiB tool-identity
+//! data, prepared outside timing. On Unix the readable data file has effective
+//! executable permission, satisfying the selected-tool identity precondition.
+//! It is NOT a runnable program and is NEVER dispatched: the first benchmark's
+//! transport returns a distinctive error at AC lookup, after key derivation.
+//! Every iteration asserts that exact error, so early identity refusal cannot
+//! masquerade as a faster key path. The other benchmark seeds a synthetic memo
+//! before timing and asserts the same key and a real public HIT on each call.
 //!
-//! No baseline number is asserted or invented here. Record Criterion's output
-//! from the same revision, machine, and build profile when comparing changes.
+//! This measures key/lookup and memo-replay boundaries, not command execution.
+//! Logical throughput is the declared input plus tool fixture size, not measured
+//! disk traffic: input reads recur, while the implementation may cache tool hashes.
+//! v2 names deliberately separate these samples from the former spawn-failure
+//! benchmark. Do not compare them as an unchanged workload or claim a speedup.
 //!
-//! Run with: `cargo bench -p clw-run --bench run_key` (Criterion output is under
-//! `run_key_fs_warm/ac_miss_key_and_tool_digest_fs_warm` and
-//! `run_key_fs_warm/ac_hit_recompute_memo_hit_fs_warm`).
-//! Compile-check only: `cargo bench -p clw-run --bench run_key --no-run`
+//! Run: `cargo bench -p clw-run --bench run_key`.
+//! Smoke only: `cargo bench -p clw-run --bench run_key -- --test`.
+//! Compile only: `cargo bench -p clw-run --bench run_key --no-run`.
 
 use async_trait::async_trait;
 use clw_run::{run_memoized, RunOptions};
@@ -36,6 +36,7 @@ use tokio::runtime::Runtime;
 
 const INPUT_BYTES: usize = 32 * 1024 * 1024;
 const TOOL_BYTES: usize = 4 * 1024 * 1024;
+const LOOKUP_STOP: &str = "benchmark: key computed; stop at AC lookup before dispatch";
 
 /// Deterministic xorshift bytes keep fixture contents stable without a random
 /// dependency or host-specific input. Fixture creation is outside timing.
@@ -59,13 +60,22 @@ fn fixture() -> (TempDir, RunOptions, u64) {
         deterministic_bytes(INPUT_BYTES, 0x11),
     )
     .expect("write input fixture");
-    // This is data, not a platform executable. It is only read for the tool
-    // identity and intentionally fails at spawn in the AC-miss benchmark.
+    // Data for identity measurement, not a runnable executable. Both transports
+    // terminate before dispatch; neither benchmark may execute these bytes.
     std::fs::write(
         dir.path().join("tool.bin"),
         deterministic_bytes(TOOL_BYTES, 0x22),
     )
     .expect("write tool fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            dir.path().join("tool.bin"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("mark private identity fixture executable");
+    }
 
     let opts = RunOptions {
         inputs: vec!["input.bin".to_owned()],
@@ -75,14 +85,13 @@ fn fixture() -> (TempDir, RunOptions, u64) {
     (dir, opts, (INPUT_BYTES + TOOL_BYTES) as u64)
 }
 
-/// An AC/CAS transport that forces an AC miss. The miss reaches the local
-/// fixture spawn after the key has been fully derived; no network and no host
-/// command are involved.
+/// Refuse at the actual AC lookup boundary. The exact sentinel proves that
+/// selection and key derivation completed without ever dispatching fixture data.
 #[derive(Clone, Copy, Default)]
-struct EmptyStore;
+struct LookupStopStore;
 
 #[async_trait]
-impl CasTransport for EmptyStore {
+impl CasTransport for LookupStopStore {
     async fn exists(&self, _digest: &Digest) -> Result<bool> {
         Ok(false)
     }
@@ -105,9 +114,9 @@ impl CasTransport for EmptyStore {
 }
 
 #[async_trait]
-impl AcTransport for EmptyStore {
+impl AcTransport for LookupStopStore {
     async fn get(&self, _key: &Digest) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        Err(ClwError::Transport(LOOKUP_STOP.to_owned()))
     }
 
     async fn put(&self, _key: &Digest, _value: Vec<u8>) -> Result<()> {
@@ -243,29 +252,36 @@ impl AcTransport for WarmStore {
 }
 
 fn bench_run_key_fs_warm(c: &mut Criterion) {
-    // Keep the fixtures separate so a process-local tool-digest cache warmed by
-    // the AC-hit setup cannot turn the AC-miss case into an AC-hit tool lookup.
-    let (ac_miss_dir, ac_miss_opts, bytes) = fixture();
+    // Independent paths keep the replay setup from prewarming the other tool.
+    // Repeated calls within each case may still reuse a valid tool fingerprint.
+    let (lookup_dir, lookup_opts, bytes) = fixture();
     let (warm_dir, warm_opts, _) = fixture();
     let runtime = Runtime::new().expect("Tokio runtime");
-    let ac_miss = EmptyStore;
+    let lookup_stop = LookupStopStore;
     let warm = WarmStore::default();
 
     // Keep lazy fixture seeding and all filesystem setup out of the measured
     // warm path. This also proves the public call really returns a memo hit.
-    let seeded = runtime.block_on(run_memoized(warm_dir.path(), &warm, &warm_opts));
-    assert!(seeded.expect("seed warm memo").hit);
+    let seeded = runtime
+        .block_on(run_memoized(warm_dir.path(), &warm, &warm_opts))
+        .expect("seed warm memo");
+    assert!(seeded.hit);
+    assert_eq!(seeded.stdout, b"benchmark stdout");
+    assert_eq!(seeded.stderr, b"benchmark stderr");
 
-    let mut group = c.benchmark_group("run_key_fs_warm");
+    let mut group = c.benchmark_group("run_key_fs_warm_v2");
     group.throughput(Throughput::Bytes(bytes));
-    group.bench_function("ac_miss_key_and_tool_digest_fs_warm", |b| {
+    group.bench_function("lookup_refusal_after_key_fs_warm", |b| {
         b.iter(|| {
             let result = runtime.block_on(run_memoized(
-                black_box(ac_miss_dir.path()),
-                &ac_miss,
-                black_box(&ac_miss_opts),
+                black_box(lookup_dir.path()),
+                &lookup_stop,
+                black_box(&lookup_opts),
             ));
-            assert!(result.is_err(), "non-executable fixture must not run");
+            assert!(
+                matches!(&result, Err(ClwError::Transport(message)) if message == LOOKUP_STOP),
+                "must reach the actual AC lookup, not fail earlier: {result:?}"
+            );
             black_box(result)
         })
     });
@@ -279,6 +295,7 @@ fn bench_run_key_fs_warm(c: &mut Criterion) {
                 ))
                 .expect("seeded memo hit");
             assert!(result.hit);
+            assert_eq!(result.key, seeded.key, "warm key must stay stable");
             black_box(result)
         })
     });

@@ -26,6 +26,15 @@
 
 pub use clw_types as types;
 
+#[cfg(unix)]
+mod selected_tool;
+
+struct PreparedRun {
+    key: Digest,
+    #[cfg(unix)]
+    tool: selected_tool::SelectedTool,
+}
+
 use clw_manifest::walk;
 use clw_types::{AcTransport, CasTransport, ClwError, Digest, Result, CAS_BLOB_CAP_BYTES};
 use serde::{Deserialize, Serialize};
@@ -328,6 +337,7 @@ fn global_tool_digest_cache() -> &'static ToolDigestCache {
 /// path separator (`\` on Windows), and absolute paths incl. Windows drive-letters
 /// (`C:\tool.exe`, `C:/tool.exe`). Without the Windows arms, a backslash/drive
 /// path would fall into the PATH branch, miss, and silently degrade the tool key.
+#[cfg(any(test, not(unix)))]
 fn looks_like_path(cmd0: &str) -> bool {
     cmd0.contains('/') || cmd0.contains(std::path::MAIN_SEPARATOR) || Path::new(cmd0).is_absolute()
 }
@@ -335,6 +345,7 @@ fn looks_like_path(cmd0: &str) -> bool {
 /// Search `PATH` for a bare command name. On Windows a bare `cargo` is launched as
 /// `cargo.exe`, so we also try each `PATHEXT` extension — otherwise the lookup
 /// misses and the tool key degrades to a content-free literal.
+#[cfg(any(test, not(unix)))]
 fn search_path(cmd0: &str) -> Option<std::path::PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
@@ -368,6 +379,7 @@ fn search_path(cmd0: &str) -> Option<std::path::PathBuf> {
 /// digest only when its exact executable fingerprint still matches. Tests can
 /// pass an isolated cache to prove a true no-rehash hit without relying on timing
 /// or global test execution order.
+#[cfg(any(test, not(unix)))]
 async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCache) -> String {
     // A relative tool path must resolve where the command actually RUNS, not
     // against the orchestrator process cwd (else the digest is unstable / wrong).
@@ -383,6 +395,12 @@ async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCa
         return format!("literal:{cmd0}");
     };
 
+    digest_tool_path(&path, cmd0, cache).await
+}
+
+/// Hash the already-selected path with the existing bounded fingerprint cache.
+/// Unix callers reject metadata/literal fallbacks before authorizing a memo.
+async fn digest_tool_path(path: &Path, cmd0: &str, cache: &ToolDigestCache) -> String {
     // A resolution/reread can race a package-manager replacement. Retry a
     // bounded number of times; on persistent churn we deliberately fail closed
     // to the established metadata/literal fallback instead of returning bytes
@@ -390,12 +408,12 @@ async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCa
     const RESOLUTION_ATTEMPTS: usize = 3;
     for _ in 0..RESOLUTION_ATTEMPTS {
         if ToolFingerprint::cacheable() {
-            if let Ok(fingerprint) = ToolFingerprint::read(&path).await {
+            if let Ok(fingerprint) = ToolFingerprint::read(path).await {
                 if let Some(digest) = cache.get(&fingerprint) {
                     // Read the resolved path again immediately before returning:
                     // a rename with preserved len/mtime is rejected by the Unix
                     // device/inode/ctime fields in the complete fingerprint.
-                    if ToolFingerprint::read(&path).await.ok().as_ref() == Some(&fingerprint) {
+                    if ToolFingerprint::read(path).await.ok().as_ref() == Some(&fingerprint) {
                         return format!("digest:{}", digest.to_hex());
                     }
                     continue;
@@ -408,23 +426,23 @@ async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCa
         // Open once, then inspect and hash that same descriptor. Metadata from a
         // separate pathname lookup could belong to a replacement made while the
         // digest was running.
-        let mut file = match tokio::fs::File::open(&path).await {
+        let mut file = match tokio::fs::File::open(path).await {
             Ok(file) => file,
-            Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+            Err(_) => return tool_metadata_or_literal(path, cmd0).await,
         };
         let before = match file.metadata().await {
-            Ok(metadata) => match ToolFingerprint::from_metadata(&path, &metadata) {
+            Ok(metadata) => match ToolFingerprint::from_metadata(path, &metadata) {
                 Ok(fingerprint) => fingerprint,
                 // No exact fingerprint means no proof and hence no cache. The
                 // digest is still valid for this one invocation, as before.
                 Err(_) => match digest_open_file(&mut file).await {
                     Ok(digest) => return format!("digest:{}", digest.to_hex()),
-                    Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+                    Err(_) => return tool_metadata_or_literal(path, cmd0).await,
                 },
             },
             Err(_) => match digest_open_file(&mut file).await {
                 Ok(digest) => return format!("digest:{}", digest.to_hex()),
-                Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+                Err(_) => return tool_metadata_or_literal(path, cmd0).await,
             },
         };
 
@@ -432,13 +450,13 @@ async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCa
         // read with a blocking std::fs call nor allocated in full on the async worker.
         let digest = match digest_open_file(&mut file).await {
             Ok(digest) => digest,
-            Err(_) => return tool_metadata_or_literal(&path, cmd0).await,
+            Err(_) => return tool_metadata_or_literal(path, cmd0).await,
         };
         let after = match file.metadata().await {
-            Ok(metadata) => ToolFingerprint::from_metadata(&path, &metadata).ok(),
+            Ok(metadata) => ToolFingerprint::from_metadata(path, &metadata).ok(),
             Err(_) => None,
         };
-        let path_now = ToolFingerprint::read(&path).await.ok();
+        let path_now = ToolFingerprint::read(path).await.ok();
         if after.as_ref() != Some(&before) || path_now.as_ref() != Some(&before) {
             continue;
         }
@@ -452,7 +470,7 @@ async fn resolve_tool_id_with_cache(cwd: &Path, cmd0: &str, cache: &ToolDigestCa
         return format!("digest:{}", digest.to_hex());
     }
 
-    tool_metadata_or_literal(&path, cmd0).await
+    tool_metadata_or_literal(path, cmd0).await
 }
 
 /// Preserve the historical failed-digest fallbacks byte-for-byte. This helper is
@@ -489,6 +507,7 @@ async fn tool_metadata_or_literal(path: &Path, cmd0: &str) -> String {
 ///
 /// Returns `Err(ClwError::Io(...))` if any input path is missing, or
 /// `Err(ClwError::InvalidManifest(...))` for walk errors.
+#[cfg(test)]
 async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
     compute_key_with_tool_digest_cache(cwd, opts, global_tool_digest_cache()).await
 }
@@ -496,11 +515,29 @@ async fn compute_key(cwd: &Path, opts: &RunOptions) -> Result<Digest> {
 /// Cache-injectable form of [`compute_key`]. This keeps the production payload
 /// and resulting digest exactly the same while making the tool-digest cache
 /// observable in deterministic tests.
+#[cfg(test)]
 async fn compute_key_with_tool_digest_cache(
     cwd: &Path,
     opts: &RunOptions,
     tool_digest_cache: &ToolDigestCache,
 ) -> Result<Digest> {
+    Ok(
+        prepare_run_with_tool_digest_cache(cwd, opts, tool_digest_cache)
+            .await?
+            .key,
+    )
+}
+
+/// Build the key and retain the Unix executable chosen for this invocation.
+async fn prepare_run_with_tool_digest_cache(
+    cwd: &Path,
+    opts: &RunOptions,
+    tool_digest_cache: &ToolDigestCache,
+) -> Result<PreparedRun> {
+    let cmd0 = opts
+        .command
+        .first()
+        .ok_or_else(|| ClwError::InvalidManifest("empty command".into()))?;
     // --- inputs ---
     // NOTE (cache-key change): this key now folds in (a) empty input directories
     // by path, (b) each input file's unix mode (exec/perm bits), and (c) `/`-
@@ -616,23 +653,19 @@ async fn compute_key_with_tool_digest_cache(
     }
 
     // --- tool identity ---
-    // Resolve command[0] to a content digest (or literal marker) so an in-place
-    // toolchain upgrade invalidates stale memoized results instead of replaying
-    // them. `run_memoized` guarantees a non-empty command before reaching here,
-    // but guard defensively in case compute_key is ever called directly.
-    let tool = if opts.command.is_empty() {
-        String::new()
-    } else {
-        // Tool resolution retains the streamed file-digest state machine. Box it
-        // at this boundary so callers of `compute_key` do not inherit that large
-        // future frame on Tokio's default worker stack.
-        Box::pin(resolve_tool_id_with_cache(
-            cwd,
-            &opts.command[0],
-            tool_digest_cache,
-        ))
-        .await
-    };
+    // Unix selects once and retains that path across lookup and dispatch.
+    // The non-Unix branch remains unchanged and is not certified by this fix.
+    #[cfg(unix)]
+    let selected = Box::pin(selected_tool::SelectedTool::resolve(
+        cwd,
+        cmd0,
+        tool_digest_cache,
+    ))
+    .await?;
+    #[cfg(unix)]
+    let tool = selected.identity.clone();
+    #[cfg(not(unix))]
+    let tool = Box::pin(resolve_tool_id_with_cache(cwd, cmd0, tool_digest_cache)).await;
 
     // --- working directory ---
     // Fold the canonicalized absolute cwd into the key so two invocations with
@@ -660,7 +693,11 @@ async fn compute_key_with_tool_digest_cache(
     let mut hasher = blake3::Hasher::new();
     hasher.update(RUN_KEY_DOMAIN.as_bytes());
     hasher.update(&json_bytes);
-    Ok(Digest(*hasher.finalize().as_bytes()))
+    Ok(PreparedRun {
+        key: Digest(*hasher.finalize().as_bytes()),
+        #[cfg(unix)]
+        tool: selected,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +804,7 @@ fn initial_lookup_error(error: ClwError) -> ClwError {
 /// On a key HIT the stored stdout/stderr/exit are replayed without re-executing;
 /// on a MISS the child runs (inheriting the orchestrator's full ambient
 /// environment — clw does NOT `env_clear()` in v0.1) and a zero-exit result is
-/// memoized. The key is derived by [`compute_key`] from the declared `--input`
+/// memoized. The key is derived by `prepare_run_with_tool_digest_cache` from the declared `--input`
 /// digests, the declared `--env` variable NAMES, the command + tool identity,
 /// and the canonicalized `cwd`. See the crate-level "Memoization contract (v0.1)"
 /// doc: UNDECLARED env vars that affect the command's output are NOT in the key
@@ -782,13 +819,17 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
         return Err(ClwError::InvalidManifest("empty command".to_string()));
     }
 
-    let key = compute_key(cwd, opts).await?;
+    let prepared =
+        prepare_run_with_tool_digest_cache(cwd, opts, global_tool_digest_cache()).await?;
+    let key = prepared.key;
 
     // --- AC lookup ---
-    if let Some(record_bytes) = AcTransport::get(client, &key)
+    let record_bytes = AcTransport::get(client, &key)
         .await
-        .map_err(initial_lookup_error)?
-    {
+        .map_err(initial_lookup_error)?;
+    #[cfg(unix)]
+    prepared.tool.verify().await?;
+    if let Some(record_bytes) = record_bytes {
         // Non-success records retain their blob references for GC, but do not
         // authorize replay. Leave an occupied create-only AC key untouched;
         // a failed cache write never changes the completed fallback outcome.
@@ -801,6 +842,8 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
                 CasTransport::get(client, &record.stderr).await,
             ) {
                 (Ok(stdout), Ok(stderr)) => {
+                    #[cfg(unix)]
+                    prepared.tool.verify().await?;
                     // Diagnostic channel (M5.1): cache hit + key on stderr.
                     tracing::debug!(key = %key.to_hex(), hit = true, "run cache hit");
                     return Ok(RunOutcome {
@@ -822,6 +865,9 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // --- MISS: execute the command ---
     // Diagnostic channel (M5.1): cache miss + key on stderr.
     tracing::debug!(key = %key.to_hex(), hit = false, "run cache miss; executing");
+    #[cfg(unix)]
+    let mut command = prepared.tool.command(&opts.command[0]);
+    #[cfg(not(unix))]
     let mut command = tokio::process::Command::new(&opts.command[0]);
     command
         .args(&opts.command[1..])
@@ -838,6 +884,8 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // A caller may cancel `run_memoized` while the command is still running.
     // Tie the direct child to this future so dropping it does not leak that child.
     command.kill_on_drop(true);
+    #[cfg(unix)]
+    prepared.tool.verify().await?;
     let mut child = command.spawn()?;
 
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
@@ -965,7 +1013,12 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     // the child's result. A cap-blow or a non-zero/signal exit never reaches here (the
     // former returns `TooLarge` above; the latter fails the `== 0` guard), so a torn
     // or unsuccessful run is never cached as a complete success.
-    if exit_code == 0 {
+    let publish = exit_code == 0;
+    #[cfg(unix)]
+    let publish = publish && prepared.tool.is_current().await;
+    // Detected post-dispatch changes suppress caching, never the actual result
+    // and never authorize an automatic second run. This is not an ABA proof.
+    if publish {
         let stdout_digest = Digest::of_bytes(&stdout);
         let stderr_digest = Digest::of_bytes(&stderr);
 
@@ -1331,6 +1384,13 @@ mod tests {
         let tool_path = cwd.join("tool");
         std::fs::write(&input, b"input-v1").unwrap();
         std::fs::write(&tool_path, b"tool-v1").unwrap();
+        // Key derivation now admits executable tools, not any regular file.
+        // This fixture exercises hashing only; it does not claim loader acceptance.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let tool = tool_path.to_string_lossy().into_owned();
         let opts = RunOptions {
@@ -1377,6 +1437,13 @@ mod tests {
         let original = b"#!/bin/sh\necho stable\n";
         std::fs::write(&tool_a, original).unwrap();
         std::fs::write(&tool_b, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for tool in [&tool_a, &tool_b] {
+                std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
         // Explicit timestamps make the mtime-only invalidation deterministic;
         // no wall-clock resolution or sleep is involved.
         set_modified(&tool_a, 10_000);

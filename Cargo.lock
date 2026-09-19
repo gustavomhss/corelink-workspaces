@@ -441,6 +441,7 @@ dependencies = [
  "clw-types",
  "criterion",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

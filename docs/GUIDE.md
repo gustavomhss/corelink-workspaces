@@ -196,6 +196,32 @@ an unverified download. See [DISTRIBUTION.md](DISTRIBUTION.md) for the selected
 platform signing policy, rather than assuming every current asset is unsigned.
 
 
+### Unix executable identity (#301 implementation slice)
+
+Unix runs resolve an executable once, check effective launch access and readable
+content identity, and launch that same selected path while preserving native
+argv0, arguments and cwd. Missing or unreadable tools cannot authorize a cache
+HIT. Relative command/PATH entries use child cwd. A PATH made only of empty
+entries (`""`, `":"`, `"::"`) retains its original value and bare script spelling;
+all entries identify that same cwd location. On Linux, if an empty entry in a
+**mixed-directory PATH** wins selection, the invocation is refused before lookup:
+use an explicit `./tool` path or `PATH=.`. This conservative boundary avoids
+changing script `$0`, silently rewriting the child's PATH, or selecting another
+location. Nonempty winning entries are unaffected.
+A bare command with **PATH absent is explicitly refused**; supply an explicit
+path rather than relying on an OS default search.
+
+The v4 run domain remains, with a disjoint `unix-executable-v1:` tool field.
+Previously keyed Unix memos become cold without deletion; downgrading to the
+old encoding can reactivate them. Detectable changes during lookup are refused;
+detectable changes after execution prevent memo storage but preserve its actual
+result. These checks are not atomic executable snapshots, ABA protection or
+transitive interpreter/toolchain tracking.
+
+This is a Unix-only source update, not Windows parity or release evidence.
+See [the scoped decision and acceptance criteria](validation/2026-09-19-unix-tool-identity.md).
+The #302 environment rules and external-Action limitations below remain intact.
+
 ### Declared environment compatibility (#302)
 
 `--env NAME` accepts absent, empty and nonempty UTF-8 values as distinct inputs.

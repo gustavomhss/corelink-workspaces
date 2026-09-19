@@ -6312,3 +6312,66 @@ async fn run_declared_non_utf8_env_rejected_before_lookup_or_spawn() {
     assert!(String::from_utf8_lossy(&again.stderr).contains("cache hit"));
     assert_eq!(std::fs::read(root.path().join("executions")).unwrap(), b"x");
 }
+
+// #301: real CLI + HTTP, with PATH explicitly declared and an unexecutable shadow.
+#[tokio::test]
+async fn run_tool_path_shadow_tracks_actual_executable_content() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let server = MockServer::start().await;
+    let (_cas, _ac) = mount_corelink_opts(&server, true, true).await;
+    let cache = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let shadow = root.path().join("shadow");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&shadow).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(root.path().join("input.txt"), b"stable").unwrap();
+    let name = "clw301-cli-probe";
+    std::fs::write(shadow.join(name), b"not executable").unwrap();
+    std::fs::set_permissions(shadow.join(name), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let tool = bin.join(name);
+    let write_tool = |value: &str| {
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nprintf '{value}'\nprintf x >> executions\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let path_value = std::env::join_paths([&shadow, &bin]).unwrap();
+    let invoke = || {
+        clw_cmd(&server.uri(), cache.path())
+            .env("HOME", home.path())
+            .env("PATH", &path_value)
+            .current_dir(root.path())
+            .args(["run", "--input", "input.txt", "--env", "PATH", "--", name])
+            .output()
+            .unwrap()
+    };
+    for (i, value) in ["old", "new"].iter().enumerate() {
+        write_tool(value);
+        let first = invoke();
+        assert!(first.status.success(), "{first:?}");
+        assert_eq!(first.stdout, value.as_bytes());
+        assert!(String::from_utf8_lossy(&first.stderr).contains("cache miss"));
+        let repeat = invoke();
+        assert!(repeat.status.success(), "{repeat:?}");
+        assert_eq!(repeat.stdout, value.as_bytes());
+        assert!(String::from_utf8_lossy(&repeat.stderr).contains("cache hit"));
+        assert_eq!(
+            std::fs::read(root.path().join("executions")).unwrap(),
+            vec![b'x'; i + 1]
+        );
+    }
+    std::fs::remove_file(&tool).unwrap();
+    let before = server.received_requests().await.unwrap().len();
+    let absent = invoke();
+    assert_eq!(absent.status.code(), Some(125));
+    assert!(absent.stdout.is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+    assert_eq!(
+        std::fs::read(root.path().join("executions")).unwrap(),
+        b"xx"
+    );
+}
