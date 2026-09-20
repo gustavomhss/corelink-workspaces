@@ -15,6 +15,8 @@ tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# Already locked; private namespace probes and complete-file no-clobber publication.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

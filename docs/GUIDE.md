@@ -196,6 +196,20 @@ an unverified download. See [DISTRIBUTION.md](DISTRIBUTION.md) for the selected
 platform signing policy, rather than assuming every current asset is unsigned.
 
 
+### Destination name compatibility
+
+Hydration checks literal names and implicit directory prefixes in a private,
+payload-free probe on the destination filesystem before fetching file chunks.
+Case or Unicode-equivalent names that collide there are refused; names are not
+lowercased or rewritten. The finite namespace limit includes implicit parents:
+1,000,000 nodes. An unrepresentable tree is not reported as a successful restore.
+
+Regular files publish complete, synced content with final metadata using a
+no-clobber operation. A late occupant causes an explicit error, not replacement.
+A failure can leave an empty destination or already completed files; this is not
+a transactional whole-tree restore or protection against arbitrary local writers.
+See [the namespace decision and native-volume evidence](validation/2026-09-19-destination-namespace.md).
+
 ### Unix executable identity (#301 implementation slice)
 
 Unix runs resolve an executable once, check effective launch access and readable

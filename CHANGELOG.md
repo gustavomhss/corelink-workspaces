@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Fixed
+- Namespace-probe cleanup removes only successfully created names in reverse
+  order, preserving failed aliases and reporting unknown residue (#303).
+- Hydrate rejects destination name collisions, including implicit directory
+  aliases, before file-content fetches (#303). Literal manifest names remain
+  unchanged; private filesystem probes include at most 1,000,000 namespace nodes.
+  Complete regular-file publication now refuses occupied names instead of
+  overwriting them. Native sensitive/insensitive-volume evidence is kept separate
+  from Windows copy-policy and sibling-writer lifetime obligations.
 - Cwd-only PATH lists preserve native script launch spelling and their exact
   child PATH in the Unix selected-tool correction (#301). On Linux, a selected
   empty component in a mixed PATH is explicitly refused before memo lookup;

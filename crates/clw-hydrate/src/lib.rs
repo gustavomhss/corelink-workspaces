@@ -11,7 +11,11 @@ pub use clw_types as types;
 // The Windows copy-fallback's self-reference guard. Deliberately NOT
 // `cfg(windows)`: it is a plain, target-independent predicate so its table test
 // runs under a normal `cargo test` on every platform (see the module docs).
+mod destination_namespace;
 mod path_containment;
+
+#[cfg(all(test, unix))]
+mod destination_namespace_tests;
 
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -408,6 +412,17 @@ where
     // 3. Ensure dest exists.
     // ------------------------------------------------------------------
     std::fs::create_dir_all(dest)?;
+    // #303: validate real destination name equivalence before fetching payloads.
+    // Move the manifest through the blocking task instead of cloning its entries.
+    let probe_dest = dest.to_path_buf();
+    let manifest = tokio::task::spawn_blocking(move || {
+        destination_namespace::validate(&probe_dest, &manifest)?;
+        Ok::<_, ClwError>(manifest)
+    })
+    .await
+    .map_err(|error| {
+        ClwError::Transport(format!("destination name validation task failed: {error}"))
+    })??;
 
     // Shared state for per-file counters.
     let bytes_from_cache = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -579,6 +594,17 @@ impl Drop for TmpFileGuard {
     }
 }
 
+/// Remove a post-publication temporary name when the no-clobber primitive
+/// used a hard-link fallback. A missing name means the primitive already moved
+/// or unlinked it; any other error is a real cleanup failure and must surface.
+fn cleanup_published_temp(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ClwError::Io(error)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal: materialise one file
 //
@@ -691,7 +717,14 @@ fn spawn_file_writer(
                         })?;
                     }
                     drop(file);
-                    std::fs::rename(&tmp_path, &abs)?;
+                    // Atomic no-replacement of the final name, not exists+rename.
+                    // The existing guard remains the sole cleanup owner on errors.
+                    let mut owned = tempfile::TempPath::from_path(tmp_path.clone());
+                    owned.disable_cleanup(true);
+                    owned.persist_noclobber(&abs).map_err(|error| error.error)?;
+                    // The safe dependency may fall back to hard-link + unlink.
+                    // Require removal of that extra temporary name before success.
+                    cleanup_published_temp(&tmp_path)?;
                     tmp_guard.disarm();
                     if let Ok(dir) = std::fs::File::open(&parent) {
                         let _ = dir.sync_all();
@@ -2848,6 +2881,25 @@ mod tests {
             );
             assert_eq!(std::fs::read(&final_path).unwrap(), b"private-bytes");
         }
+    }
+
+    #[test]
+    fn published_temp_cleanup_distinguishes_absent_from_real_failure() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("already-absent");
+        cleanup_published_temp(&missing).unwrap();
+
+        let directory = dir.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        let error = cleanup_published_temp(&directory).unwrap_err();
+        assert!(matches!(
+            error,
+            ClwError::Io(ref error) if error.kind() != ErrorKind::NotFound
+        ));
+        assert!(
+            directory.is_dir(),
+            "cleanup must not remove an unexpected directory"
+        );
     }
 
     #[cfg(unix)]
