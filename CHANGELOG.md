@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Fixed
+- Unix hydration validates the complete manifest path tree and bounded symlink
+  resolution before destination writes (#296). All implicit directories are
+  created before links; link names are exclusively reserved to detect filesystem
+  aliases before any link is published, and publication checks plain parents. Safe
+  relative links and dangling normal suffixes remain supported. Unresolvable
+  parent traversal, detected graph cycles and excessive resolution work are refused. This does
+  not change manifest-v1 serialization or certify hostile local-writer exclusion
+  or Windows copy/ACL behavior. Destination name-equivalence protection remains
+  the complementary #303 guard rather than being reimplemented here.
 - Namespace-probe cleanup removes only successfully created names in reverse
   order, preserving failed aliases and reporting unknown residue (#303).
 - Hydrate rejects destination name collisions, including implicit directory

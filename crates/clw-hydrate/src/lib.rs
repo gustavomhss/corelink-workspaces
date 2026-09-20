@@ -8,6 +8,10 @@
 
 pub use clw_types as types;
 
+// Unix-only whole-tree admission; the portable manifest wire format is unchanged.
+#[cfg(unix)]
+mod manifest_paths;
+
 // The Windows copy-fallback's self-reference guard. Deliberately NOT
 // `cfg(windows)`: it is a plain, target-independent predicate so its table test
 // runs under a normal `cargo test` on every platform (see the module docs).
@@ -408,6 +412,10 @@ where
         total_chunks,
     )?;
 
+    // Validate the complete tree/link graph before creating destination entries.
+    #[cfg(unix)]
+    manifest_paths::validate(&manifest)?;
+
     // ------------------------------------------------------------------
     // 3. Ensure dest exists.
     // ------------------------------------------------------------------
@@ -423,6 +431,14 @@ where
     .map_err(|error| {
         ClwError::Transport(format!("destination name validation task failed: {error}"))
     })??;
+    // Pin the user-selected root's physical location (including a deliberate
+    // root alias such as macOS /tmp). Below it, only plain parents are accepted.
+    #[cfg(unix)]
+    let physical_dest = std::fs::canonicalize(dest)?;
+    #[cfg(unix)]
+    let dest = physical_dest.as_path();
+    #[cfg(unix)]
+    manifest_paths::prepare_directories(dest, &manifest)?;
 
     // Shared state for per-file counters.
     let bytes_from_cache = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -436,7 +452,8 @@ where
     // (3c, after all regular files exist). A symlink created before its sibling
     // files could redirect a later file write outside the intended location
     // (e.g. a link `out/sub` → `/etc` followed by a file `out/sub/passwd`).
-    // Creating every regular file first removes that window.
+    // Ordering alone is insufficient: Unix also validates the complete link
+    // graph above and reserves all link names before the final link pass.
     // ------------------------------------------------------------------
     for entry in &manifest.entries {
         if let Entry::Dir { path } = entry {
@@ -513,6 +530,8 @@ where
     // ------------------------------------------------------------------
     // The symlink-count cap (MAX_SYMLINK_ENTRIES) was already enforced up-front
     // in enforce_resource_bounds, before any filesystem work — see pass 2c.
+    #[cfg(unix)]
+    let mut link_slots = manifest_paths::LinkSlots::reserve(dest, &manifest)?;
     for entry in &manifest.entries {
         if let Entry::Symlink { path, target } = entry {
             // Defense-in-depth: validate both the link path and its target. The
@@ -522,13 +541,15 @@ where
             // any target that would escape the workspace root is still rejected.
             clw_types::validate_rel_path(path)?;
             clw_types::validate_symlink_target_contained(path, target)?;
+            #[cfg(windows)]
             let abs = dest.join(path);
+            #[cfg(windows)]
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             // On unix, create a real symlink.
             #[cfg(unix)]
-            std::os::unix::fs::symlink(target, &abs)?;
+            link_slots.publish(dest, path, target)?;
             // On Windows there are no *unprivileged* symlinks (creating one
             // requires elevated privileges / Developer Mode), so clw copies the
             // target's bytes into the link path instead of linking. This means a
@@ -1385,6 +1406,9 @@ mod tests {
             "report echoes the requested manifest digest"
         );
     }
+
+    #[cfg(unix)]
+    mod confinement_integration_tests;
 
     // -----------------------------------------------------------------------
     // Test 1c: a manifest-digest hydrate is self-verifying — if the CAS bytes at
