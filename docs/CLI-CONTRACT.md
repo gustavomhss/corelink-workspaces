@@ -77,9 +77,10 @@ Wrappers that must decide whether an optional cold retry is safe may set
 `CLW_RUN_STATE_FILE` to a fresh, private file path. `clw run` consumes this variable and strips it
 from the child environment. The file contains exactly one ASCII state line: `NOT_STARTED`,
 `DISPATCHING`, or `EXECUTED`. `NOT_STARTED` is written before setup; immediately before spawn the
-state advances to `DISPATCHING`; a known OS spawn failure restores `NOT_STARTED`; successful spawn
-advances it to `EXECUTED`. State updates use a temporary sibling and atomic rename. Failure to
-advance after dispatch leaves an ambiguous state and cannot authorize a retry. Missing, malformed,
+state advances to `DISPATCHING`; a known OS spawn failure restores `NOT_STARTED`. `EXECUTED` is
+written only after the direct child's exit status is observed and its bounded stdout/stderr capture
+succeeds. State updates use a temporary sibling and atomic rename. Any post-spawn wait, pipe, or
+output-cap failure leaves an ambiguous state and cannot authorize a retry. Missing, malformed,
 or unknown receipt content is also ambiguous. A wrapper may retry only when the command failed and
 the final receipt is exactly `NOT_STARTED`; exit numbers and output text never prove execution
 state. This additive variable leaves ordinary `clw run` invocation and exit-code behavior unchanged.

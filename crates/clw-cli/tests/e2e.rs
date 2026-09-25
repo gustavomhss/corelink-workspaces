@@ -3175,6 +3175,40 @@ async fn run_missing_command_exits_reserved_125_child_never_ran() {
     );
 }
 
+/// Receipt initialization must fail before dispatch: without a writable receipt,
+/// the child is not launched and cannot be mistaken for a retry-safe failure.
+#[tokio::test]
+async fn run_receipt_initialization_failure_does_not_spawn_child() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+    let state_file = work.path().join("missing-parent/run-state");
+    let marker = work.path().join("child-ran");
+    let script = format!("printf x >> {}; exit 125", marker.display());
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state_file)
+        .args([
+            "run",
+            "--input",
+            "input.txt",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(125));
+    assert!(!marker.exists(), "receipt failure must happen before child spawn");
+    assert!(!state_file.exists(), "failed receipt initialization leaves no receipt");
+}
+
 /// A child killed by a signal must propagate the POSIX 128+signal code (SIGTERM → 143),
 /// not a truncated 255, and a signal-killed (non-zero) result must NOT be cached.
 #[tokio::test]
@@ -4704,7 +4738,7 @@ async fn run_oversized_child_output_exits_137() {
                 .unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert_eq!(out.status.code(), Some(137), "{stderr}");
-            assert_eq!(std::fs::read(&state_file).unwrap(), b"EXECUTED\n");
+            assert_eq!(std::fs::read(&state_file).unwrap(), b"DISPATCHING\n");
             assert!(stderr.contains("child output exceeded the cap"), "{stderr}");
             assert!(!stderr.contains("child not run"), "{stderr}");
             assert_eq!(

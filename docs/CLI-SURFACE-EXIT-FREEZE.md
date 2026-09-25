@@ -78,11 +78,11 @@ history. Different paths can return the same integer.
 When `CLW_RUN_STATE_FILE` names a fresh private path, `clw run` writes one strict ASCII state line:
 `NOT_STARTED\n`, `DISPATCHING\n`, or `EXECUTED\n`. The receipt is control metadata and is removed
 from the child environment. `NOT_STARTED` is initialized before run setup; immediately before OS
-spawn the state becomes `DISPATCHING`; a known spawn failure restores `NOT_STARTED`; successful
-spawn advances it to `EXECUTED`. Each state replacement is written to a sibling temporary file and
-atomically renamed. If dispatch may have happened, the state stays `DISPATCHING` or `EXECUTED` even
-when later I/O, signal, or output-cap handling fails. Missing, malformed, unreadable, or unknown
-state means unknown/possibly executed.
+spawn the state becomes `DISPATCHING`; a known spawn failure restores `NOT_STARTED`. `EXECUTED` is
+written only after the direct child's exit status is observed and its bounded stdout/stderr capture
+succeeds. Each state replacement is written to a sibling temporary file and atomically renamed. If
+dispatch may have happened, the state stays `DISPATCHING` when wait, pipe, I/O, or output-cap
+handling fails. Missing, malformed, unreadable, or unknown state means unknown/possibly executed.
 
 An optional consumer may make one cold fallback only when the command failed and the final receipt
 is exactly `NOT_STARTED`. `EXECUTED` preserves the observed child verdict, including 125. All other

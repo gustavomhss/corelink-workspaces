@@ -957,16 +957,6 @@ async fn run_memoized_inner<C: CasTransport + AcTransport>(
             return Err(error.into());
         }
     };
-    if let Some(path) = state_file {
-        if let Err(error) = write_execution_state(path, RUN_STATE_EXECUTED) {
-            // We already have a child process; never turn a receipt failure into a
-            // retry authorization. Leave DISPATCHING in place and stop the child.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(error.into());
-        }
-    }
-
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
     // child output first. `wait_with_output` reads ALL of stdout/stderr into memory
     // before any size check runs, so a command emitting gigabytes OOMs the process
@@ -1137,6 +1127,15 @@ async fn run_memoized_inner<C: CasTransport + AcTransport>(
             );
         })
         .await;
+    }
+
+    if let Some(path) = state_file {
+        // EXECUTED means we observed the direct child's completed verdict and
+        // captured its bounded output successfully. Until this point, any
+        // post-spawn wait/pipe/cap failure leaves DISPATCHING so callers fail
+        // closed instead of mistaking a wrapper error (including 125) for the
+        // child's result. If this atomic receipt update fails, DISPATCHING remains.
+        write_execution_state(path, RUN_STATE_EXECUTED)?;
     }
 
     Ok(RunOutcome {
