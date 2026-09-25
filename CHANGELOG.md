@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- `clw run` can write an atomic `CLW_RUN_STATE_FILE` receipt so wrappers distinguish
+  proven pre-spawn failure from a child result without parsing exit codes or output.
+  The additive states are `NOT_STARTED`, `DISPATCHING`, and `EXECUTED`; uncertain
+  dispatch never authorizes an automatic retry (#567).
 - Unix hydration validates the complete manifest path tree and bounded symlink
   resolution before destination writes (#296). All implicit directories are
   created before links; link names are exclusively reserved to detect filesystem

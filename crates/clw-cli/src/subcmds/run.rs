@@ -19,7 +19,9 @@ use std::io::Write as _;
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_run::{run_memoized, RunOptions};
+use clw_run::{
+    initialize_execution_state, run_memoized, run_memoized_with_state_file, RunOptions,
+};
 use clw_types::ClwError;
 
 use crate::config::ResolvedConfig;
@@ -73,9 +75,9 @@ const JSON_NOT_APPLICABLE_HINT: &str =
     "[clw] note: --json does not apply to `run` (it proxies the child's stdout/stderr); ignoring it";
 
 /// Reserved exit code for a `clw run` clw-INTERNAL failure where the **child never
-/// ran** (substrate unreachable, bad config, hydrate/cache error). Distinct from the
-/// child's passed-through exit code so a caller (e.g. the CoreLink runner) can tell a
-/// clw failure from a child result, and never caches it. 125 is the docker / `env` /
+/// ran** (substrate unreachable, bad config, hydrate/cache error). A child may also
+/// return 125, so callers use the optional execution receipt rather than treating
+/// this numeric value as proof. This wrapper error is never cached. 125 is the docker / `env` /
 /// `timeout` "the wrapper itself failed" convention. FROZEN — see docs/CLI-CONTRACT.md.
 ///
 /// `pub` so `main.rs` can route a `clw run` that fails DURING config/identity
@@ -124,17 +126,24 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
     };
 
     // EXIT-CODE CONTRACT (frozen — see docs/CLI-CONTRACT.md "exit-code convention"):
-    // `clw run` either runs the child (and passes the child's exit code through
-    // verbatim below) OR fails BEFORE the child ever runs — substrate unreachable,
-    // bad config, hydrate/cache error. That latter case is a clw-INTERNAL failure:
-    // the child never executed, so its result must NOT be mistaken for a child exit
-    // code and must NOT be cached. Signal it with the RESERVED exit code 125 — the
-    // docker / `env` / `timeout` "the wrapper itself failed" convention — which is
-    // distinct from the child passthrough. (A child SHOULD avoid emitting 125-127.)
+    // `clw run` passes a completed child's exit code verbatim or returns a wrapper
+    // error code. A child may return the same numeric value (notably 125), so callers
+    // that need retry safety use the optional out-of-band execution-state receipt.
+    let state_file = std::env::var_os("CLW_RUN_STATE_FILE").map(std::path::PathBuf::from);
+    if let Some(path) = state_file.as_deref() {
+        if let Err(error) = initialize_execution_state(path) {
+            eprintln!("[clw] could not initialize run execution receipt: {error}");
+            std::process::exit(CLW_RUN_INTERNAL_NOT_RUN);
+        }
+    }
     let outcome = match async move {
         let client = HttpClient::new(cfg.clw_config)?;
         let cwd = std::env::current_dir()?;
-        run_memoized(&cwd, &client, &opts).await
+        if let Some(path) = state_file.as_deref() {
+            run_memoized_with_state_file(&cwd, &client, &opts, path).await
+        } else {
+            run_memoized(&cwd, &client, &opts).await
+        }
     }
     .await
     {

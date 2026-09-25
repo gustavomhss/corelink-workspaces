@@ -4,7 +4,8 @@
 > drives. Requested by the Runners TL (2026-06-17 `relay-to-clw-tl-cli-and-exit-code-freeze.md`).
 > The original freeze is v0.1.0; additive changes and corrections are recorded below.
 > The 2026-09-18 clarification preserves the numeric interface and withdraws the
-> unsupported claim that an exit value uniquely proves execution history.
+> unsupported claim that an exit value uniquely proves execution history. The
+> additive execution-state receipt is documented below; it does not change exits.
 
 ## 1. The driven verbs (exact surface)
 
@@ -36,7 +37,7 @@
   #302: declared values must be representable as UTF-8; unsupported OS values
   fail before lookup/spawn **inside this clw invocation**, through the existing
   internal-error path (125). An enclosing Action in `optional` mode may run its
-  own cold fallback; this patch does not change that consumer (#567/#568).
+  own cold fallback only with the explicit `CLW_RUN_STATE_FILE` receipt below.
   The internal run-key domain moves to v4 (one cold memo domain); no flag,
   process code or RunRecord schema changes. A downgrade to a v3 client can
   reactivate incorrectly keyed legacy memos and is not a safe recovery path;
@@ -72,6 +73,22 @@ history. Different paths can return the same integer.
 | Invalid CLI arguments rejected by clap | `2` | This parser path does not start a child. A legitimate child may also return 2. |
 | Other wrapper errors handled by `run_err_exit_code` | `125` | The existing fallback mapping remains; #305 does not establish the execution phase of every other error, including errors after dispatch. |
 
+### Additive execution-state receipt for wrappers
+
+When `CLW_RUN_STATE_FILE` names a fresh private path, `clw run` writes one strict ASCII state line:
+`NOT_STARTED\n`, `DISPATCHING\n`, or `EXECUTED\n`. The receipt is control metadata and is removed
+from the child environment. `NOT_STARTED` is initialized before run setup; immediately before OS
+spawn the state becomes `DISPATCHING`; a known spawn failure restores `NOT_STARTED`; successful
+spawn advances it to `EXECUTED`. Each state replacement is written to a sibling temporary file and
+atomically renamed. If dispatch may have happened, the state stays `DISPATCHING` or `EXECUTED` even
+when later I/O, signal, or output-cap handling fails. Missing, malformed, unreadable, or unknown
+state means unknown/possibly executed.
+
+An optional consumer may make one cold fallback only when the command failed and the final receipt
+is exactly `NOT_STARTED`. `EXECUTED` preserves the observed child verdict, including 125. All other
+states fail closed. This adds no flag, changes no ordinary invocation or numeric exit value, and
+does not interpret stderr, cache HIT text, or the child's output as execution proof.
+
 Child exits 125 and 137 remain legitimate passthrough values. Asking commands to
 avoid them is not an enforced discriminator. The wrapper's diagnostic strings
 are for people: the existing `child not run` wording does not provide a reliable
@@ -83,8 +100,9 @@ text. Do not infer execution history by searching stderr for that phrase.
 Preserve the observed process result. **Do not automatically execute the command
 again solely because the result equals 125, 137, or 2.** A retry that depends on
 "the child did not run" needs positive, trustworthy phase evidence for that
-invocation; the numeric exit interface alone does not provide it. This
-clarification adds no new CLI flag, side channel, return code or public type.
+invocation; the numeric exit interface alone does not provide it. With
+`CLW_RUN_STATE_FILE`, only an exact `NOT_STARTED` receipt authorizes one optional
+cold fallback. Missing or ambiguous state fails closed.
 
 The earlier rule that classified every 125 as `ClwFailed`/never-executed and every
 137 as wrapper-terminated is withdrawn as a general consumer rule. It conflicted
@@ -93,9 +111,9 @@ record in Git rather than retaining contradictory current instructions.
 
 The separate consumer correction is tracked in
 [corelink-runners #567](https://github.com/HuGR-Labs/corelink-runners/issues/567).
-This document does not claim that consumer has been repaired. The #305 change
-only corrects the oversized **initial** lookup classification. Other error-phase
-limitations and final stream delivery remain separately scoped work.
+The receipt closes its retry-classification ambiguity. The #305 change only
+corrects the oversized **initial** lookup classification. Final stream delivery
+remains separately scoped work.
 
 For `snapshot` and `hydrate`, no child command is wrapped: zero remains success
 and a nonzero result is failure of that CLI operation.
@@ -108,7 +126,7 @@ An oversized initial AC response is refused **before child spawn**. At the
 the lower-level HTTP client still enforces and returns its typed body-cap error.
 The CLI reports its existing internal-error exit **125**, not a claim that a child
 was killed. Actual captured-output overflow retains **137** and no memo is stored.
-No shared error-enum variant, public function signature or key domain changes.
+No numeric outcome or key-domain changes.
 
 A child may itself return 125 or 137; those outcomes remain verbatim passthrough.
 These integers alone are therefore not a unique lifecycle discriminator and do

@@ -84,6 +84,39 @@ pub struct RunOptions {
     pub env_keys: Vec<String>,
 }
 
+const RUN_STATE_NOT_STARTED: &[u8] = b"NOT_STARTED\n";
+const RUN_STATE_DISPATCHING: &[u8] = b"DISPATCHING\n";
+const RUN_STATE_EXECUTED: &[u8] = b"EXECUTED\n";
+
+fn write_execution_state(path: &Path, state: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(format!(".tmp-{}-{id}", std::process::id()));
+    let temp = PathBuf::from(temp);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(state)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Initialize the optional wrapper receipt before any run setup can fail.
+pub fn initialize_execution_state(path: &Path) -> std::io::Result<()> {
+    write_execution_state(path, RUN_STATE_NOT_STARTED)
+}
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub key: Digest,
@@ -815,6 +848,28 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     client: &C,
     opts: &RunOptions,
 ) -> Result<RunOutcome> {
+    run_memoized_inner(cwd, client, opts, None).await
+}
+
+/// Run with an optional out-of-band execution-state receipt for wrappers that
+/// must distinguish a proven pre-spawn failure from an ambiguous/started child.
+/// The receipt is deliberately separate from stdout, stderr, and the exit code.
+pub async fn run_memoized_with_state_file<C: CasTransport + AcTransport>(
+    cwd: &Path,
+    client: &C,
+    opts: &RunOptions,
+    state_file: &Path,
+) -> Result<RunOutcome> {
+    initialize_execution_state(state_file)?;
+    run_memoized_inner(cwd, client, opts, Some(state_file)).await
+}
+
+async fn run_memoized_inner<C: CasTransport + AcTransport>(
+    cwd: &Path,
+    client: &C,
+    opts: &RunOptions,
+    state_file: Option<&Path>,
+) -> Result<RunOutcome> {
     if opts.command.is_empty() {
         return Err(ClwError::InvalidManifest("empty command".to_string()));
     }
@@ -881,12 +936,36 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     for var in SECRET_ENV_VARS {
         command.env_remove(var);
     }
+    // The caller's receipt path is control metadata for clw, never child input.
+    command.env_remove("CLW_RUN_STATE_FILE");
     // A caller may cancel `run_memoized` while the command is still running.
     // Tie the direct child to this future so dropping it does not leak that child.
     command.kill_on_drop(true);
     #[cfg(unix)]
     prepared.tool.verify().await?;
-    let mut child = command.spawn()?;
+    if let Some(path) = state_file {
+        write_execution_state(path, RUN_STATE_DISPATCHING)?;
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(path) = state_file {
+                // Restore proof only for the known OS spawn failure. If the write
+                // fails, DISPATCHING remains and consumers must fail closed.
+                let _ = write_execution_state(path, RUN_STATE_NOT_STARTED);
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(path) = state_file {
+        if let Err(error) = write_execution_state(path, RUN_STATE_EXECUTED) {
+            // We already have a child process; never turn a receipt failure into a
+            // retry authorization. Leave DISPATCHING in place and stop the child.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error.into());
+        }
+    }
 
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
     // child output first. `wait_with_output` reads ALL of stdout/stderr into memory

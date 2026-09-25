@@ -64,12 +64,25 @@ tenant-in-path is the sole client tenant authority. See [`config.rs`](../crates/
   to `128 + signal` (SIGTERM → 143); an unavailable signal number, and every non-Unix no-code status, map
   to `255`. A **clw-internal failure where the child never ran** (config / transport / hydrate / cache
   error) exits the **reserved code `125`** (the
-  docker / `env` / `timeout` "wrapper itself failed" convention) — distinct from any child passthrough —
-  so a runner classifies `125 → clw-failed`, any other code → the child's own result. (A clap *usage*
+  docker / `env` / `timeout` "wrapper itself failed" convention). Child commands may also return 125,
+  so a runner must not infer execution state from that number alone. (A clap *usage*
   error on `clw run` — malformed args, child never ran — exits `2` per clap; the runner builds the argv,
   so that is not expected in practice.) If `clw` kills a child for captured output over the CAS cap, the
   distinct internal outcome is `137` (`128 + SIGKILL`), not `125`. A non-zero run is **not** memoized — a
   failing job never poisons the cache. **Full frozen surface + exit table: `docs/CLI-SURFACE-EXIT-FREEZE.md`.**
+
+### Out-of-band execution receipt (additive)
+
+Wrappers that must decide whether an optional cold retry is safe may set
+`CLW_RUN_STATE_FILE` to a fresh, private file path. `clw run` consumes this variable and strips it
+from the child environment. The file contains exactly one ASCII state line: `NOT_STARTED`,
+`DISPATCHING`, or `EXECUTED`. `NOT_STARTED` is written before setup; immediately before spawn the
+state advances to `DISPATCHING`; a known OS spawn failure restores `NOT_STARTED`; successful spawn
+advances it to `EXECUTED`. State updates use a temporary sibling and atomic rename. Failure to
+advance after dispatch leaves an ambiguous state and cannot authorize a retry. Missing, malformed,
+or unknown receipt content is also ambiguous. A wrapper may retry only when the command failed and
+the final receipt is exactly `NOT_STARTED`; exit numbers and output text never prove execution
+state. This additive variable leaves ordinary `clw run` invocation and exit-code behavior unchanged.
 
 ## `clw run` memoization scope (v0.1)
 The run cache key is derived **only** from: the declared `--input` path digests (and Unix mode bits),
