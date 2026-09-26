@@ -19,7 +19,10 @@ use std::io::Write as _;
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_run::{initialize_execution_state, run_memoized, run_memoized_with_state_file, RunOptions};
+use clw_run::{
+    initialize_execution_state, run_memoized, run_memoized_required_hit,
+    run_memoized_with_state_file, RunOptions, REQUIRED_HIT_CAPABILITY,
+};
 use clw_types::ClwError;
 
 use crate::config::ResolvedConfig;
@@ -56,6 +59,13 @@ pub struct RunArgs {
         help = "Environment variable names to fold into the cache key; repeat for multiple"
     )]
     pub env: Vec<String>,
+
+    /// Refuse execution unless the matching cached result and both output blobs verify.
+    #[arg(
+        long = "require-hit",
+        help = "Require a complete, verified cache hit; never execute on a miss (capability required-hit/v1)"
+    )]
+    pub require_hit: bool,
 
     /// The command to run (after `--`).
     #[arg(
@@ -117,6 +127,7 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
         eprintln!("{JSON_NOT_APPLICABLE_HINT}");
     }
 
+    let require_hit = args.require_hit;
     let opts = RunOptions {
         inputs: args.input,
         command: args.cmd,
@@ -138,7 +149,25 @@ pub async fn run(args: RunArgs, cfg: ResolvedConfig, json: bool) -> Result<(), C
         let client = HttpClient::new(cfg.clw_config)?;
         let cwd = std::env::current_dir()?;
         if let Some(path) = state_file.as_deref() {
-            run_memoized_with_state_file(&cwd, &client, &opts, path).await
+            if require_hit {
+                run_memoized_required_hit(&cwd, &client, &opts)
+                    .await?
+                    .ok_or_else(|| {
+                        ClwError::InvalidManifest(format!(
+                            "required cache hit was not verified ({REQUIRED_HIT_CAPABILITY})"
+                        ))
+                    })
+            } else {
+                run_memoized_with_state_file(&cwd, &client, &opts, path).await
+            }
+        } else if require_hit {
+            run_memoized_required_hit(&cwd, &client, &opts)
+                .await?
+                .ok_or_else(|| {
+                    ClwError::InvalidManifest(format!(
+                        "required cache hit was not verified ({REQUIRED_HIT_CAPABILITY})"
+                    ))
+                })
         } else {
             run_memoized(&cwd, &client, &opts).await
         }

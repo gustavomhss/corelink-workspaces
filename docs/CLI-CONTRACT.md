@@ -85,6 +85,17 @@ or unknown receipt content is also ambiguous. A wrapper may retry only when the 
 the final receipt is exactly `NOT_STARTED`; exit numbers and output text never prove execution
 state. This additive variable leaves ordinary `clw run` invocation and exit-code behavior unchanged.
 
+### Required verified cache hit
+
+`clw run --require-hit` implements the independent capability `required-hit/v1`; this identifier is
+not derived from the clw package version. It computes the normal run key and returns success only
+when the AC record parses as a run result and both referenced CAS blobs are present and match
+their declared digests. A miss, malformed/incomplete record, missing or corrupt blob, or backend
+failure returns nonzero without dispatching the child. The optional default remains unchanged: a
+miss still executes and memoizes the command. With `CLW_RUN_STATE_FILE`, required-hit follows the
+same receipt initialization contract; lookup/refusal happens before any child dispatch and leaves
+`NOT_STARTED`.
+
 ## `clw run` memoization scope (v0.1)
 The run cache key is derived **only** from: the declared `--input` path digests (and Unix mode bits),
 the declared `--env` variable **names** (and their current presence/value), the command vector + the

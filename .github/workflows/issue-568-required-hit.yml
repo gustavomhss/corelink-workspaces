@@ -1,0 +1,653 @@
+name: Issue 568 required-hit CLI candidate
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue-568-required-hit.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/clw-cli/**'
+      - 'crates/clw-run/**'
+      - 'docs/CLI-CONTRACT.md'
+      - 'scripts/i568_required_hit_matrix.py'
+  workflow_dispatch:
+    inputs:
+      workspaces_source_sha:
+        description: Exact Workspaces PR head SHA bound by the candidate manifest
+        required: true
+        type: string
+      source_run_id:
+        description: Successful exact-head candidate workflow run ID
+        required: true
+        type: string
+      source_run_attempt:
+        description: Successful candidate workflow attempt
+        required: true
+        type: string
+      artifact_id:
+        description: Exact private candidate artifact ID
+        required: true
+        type: string
+      artifact_name:
+        description: Exact private candidate artifact name
+        required: true
+        type: string
+      manifest_signature_base64:
+        description: Base64-encoded detached SSH signature over candidate-manifest.json
+        required: true
+        type: string
+      runners_sha:
+        description: Exact Runners PR/action commit SHA to exercise
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-568-required-hit-${{ github.event.pull_request.head.sha || inputs.workspaces_source_sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  required-hit-candidate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_TERM_COLOR: always
+      CLW_CRED_TICKET: ''
+      CLW_LEASE_ID: ''
+      CLW_FABRIC_ENDPOINT: ''
+    steps:
+      - name: Checkout exact candidate source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Assert checkout matches the recorded source SHA
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Test required-hit lookup and fail-closed cases
+        run: cargo test --locked -p clw-run required_hit
+
+      - name: Exercise real CLI no-exec receipt
+        run: cargo test --locked -p clw-cli --test e2e required_hit_replays_verified_result_and_refuses_miss_without_child
+
+      - name: Build candidate CLI
+        run: cargo build --locked --release -p clw-cli
+
+      - name: Probe required-hit capability on the built binary
+        run: |
+          set -euo pipefail
+          target/release/clw run --help > "$RUNNER_TEMP/clw-required-hit-help.txt"
+          grep -F -- '--require-hit' "$RUNNER_TEMP/clw-required-hit-help.txt"
+          grep -F 'required-hit/v1' "$RUNNER_TEMP/clw-required-hit-help.txt"
+
+      - name: Bind candidate binary to source and capability
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clw-required-hit-candidate"
+          install -m 0755 target/release/clw "$RUNNER_TEMP/clw-required-hit-candidate/clw"
+          binary="$RUNNER_TEMP/clw-required-hit-candidate/clw"
+          digest="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "clw-cli") | .version')"
+          capability="$(sed -n 's/^pub const REQUIRED_HIT_CAPABILITY: &str = "\([^"]*\)";.*/\1/p' crates/clw-run/src/required_hit.rs)"
+          test -n "$capability"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson repository_id 1259579816 \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg package_version "$version" \
+            --arg capability "$capability" \
+            --arg binary "clw" \
+            --arg sha256 "$digest" \
+            --arg target "x86_64-unknown-linux-gnu" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema_version:1,repository:$repository,repository_id:$repository_id,source_sha:$source_sha,package_version:$package_version,capability:$capability,binary:$binary,target:$target,binary_sha256:$sha256,workflow_run_id:$run_id,workflow_run_attempt:$run_attempt}' \
+            > "$RUNNER_TEMP/clw-required-hit-candidate/candidate-manifest.json"
+
+      - name: Upload private unsigned candidate artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clw-required-hit-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/clw-required-hit-candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  required-hit-signed-matrix:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CANDIDATE_SOURCE_SHA: ${{ inputs.workspaces_source_sha }}
+      CANDIDATE_RUN_ID: ${{ inputs.source_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+      CANDIDATE_ARTIFACT_ID: ${{ inputs.artifact_id }}
+      CANDIDATE_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      CANDIDATE_SIGNATURE_BASE64: ${{ inputs.manifest_signature_base64 }}
+      RUNNERS_SHA: ${{ inputs.runners_sha }}
+      GH_REPOSITORY: ${{ github.repository }}
+      GH_REF: ${{ github.ref }}
+      GH_SHA: ${{ github.sha }}
+      WORKSPACES_DIRECTORY: ${{ github.workspace }}
+      RUNNERS_DIRECTORY: ${{ github.workspace }}/_runners_action
+      GITHUB_TOKEN: ''
+      I568_CASE_KEY: issue-568-hit-seed
+    steps:
+      - name: Checkout trusted Workspaces main harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate exact source run and artifact membership before download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/i568_required_hit_matrix.py validate-source
+
+      - name: Checkout exact Runners Action commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: HuGR-dev/corelink-runners
+          ref: ${{ inputs.runners_sha }}
+          path: _runners_action
+          persist-credentials: false
+
+      - name: Download the exact private candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          path: ${{ runner.temp }}/clw-required-hit-candidate
+          merge-multiple: true
+          repository: HuGR-dev/corelink-workspaces
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify signed candidate and start isolated loopback fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/i568_required_hit_matrix.py prepare
+
+      - name: Optional Action seed (real child executes once)
+        id: seed_hit
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: optional
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            printf 'cached stdout\n'
+            printf 'cached stderr\n' >&2
+            exit 0
+
+      - name: Snapshot optional seed and require durable one-child evidence
+        env:
+          CASE_NAME: optional-seed-hit
+          SEED_OUTCOME: ${{ steps.seed_hit.outcome }}
+          EXPECTED_SEED_OUTCOME: success
+          EXPECTED_SEED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py snapshot-seed
+
+      - name: Required-hit Action replays verified cache entry without child execution
+        id: required_hit
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            printf 'cached stdout\n'
+            printf 'cached stderr\n' >&2
+            exit 0
+
+      - name: Assert verified HIT result had zero additional child effects
+        env:
+          CASE_NAME: required-verified-hit
+          ACTION_OUTCOME: ${{ steps.required_hit.outcome }}
+          EXPECTED_OUTCOME: success
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare malformed AC record
+        env:
+          FIXTURE_NAME: malformed-ac
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses malformed AC without executing child
+        id: malformed_ac
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert malformed AC failed closed
+        env:
+          CASE_NAME: malformed-ac
+          ACTION_OUTCOME: ${{ steps.malformed_ac.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare incomplete AC record
+        env:
+          FIXTURE_NAME: incomplete-ac
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses incomplete AC without executing child
+        id: incomplete_ac
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert incomplete AC failed closed
+        env:
+          CASE_NAME: incomplete-ac
+          ACTION_OUTCOME: ${{ steps.incomplete_ac.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare missing stdout blob
+        env:
+          FIXTURE_NAME: missing-stdout
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses missing stdout blob without child
+        id: missing_stdout
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert missing stdout blob failed closed
+        env:
+          CASE_NAME: missing-stdout-blob
+          ACTION_OUTCOME: ${{ steps.missing_stdout.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare missing stderr blob
+        env:
+          FIXTURE_NAME: missing-stderr
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses missing stderr blob without child
+        id: missing_stderr
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert missing stderr blob failed closed
+        env:
+          CASE_NAME: missing-stderr-blob
+          ACTION_OUTCOME: ${{ steps.missing_stderr.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare corrupt stdout blob
+        env:
+          FIXTURE_NAME: corrupt-stdout
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses corrupt stdout blob without child
+        id: corrupt_stdout
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert corrupt stdout blob failed closed
+        env:
+          CASE_NAME: corrupt-stdout-blob
+          ACTION_OUTCOME: ${{ steps.corrupt_stdout.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare corrupt stderr blob
+        env:
+          FIXTURE_NAME: corrupt-stderr
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses corrupt stderr blob without child
+        id: corrupt_stderr
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert corrupt stderr blob failed closed
+        env:
+          CASE_NAME: corrupt-stderr-blob
+          ACTION_OUTCOME: ${{ steps.corrupt_stderr.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare unavailable backend
+        env:
+          FIXTURE_NAME: unavailable
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit refuses unavailable backend without child
+        id: backend_unavailable
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            exit 0
+
+      - name: Assert backend failure remained fail-closed
+        env:
+          CASE_NAME: backend-unavailable
+          ACTION_OUTCOME: ${{ steps.backend_unavailable.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Mutate the valid seeded record to cached exit 7
+        env:
+          FIXTURE_NAME: cached-exit-7
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit Action refuses cached exit 7 without child execution
+        id: required_hit_nonzero
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_EFFECT_LOG"
+            printf 'cached stdout\n'
+            printf 'cached stderr\n' >&2
+            exit 0
+
+      - name: Probe exact exit 7 through the same candidate and cache key
+        run: python3 scripts/i568_required_hit_matrix.py probe-exit7
+
+      - name: Assert cached exit 7 had no second child effect
+        env:
+          CASE_NAME: required-hit-preserves-exit-7
+          ACTION_OUTCOME: ${{ steps.required_hit_nonzero.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_EFFECT_LOG }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Clear remote cache for required miss case
+        env:
+          FIXTURE_NAME: empty
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit miss refuses without executing child
+        id: required_miss
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        env:
+          I568_CASE_KEY: issue-568-required-miss
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_MISS_EFFECT"
+            exit 0
+
+      - name: Assert required miss had no child effect
+        env:
+          CASE_NAME: required-miss
+          ACTION_OUTCOME: ${{ steps.required_miss.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_MISS_EFFECT }}
+          EXPECTED_EFFECTS: '0'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare missing proof files
+        env:
+          FIXTURE_NAME: missing-proof
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit rejects absent signed proof before child execution
+        id: missing_proof
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_PROOF_EFFECT"
+            exit 0
+
+      - name: Assert missing proof failed before child launch
+        env:
+          CASE_NAME: missing-proof
+          ACTION_OUTCOME: ${{ steps.missing_proof.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_PROOF_EFFECT }}
+          EXPECTED_EFFECTS: '0'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare invalid SSH signature
+        env:
+          FIXTURE_NAME: invalid-signature
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit rejects invalid SSH signature before child execution
+        id: invalid_signature
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_PROOF_EFFECT"
+            exit 0
+
+      - name: Assert invalid signature failed before child launch
+        env:
+          CASE_NAME: invalid-signature
+          ACTION_OUTCOME: ${{ steps.invalid_signature.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_PROOF_EFFECT }}
+          EXPECTED_EFFECTS: '0'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare capability-tampered manifest with original signature
+        env:
+          FIXTURE_NAME: tampered-capability-manifest
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit rejects tampered capability manifest before child
+        id: tampered_capability_manifest
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_PROOF_EFFECT"
+            exit 0
+
+      - name: Assert tampered manifest failed before child launch
+        env:
+          CASE_NAME: tampered-capability-manifest
+          ACTION_OUTCOME: ${{ steps.tampered_capability_manifest.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_PROOF_EFFECT }}
+          EXPECTED_EFFECTS: '0'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare binary digest mismatch with a still-runnable candidate copy
+        env:
+          FIXTURE_NAME: binary-digest-mismatch
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Required-hit rejects binary digest mismatch before child execution
+        id: binary_digest_mismatch
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        with:
+          cache-policy: required-hit
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_PROOF_EFFECT"
+            exit 0
+
+      - name: Assert digest mismatch failed before child launch
+        env:
+          CASE_NAME: binary-digest-mismatch
+          ACTION_OUTCOME: ${{ steps.binary_digest_mismatch.outcome }}
+          EXPECTED_OUTCOME: failure
+          EFFECT_PATH: ${{ env.I568_PROOF_EFFECT }}
+          EXPECTED_EFFECTS: '0'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Prepare unavailable backend for optional fallback regression
+        env:
+          FIXTURE_NAME: optional-unavailable-no-proof
+        run: python3 scripts/i568_required_hit_matrix.py fixture
+
+      - name: Verify the signed candidate binary is restored on PATH
+        run: python3 scripts/i568_required_hit_matrix.py verify-path
+
+      - name: Optional policy falls back once only after NOT_STARTED
+        id: optional_fallback
+        continue-on-error: true
+        uses: ./_runners_action/actions/corelink-memoize
+        env:
+          I568_CASE_KEY: issue-568-optional-fallback
+        with:
+          cache-policy: optional
+          required-hit-manifest: ${{ env.I568_CASE_MANIFEST }}
+          required-hit-signature: ${{ env.I568_CASE_SIGNATURE }}
+          inputs: Cargo.toml
+          env: I568_CASE_KEY
+          run: |
+            printf 'x' >> "$I568_OPTIONAL_EFFECT"
+            exit 0
+
+      - name: Assert optional fallback executed exactly once
+        env:
+          CASE_NAME: optional-not-started-fallback-once
+          ACTION_OUTCOME: ${{ steps.optional_fallback.outcome }}
+          EXPECTED_OUTCOME: success
+          EFFECT_PATH: ${{ env.I568_OPTIONAL_EFFECT }}
+          EXPECTED_EFFECTS: '1'
+        run: python3 scripts/i568_required_hit_matrix.py assert-case
+
+      - name: Write machine-readable matrix receipt
+        if: always()
+        run: python3 scripts/i568_required_hit_matrix.py receipt
+
+      - name: Stop isolated loopback fixture server
+        if: always()
+        run: python3 scripts/i568_required_hit_matrix.py stop
+
+      - name: Upload signed-candidate matrix receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: i568-matrix-receipt-${{ inputs.workspaces_source_sha }}-${{ inputs.runners_sha }}
+          path: ${{ runner.temp }}/i568-matrix-receipt.json
+          if-no-files-found: warn
+          retention-days: 7

@@ -1085,6 +1085,86 @@ async fn run_memoization_and_exit_codes() {
     );
 }
 
+#[tokio::test]
+async fn required_hit_replays_verified_result_and_refuses_miss_without_child() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    std::fs::write(work.path().join("in.txt"), b"declared input").unwrap();
+    let effects = work.path().join("effects");
+    let state = work.path().join("required-hit-state");
+    let script = "printf x >> effects; printf cached-result";
+
+    // Populate through the backwards-compatible optional path.
+    let first = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .args(["run", "--input", "in.txt", "--", "/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(std::fs::read(&effects).unwrap(), b"x");
+    std::fs::remove_file(&effects).unwrap();
+
+    let hit = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state)
+        .args([
+            "run",
+            "--require-hit",
+            "--input",
+            "in.txt",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        hit.status.code(),
+        Some(0),
+        "verified hit should succeed: {}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert_eq!(hit.stdout, b"cached-result");
+    assert!(
+        !effects.exists(),
+        "verified required hit must not dispatch the child"
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), b"NOT_STARTED\n");
+
+    let miss_effects = work.path().join("miss-effects");
+    let miss_state = work.path().join("miss-state");
+    let miss_script = "printf x >> miss-effects";
+    let miss = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &miss_state)
+        .args([
+            "run",
+            "--require-hit",
+            "--input",
+            "in.txt",
+            "--",
+            "/bin/sh",
+            "-c",
+            miss_script,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        miss.status.code(),
+        Some(125),
+        "miss must fail closed: {}",
+        String::from_utf8_lossy(&miss.stderr)
+    );
+    assert!(
+        !miss_effects.exists(),
+        "required-hit miss must leave durable child counter at zero"
+    );
+    assert_eq!(std::fs::read(&miss_state).unwrap(), b"NOT_STARTED\n");
+}
+
 // ---------------------------------------------------------------------------
 // Test 4: json_report
 // ---------------------------------------------------------------------------
@@ -3288,7 +3368,8 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
 /// and its running command. The direct wrapper is terminated by the signal
 /// itself (so its status reports SIGTERM, rather than the 128+signal mapper used
 /// for a child result), while the shell's trap proves the group signal reached
-/// the descendant too.
+/// its direct command shell. The shell loop uses only builtins so an external
+/// `sleep` process cannot race shell trap delivery after the group signal.
 #[tokio::test]
 async fn run_process_group_sigterm_reaches_clw_and_child() {
     let server = MockServer::start().await;
@@ -3333,7 +3414,7 @@ async fn run_process_group_sigterm_reaches_clw_and_child() {
             "/bin/sh",
             "-c",
             &format!(
-                "trap 'touch {}' TERM; touch {}; while :; do sleep 1; done",
+                "trap 'touch {}; exit 0' TERM; touch {}; while :; do :; done",
                 term_seen.display(),
                 ready.display()
             ),
@@ -3400,8 +3481,8 @@ async fn run_process_group_sigterm_reaches_clw_and_child() {
         panic!("child shell did not observe SIGTERM within 10 seconds; cleanup={cleanup:?}");
     }
 
-    // The trap normally exits the child shell; this also confirms cleanup if a
-    // platform shell delayed trap delivery and left a shell/sleep descendant.
+    // The trap normally exits the child shell; retain cleanup as a guard if a
+    // platform shell delays trap delivery.
     process_group
         .cleanup()
         .unwrap_or_else(|error| panic!("process-group cleanup failed: {error}"));

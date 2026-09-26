@@ -26,6 +26,12 @@
 
 pub use clw_types as types;
 
+mod required_hit;
+pub use required_hit::{run_memoized_required_hit, REQUIRED_HIT_CAPABILITY};
+
+#[cfg(test)]
+mod required_hit_tests;
+
 #[cfg(unix)]
 mod selected_tool;
 
