@@ -110,7 +110,7 @@ with the same document's verbatim child-exit contract. Preserve the historical
 record in Git rather than retaining contradictory current instructions.
 
 The separate consumer correction is tracked in
-[corelink-runners #567](https://github.com/HuGR-Labs/corelink-runners/issues/567).
+[corelink-runners #567](https://github.com/HuGR-dev/corelink-runners/issues/567).
 The receipt closes its retry-classification ambiguity. The #305 change only
 corrects the oversized **initial** lookup classification. Final stream delivery
 remains separately scoped work.
