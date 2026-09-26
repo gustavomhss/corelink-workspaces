@@ -71,6 +71,8 @@ jobs:
       # which needs the mingw-w64 cross-CC (x86_64-w64-mingw32-gcc).
       - name: ensure mingw-w64 (windows-gnu cross-CC for ring's C build)
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: ensure ripgrep (fuzz self-test assertions)
+        run: sudo apt-get install -y ripgrep
       - name: gates (fmt + clippy + test + supply-chain + windows cross-check)
         run: bash scripts/gates.sh
 
