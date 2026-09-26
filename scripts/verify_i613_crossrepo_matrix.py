@@ -14,8 +14,13 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+HARNESS = Path(os.environ.get("HARNESS_DIRECTORY", ROOT))
 REPOS = {
-    "workspaces": ("HuGR-dev/corelink-workspaces", "1259579816", ROOT),
+    "workspaces": (
+        "HuGR-dev/corelink-workspaces",
+        "1259579816",
+        Path(os.environ.get("WORKSPACES_DIRECTORY", ROOT.parent / "workspaces")),
+    ),
     "runners": (
         "HuGR-dev/corelink-runners",
         "1266754321",
@@ -46,6 +51,19 @@ def sources() -> dict[str, object]:
     workflow_sha = os.environ.get("GH_SHA", "")
     if not re.fullmatch(r"[0-9a-f]{40}", workflow_sha):
         failures.append("workflow commit is not an exact 40-hex SHA")
+    harness_sha = git(HARNESS, "rev-parse", "HEAD")
+    harness_remote = git(HARNESS, "remote", "get-url", "origin")
+    if harness_sha != workflow_sha:
+        failures.append("trusted harness checkout does not match the workflow definition SHA")
+    if canonical_repository(harness_remote) != "hugr-dev/corelink-workspaces":
+        failures.append("trusted harness checkout remote has the wrong repository identity")
+    harness = {
+        "repository": "HuGR-dev/corelink-workspaces",
+        "repository_id": "1259579816",
+        "workflow_definition_sha": workflow_sha,
+        "actual_sha": harness_sha,
+        "remote": harness_remote,
+    }
     for key, (name, repo_id, path) in REPOS.items():
         sha = git(path, "rev-parse", "HEAD")
         remote = git(path, "remote", "get-url", "origin")
@@ -68,7 +86,7 @@ def sources() -> dict[str, object]:
         }
     if failures:
         raise ValueError("; ".join(failures))
-    return actual
+    return {"harness": harness, **actual}
 
 
 def direct_cli_cases(temp: Path) -> tuple[list[dict[str, object]], list[str]]:
@@ -101,7 +119,8 @@ def direct_cli_cases(temp: Path) -> tuple[list[dict[str, object]], list[str]]:
         argv = [binary, "run", "--input", "Cargo.toml", "--", *command]
         try:
             proc = subprocess.run(
-                argv, cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                argv, cwd=REPOS["workspaces"][2], env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=limit, check=False,
             )
             return_code = proc.returncode if proc.returncode >= 0 else 128 + -proc.returncode
@@ -284,6 +303,7 @@ def runtime() -> tuple[dict[str, object], list[str]]:
     receipt: dict[str, object] = {
         "schema": "corelink.issue-613.receipt.v2",
         "repositories": repos,
+        "workflow_definition_sha": os.environ.get("GH_SHA", ""),
         "workflow_commit_sha": os.environ.get("GH_SHA", ""),
         "workflow_run_url": (
             f"{os.environ.get('GH_SERVER_URL', 'https://github.com')}/"
@@ -306,7 +326,7 @@ def runtime() -> tuple[dict[str, object], list[str]]:
 
 
 def static() -> list[str]:
-    path = ROOT / ".github/workflows/issue-613-crossrepo-matrix.yml"
+    path = HARNESS / ".github/workflows/issue-613-crossrepo-matrix.yml"
     source = path.read_text(encoding="utf-8")
     failures = []
     required = (
@@ -324,14 +344,23 @@ def static() -> list[str]:
         r"(?m)^        required:\s*true\s*$",
         r"(?m)^          ref:\s*\$\{\{\s*inputs\.workspaces_sha\s*\}\}\s*$",
         r"(?m)^          ref:\s*\$\{\{\s*inputs\.runners_sha\s*\}\}\s*$",
+        r"(?m)^          ref:\s*\$\{\{\s*github\.sha\s*\}\}\s*$",
         r"(?m)^          repository:\s*HuGR-dev/corelink-workspaces\s*$",
         r"(?m)^          repository:\s*HuGR-dev/corelink-runners\s*$",
         r"(?m)^          persist-credentials:\s*false\s*$",
+        r"(?m)^      HARNESS_DIRECTORY:\s*\$\{\{\s*github\.workspace\s*\}\}/harness\s*$",
+        r"(?m)^      WORKSPACES_DIRECTORY:\s*\$\{\{\s*github\.workspace\s*\}\}/workspaces\s*$",
+        r"(?m)^      RUNNERS_DIRECTORY:\s*\$\{\{\s*github\.workspace\s*\}\}/runners\s*$",
+        r"(?m)^          inputs:\s*workspaces/Cargo\.toml\s*$",
         r"(?m)^          python3 scripts/verify_i613_crossrepo_matrix\.py --runtime --receipt",
     )
     for pattern in required:
         if not re.search(pattern, source):
             failures.append(f"workflow is missing required contract: {pattern}")
+    if len(re.findall(r"(?m)^\s+uses:\s+\./runners/actions/corelink-memoize\s*$", source)) != 11:
+        failures.append("all eleven Action cases must use the checked-out local Runners Action")
+    if len(re.findall(r"(?m)^\s+inputs:\s+workspaces/Cargo\.toml\s*$", source)) != 11:
+        failures.append("all eleven Action cases must resolve the candidate manifest from the workspace root")
 
     trigger_lines = source.splitlines()
     try:
@@ -365,7 +394,7 @@ def static() -> list[str]:
         failures.append("workflow contains a stale repository identity or runner SHA")
     if re.search(r"(?i)corelink-dogfood|runs-on:\s*['\"]?self-hosted|\$\{\{\s*secrets\.", source):
         failures.append("workflow must not use self-hosted runners, dogfood, or repository secrets")
-    for required_file in (ROOT / "scripts/i613_local_ac_server.py", ROOT / "scripts/verify_i613_crossrepo_matrix.py"):
+    for required_file in (HARNESS / "scripts/i613_local_ac_server.py", HARNESS / "scripts/verify_i613_crossrepo_matrix.py"):
         if not required_file.is_file():
             failures.append(f"workflow helper is missing: {required_file.relative_to(ROOT)}")
     return failures

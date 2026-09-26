@@ -25,6 +25,9 @@ jobs:
     env:
       RUNNERS_SHA: ${{ inputs.runners_sha }}
       WORKSPACES_SHA: ${{ inputs.workspaces_sha }}
+      HARNESS_DIRECTORY: ${{ github.workspace }}/harness
+      WORKSPACES_DIRECTORY: ${{ github.workspace }}/workspaces
+      RUNNERS_DIRECTORY: ${{ github.workspace }}/runners
       WORKSPACES_REPOSITORY_ID: '1259579816'
       RUNNERS_REPOSITORY_ID: '1266754321'
       CLW_TENANT: issue-613-test
@@ -32,10 +35,6 @@ jobs:
       CLW_CACHE_DIR: ${{ github.workspace }}/.issue-613-action-cache
       CLW_CASE: action-exit-0
       EFFECT_LOG: ${{ github.workspace }}/.issue-613-action-effects-0
-
-    defaults:
-      run:
-        working-directory: workspaces
 
     steps:
       - name: Validate exact candidate SHA inputs
@@ -46,6 +45,15 @@ jobs:
         run: |
           [[ "$INPUT_WORKSPACES_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INPUT_RUNNERS_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout trusted workflow and harness at the workflow SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: HuGR-dev/corelink-workspaces
+          ref: ${{ github.sha }}
+          token: ${{ github.token }}
+          persist-credentials: false
+          path: harness
 
       - name: Checkout private workspaces at the authored SHA
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -66,15 +74,18 @@ jobs:
           path: runners
 
       - name: Verify the bounded workflow contract
+        working-directory: ${{ github.workspace }}/harness
         run: python3 scripts/verify_i613_crossrepo_matrix.py --static
 
       - name: Build the real clw CLI
+        working-directory: ${{ github.workspace }}/workspaces
         run: cargo build --locked --manifest-path Cargo.toml -p clw-cli
 
       - name: Add the compiled CLI to PATH
         run: echo "$GITHUB_WORKSPACE/workspaces/target/debug" >> "$GITHUB_PATH"
 
       - name: Start loopback only CAS and AC double
+        working-directory: ${{ github.workspace }}/harness
         run: |
           port_file="$RUNNER_TEMP/issue-613-local-ac.port"
           request_log="$RUNNER_TEMP/issue-613-local-ac.requests"
@@ -94,7 +105,7 @@ jobs:
         continue-on-error: true
         uses: ./runners/actions/corelink-memoize
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -109,7 +120,7 @@ jobs:
         continue-on-error: true
         uses: ./runners/actions/corelink-memoize
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -127,7 +138,7 @@ jobs:
           CLW_CASE: action-exit-7
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -145,7 +156,7 @@ jobs:
           CLW_CASE: action-exit-7
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -163,7 +174,7 @@ jobs:
           CLW_CASE: action-exit-125
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -181,7 +192,7 @@ jobs:
           CLW_CASE: action-exit-125
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -199,7 +210,7 @@ jobs:
           CLW_ENDPOINT: http://127.0.0.1:1
           CLW_CASE: action-preexec-fallback
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$RUNNER_TEMP/issue-613-action-fallback-effects"
@@ -213,7 +224,7 @@ jobs:
           CLW_CASE: action-postdispatch-uncertain
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-postdispatch-effects
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -228,7 +239,7 @@ jobs:
           CLW_CASE: action-child-signal
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-signal-effects
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -242,7 +253,7 @@ jobs:
           CLW_CASE: action-output-cap
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-output-cap-effects
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -260,7 +271,7 @@ jobs:
           CLW_CASE: action-held-pipe-grace
           EFFECT_LOG: ${{ runner.temp }}/issue-613-action-held-pipe-effects
         with:
-          inputs: Cargo.toml
+          inputs: workspaces/Cargo.toml
           env: CLW_CASE
           run: |
             printf 'x\n' >> "$EFFECT_LOG"
@@ -278,6 +289,7 @@ jobs:
 
       - name: Verify Action effects and direct compiled CLI receipts
         if: always()
+        working-directory: ${{ github.workspace }}/harness
         env:
           GH_REPOSITORY: ${{ github.repository }}
           GH_SHA: ${{ github.sha }}
