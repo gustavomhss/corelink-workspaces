@@ -2954,14 +2954,14 @@ async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
     cmd.current_dir(work.path())
         .env("CLW_RUN_STATE_FILE", &state_file)
         .args([
-        "run",
-        "--input",
-        input.to_str().unwrap(),
-        "--",
-        "/bin/sh",
-        "-c",
-        &format!("touch {}", marker.to_str().unwrap()),
-    ]);
+            "run",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("touch {}", marker.to_str().unwrap()),
+        ]);
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(90),
         tokio::task::spawn_blocking(move || cmd.output().unwrap()),
@@ -3205,8 +3205,14 @@ async fn run_receipt_initialization_failure_does_not_spawn_child() {
         .unwrap();
 
     assert_eq!(out.status.code(), Some(125));
-    assert!(!marker.exists(), "receipt failure must happen before child spawn");
-    assert!(!state_file.exists(), "failed receipt initialization leaves no receipt");
+    assert!(
+        !marker.exists(),
+        "receipt failure must happen before child spawn"
+    );
+    assert!(
+        !state_file.exists(),
+        "failed receipt initialization leaves no receipt"
+    );
 }
 
 /// A child killed by a signal must propagate the POSIX 128+signal code (SIGTERM → 143),

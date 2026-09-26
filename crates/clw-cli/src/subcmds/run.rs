@@ -19,9 +19,7 @@ use std::io::Write as _;
 
 use clap::Args;
 use clw_client::HttpClient;
-use clw_run::{
-    initialize_execution_state, run_memoized, run_memoized_with_state_file, RunOptions,
-};
+use clw_run::{initialize_execution_state, run_memoized, run_memoized_with_state_file, RunOptions};
 use clw_types::ClwError;
 
 use crate::config::ResolvedConfig;
