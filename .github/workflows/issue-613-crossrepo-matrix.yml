@@ -31,7 +31,7 @@ jobs:
       CLW_TOKEN: issue-613-local-only
       CLW_CACHE_DIR: ${{ github.workspace }}/.issue-613-action-cache
       CLW_CASE: action-exit-0
-      EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects
+      EFFECT_LOG: ${{ github.workspace }}/.issue-613-action-effects-0
 
     defaults:
       run:
@@ -124,6 +124,7 @@ jobs:
         uses: ./runners/actions/corelink-memoize
         env:
           CLW_CASE: action-exit-7
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
         with:
           inputs: Cargo.toml
           env: CLW_CASE
@@ -132,7 +133,7 @@ jobs:
             exit 7
       - name: Snapshot Action effects after exit 7 (first)
         run: |
-          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-7" | tr -d ' ')"
           echo "ACTION_7_FIRST_COUNT=$count" >> "$GITHUB_ENV"
 
       - name: Action child exit 7 (repeat)
@@ -141,6 +142,7 @@ jobs:
         uses: ./runners/actions/corelink-memoize
         env:
           CLW_CASE: action-exit-7
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
         with:
           inputs: Cargo.toml
           env: CLW_CASE
@@ -149,7 +151,7 @@ jobs:
             exit 7
       - name: Snapshot Action effects after exit 7 (repeat)
         run: |
-          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-7" | tr -d ' ')"
           echo "ACTION_7_REPEAT_COUNT=$count" >> "$GITHUB_ENV"
 
       - name: Action child exit 125 (first)
@@ -158,6 +160,7 @@ jobs:
         uses: ./runners/actions/corelink-memoize
         env:
           CLW_CASE: action-exit-125
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
         with:
           inputs: Cargo.toml
           env: CLW_CASE
@@ -166,7 +169,7 @@ jobs:
             exit 125
       - name: Snapshot Action effects after exit 125 (first)
         run: |
-          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-125" | tr -d ' ')"
           echo "ACTION_125_FIRST_COUNT=$count" >> "$GITHUB_ENV"
 
       - name: Action child exit 125 (repeat)
@@ -175,6 +178,7 @@ jobs:
         uses: ./runners/actions/corelink-memoize
         env:
           CLW_CASE: action-exit-125
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
         with:
           inputs: Cargo.toml
           env: CLW_CASE
@@ -183,7 +187,7 @@ jobs:
             exit 125
       - name: Snapshot Action effects after exit 125 (repeat)
         run: |
-          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-125" | tr -d ' ')"
           echo "ACTION_125_REPEAT_COUNT=$count" >> "$GITHUB_ENV"
 
       - name: Action dead endpoint pre-exec failure falls back once
