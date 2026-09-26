@@ -12,14 +12,21 @@ ROUTE = re.compile(r"^/v1/(?:ac|cas)/issue-613-test/[a-f0-9]{64}$")
 TOKEN = "Bearer issue-613-local-only"
 records: dict[str, bytes] = {}
 records_lock = threading.Lock()
+request_log_lock = threading.Lock()
+request_count = 0
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "issue-613-loopback/1"
 
     def _record_request(self, status: int) -> None:
-        with open(self.server.request_log, "a", encoding="ascii") as stream:
-            stream.write(f"{self.command} {self.path} {status}\n")
+        global request_count
+        with request_log_lock:
+            if request_count >= 512:
+                return
+            with open(self.server.request_log, "a", encoding="ascii") as stream:
+                stream.write(f"{self.command} {self.path} {status}\n")
+            request_count += 1
 
     def _respond(self, status: int, body: bytes = b"") -> None:
         self.send_response(status)
