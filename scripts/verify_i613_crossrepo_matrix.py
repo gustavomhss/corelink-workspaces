@@ -85,7 +85,8 @@ def direct_cli_cases(temp: Path) -> tuple[list[dict[str, object]], list[str]]:
 
     def count(marker: Path) -> int:
         try:
-            return len(marker.read_bytes().splitlines())
+            # Direct CLI children append exactly one byte per side effect.
+            return len(marker.read_bytes())
         except OSError:
             return 0
 
@@ -116,7 +117,7 @@ def direct_cli_cases(temp: Path) -> tuple[list[dict[str, object]], list[str]]:
             "EXECUTED": "child_verdict",
             "NOT_STARTED": "preexec_failure",
             "DISPATCHING": "execution_uncertain",
-        }.get(state_text, "unknown")
+        }.get(state_text.rstrip("\n") if state_text is not None else None, "unknown")
         return {
             "label": label,
             "argv": ["clw", *argv[1:]],
