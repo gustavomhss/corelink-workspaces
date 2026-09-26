@@ -1159,6 +1159,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    #[test]
+    fn execution_state_receipt_is_initialized_and_atomically_updated() {
+        let temp = TempDir::new().unwrap();
+        let receipt = temp.path().join("run-state");
+
+        initialize_execution_state(&receipt).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_NOT_STARTED);
+
+        write_execution_state(&receipt, RUN_STATE_DISPATCHING).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_DISPATCHING);
+
+        write_execution_state(&receipt, RUN_STATE_EXECUTED).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_EXECUTED);
+    }
+
+    #[test]
+    fn execution_state_initialization_fails_closed_when_parent_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let receipt = temp.path().join("missing-parent").join("run-state");
+
+        assert!(initialize_execution_state(&receipt).is_err());
+        assert!(!receipt.exists());
+    }
+
     /// Best-effort test-fixture cleanup for a process whose PID is published to a file.
     ///
     /// The cancellation and backgrounded-grandchild regressions deliberately keep
