@@ -1,0 +1,307 @@
+name: Issue 613 cross-repository Action + CLI matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspaces_sha:
+        description: Exact workspaces candidate commit (40 hex characters)
+        type: string
+        required: true
+      runners_sha:
+        description: Exact public HuGR-dev/corelink-runners commit (40 hex characters)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  hosted-matrix:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RUNNERS_SHA: ${{ inputs.runners_sha }}
+      WORKSPACES_SHA: ${{ inputs.workspaces_sha }}
+      WORKSPACES_REPOSITORY_ID: '1259579816'
+      RUNNERS_REPOSITORY_ID: '1266754321'
+      CLW_TENANT: issue-613-test
+      CLW_TOKEN: issue-613-local-only
+      CLW_CACHE_DIR: ${{ github.workspace }}/.issue-613-action-cache
+      CLW_CASE: action-exit-0
+      EFFECT_LOG: ${{ github.workspace }}/.issue-613-action-effects-0
+
+    defaults:
+      run:
+        working-directory: workspaces
+
+    steps:
+      - name: Validate exact candidate SHA inputs
+        env:
+          INPUT_WORKSPACES_SHA: ${{ inputs.workspaces_sha }}
+          INPUT_RUNNERS_SHA: ${{ inputs.runners_sha }}
+        run: |
+          [[ "$INPUT_WORKSPACES_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INPUT_RUNNERS_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout private workspaces at the authored SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: HuGR-dev/corelink-workspaces
+          ref: ${{ inputs.workspaces_sha }}
+          token: ${{ github.token }}
+          persist-credentials: false
+          path: workspaces
+
+      - name: Checkout public runners at the requested exact SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: HuGR-dev/corelink-runners
+          ref: ${{ inputs.runners_sha }}
+          token: ${{ github.token }}
+          persist-credentials: false
+          path: runners
+
+      - name: Verify the bounded workflow contract
+        run: python3 scripts/verify_i613_crossrepo_matrix.py --static
+
+      - name: Build the real clw CLI
+        run: cargo build --locked --manifest-path Cargo.toml -p clw-cli
+
+      - name: Add the compiled CLI to PATH
+        run: echo "$GITHUB_WORKSPACE/workspaces/target/debug" >> "$GITHUB_PATH"
+
+      - name: Start loopback only CAS and AC double
+        run: |
+          port_file="$RUNNER_TEMP/issue-613-local-ac.port"
+          request_log="$RUNNER_TEMP/issue-613-local-ac.requests"
+          nohup python3 scripts/i613_local_ac_server.py \
+            --port-file "$port_file" --request-log "$request_log" \
+            >/dev/null 2>&1 </dev/null &
+          echo "$!" > "$RUNNER_TEMP/issue-613-local-ac.pid"
+          for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep 0.1; done
+          test -s "$port_file"
+          port="$(cat "$port_file")"
+          case "$port" in *[!0-9]*|'') exit 1 ;; esac
+          echo "CLW_ENDPOINT=http://127.0.0.1:$port" >> "$GITHUB_ENV"
+          echo "I613_REQUEST_LOG=$request_log" >> "$GITHUB_ENV"
+
+      - name: Action child exit 0 (first)
+        id: action_0_first
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 0
+      - name: Snapshot Action effects after exit 0 (first)
+        run: |
+          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          echo "ACTION_0_FIRST_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action child exit 0 (repeat cache hit)
+        id: action_0_repeat
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 0
+      - name: Snapshot Action effects after exit 0 (repeat)
+        run: |
+          count="$(wc -l < "$EFFECT_LOG" | tr -d ' ')"
+          echo "ACTION_0_REPEAT_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action child exit 7 (first)
+        id: action_7_first
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-exit-7
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 7
+      - name: Snapshot Action effects after exit 7 (first)
+        run: |
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-7" | tr -d ' ')"
+          echo "ACTION_7_FIRST_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action child exit 7 (repeat)
+        id: action_7_repeat
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-exit-7
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-7
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 7
+      - name: Snapshot Action effects after exit 7 (repeat)
+        run: |
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-7" | tr -d ' ')"
+          echo "ACTION_7_REPEAT_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action child exit 125 (first)
+        id: action_125_first
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-exit-125
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 125
+      - name: Snapshot Action effects after exit 125 (first)
+        run: |
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-125" | tr -d ' ')"
+          echo "ACTION_125_FIRST_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action child exit 125 (repeat)
+        id: action_125_repeat
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-exit-125
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-effects-125
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            exit 125
+      - name: Snapshot Action effects after exit 125 (repeat)
+        run: |
+          count="$(wc -l < "$RUNNER_TEMP/issue-613-action-effects-125" | tr -d ' ')"
+          echo "ACTION_125_REPEAT_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Action dead endpoint pre-exec failure falls back once
+        id: action_preexec
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_ENDPOINT: http://127.0.0.1:1
+          CLW_CASE: action-preexec-fallback
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$RUNNER_TEMP/issue-613-action-fallback-effects"
+            exit 0
+
+      - name: Action post-dispatch parent signal is not retried
+        id: action_postdispatch
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-postdispatch-uncertain
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-postdispatch-effects
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            kill -TERM "$PPID"
+            exec sleep 1
+
+      - name: Action child signal preserves failure without retry
+        id: action_signal
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-child-signal
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-signal-effects
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            kill -TERM $$
+
+      - name: Action output cap preserves failure without retry
+        id: action_output_cap
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-output-cap
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-output-cap-effects
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            head -c 6291456 /dev/zero
+
+      - name: Mark Action held-pipe start
+        run: echo "ACTION_HELD_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+
+      - name: Action held-pipe grace completes within bound
+        id: action_held_pipe
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: ./runners/actions/corelink-memoize
+        env:
+          CLW_CASE: action-held-pipe-grace
+          EFFECT_LOG: ${{ runner.temp }}/issue-613-action-held-pipe-effects
+        with:
+          inputs: Cargo.toml
+          env: CLW_CASE
+          run: |
+            printf 'x\n' >> "$EFFECT_LOG"
+            (sleep 5) &
+            exit 0
+
+      - name: Snapshot Action held-pipe end and effects
+        run: |
+          echo "ACTION_HELD_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          count=0
+          if [ -f "$RUNNER_TEMP/issue-613-action-held-pipe-effects" ]; then
+            count="$(wc -l < "$RUNNER_TEMP/issue-613-action-held-pipe-effects" | tr -d ' ')"
+          fi
+          echo "ACTION_HELD_COUNT=$count" >> "$GITHUB_ENV"
+
+      - name: Verify Action effects and direct compiled CLI receipts
+        if: always()
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          ACTION_0_FIRST: ${{ steps.action_0_first.outcome }}
+          ACTION_0_REPEAT: ${{ steps.action_0_repeat.outcome }}
+          ACTION_7_FIRST: ${{ steps.action_7_first.outcome }}
+          ACTION_7_REPEAT: ${{ steps.action_7_repeat.outcome }}
+          ACTION_125_FIRST: ${{ steps.action_125_first.outcome }}
+          ACTION_125_REPEAT: ${{ steps.action_125_repeat.outcome }}
+          ACTION_PREEXEC: ${{ steps.action_preexec.outcome }}
+          ACTION_POSTDISPATCH: ${{ steps.action_postdispatch.outcome }}
+          ACTION_SIGNAL: ${{ steps.action_signal.outcome }}
+          ACTION_OUTPUT_CAP: ${{ steps.action_output_cap.outcome }}
+          ACTION_HELD_PIPE: ${{ steps.action_held_pipe.outcome }}
+        run: |
+          receipt="$RUNNER_TEMP/issue-613-receipt.json"
+          python3 scripts/verify_i613_crossrepo_matrix.py --runtime --receipt "$receipt" || matrix_status=$?
+          [ ! -f "$receipt" ] || cat "$receipt" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${matrix_status:-}" ]; then exit "$matrix_status"; fi
+
+      - name: Stop loopback service
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/issue-613-local-ac.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/issue-613-local-ac.pid")" 2>/dev/null || true
+          fi
