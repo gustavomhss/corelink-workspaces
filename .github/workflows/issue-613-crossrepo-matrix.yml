@@ -39,6 +39,7 @@ jobs:
 
     steps:
       - name: Validate exact candidate SHA inputs
+        working-directory: ${{ github.workspace }}
         env:
           INPUT_WORKSPACES_SHA: ${{ inputs.workspaces_sha }}
           INPUT_RUNNERS_SHA: ${{ inputs.runners_sha }}
@@ -301,6 +302,7 @@ jobs:
 
       - name: Stop loopback service
         if: always()
+        working-directory: ${{ github.workspace }}
         run: |
           if [ -s "$RUNNER_TEMP/issue-613-local-ac.pid" ]; then
             kill "$(cat "$RUNNER_TEMP/issue-613-local-ac.pid")" 2>/dev/null || true
