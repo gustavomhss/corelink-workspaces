@@ -84,6 +84,39 @@ pub struct RunOptions {
     pub env_keys: Vec<String>,
 }
 
+const RUN_STATE_NOT_STARTED: &[u8] = b"NOT_STARTED\n";
+const RUN_STATE_DISPATCHING: &[u8] = b"DISPATCHING\n";
+const RUN_STATE_EXECUTED: &[u8] = b"EXECUTED\n";
+
+fn write_execution_state(path: &Path, state: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(format!(".tmp-{}-{id}", std::process::id()));
+    let temp = PathBuf::from(temp);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(state)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Initialize the optional wrapper receipt before any run setup can fail.
+pub fn initialize_execution_state(path: &Path) -> std::io::Result<()> {
+    write_execution_state(path, RUN_STATE_NOT_STARTED)
+}
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub key: Digest,
@@ -815,6 +848,28 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     client: &C,
     opts: &RunOptions,
 ) -> Result<RunOutcome> {
+    run_memoized_inner(cwd, client, opts, None).await
+}
+
+/// Run with an optional out-of-band execution-state receipt for wrappers that
+/// must distinguish a proven pre-spawn failure from an ambiguous/started child.
+/// The receipt is deliberately separate from stdout, stderr, and the exit code.
+pub async fn run_memoized_with_state_file<C: CasTransport + AcTransport>(
+    cwd: &Path,
+    client: &C,
+    opts: &RunOptions,
+    state_file: &Path,
+) -> Result<RunOutcome> {
+    initialize_execution_state(state_file)?;
+    run_memoized_inner(cwd, client, opts, Some(state_file)).await
+}
+
+async fn run_memoized_inner<C: CasTransport + AcTransport>(
+    cwd: &Path,
+    client: &C,
+    opts: &RunOptions,
+    state_file: Option<&Path>,
+) -> Result<RunOutcome> {
     if opts.command.is_empty() {
         return Err(ClwError::InvalidManifest("empty command".to_string()));
     }
@@ -881,13 +936,27 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
     for var in SECRET_ENV_VARS {
         command.env_remove(var);
     }
+    // The caller's receipt path is control metadata for clw, never child input.
+    command.env_remove("CLW_RUN_STATE_FILE");
     // A caller may cancel `run_memoized` while the command is still running.
     // Tie the direct child to this future so dropping it does not leak that child.
     command.kill_on_drop(true);
     #[cfg(unix)]
     prepared.tool.verify().await?;
-    let mut child = command.spawn()?;
-
+    if let Some(path) = state_file {
+        write_execution_state(path, RUN_STATE_DISPATCHING)?;
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(path) = state_file {
+                // Restore proof only for the known OS spawn failure. If the write
+                // fails, DISPATCHING remains and consumers must fail closed.
+                let _ = write_execution_state(path, RUN_STATE_NOT_STARTED);
+            }
+            return Err(error.into());
+        }
+    };
     // FIX 3: enforce the output-size cap WHILE capturing, never buffering the whole
     // child output first. `wait_with_output` reads ALL of stdout/stderr into memory
     // before any size check runs, so a command emitting gigabytes OOMs the process
@@ -1060,6 +1129,15 @@ pub async fn run_memoized<C: CasTransport + AcTransport>(
         .await;
     }
 
+    if let Some(path) = state_file {
+        // EXECUTED means we observed the direct child's completed verdict and
+        // captured its bounded output successfully. Until this point, any
+        // post-spawn wait/pipe/cap failure leaves DISPATCHING so callers fail
+        // closed instead of mistaking a wrapper error (including 125) for the
+        // child's result. If this atomic receipt update fails, DISPATCHING remains.
+        write_execution_state(path, RUN_STATE_EXECUTED)?;
+    }
+
     Ok(RunOutcome {
         key,
         hit: false,
@@ -1080,6 +1158,30 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn execution_state_receipt_is_initialized_and_atomically_updated() {
+        let temp = TempDir::new().unwrap();
+        let receipt = temp.path().join("run-state");
+
+        initialize_execution_state(&receipt).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_NOT_STARTED);
+
+        write_execution_state(&receipt, RUN_STATE_DISPATCHING).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_DISPATCHING);
+
+        write_execution_state(&receipt, RUN_STATE_EXECUTED).unwrap();
+        assert_eq!(std::fs::read(&receipt).unwrap(), RUN_STATE_EXECUTED);
+    }
+
+    #[test]
+    fn execution_state_initialization_fails_closed_when_parent_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let receipt = temp.path().join("missing-parent").join("run-state");
+
+        assert!(initialize_execution_state(&receipt).is_err());
+        assert!(!receipt.exists());
+    }
 
     /// Best-effort test-fixture cleanup for a process whose PID is published to a file.
     ///

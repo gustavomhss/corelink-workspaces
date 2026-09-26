@@ -2943,6 +2943,7 @@ async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
     std::fs::write(&input, b"declared input").unwrap();
     // Absolute marker the child would `touch` IF it ever ran.
     let marker = work.path().join("child_ran.marker");
+    let state_file = work.path().join("run-state");
 
     // http://127.0.0.1:1 — port 1 is not listening: connection refused (no mock).
     // A connection-refused IS retried (Transport errors walk the AIMD ladder), so this
@@ -2950,15 +2951,17 @@ async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
     // FUTURE retry-policy change that turned this into an unbounded hang fails loudly
     // instead of silently stalling CI.
     let mut cmd = clw_cmd("http://127.0.0.1:1", cache.path());
-    cmd.current_dir(work.path()).args([
-        "run",
-        "--input",
-        input.to_str().unwrap(),
-        "--",
-        "/bin/sh",
-        "-c",
-        &format!("touch {}", marker.to_str().unwrap()),
-    ]);
+    cmd.current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state_file)
+        .args([
+            "run",
+            "--input",
+            input.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("touch {}", marker.to_str().unwrap()),
+        ]);
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(90),
         tokio::task::spawn_blocking(move || cmd.output().unwrap()),
@@ -2978,6 +2981,7 @@ async fn run_dead_endpoint_exits_reserved_125_child_never_ran() {
         !marker.exists(),
         "the child must NEVER have run on a 125 (child-never-ran) failure"
     );
+    assert_eq!(std::fs::read(&state_file).unwrap(), b"NOT_STARTED\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("child not run") || stderr.contains("internal"),
@@ -3008,8 +3012,10 @@ async fn run_oversized_initial_ac_response_is_not_child_output() {
     let work = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+    let state_file = work.path().join("run-state");
     let out = clw_cmd(&server.uri(), cache.path())
         .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state_file)
         .timeout(Duration::from_secs(20))
         .args([
             "run",
@@ -3050,6 +3056,7 @@ async fn run_oversized_initial_ac_response_is_not_child_output() {
         !stderr.contains("child killed"),
         "must not invent child death: {stderr}"
     );
+    assert_eq!(std::fs::read(&state_file).unwrap(), b"NOT_STARTED\n");
 }
 
 /// 125/137 are also legitimate child results; integer equality does not prove
@@ -3063,11 +3070,13 @@ async fn run_child_exit_125_and_137_remain_passthrough() {
         let work = TempDir::new().unwrap();
         std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
         let script = format!(
-            "printf x >> executions; printf child-output; printf child-stderr >&2; exit {code}"
+            "test -z \"${{CLW_RUN_STATE_FILE+x}}\" && printf x >> executions; printf child-output; printf child-stderr >&2; exit {code}"
         );
+        let state_file = work.path().join("run-state");
         for attempt in 0..2 {
             let out = clw_cmd(&server.uri(), cache.path())
                 .current_dir(work.path())
+                .env("CLW_RUN_STATE_FILE", &state_file)
                 .timeout(Duration::from_secs(20))
                 .args([
                     "run",
@@ -3081,6 +3090,15 @@ async fn run_child_exit_125_and_137_remain_passthrough() {
                 .output()
                 .unwrap();
             assert_eq!(out.status.code(), Some(code));
+            assert_eq!(
+                std::fs::read(&state_file).unwrap(),
+                if code == 0 && attempt == 1 {
+                    b"NOT_STARTED\n".as_slice()
+                } else {
+                    b"EXECUTED\n".as_slice()
+                },
+                "receipt must distinguish replay from an executed child"
+            );
             assert_eq!(out.stdout, b"child-output");
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(stderr.contains("child-stderr"), "{stderr}");
@@ -3125,9 +3143,11 @@ async fn run_missing_command_exits_reserved_125_child_never_ran() {
     let cache = TempDir::new().unwrap();
     let input = work.path().join("in.txt");
     std::fs::write(&input, b"declared input").unwrap();
+    let state_file = work.path().join("run-state");
 
     let out = clw_cmd(&server.uri(), cache.path())
         .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state_file)
         .args([
             "run",
             "--input",
@@ -3137,6 +3157,7 @@ async fn run_missing_command_exits_reserved_125_child_never_ran() {
         ])
         .output()
         .unwrap();
+    assert_eq!(std::fs::read(&state_file).unwrap(), b"NOT_STARTED\n");
 
     assert_eq!(
         out.status.code(),
@@ -3151,6 +3172,46 @@ async fn run_missing_command_exits_reserved_125_child_never_ran() {
     assert!(
         stderr.contains("child not run") || stderr.contains("internal"),
         "an un-spawnable command must report the clw-internal child-not-run failure, got:\n{stderr}"
+    );
+}
+
+/// Receipt initialization must fail before dispatch: without a writable receipt,
+/// the child is not launched and cannot be mistaken for a retry-safe failure.
+#[tokio::test]
+async fn run_receipt_initialization_failure_does_not_spawn_child() {
+    let server = MockServer::start().await;
+    mount_corelink(&server, true).await;
+
+    let work = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+    let state_file = work.path().join("missing-parent/run-state");
+    let marker = work.path().join("child-ran");
+    let script = format!("printf x >> {}; exit 125", marker.display());
+
+    let out = clw_cmd(&server.uri(), cache.path())
+        .current_dir(work.path())
+        .env("CLW_RUN_STATE_FILE", &state_file)
+        .args([
+            "run",
+            "--input",
+            "input.txt",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        !marker.exists(),
+        "receipt failure must happen before child spawn"
+    );
+    assert!(
+        !state_file.exists(),
+        "failed receipt initialization leaves no receipt"
     );
 }
 
@@ -3170,9 +3231,11 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
     // actually executed (distinguishing the 143-via-signal path from a 125 spawn failure).
     let marker = work.path().join("child_started.marker");
     let shell_cmd = format!("touch {}; kill -TERM $$", marker.to_str().unwrap());
+    let state_file = work.path().join("run-state");
     let run_self_sigterm = || {
         clw_cmd(&server.uri(), cache.path())
             .current_dir(work.path())
+            .env("CLW_RUN_STATE_FILE", &state_file)
             .args([
                 "run",
                 "--input",
@@ -3194,6 +3257,7 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
         "a SIGTERM-killed child must propagate 128+15=143, got: {:?}",
         out1.status.code()
     );
+    assert_eq!(std::fs::read(&state_file).unwrap(), b"EXECUTED\n");
     assert!(
         marker.exists(),
         "the child must have actually RUN (marker present) — proving this is the signal \
@@ -3213,6 +3277,7 @@ async fn run_signal_killed_child_propagates_128_plus_signal_and_is_not_cached() 
         "a signal-killed result must not be cached → still 143 on re-run, got: {:?}",
         out2.status.code()
     );
+    assert_eq!(std::fs::read(&state_file).unwrap(), b"EXECUTED\n");
     assert!(
         String::from_utf8_lossy(&out2.stderr).contains("cache miss"),
         "a signal-killed result must NOT be cached (second run is still a miss)"
@@ -4659,10 +4724,12 @@ async fn run_oversized_child_output_exits_137() {
         let cache = TempDir::new().unwrap();
         let work = TempDir::new().unwrap();
         std::fs::write(work.path().join("input.txt"), b"declared input").unwrap();
+        let state_file = work.path().join("run-state");
         let script = format!("printf x >> executions; head -c 6291456 /dev/zero{redirect}");
         for attempt in 1..=2 {
             let out = clw_cmd(&server.uri(), cache.path())
                 .current_dir(work.path())
+                .env("CLW_RUN_STATE_FILE", &state_file)
                 .timeout(Duration::from_secs(20))
                 .args([
                     "run",
@@ -4677,6 +4744,7 @@ async fn run_oversized_child_output_exits_137() {
                 .unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert_eq!(out.status.code(), Some(137), "{stderr}");
+            assert_eq!(std::fs::read(&state_file).unwrap(), b"DISPATCHING\n");
             assert!(stderr.contains("child output exceeded the cap"), "{stderr}");
             assert!(!stderr.contains("child not run"), "{stderr}");
             assert_eq!(
