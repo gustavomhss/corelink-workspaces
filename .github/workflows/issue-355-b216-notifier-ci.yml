@@ -1,0 +1,58 @@
+name: Issue 355 B-216 notifier exact-head proof
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/b216-incident-notifier.yml'
+      - '.github/workflows/issue-355-b216-notifier-ci.yml'
+      - 'scripts/b216_incident_notifier.py'
+      - 'scripts/test_b216_incident_notifier.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-355-b216-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  exact-head-proof:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert checkout is the exact PR head
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Run focused adversarial notifier tests
+        run: python3 -m unittest discover -s scripts -p 'test_b216_incident_notifier.py' -v
+      - name: Install checksum-pinned actionlint 1.7.12
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          bin_dir="$RUNNER_TEMP/actionlint-1.7.12"
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          mkdir -p "$bin_dir"
+          tar -xzf "$archive" -C "$bin_dir" actionlint
+          echo "$bin_dir" >> "$GITHUB_PATH"
+      - name: Lint workflows at exact PR head
+        run: actionlint -version && actionlint
+      - name: Check exact PR head DCO trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git cat-file -e "$BASE_SHA^{commit}"
+          bash scripts/dco-check.sh "$BASE_SHA"

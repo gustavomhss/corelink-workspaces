@@ -1,0 +1,96 @@
+name: B-216 private incident notifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Credentialless validation only; never reads D1 or writes issues
+        required: true
+        default: true
+        type: boolean
+      enable_notifier:
+        description: Explicit opt-in after protected D1 Read authority is provisioned
+        required: true
+        default: false
+        type: boolean
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b216-notifier
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Assert exact main checkout and validate disabled state
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$REF_NAME" = refs/heads/main
+          test "${B216_NOTIFIER_ENABLED:-false}" != true
+          python3 -m py_compile scripts/b216_incident_notifier.py
+
+  notify:
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && inputs.enable_notifier && github.ref == 'refs/heads/main' && vars.B216_NOTIFIER_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: b216-notifier-read
+    permissions:
+      contents: read
+      issues: write
+    env:
+      B216_NOTIFIER_ENABLED: ${{ vars.B216_NOTIFIER_ENABLED }}
+      B216_D1_READ_TOKEN: ${{ secrets.B216_D1_READ_TOKEN }}
+      B216_D1_ACCOUNT_ID: ${{ vars.B216_D1_ACCOUNT_ID }}
+      B216_D1_DATABASE_ID: ${{ vars.B216_D1_DATABASE_ID }}
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Assert exact main revision and run notifier
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 scripts/b216_incident_notifier.py run
+
+  acknowledge:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null && github.repository == 'HuGR-dev/corelink-workspaces' && github.ref == 'refs/heads/main' && vars.B216_NOTIFIER_ENABLED == 'true' && github.event.comment.user.login == 'gmhelmold'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      GITHUB_EVENT_JSON: ${{ toJSON(github.event) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - name: Assert main code and process attributable acknowledgement
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          python3 scripts/b216_incident_notifier.py ack
