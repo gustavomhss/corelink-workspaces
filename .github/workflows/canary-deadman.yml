@@ -68,6 +68,7 @@ env:
   # $DEADMAN_LANES: the gate would then check something the workflow never runs.
   DEADMAN_LANES: |
     # deadman:lanes:begin
+    b216-incident-notifier.yml 1      # cron "*/5 * * * *" — every 5 minutes; inert until runtime enablement
     conformance-canary.yml     26     # cron "0 13 * * *"  — daily 13:00 UTC
     fuzz.yml                   26     # cron "0 8 * * *"   — daily 08:00 UTC
     live-journeys.yml          192    # cron "17 6 * * 1"  — Mon 06:17 UTC
