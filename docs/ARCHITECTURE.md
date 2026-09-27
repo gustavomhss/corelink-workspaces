@@ -114,9 +114,14 @@ These are distinct tracked defects:
 Neither a presence check nor `--force` is a general integrity scrub of
 corrupt-but-present remote bytes.
 
-The small-file growth bound is tracked in
-[#291](https://github.com/HuGR-Labs/corelink-workspaces/issues/291): a post-read
-check must not be described as preventing the allocation that already occurred.
+The small-file path reads into a buffer capped at 16 MiB, then probes one additional
+byte to distinguish an exact-threshold file from concurrent growth. Growth returns an
+actionable retry error; it cannot make this path retain the enlarged file
+([#291](https://github.com/HuGR-Labs/corelink-workspaces/issues/291)). Within one live
+snapshot invocation, configured file concurrency bounds simultaneous small-file buffers
+by concurrency × 16 MiB. Dropping a caller does not cancel a blocking read already running
+on Tokio's blocking pool, so detached reads can overlap a later invocation; separate
+local-manifest calls can also overlap their reads.
 The root size check follows chunk processing, so it is not a preflight that avoids
 all upload work for an oversized root.
 

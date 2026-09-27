@@ -483,9 +483,12 @@ This closes them so green means green.
   cred-ticket response with a raw `.text()` (no ceiling) — a buggy/hostile `CLW_FABRIC_ENDPOINT`
   could OOM the client at runner boot; it now routes through `read_body_capped` (64 KiB, a PAT
   envelope is <1 KiB). The snapshot small-file fast path chose the in-memory branch on the
-  walk-time size but read the current bytes; a file grown past the 16 MiB stream threshold
-  between walk and read is now rejected with an actionable message instead of being slurped
-  (both the upload and manifest paths).
+  walk-time size but read the current bytes; a bounded read now retains at most 16 MiB and
+  probes only one extra byte before returning an actionable retry message when the file grew
+  past the threshold (both upload and local-manifest paths). During one live snapshot call,
+  file concurrency N bounds simultaneous small-file buffers to N × 16 MiB. An already-running
+  blocking read is not cancelled when its async caller is dropped, so it can overlap reads
+  from a later invocation; concurrent local-manifest calls can also overlap their reads.
 
 ### Changed
 - **The PR fast-lane (`scripts/gates.sh` scoped lane) no longer has coverage holes.** Scoped

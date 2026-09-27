@@ -6,6 +6,7 @@
 //! the workspace can be hydrated later.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -105,24 +106,63 @@ pub struct SnapshotReport {
 /// so the manifest/digest is unaffected by which path a file takes.
 const STREAM_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Guard the small-file in-memory fast path against a TOCTOU size-growth. That path is
-/// selected on the WALK-TIME size (`f.size`), but the `std::fs::read` returns the file's
-/// CURRENT bytes. If the file grew past the stream threshold between walk and read (or the
-/// path was swapped for a large one), a full in-memory read would defeat the threshold and
-/// — multiplied by the upload concurrency — could exhaust memory. Fail loudly (a
-/// user-facing `Message`, not a mislabeled transport error) rather than slurp it.
-fn guard_small_file_size(f: &WalkedFile, read_len: usize) -> Result<()> {
-    if read_len as u64 > STREAM_THRESHOLD_BYTES {
-        return Err(ClwError::Message(format!(
-            "snapshot: '{}' grew from {} to {} bytes during the operation (exceeds the \
-             {}-byte stream threshold); re-run the snapshot",
-            f.abs.display(),
-            f.size,
-            read_len,
-            STREAM_THRESHOLD_BYTES
-        )));
+/// The fixed scratch buffer bounds each blocking read independently of the file's current
+/// size. The `Vec` retains at most the threshold; a one-byte probe distinguishes an exact
+/// threshold-sized file from one that grew and must be retried through a fresh walk.
+const SMALL_FILE_READ_BUFFER_BYTES: usize = 64 * 1024;
+
+fn read_small_file_bounded<R: Read>(mut reader: R, f: &WalkedFile) -> Result<Vec<u8>> {
+    let threshold = STREAM_THRESHOLD_BYTES as usize;
+    let mut data = Vec::new();
+    let initial = (f.size.min(STREAM_THRESHOLD_BYTES)) as usize;
+    data.try_reserve_exact(initial).map_err(|error| {
+        ClwError::Message(format!(
+            "snapshot: could not allocate the bounded small-file buffer for '{}': {error}",
+            f.abs.display()
+        ))
+    })?;
+
+    let mut scratch = [0u8; SMALL_FILE_READ_BUFFER_BYTES];
+    loop {
+        let remaining = threshold - data.len();
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            match reader.read(&mut probe) {
+                Ok(0) => return Ok(data),
+                Ok(_) => {
+                    return Err(ClwError::Message(format!(
+                        "snapshot: '{}' grew from {} bytes to more than the {}-byte stream \
+                         threshold during the operation; re-run the snapshot",
+                        f.abs.display(),
+                        f.size,
+                        STREAM_THRESHOLD_BYTES
+                    )))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let read_limit = remaining.min(scratch.len());
+        let read = match reader.read(&mut scratch[..read_limit]) {
+            Ok(0) => return Ok(data),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        data.try_reserve_exact(read).map_err(|error| {
+            ClwError::Message(format!(
+                "snapshot: could not grow the bounded small-file buffer for '{}': {error}",
+                f.abs.display()
+            ))
+        })?;
+        data.extend_from_slice(&scratch[..read]);
     }
-    Ok(())
+}
+
+fn read_small_file(f: &WalkedFile) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(&f.abs)?;
+    read_small_file_bounded(file, f)
 }
 
 /// Upload one chunk: write it into the local cache, then PUT it to the remote
@@ -225,15 +265,17 @@ where
     // writer on a SHARED checkout could swap the path. The CONTENT-swap correctness angle
     // is out of the v0.1 threat model (single-operator local tool; deferred hardening:
     // O_NOFOLLOW open + fstat-after-open). The MEMORY-size angle IS guarded: the small-file
-    // branch below rejects a file that grew past the stream threshold between walk and read
-    // (`guard_small_file_size`), so a mid-operation growth can't OOM instead of streaming.
+    // branch below retains at most the stream threshold and consumes at most one additional
+    // probe byte before asking the caller to re-run the snapshot. Within one live snapshot,
+    // configured file concurrency bounds simultaneous small-file buffers to concurrency ×
+    // threshold bytes. Dropping a caller does not stop an already-running spawn_blocking read;
+    // it remains individually bounded but can overlap reads from a later invocation.
     let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
         // ---- small file: in-memory fast path -----------------------------
-        let abs = f.abs.clone();
-        let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
+        let read_info = f.clone();
+        let data = tokio::task::spawn_blocking(move || read_small_file(&read_info))
             .await
             .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
-        guard_small_file_size(&f, data.len())?;
 
         let chunks_raw = chunk_bytes(&data);
         let chunk_refs = to_chunk_refs(&chunks_raw);
@@ -401,9 +443,10 @@ fn existing_ref_matches(existing_bytes: &[u8], want_bytes: &[u8], want: &RefReco
 
 /// Walk `root` and build a [`Manifest`] by chunking every file.
 ///
-/// Symlinks and empty directories are included as-is.  File bytes are read
-/// with `tokio::task::spawn_blocking` so this function is safe to `.await`
-/// inside a Tokio runtime.
+/// Symlinks and empty directories are included as-is. File bytes are read with
+/// `tokio::task::spawn_blocking` so this function is safe to `.await` inside a Tokio runtime.
+/// Each call processes files sequentially; concurrent calls can have separate bounded reads
+/// in flight. Dropping a call does not cancel a blocking read that has already started.
 pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
     // Walk is sync; run it on the blocking thread pool.
     let root_owned = root.to_path_buf();
@@ -411,6 +454,10 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
         .await
         .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
 
+    build_manifest_local_from_walked(walked).await
+}
+
+async fn build_manifest_local_from_walked(walked: Vec<WalkedEntry>) -> Result<Manifest> {
     let mut entries: Vec<Entry> = Vec::with_capacity(walked.len());
     let mut total_size: u64 = 0;
 
@@ -422,12 +469,10 @@ pub async fn build_manifest_local(root: &Path) -> Result<Manifest> {
                 // Both paths are dedupe-identical, so the manifest produced here
                 // matches `snapshot`'s regardless of which path a file takes.
                 let chunk_refs: Vec<ChunkRef> = if f.size <= STREAM_THRESHOLD_BYTES {
-                    let abs = f.abs.clone();
-                    let data = tokio::task::spawn_blocking(move || std::fs::read(&abs))
+                    let read_info = f.clone();
+                    let data = tokio::task::spawn_blocking(move || read_small_file(&read_info))
                         .await
                         .map_err(|e| clw_types::ClwError::Transport(e.to_string()))??;
-                    // Same TOCTOU size-growth guard as `snapshot` (see the note there).
-                    guard_small_file_size(&f, data.len())?;
 
                     let chunks_raw = chunk_bytes(&data);
                     to_chunk_refs(&chunks_raw)
@@ -796,9 +841,189 @@ mod tests {
     use super::*;
     use clw_types::{ref_key, AcTransport, CasTransport, ClwError, Digest, Result};
     use std::collections::HashMap;
+    use std::io::Read;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
+
+    struct CountingReader {
+        total: usize,
+        consumed: Arc<AtomicUsize>,
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            let remaining = self.total - self.consumed.load(Ordering::Relaxed);
+            let read = remaining.min(output.len());
+            output[..read].fill(0x5a);
+            self.consumed.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    struct ErrorOnceReader<R> {
+        inner: R,
+        trigger_buffer_len: usize,
+        kind: std::io::ErrorKind,
+        triggered: bool,
+    }
+
+    impl<R: Read> Read for ErrorOnceReader<R> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if !self.triggered && output.len() == self.trigger_buffer_len {
+                self.triggered = true;
+                return Err(std::io::Error::new(self.kind, "injected read error"));
+            }
+            self.inner.read(output)
+        }
+    }
+
+    #[test]
+    fn bounded_small_file_reader_covers_threshold_and_counts_growth_bytes() {
+        let threshold = STREAM_THRESHOLD_BYTES as usize;
+        for (file_size, should_succeed) in [
+            (threshold - 1, true),
+            (threshold, true),
+            (threshold + 1, false),
+            (threshold * 16 + 37, false),
+        ] {
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let read_calls = Arc::new(AtomicUsize::new(0));
+            let reader = CountingReader {
+                total: file_size,
+                consumed: Arc::clone(&consumed),
+                read_calls: Arc::clone(&read_calls),
+            };
+            let walked = WalkedFile {
+                abs: Path::new("instrumented-small-file").to_path_buf(),
+                rel: "instrumented-small-file".into(),
+                mode: 0o644,
+                size: 7, // Simulate stale walk metadata without reserving for the actual size.
+            };
+
+            let result = read_small_file_bounded(reader, &walked);
+            let bytes_consumed = consumed.load(Ordering::Relaxed);
+            assert!(
+                read_calls.load(Ordering::Relaxed) <= 1024,
+                "the 16 MiB boundary should use bounded chunk reads, not thousands of tiny reads"
+            );
+            if should_succeed {
+                let data = result.unwrap();
+                assert_eq!(data.len(), file_size);
+                assert!(data.capacity() <= threshold);
+                assert!(data.iter().all(|byte| *byte == 0x5a));
+                assert_eq!(bytes_consumed, file_size);
+            } else {
+                if file_size > threshold + 1 {
+                    assert!(
+                        file_size > threshold.saturating_mul(2),
+                        "substantial-growth input must remain substantially over threshold"
+                    );
+                }
+                assert!(matches!(result, Err(ClwError::Message(_))));
+                assert_eq!(bytes_consumed, threshold + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_small_file_read_retries_interrupted_data_read() {
+        let walked = WalkedFile {
+            abs: Path::new("interrupted-data-read").to_path_buf(),
+            rel: "interrupted-data-read".into(),
+            mode: 0o644,
+            size: 0,
+        };
+        let reader = ErrorOnceReader {
+            inner: std::io::Cursor::new(vec![0x5a]),
+            trigger_buffer_len: SMALL_FILE_READ_BUFFER_BYTES,
+            kind: std::io::ErrorKind::Interrupted,
+            triggered: false,
+        };
+
+        assert_eq!(
+            read_small_file_bounded(reader, &walked).unwrap(),
+            vec![0x5a]
+        );
+    }
+
+    #[test]
+    fn bounded_small_file_read_propagates_non_interrupted_data_error() {
+        let walked = WalkedFile {
+            abs: Path::new("failed-data-read").to_path_buf(),
+            rel: "failed-data-read".into(),
+            mode: 0o644,
+            size: 0,
+        };
+        let reader = ErrorOnceReader {
+            inner: std::io::Cursor::new(vec![0x5a]),
+            trigger_buffer_len: SMALL_FILE_READ_BUFFER_BYTES,
+            kind: std::io::ErrorKind::PermissionDenied,
+            triggered: false,
+        };
+
+        assert!(matches!(
+            read_small_file_bounded(reader, &walked),
+            Err(ClwError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn bounded_small_file_read_retries_interrupted_overflow_probe() {
+        let threshold = STREAM_THRESHOLD_BYTES as usize;
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let reader = ErrorOnceReader {
+            inner: CountingReader {
+                total: threshold,
+                consumed,
+                read_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            trigger_buffer_len: 1,
+            kind: std::io::ErrorKind::Interrupted,
+            triggered: false,
+        };
+        let walked = WalkedFile {
+            abs: Path::new("interrupted-overflow-probe").to_path_buf(),
+            rel: "interrupted-overflow-probe".into(),
+            mode: 0o644,
+            size: STREAM_THRESHOLD_BYTES,
+        };
+
+        assert_eq!(
+            read_small_file_bounded(reader, &walked).unwrap().len(),
+            threshold
+        );
+    }
+
+    #[test]
+    fn bounded_small_file_read_propagates_non_interrupted_probe_error() {
+        let threshold = STREAM_THRESHOLD_BYTES as usize;
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let reader = ErrorOnceReader {
+            inner: CountingReader {
+                total: threshold,
+                consumed,
+                read_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            trigger_buffer_len: 1,
+            kind: std::io::ErrorKind::PermissionDenied,
+            triggered: false,
+        };
+        let walked = WalkedFile {
+            abs: Path::new("failed-overflow-probe").to_path_buf(),
+            rel: "failed-overflow-probe".into(),
+            mode: 0o644,
+            size: STREAM_THRESHOLD_BYTES,
+        };
+
+        assert!(matches!(
+            read_small_file_bounded(reader, &walked),
+            Err(ClwError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // In-crate fake transport (CasTransport + AcTransport over in-memory maps)
@@ -1257,6 +1482,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unchanged_streaming_file_keeps_snapshot_manifest_bytes_identical() {
+        let root_dir = TempDir::new().unwrap();
+        let file = root_dir.path().join("above-threshold.bin");
+        std::fs::write(&file, vec![0x6d; STREAM_THRESHOLD_BYTES as usize + 1]).unwrap();
+
+        let local = build_manifest_local(root_dir.path()).await.unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let cache = LocalCache::new(cache_dir.path()).unwrap();
+        let client = FakeTransport::default();
+        let report = snapshot(
+            root_dir.path(),
+            &client,
+            &cache,
+            &SnapshotOptions::new("streaming-equivalence"),
+        )
+        .await
+        .unwrap();
+        let remote = Manifest::from_bytes(
+            client
+                .cas
+                .lock()
+                .await
+                .get(&report.root)
+                .expect("snapshot publishes its manifest")
+                .as_slice(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            local.canonical_bytes().unwrap(),
+            remote.canonical_bytes().unwrap()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test 5: looks_like_secret pattern matching (unit)
     // -----------------------------------------------------------------------
@@ -1569,9 +1829,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_path_rejects_file_grown_past_threshold() {
-        // TOCTOU size-growth: the walk-time size says "small" (selects the in-memory fast
-        // path), but the file on disk is actually larger than the stream threshold. The
-        // guard must REJECT it (a user-facing Message), not slurp the whole thing into RAM.
+        // A barrier between the walk and open deterministically reproduces growth. The
+        // bounded-reader test above proves only threshold+1 bytes are consumed.
         let cache_dir = TempDir::new().unwrap();
         let cache = LocalCache::new(cache_dir.path()).unwrap();
         let client = FakeTransport::default();
@@ -1586,13 +1845,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let grown = tmp.path().join("grown.bin");
+        std::fs::write(&grown, vec![0u8; 1024]).unwrap();
+        let walked = walk(tmp.path()).unwrap();
+        let wf = walked
+            .into_iter()
+            .find_map(|entry| match entry {
+                WalkedEntry::File(file) => Some(file),
+                _ => None,
+            })
+            .expect("walker should find grown.bin");
+        assert_eq!(wf.size, 1024);
         std::fs::write(&grown, vec![0u8; STREAM_THRESHOLD_BYTES as usize + 1]).unwrap();
-        let wf = WalkedFile {
-            abs: grown.clone(),
-            rel: "grown.bin".into(),
-            mode: 0o644,
-            size: 1, // WRONG-small on purpose → selects the in-memory fast path
-        };
         let err = process_file(&client, &cache, &up, 4, true, wf)
             .await
             .unwrap_err();
@@ -1609,6 +1872,30 @@ mod tests {
             }
             other => panic!("expected a Message size-growth rejection, got {other:?}"),
         }
+        assert!(
+            client.cas.lock().await.is_empty(),
+            "growth error must not upload chunks"
+        );
+        assert!(
+            client.ac.lock().await.is_empty(),
+            "growth error must not publish a ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_manifest_local_rejects_growth_after_walk() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("grown.bin");
+        std::fs::write(&path, vec![3u8; 2048]).unwrap();
+        let walked = walk(tmp.path()).unwrap();
+        assert!(walked.iter().any(|entry| matches!(entry,
+            WalkedEntry::File(file) if file.size == 2048)));
+
+        // Deterministic mutation in the same interval that the public entrypoint has between
+        // its walk and its per-file open. The entrypoint delegates to this same implementation.
+        std::fs::write(&path, vec![4u8; STREAM_THRESHOLD_BYTES as usize + 32]).unwrap();
+        let error = build_manifest_local_from_walked(walked).await.unwrap_err();
+        assert!(matches!(error, ClwError::Message(message) if message.contains("grew")));
     }
 
     // -----------------------------------------------------------------------

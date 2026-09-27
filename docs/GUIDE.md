@@ -117,8 +117,8 @@ Producer canonical bytes and reader acceptance are distinct; see §19.
 ### Chunking and sharing
 
 FastCDC uses 256 KiB / 1 MiB / 4 MiB min/average/max settings. Snapshot has
-in-memory and streaming paths with an equivalence test. A post-read length check
-in the small-file path is not an allocation bound
+in-memory and streaming paths with an equivalence test. The small-file path retains
+at most 16 MiB and probes one additional byte before reporting concurrent growth
 ([#291](https://github.com/HuGR-Labs/corelink-workspaces/issues/291)).
 
 Remote sharing is within the configured, authorized tenant. Actual authorization
@@ -599,7 +599,7 @@ The table distinguishes per-body, manifest, captured-stream and local-cache poli
 |---|---|---|
 | **Local cache GC budget** | **8 GiB**, overridable with `CLW_CACHE_BUDGET_BYTES` | Best-effort target, not a quota. New-blob PUTs trigger a sweep after 256 writes on that cache instance; a re-PUT of an existing blob returns before the counter. Recency refresh is amortized to 60 seconds. Successful hydrate also requests a final sweep; snapshot has no equivalent unconditional final sweep (#304). Errors, concurrent writers and excluded temporaries can leave usage above budget. Evicted content is recoverable only while another authoritative copy remains available. |
 | CAS blob / manifest / `run` output cap | **5 MiB** | A single CAS blob is ≤ 5 MiB (`CAS_BLOB_CAP_BYTES`). A manifest is one blob → an oversized root is rejected after chunk processing, which may already have uploaded bytes. When either captured stream exceeds 5 MiB, `run` requests termination of its direct child and maps the output-limit error to 137. That number alone does not prove a particular OS signal or child history; see §9 and #305. |
-| Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time); the small-path length check currently happens after reading; it does not prevent that allocation (#291). |
+| Snapshot stream threshold | **16 MiB** | Files > 16 MiB stream (one chunk in memory at a time). A file selected as small from stale walk metadata retains at most 16 MiB and consumes at most one extra probe byte before returning a retry message if it grew (#291). During one live snapshot invocation, configured file concurrency N bounds these buffers to N × 16 MiB; each local-manifest call reads sequentially. A blocking read can outlive cancellation and overlap a later or concurrent invocation. |
 | Hydrate resource caps | ≤ **1M** entries · **100k** symlinks · **1 TiB** total · **64M** total chunks · **16M** chunks/file | Checked after root parsing and before destination materialization against declared chunk sums/counts. Not all-allocation or physical-disk protection; Windows copy expansion remains #298. |
 | `ls --all` / `prune` enumeration caps | **16 MiB** per page · **10M** keys total · **1M** pages · page size **1000** | A tenant enumeration that blows past 10M keys aborts with `TooLarge` rather than growing unbounded. |
 | HTTP timeouts | request **120s**, connect **10s** (cred-ticket redeem: **30s** / **10s**) | A single stalled request is abandoned at 120s; the per-transport-operation deadline (`CLW_OP_DEADLINE_SECS`, default 300s) bounds the retry budget. This is why the 300s default ≈ a couple of full 120s attempts. |
