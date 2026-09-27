@@ -223,18 +223,31 @@ class AcknowledgementAndTimeoutTests(unittest.TestCase):
 
 
 class WorkflowGuardTests(unittest.TestCase):
-    def test_runtime_workflow_is_gated_and_same_repo_only(self):
+    def test_runtime_workflow_has_guarded_schedule_and_exact_protected_secret(self):
         text = Path(".github/workflows/b216-incident-notifier.yml").read_text()
         self.assertIn("workflow_dispatch:", text)
-        self.assertNotIn("schedule:", text)
+        self.assertIn("schedule:\n    - cron: '*/5 * * * *'", text)
         self.assertIn("default: false", text)
         self.assertIn("environment: b216-notifier-read", text)
+        self.assertIn("B216_D1_READ_TOKEN: ${{ secrets.B216_CF_NOTIFIER_D1_READ_TOKEN }}", text)
+        self.assertNotIn("secrets.B216_D1_READ_TOKEN", text)
+        self.assertNotIn("|| secrets.", text)
+        notify = text.split("  notify:\n", 1)[1].split("\n  acknowledge:\n", 1)[0]
+        self.assertIn("github.repository == 'HuGR-dev/corelink-workspaces'", notify)
+        self.assertIn("github.ref == 'refs/heads/main'", notify)
+        self.assertIn("vars.B216_NOTIFIER_ENABLED == 'true'", notify)
+        self.assertIn("github.event_name == 'schedule'", notify)
+        self.assertIn("!inputs.dry_run && inputs.enable_notifier", notify)
         self.assertIn("issues: write", text)
         self.assertIn("github.event.comment.user.login == 'gmhelmold'", text)
         self.assertIn("cancel-in-progress: false", text)
+        dry_run = text.split("  dry-run:\n", 1)[1].split("\n  notify:\n", 1)[0]
+        self.assertNotIn("B216_D1_READ_TOKEN", dry_run)
         acknowledge = text.split("  acknowledge:\n", 1)[1]
         self.assertIn("vars.B216_NOTIFIER_ENABLED == 'true'", acknowledge)
         self.assertIn("github.ref == 'refs/heads/main'", acknowledge)
+        self.assertNotIn("B216_D1_READ_TOKEN", acknowledge)
+        self.assertNotIn("environment: b216-notifier-read", acknowledge)
 
     def test_timeout_renotification_marker_is_once_and_reconciled(self):
         dg = "a" * 64

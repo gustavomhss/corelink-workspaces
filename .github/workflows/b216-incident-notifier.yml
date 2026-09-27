@@ -13,6 +13,8 @@ on:
         required: true
         default: false
         type: boolean
+  schedule:
+    - cron: '*/5 * * * *'
   issue_comment:
     types: [created]
 
@@ -46,7 +48,12 @@ jobs:
           python3 -m py_compile scripts/b216_incident_notifier.py
 
   notify:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && inputs.enable_notifier && github.ref == 'refs/heads/main' && vars.B216_NOTIFIER_ENABLED == 'true'
+    if: >-
+      github.repository == 'HuGR-dev/corelink-workspaces' &&
+      github.ref == 'refs/heads/main' &&
+      vars.B216_NOTIFIER_ENABLED == 'true' &&
+      ((github.event_name == 'workflow_dispatch' && !inputs.dry_run && inputs.enable_notifier) ||
+       github.event_name == 'schedule')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: b216-notifier-read
@@ -55,7 +62,7 @@ jobs:
       issues: write
     env:
       B216_NOTIFIER_ENABLED: ${{ vars.B216_NOTIFIER_ENABLED }}
-      B216_D1_READ_TOKEN: ${{ secrets.B216_D1_READ_TOKEN }}
+      B216_D1_READ_TOKEN: ${{ secrets.B216_CF_NOTIFIER_D1_READ_TOKEN }}
       B216_D1_ACCOUNT_ID: ${{ vars.B216_D1_ACCOUNT_ID }}
       B216_D1_DATABASE_ID: ${{ vars.B216_D1_DATABASE_ID }}
       GH_TOKEN: ${{ github.token }}
